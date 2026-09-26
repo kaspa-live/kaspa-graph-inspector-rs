@@ -729,6 +729,31 @@ may start; storage owns the atomic replacement itself.
 ## Block materialization transaction — settled
 
 ```rust
+struct ParentCommitted {
+    hash: BlockHash,
+    coordinate: Option<BlockCoordinate>, // None at outside-PP boundary
+}
+
+struct LevelCommitted {
+    level: u64,
+    size: u64,
+    daa_score: Option<u64>,
+}
+
+struct BlockCommitted {
+    hash: BlockHash,
+    coordinate: BlockCoordinate,
+    timestamp: Timestamp,
+    daa_score: u64,
+    selected_parent_index: Option<u32>,
+    direct_parents: Arc<[ParentCommitted]>,
+    blue_merge_set: Arc<[BlockHash]>,
+    red_merge_set: Arc<[BlockHash]>,
+    color: BlockColor,
+    is_in_vspc: bool,
+    level_snapshots: Arc<[LevelCommitted]>,
+}
+
 enum ReferencePolicy {
     AllowBoundaryIdentities,
     RequireMaterialized,
@@ -771,8 +796,24 @@ persists its hash, selected parent, direct parents, merge sets, timestamp, and
 DAA score; blue score and blue work remain available to processing but are not
 duplicated in the block row. Storage owns transactional ID resolution,
 coordinate allocation, initial color, persistence, and construction of the
-API-owned [`BlockCommitted`](api.md#in-process-api-and-graph-observer-feed--partially-open)
-value for a new insertion.
+`BlockCommitted` value for a new insertion.
+
+The parent payload contains actual direct parents only. For every non-Genesis
+block, `selected_parent_index` is `Some(index)`, the index is representable as
+`u32` and in bounds for `direct_parents`, and that entry is the block's selected
+parent. Its coordinate can be `None` at the outside-PP boundary. Genesis has an
+empty `direct_parents` payload and `selected_parent_index = None`. Synthetic
+ORIGIN is Genesis's persisted selected-parent identity, but it is never inserted
+into `direct_parents` or emitted as a graph parent. The payload therefore
+identifies the selected-parent coordinate without duplicating its hash.
+
+`level_snapshots` is non-repeating by level and contains complete post-commit
+snapshots for the inserted block's level, always, and every distinct
+materialized direct-parent level needed by its emitted edges. It contains no
+entry for an outside-boundary parent. `None` represents storage's no-VSPC DAA
+sentinel. The collection includes parent-level context even when the
+materialization transaction did not mutate that parent level; it is therefore
+not named or interpreted as a change list.
 
 For every materialization, intern hashes in this order:
 
@@ -842,22 +883,26 @@ Slot allocation is atomic, conceptually:
 INSERT INTO levels(level, size, daa_score) VALUES ($1, 1, $no_vspc)
 ON CONFLICT(level)
 DO UPDATE SET size = levels.size + 1
-RETURNING size - 1;
+RETURNING levels.size - 1 AS slot, levels.size, levels.daa_score;
 ```
 
 A newly inserted block starts `Gray` and outside VSPC. Parent rows contain
 each actual materialized coordinate or the outside-boundary sentinel `(0,0)`.
-Normal block materialization leaves the level DAA score at its sentinel.
+A newly created level starts with the no-VSPC DAA sentinel. Materialization at
+an existing level preserves that level's current DAA score while increasing its
+size.
 
 For a new insertion, construct `BlockCommitted` inside the same transaction
 from the validated block, its allocated coordinate, and every direct parent's
-resolved storage state. A materialized parent has `Some(coordinate)` and the
-`Some(levels.size)` value observed for its level in that transaction. An
-outside-boundary parent has `None` for both fields. Preserve the validated
-direct-parent sequence and mark its selected parent. Return the `Inserted`
-outcome, including that complete payload, only after definite commit. The
-payload therefore describes the same committed state as the insertion; no
-post-commit projection read is allowed.
+resolved storage state. A materialized parent has `Some(coordinate)` and its
+complete level state appears once in `level_snapshots`; an outside-boundary
+parent has `None` and contributes no level snapshot. Preserve the validated
+direct-parent sequence, record its selected-parent index, and include the
+persisted initial color and VSPC membership. The inserted block's resulting
+level snapshot reflects every size or DAA-score value stored by the transaction.
+Return the `Inserted` outcome, including that complete payload, only after
+definite commit. The payload therefore describes the same committed state as
+the insertion; no post-commit projection read is allowed.
 
 An already materialized own hash returns `AlreadyMaterialized` with its ID and
 coordinate. It carries no `BlockCommitted` because deduplication creates no

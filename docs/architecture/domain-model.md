@@ -15,6 +15,12 @@ Rust declarations follow the semantic-shape convention in the
 ```rust
 type Timestamp = u64;
 
+enum BlockColor {
+    Gray,
+    Blue,
+    Red,
+}
+
 const MAX_DAA_SCORE: u64 = i64::MAX as u64 - 1;
 const MAX_BLUE_SCORE: u64 = i64::MAX as u64;
 
@@ -57,6 +63,10 @@ struct MaterializedSyncAnchor {
 Unix epoch. KGI accepts the complete upstream `u64` domain. It is informational
 block metadata; KGI does not use it for consensus, ordering, recovery, or
 arithmetic.
+
+`BlockColor` is the shared color vocabulary. Storage owns persisted color
+transitions, VspcProcessor owns when to request them, and API projections
+consume the committed value.
 
 Every KGI DAA score is in `0..=MAX_DAA_SCORE`, and every KGI blue score is in
 `0..=MAX_BLUE_SCORE`. The fields remain ordinary `u64`; these constants define

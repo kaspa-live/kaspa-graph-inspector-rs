@@ -30,55 +30,18 @@ sequence number is needed for observer-only continuity. The invalid flag also
 catches loss of the **last** update that no later sequence number could
 expose.
 
-Conceptual committed payloads (field names can change, semantic content
-must not):
-
-```rust
-struct GraphParent {
-    hash: BlockHash,
-    coordinate: Option<BlockCoordinate>, // None at outside-PP boundary
-    level_size: Option<u64>,              // needed for external endpoint
-    is_selected: bool,
-}
-struct BlockCommitted {
-    hash: BlockHash,
-    coordinate: BlockCoordinate,
-    timestamp: Timestamp,
-    daa_score: u64,
-    direct_parents: Arc<[GraphParent]>,
-    blue_merge_set: Arc<[BlockHash]>,
-    red_merge_set: Arc<[BlockHash]>,
-}
-struct VspcCommitted {
-    source: BlockHash,
-    destination: BlockHash,
-    removed: Arc<[BlockHash]>,
-    added: Arc<[BlockHash]>,
-}
-```
-
-The parent payload contains actual direct parents only. For every non-Genesis
-block, its selected parent is one actual direct parent and appears exactly once
-with `is_selected = true`; its coordinate can be `None` at the outside-PP
-boundary. Genesis has an empty `direct_parents` payload. Synthetic ORIGIN is
-Genesis's persisted selected-parent identity, but it is never inserted into
-`direct_parents` and never becomes a public graph edge endpoint.
-
-The payload therefore carries direct-parent coordinates and, for non-Genesis
-blocks, the selected-parent coordinate without duplication. ApiService consumes
-every successfully delivered `BlockCommitted`, including updates for blocks
-below the current head view. A block within the view follows normal insertion
-handling. A block below `low_level` does not reintroduce its block into the
-view or extend its extent. Its coordinate supplies
-the committed level-size candidate `slot + 1`. If that level remains cached as
-an external endpoint for a crossing edge, update its cached size monotonically:
-
-```text
-cached_external_level_size = max(cached_external_level_size, slot + 1)
-```
-
-An external level can first be seeded from an incoming child's parent data. A
-later below-range update publishes an atomic graph revision only when it changes
+ApiService consumes storage's
+[`BlockCommitted`](storage.md#block-materialization-transaction--settled) and
+VspcProcessor's
+[`VspcCommitted`](vspc-processing.md#commit-and-graph-publication--settled)
+without redefining either producer payload. It consumes every successfully
+delivered `BlockCommitted`, including updates for blocks below the current head
+view. A block within the view follows normal insertion handling. A block below
+`low_level` does not reintroduce its block into the view or extend its extent.
+Its complete committed level snapshot updates that level when it remains cached
+as an external endpoint for a crossing edge. Parent-level snapshots can seed
+external levels required by the incoming child's edges. A later below-range
+update publishes an atomic graph revision only when a supplied snapshot changes
 retained endpoint state. An update for a level with no retained crossing-edge
 endpoint has no visible view effect. The graph-view contract below owns endpoint
 retention and removal.
@@ -156,6 +119,19 @@ struct GraphEdge {
     id: EdgeId,
     parent_coordinate: BlockCoordinate,
     child_coordinate: BlockCoordinate,
+}
+
+struct GraphBlock {
+    hash: BlockHash,
+    coordinate: BlockCoordinate,
+    timestamp: Timestamp,
+    daa_score: u64,
+    selected_parent_index: Option<u32>,
+    direct_parents: Arc<[BlockHash]>,
+    blue_merge_set: Arc<[BlockHash]>,
+    red_merge_set: Arc<[BlockHash]>,
+    color: BlockColor,
+    is_in_vspc: bool,
 }
 
 struct GraphView {
@@ -276,19 +252,23 @@ extraction and drawing;
 it does not depend on either endpoint block being present in the view. For
 every `Some(edge)` in `edge_changes`, the map key equals `edge.id`. Likewise,
 for every `Some(block)` in `block_changes`, the map key equals `block.hash`.
-The block's mutable VSPC projection is not part of its immutable `GraphBlock`
-value.
+`GraphBlock` combines immutable block and graph data with the view's current
+mutable `color` and `is_in_vspc` projection. Block add/remove changes carry the
+complete value; dedicated VSPC mutations will update only that projection under
+completion item 4.
 
 The absolute map semantics are:
 
 ```text
-Some(value) => ensure the immutable value is present
-None        => ensure the identified value is absent
+Some(value) => ensure the identified edge or block value is present
+None        => ensure the identified edge or block is absent
 ```
 
-Composition is right-biased for each identity. A repeated present value for
-one identity must be the same immutable edge or block. Add-then-remove and
-remove-then-add therefore compose without reading the starting view.
+Composition is right-biased for each identity. A repeated present edge must be
+the same immutable edge. A repeated present block must have the same immutable
+block and graph fields; VSPC projection composition belongs to completion item
+4. Add-then-remove and remove-then-add therefore compose without reading the
+starting view.
 
 An edge belongs to an extent `[low_level, high_level]` when its level span
 intersects that extent:

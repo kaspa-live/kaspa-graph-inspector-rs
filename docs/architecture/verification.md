@@ -340,9 +340,14 @@ references and newly absent references succeed as boundary leaves and do not
 produce that strict-policy result.
 
 For an inserted block, verify that the returned `BlockCommitted` contains the
-new coordinate plus every direct parent's coordinate and level size from the
-same committed transaction, with both optional fields absent for an
-outside-boundary parent. `AlreadyMaterialized` returns no observer payload.
+new coordinate plus every direct parent's coordinate from the same committed
+transaction, with the coordinate absent for an outside-boundary parent. Its
+non-repeating `level_snapshots` must contain the complete resulting block level
+and every distinct materialized parent level, preserve an existing level's DAA
+score while its size changes, translate the no-VSPC sentinel to `None`, and
+exclude outside-boundary parents. Cover the selected-parent index and committed
+initial color and VSPC membership. `AlreadyMaterialized` returns no observer
+payload.
 Verify BlockProcessor forwards the inserted payload before `PersistedBlock`;
 failed observer delivery invalidates the API image but does not suppress the
 later `PersistedBlock` delivery.
@@ -610,13 +615,18 @@ complete view levels, external parent-edge endpoints and level sizes, actual par
 presence independent of visible edges, and one Reset-driven replacement
 `GraphPublication` per prepared processing session.
 
+Cover `BlockCommitted` conversion to `GraphBlock`, including the selected-parent
+index for an ordinary block, the Genesis `None` case, and propagation of the
+committed initial color and VSPC membership.
+
 For below-range block updates, verify that every delivered `BlockCommitted` is
-consumed, a referenced external level size grows monotonically from the
-committed coordinate, and the resulting endpoint change is published as one
-atomic revision. The update must neither expand the view extent nor restore
-the below-range block or level as head-view content. An update for a level with no
-retained crossing-edge endpoint produces no visible revision, and unreferenced
-external endpoint metadata can be discarded.
+consumed, its complete level snapshot updates retained external state, and the
+resulting endpoint change is published as one atomic revision. Parent snapshots
+seed exact external level state for new crossing edges. The update must neither
+expand the view extent nor restore the below-range block or level as head-view
+content. An update for a level with no retained crossing-edge endpoint produces
+no visible revision, and unreferenced external endpoint metadata can be
+discarded.
 
 Verify the settled graph-model core with a view and history initially at
 revision `n`. A retained mutation advances the view to `n+1` and returns
@@ -637,7 +647,8 @@ Verify the [graph-view edge and absolute-map contract](api.md#graph-views-public
 with zero, one, and two endpoint blocks retained; child addition and removal;
 parent-only removal; outside-extent parent levels under both tracking policies;
 and PP-boundary sentinel links. Cover absolute block/edge map composition,
-key/value identity agreement, and conflicting immutable values.
+key/value identity agreement, conflicting immutable edge or block data, and
+separate VSPC projection treatment.
 
 Verify [DAA navigation and graph windows](api.md#daa-navigation-and-graph-windows--settled)
 for floor selection and tie break, the sentinel result, a reorg-created
@@ -697,8 +708,9 @@ PostSeal publication. Include query/reset races and PostgreSQL `TRUNCATE`; no
 request may observe a partial or mixed generation.
 
 Observer and API projection tests cover a non-Genesis block whose selected
-parent occurs exactly once in `direct_parents` with `is_selected = true`, plus
-Genesis with an empty `direct_parents` list and no synthetic ORIGIN parent.
+parent index addresses the expected member of `direct_parents`, plus Genesis
+with `selected_parent_index = None`, an empty `direct_parents` list, and no
+synthetic ORIGIN parent.
 Genesis recognition must not require the public projection or Web client to
 expose or consult persisted `NodeMetadata.genesis_hash`.
 

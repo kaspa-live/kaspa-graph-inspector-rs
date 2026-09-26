@@ -196,7 +196,8 @@ VSPC `added` or `removed` member is Genesis, although a derived VSPC source may
 be Genesis.
 
 After `materialize_block` returns `Inserted`, BlockProcessor forwards its
-returned `BlockCommitted` value before delivering `PersistedBlock` to
+returned [`BlockCommitted`](storage.md#block-materialization-transaction--settled)
+value before delivering `PersistedBlock` to
 VspcProcessor and OrphanManager. This preserves graph observer causal order.
 `AlreadyMaterialized` produces no graph mutation but still delivers
 `PersistedBlock`. If observer delivery fails, BlockProcessor sets the API

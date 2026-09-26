@@ -350,6 +350,15 @@ nonmaterialized chain member.
 
 ## Commit and graph publication — settled
 
+```rust
+struct VspcCommitted {
+    source: BlockHash,
+    destination: BlockHash,
+    removed: Arc<[BlockHash]>,
+    added: Arc<[BlockHash]>,
+}
+```
+
 For each ready transition, VspcProcessor invokes storage's atomic VSPC
 transaction. Only definite commit advances its local committed sink and
 history. Storage returns the destination `VspcPoint`; no caller-side
