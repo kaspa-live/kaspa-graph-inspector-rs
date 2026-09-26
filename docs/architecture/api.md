@@ -2,17 +2,17 @@
 
 ## Scope and ownership
 
-This document owns ApiService, graph publication, the `HeadGraphCache`, API
-resource bulkheads, and the public graph API contract. The
+This document owns ApiService, `GraphView`, `GraphDelta`, `GraphHistory`,
+`GraphPublication`, API resource bulkheads, and the public graph API contract. The
 [processing lifecycle](processing-lifecycle.md) owns when recovery milestones
 send API controls. [Storage](storage.md) owns database transaction and query
 implementation. Web client behavior belongs to the
 [Web architecture](web.md).
 
-## In-process API and graph observer feed — settled
+## In-process API and graph observer feed — partially open
 
 KGI v2 includes an in-process `ApiService` and a complete bounded-by-level
-`HeadGraphCache` (HGC), rather than directing each head request to expensive
+head-tracking `GraphView`, rather than directing each head request to expensive
 PostgreSQL graph queries. The [system overview](overview.md#resource-isolation-and-scalability--settled)
 owns deployment evolution and the single-writer constraint.
 
@@ -67,9 +67,9 @@ Genesis's persisted selected-parent identity, but it is never inserted into
 The payload therefore carries direct-parent coordinates and, for non-Genesis
 blocks, the selected-parent coordinate without duplication. ApiService consumes
 every successfully delivered `BlockCommitted`, including updates for blocks
-below current HGC coverage. A block within HGC follows normal insertion
-handling. A block below `retain_from_level` does not reintroduce its block or
-level into HGC and does not extend `HeadGraphCoverage`. Its coordinate supplies
+below the current head view. A block within the view follows normal insertion
+handling. A block below `low_level` does not reintroduce its block into the
+view or extend its extent. Its coordinate supplies
 the committed level-size candidate `slot + 1`. If that level remains cached as
 an external endpoint for a crossing edge, update its cached size monotonically:
 
@@ -80,25 +80,21 @@ cached_external_level_size = max(cached_external_level_size, slot + 1)
 An external level can first be seeded from an incoming child's parent data. A
 later below-range update publishes an atomic graph revision only when it changes
 retained endpoint state. An update for a level with no retained crossing-edge
-endpoint has no visible HGC effect. Once no retained edge references an external
-level, HGC may discard that endpoint metadata.
+endpoint has no visible view effect. The graph-view contract below owns endpoint
+retention and removal.
 
-ApiService applies VSPC source/destination continuity:
-
-```text
-incoming.source == cache.committed_vspc_sink
-```
-
-If not, invalidate/reload HGC. From the removed/added vectors and cached
-block metadata, ApiService independently updates cached VSPC membership,
-colors, and level DAA scores, then publishes **one atomic graph revision**.
+Ordered `VspcProcessor` delivery certifies VSPC sequencing for ApiService.
+`GraphView` does not retain a committed VSPC sink and ApiService does not repeat
+the processor's source/destination continuity check. From the removed/added
+vectors and retained block metadata, the view updates VSPC membership, colors,
+and level DAA scores.
 Processing/storage need not return a list of DAA-score changes or track them
 for the API. Only actual final level-score changes matter: a remove/add pair
 may temporarily change then restore a level's original score. An added
-block's merge-set hash absent from complete HGC levels has no impact on
+block's merge-set hash absent from complete view levels has no impact on
 retained levels by definition; ignore it rather than invalidating cache.
-Do not confuse this with a required chain block missing from cache when its
-effect on a retained level cannot be determined; that case requires reload.
+The remaining absent-block behavior is part of the incomplete VSPC-delta design
+listed below.
 
 `MAX_CACHE_DEPTH = 1000` complete levels. Define a separate
 `MAX_WINDOW_DEPTH <= MAX_CACHE_DEPTH`; its exact value remains deferred in the
@@ -109,13 +105,10 @@ windowed endpoint caps requested depth to `MAX_WINDOW_DEPTH` and reports
 the effective range. An oversized `/graph/head` request cannot fall back to
 DB; it is capped.
 
-The v1 edge rule remains: emit **every materialized edge whose span
-intersects the requested window**, including a parent outside the response.
-At the head, every such edge has its child in HGC, while its parent can be
-outside. Retain cached child-to-parent records, parent hash/coordinate, and
-the external parent's level size. Do **not** require both endpoint blocks
-inside the requested window, nor omit a crossing edge. PP-boundary sentinel
-edges at level 0 are not normal visible materialized edges.
+The [graph-view contract](#graph-views-publication-revision-and-history--incomplete-working-contract)
+owns edge representation, window inclusion, endpoint retention, and lifetime.
+The observer payload above supplies the committed parent information required
+to apply that contract.
 
 `CompactId` is private to storage/processing. Each HTTP graph response has
 its own small numeric references and an included local ID-to-hash dictionary
@@ -130,42 +123,98 @@ direct-parent list. The public projection and Web client do not need to expose
 or consult the persisted `NodeMetadata.genesis_hash`, and no dedicated
 Genesis-hash API endpoint is required.
 
-## Snapshot, revision, delta, SSE, and ETags — settled
+## Graph views, publication, revision, and history — incomplete working contract
+
+The following conceptual shapes record the settled portion of the graph model.
+Container and collection types remain implementation choices, and the mutation
+fields explicitly marked pending will be completed through the numbered design
+work below.
 
 ```rust
-struct HeadGraphCoverage {
-    retain_from_level: u64,
-    head_level: u64,
+enum TrackingPolicy {
+    Head,
+    Fixed,
+}
+
+struct Level {
+    size: u64,
+    daa_score: Option<u64>,
+}
+
+struct LevelChange {
+    level: u64,
+    before: Option<Level>,
+    after: Option<Level>,
+}
+
+struct EdgeId {
+    parent: BlockHash,
+    child: BlockHash,
+}
+
+struct GraphEdge {
+    id: EdgeId,
+    parent_coordinate: BlockCoordinate,
+    child_coordinate: BlockCoordinate,
+}
+
+struct GraphView {
+    max_depth: u64,
+    low_level: u64,
+    high_level: u64,
+    current_revision_id: u64,
+    tracking_policy: TrackingPolicy,
+    levels: LevelSet, // each retained entry also keeps derived usage_count
+    blocks: BlockSet,
+    edges: EdgeSet,
+}
+
+struct GraphDelta {
+    from_revision_id: u64,
+    to_revision_id: u64,
+    high_level: u64,
+    block_changes: HashMap<BlockHash, Option<GraphBlock>>,
+    edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
+    level_changes: Vec<LevelChange>,
+    // Remaining block and VSPC mutation details remain to settle.
+}
+
+struct GraphHistory {
+    current_revision_id: u64,
+    deltas: OrderedDeltaList,
+}
+
+struct GraphPublication {
+    publication_id: u64,
+    view: GraphView,
+    history: GraphHistory,
 }
 ```
 
-`HeadGraphCoverage` describes the complete HGC range at one published
-revision. Every HGC-backed snapshot and every delta carries the coverage of
-its target revision. `Delta(a,b)` therefore carries revision `b`'s coverage.
-The invariant `retain_from_level <= head_level` holds, and every materialized
-block in that inclusive range is present in HGC. This coverage is the complete
-HGC range, independently of the narrower effective range selected for a
-particular graph response.
+Only `GraphPublication` has a `publication_id`. A `GraphView` has no origin,
+liveness, database, or publication status. A view constructed from a database
+starts at revision zero. An extract inherits its source view's revision. Any
+view may subsequently receive updates; `Head` and `Fixed` govern extent and
+pruning behavior rather than whether updates are permitted.
 
-External parent endpoints below `retain_from_level` remain reference-only graph
-metadata needed by crossing edges; they do not extend HGC coverage. A delta
-whose target boundary advances may omit block and level contents that have
-left HGC, but it retains the endpoint metadata required by every crossing edge
-in the target image. Within one GraphEpoch, `retain_from_level` never
-decreases and `head_level` never decreases.
+The `publication_id` is a fresh random nonzero `u64` for each publication.
+Together `(publication_id, revision)` form the public cursor. If the selected
+wire format cannot represent every `u64` exactly, its encoding must preserve
+the complete integer domain.
 
-ApiService begins buffering graph updates **before** a consistent DB snapshot
-read. The snapshot includes complete retained levels/blocks, external edge
-endpoint coordinates and level sizes, current colors/VSPC membership,
-committed VSPC sink, and current DB data needed for DAA resolution. Replay
-buffered block updates idempotently without overwriting snapshot colors;
-skip VSPC prefix already represented by the snapshot, then require exact
-source/sink continuity. On each new processing session, reload because the
-previous session may have committed data without publishing its observer
-update. Every reload creates a new **GraphEpoch**: this is an API publication
-continuity epoch, not a DB, node, notification, or CompactId epoch. An old
-coherent image can remain served as explicitly **stale** until a coherent
-replacement is ready, but it has no active deltas.
+ApiService begins buffering graph updates before constructing a `GraphView`
+from one consistent database snapshot. On every new processing session it
+reconstructs the view because the previous session may have committed data
+without delivering its observer update. A coherent replacement creates a new
+`GraphPublication` with a new `publication_id`; an old coherent publication can
+remain readable as explicitly Stale, but it receives no further deltas.
+
+The database projection contains the complete view levels and blocks, every
+required crossing-edge endpoint and its level size, current colors and VSPC
+membership, and the data required for DAA resolution. Buffered updates are
+then applied in their certified delivery order. The precise database projection
+and VSPC replay treatment remain the sixth and fourth open graph-model items,
+respectively.
 
 ApiService has three externally meaningful publication states:
 
@@ -173,115 +222,188 @@ ApiService has three externally meaningful publication states:
 Stale | Synchronizing | Live
 ```
 
-Reset makes the old epoch Stale. The PostSeal trigger starts snapshot/replay
-and publishes its coherent replacement as a new GraphEpoch in Synchronizing
-state. Synchronizing is a valid current-DB image: head snapshots, deltas, and
-SSE are available while processing catches up. The Live trigger changes that
-same epoch to Live without another reload or epoch change. If Live arrives
-while the replacement is still loading, remember the newer target and publish
-the completed image directly as Live. A later Reset cancels any pending
-publication and returns the API to Stale.
+Reset makes the old publication Stale. PostSeal constructs and publishes its
+coherent replacement in Synchronizing state. Live updates that same
+publication without another database reconstruction. The exact relationship
+between those lifecycle changes and graph revisions remains open.
 
-Each graph mutation and each active-epoch lifecycle-state change produces an
-atomic revision. Reset retires its epoch and need not create an old-epoch
-delta. A snapshot carries `(GraphEpoch, revision, publication_state)`. Deltas
-describe a contiguous interval `(a,b)` within one epoch, are **independent of
-requested window depth**, and compose sequentially:
+The API response envelope, rather than `GraphView` or `GraphDelta`, carries the
+owning `publication_id`. A published view response pairs it with the view's
+current revision; a delta response pairs it with the history interval actually
+returned.
+
+`GraphView` owns application of `BlockCommitted` and `VspcCommitted`. An update
+that changes no retained block, edge, or level returns no delta and leaves the
+revision unchanged. Any retained change advances the view revision and returns
+the corresponding `GraphDelta`; a retained level-size or DAA-score change is
+sufficient even when the triggering block itself is outside the block extent.
+
+The view advances before its returned delta is appended to `GraphHistory`:
+
+```text
+GraphView n / GraphHistory n
+    -> apply update to GraphView
+GraphView n+1 / GraphHistory n
+    -> append GraphDelta(n,n+1)
+GraphView n+1 / GraphHistory n+1
+```
+
+The intermediate state is valid. A view or subview request may therefore
+observe revision `n+1` while a delta-history request can reach only revision
+`n`. There is no equality invariant between the two current revision fields.
+`GraphHistory` nevertheless accepts a delta only when
+`delta.from_revision_id == history.current_revision_id`, preserving its own
+gapless sequence.
+
+`GraphDelta.high_level` is the target view's high level. It is retained in the
+internal history and included in the API delta payload. It is the semantic key
+for history pruning and lets the Web consume the target head level without
+deriving it from mutation contents. A delta does not carry `low_level` or a
+separate coverage object; explicit graph mutations drive the receiving view's
+lower-bound changes.
+
+`level_changes` contains only levels whose `size` or `daa_score` actually
+changed. `None` represents absence, so one shape covers creation, update, and
+removal. Applying a level change requires the current value to equal `before`
+before installing `after`. Gapless composition folds consecutive changes from
+the first `before` to the last `after` and omits a level whose composed change
+has no net effect. Because each change carries its pre-state, this composition
+does not require the starting view.
+
+Within the API graph model, `EdgeId` is the canonical immutable identity of a
+child-parent link. `GraphEdge` adds the complete coordinates required for
+extraction and drawing;
+it does not depend on either endpoint block being present in the view. For
+every `Some(edge)` in `edge_changes`, the map key equals `edge.id`. Likewise,
+for every `Some(block)` in `block_changes`, the map key equals `block.hash`.
+The block's mutable VSPC projection is not part of its immutable `GraphBlock`
+value.
+
+The absolute map semantics are:
+
+```text
+Some(value) => ensure the immutable value is present
+None        => ensure the identified value is absent
+```
+
+Composition is right-biased for each identity. A repeated present value for
+one identity must be the same immutable edge or block. Add-then-remove and
+remove-then-add therefore compose without reading the starting view.
+
+An edge belongs to an extent `[low_level, high_level]` when its level span
+intersects that extent:
+
+```text
+edge.child_coordinate.level >= low_level
+AND
+edge.parent_coordinate.level <= high_level
+```
+
+This rule includes an edge even when neither endpoint block is contained in
+the extent. It is also the conceptual selection predicate for subview
+extraction; the exact index used to evaluate it efficiently is an
+implementation choice. PP-boundary sentinel links at level 0 do not become
+public `GraphEdge` values.
+
+For update and pruning of a head-tracking source view, child membership owns
+edge lifetime. Adding a child adds its parent edges and increments
+`usage_count` on each referenced parent level. Removing a child removes every
+edge whose `EdgeId.child` is that block and decrements the corresponding
+parent-level counters. A parent block leaving the block extent does not remove
+an edge while its child remains. An extracted view can independently retain a
+crossing edge without retaining either endpoint block under the intersection
+rule above.
+
+`usage_count` is derived `GraphView` maintenance state. It is absent from the
+public `Level` value and from `LevelChange`; applying edge changes maintains it
+locally. A level inside the view extent remains regardless of its counter. In a
+head-tracking view, an outside-extent parent level becomes removable when its
+counter reaches zero. A fixed view never removes levels through this mechanism,
+though updates can add referenced levels.
+
+`GraphView` and `GraphDelta` contain no committed VSPC sink. ApiService trusts
+the ordered, continuity-certified `VspcProcessor` output and does not duplicate
+its continuity validation.
+
+GraphHistory retention is level-scoped. All revisions and deltas produced while
+a graph level remains within the retained head window are preserved. History
+associated with that level becomes eligible for pruning only when the level
+itself leaves the retained window. No independent revision-count or memory-size
+cap is required or permitted by this design.
+
+Kaspa does not permit unbounded revision production while the graph remains
+indefinitely at one fixed level. Therefore retaining all history for every
+level still inside the retained window is bounded by graph/window semantics. A
+hypothetical infinite activity stream at one level is not a valid Kaspa
+behavior and cannot justify an additional history cap. A cursor whose required
+deltas left with their level normally requires a fresh view.
+
+The remaining graph-model work is intentionally incomplete in this working
+contract. Completion items 2 through 6 are owned by the
+[open decision register](../decisions/open.md#api-graph-model-completion).
+
+Gapless delta intervals from one publication compose sequentially:
 
 ```text
 apply(Delta(a,b), image_at_a) = image_at_b
 apply(Delta(b,c), image_at_b) = image_at_c
-```
-
-A lifecycle-only revision carries the publication-state update even when graph
-data is unchanged.
-
-Delta mutations are idempotent absolute set/upsert patches. They state the
-resulting public block, block-state, level, publication-state, and coverage
-values rather than relative operations such as increment, decrement, or
-toggle. Reapplying one delta therefore produces the same graph state. Each
-delta response uses its own response-local hash dictionary and carries its
-target `HeadGraphCoverage`.
-
-Gapless intervals in one GraphEpoch compose without reading the starting graph:
-
-```text
 compose(Delta(a,b), Delta(b,c)) = Delta(a,c)
 ```
 
-Composition requires the same GraphEpoch and exact equality between the left
-`to` and right `from` cursors. The result uses `a` as `from`, `c` as `to`, and
-revision `c`'s coverage and publication state. A later absolute value for the
-same entity wins; updates following an insertion fold into that block's final
-public state; and reference-only endpoint metadata still required by a
-crossing edge is retained. Composition decodes both response-local dictionaries
-to hashes and constructs a self-contained dictionary for the result.
+Composition requires exact equality between the left `to` and right `from`
+revisions. The result uses `a` as `from`, `c` as `to`, and delta `c`'s
+`high_level`. Composition is associative by graph-state effect. A composed
+encoding need not be byte-identical to a directly constructed interval, but it
+must have the same graph-state effect. Every API delta response uses a
+self-contained response-local hash dictionary. Composition decodes the input
+dictionaries to hashes and constructs a new dictionary for the result.
 
-Composition is associative by graph-state effect. A composed encoding need not
-be byte-identical to a delta constructed directly for the same interval, but:
+A request from revision `a` captures a desired history target `t`. If the
+complete `Delta(a,t)` exceeds the response budget, return the largest nonempty
+prefix `Delta(a,b)` that fits and ends at a complete revision boundary; the
+client continues from `b`. Never split one atomic revision. If the first
+required revision cannot fit, incremental advancement is unavailable and the
+response requires a fresh view. No response splits a revision or returns a
+structurally partial mutation. A publication mismatch, unavailable revision,
+Stale publication, or cursor pruned by the level-scoped retention rule also
+requires a fresh view. Whether an interval is encoded as individual retained
+revisions or one composed patch remains an implementation choice under the
+composition contract.
 
-```text
-apply(compose(Delta(a,b), Delta(b,c)), image_at_a)
-    = apply(Delta(b,c), apply(Delta(a,b), image_at_a))
-```
-
-A request from cursor `a` captures a desired target cursor `t`. If the complete
-`Delta(a,t)` exceeds the response budget, return the largest nonempty prefix
-`Delta(a,b)` that fits and ends at a complete revision boundary; the client
-continues from `b`. Never split one block revision, atomic VSPC revision,
-lifecycle-state revision, or its target coverage. If the first required atomic
-revision cannot fit, incremental advancement is unavailable and the response
-requires a fresh snapshot. Existing response-size and head-availability rules
-apply if that snapshot cannot be served completely.
-
-Delta retention is bounded. Epoch mismatch, unavailable revision, stale API,
-or too-old cursor also requires a fresh snapshot. No outcome returns a
-structurally partial revision. Whether a complete interval is encoded as
-individual revision records or one coalesced absolute patch remains an
-implementation choice under this composition contract.
-
-SSE is only an ordered **cursor wakeup** `(epoch, revision)`, not the graph
-data channel. A browser `EventSource` can receive a sequence on one
-connection, but reconnection is not exactly-once. On connect the server
-immediately emits the latest cursor; subsequent publications emit updated
-cursors. Each client has a bounded cursor buffer. Slow clients get coalesced
-cursor notifications and, if persistently behind, are disconnected; they
-reconnect and use HTTP delta or snapshot.
+SSE is only an ordered cursor wakeup `(publication_id, revision)`, not the graph
+data channel. Reconnection is not exactly-once. Each client has a bounded
+cursor buffer. On connection the server emits the latest history cursor;
+subsequent history advancement emits updated cursors. Slow clients receive
+coalesced cursor notifications and, if persistently behind, are disconnected
+and recover through HTTP delta or view requests.
 
 `representation_version` is the settled term for the graph payload schema.
-An ETag for a head snapshot distinguishes epoch, revision, effective window,
-negotiated response format, `representation_version`, and publication state;
-`Cache-Control: no-cache` allows cheap revalidation/304. A fixed delta
-interval `(epoch,from,to)` is immutable and cacheable. A "to current" query
-must revalidate. SSE has no ETag. Historical DB windows have **no ETag in
-v2**, because computing an authoritative validator would itself require DB
-work. SSE stays small text cursor events.
+An ETag for a head view distinguishes publication ID, revision, effective
+window, negotiated response format, `representation_version`, and publication
+state; `Cache-Control: no-cache` allows cheap revalidation/304. A fixed delta
+interval `(publication_id,from,to)` is immutable and cacheable. A "to current"
+query must revalidate. Historical database windows have no ETag in v2, and SSE
+has no ETag.
 
-ApiService also maintains bounded server-side reuse of encoded head responses.
-This is distinct from HGC, which owns graph state. It caches immutable encoded
-bodies for an HGC-backed head snapshot at one exact revision and effective
-window, and for a delta over one exact `(epoch,from,to)` interval. Concurrent
-requests for the same absent variant are single-flight: one task constructs,
-serializes, and compresses the response, and the other requests share the
-resulting immutable bytes.
-
-A snapshot variant is identified by GraphEpoch, revision, publication state,
-effective window, negotiated response format, `representation_version`, and
-content encoding. A delta variant is identified by GraphEpoch, its actual
-`from` and `to` cursors, negotiated response format,
-`representation_version`, and content encoding. A "to current" request first
-captures an exact target cursor before it can join shared construction or use
-an encoded entry. If the bounded-delta rule returns a complete prefix, the
-actual returned interval identifies that entry.
+ApiService maintains bounded server-side reuse of encoded head responses. It
+caches immutable encoded bodies for a head view at one exact revision and
+effective window, and for a delta over one exact
+`(publication_id,from,to)` interval. Concurrent requests for the same absent
+variant are single-flight. A view variant is identified by publication ID,
+revision, publication state, effective window, negotiated response format,
+`representation_version`, and content encoding. A delta variant uses the same
+representation fields and its exact `from` and `to` revisions. A "to current"
+request captures an exact target before it can join shared construction or use
+an encoded entry; a bounded complete-prefix response is keyed by its actual
+returned interval.
 
 An encoded-cache miss or eviction affects performance only: reconstruct the
-response from HGC or the retained delta journal under the existing API
-bulkheads. Inability to retain a new encoded entry does not reject an otherwise
-serviceable response; existing request, response-memory, and encoding admission
-limits may still reject work before construction. Never reuse bytes across
-distinct variants. Cache pressure cannot affect HGC correctness or processing.
-Historical database-backed windows remain uncached in v2, and SSE remains an
-uncached cursor notification stream. Exact cache capacity, eviction policy,
+response from the current `GraphView` or retained `GraphHistory`. Historical
+database-backed windows remain uncached in v2, and SSE remains an uncached
+cursor notification stream. Failure to retain a new encoded entry does not
+reject an otherwise serviceable response, and cached bytes are never reused
+across distinct variants. Cache pressure cannot affect graph correctness or
+processing. Exact cache capacity, eviction policy,
 implementation, and graph wire format remain deferred in the
 [decision register](../decisions/deferred.md).
 
@@ -295,11 +417,11 @@ ordering belong to
 ApiService accepts exactly one Reset for each prepared processing session.
 Common Reset effects are:
 
-- mark the previously published HGC image Stale while allowing that coherent
+- mark the previously published graph view Stale while allowing that coherent
   old image to remain readable;
-- stop old-epoch deltas;
+- stop deltas for the old publication;
 - prevent pending observer updates from the previous processing session from
-  entering the replacement epoch; and
+  entering the replacement publication; and
 - arm buffering for the new session before processor Begin.
 
 Reset has a completed-effect acknowledgement. The acknowledgement establishes
@@ -313,7 +435,7 @@ acknowledgement.
 `InvalidateSession` is a reliable, exact-once terminal control for a recoverably
 aborted processing session. It marks that session's published image Stale,
 stops its deltas, cancels any pending publication, and rejects later observer
-updates from the invalidated session. It creates no GraphEpoch, performs no DB
+updates from the invalidated session. It creates no `GraphPublication`, performs no DB
 reload, and does not arm buffering for a replacement session. The next
 prepared session still begins with its own Reset. Invalidation leaves
 historical reads available unless the invalidated session's database-rebuild
@@ -335,15 +457,15 @@ otherwise cancel it and return 503. API reads cannot indefinitely delay
 processing.
 
 PostSeal starts the consistent snapshot plus buffered-update replay. Once
-coherent, ApiService publishes a new GraphEpoch in Synchronizing state; this
+coherent, ApiService publishes a new `GraphPublication` in Synchronizing state; this
 publication reopens historical reads after Rebuild. Processing does not wait
 for it to complete.
 
-The Live trigger makes the publication-state change atomically as a new
-revision in the same GraphEpoch, so snapshot validators, deltas, and SSE
-clients observe it without another reload. If PostSeal loading has not
-finished, ApiService records the newer target and publishes the completed
-image directly as Live.
+The Live trigger updates the same publication without another database reload.
+If PostSeal loading has not finished, ApiService records the newer target and
+publishes the completed image directly as Live. Whether and how lifecycle-only
+state changes advance view and history revisions remains the fifth
+[open graph-model item](../decisions/open.md#api-graph-model-completion).
 
 If `TRUNCATE` is used inside the atomic rebuild, its transactional rollback
 does **not** make it generally MVCC-safe for concurrent pre-existing
@@ -378,7 +500,7 @@ effective_start_level <= resolved_level <= effective_end_level
 For a level anchor, `resolved_level` is the retained requested level. For a
 block-hash anchor, it is the materialized block's coordinate level. For a DAA
 anchor, it is the VSPC-floor result defined below. Resolution and graph contents
-come from the same immutable HGC image or consistent database transaction.
+come from the same immutable graph view or consistent database transaction.
 
 Accept `q` only within the shared
 [`0..=MAX_DAA_SCORE` range](domain-model.md#shared-value-types--settled), then
@@ -390,9 +512,9 @@ indexed database lookup and consistent historical transaction.
 There may be VSPC-empty levels after reorg. If `q` precedes the retained PP
 and no floor exists, report explicit no-retained-match. A `q` beyond the
 current VSPC DAA resolves the current VSPC level. If `q` is at or above the
-DAA of HGC's lowest cached VSPC level, HGC can resolve it; otherwise use the
+DAA of the current head view's lowest cached VSPC level, that view can resolve it; otherwise use the
 storage lookup. Level resolution and its window must come from **one immutable
-HGC image** or one consistent DB transaction, never different revisions.
+graph view** or one consistent DB transaction, never different revisions.
 ApiService derives cached levels' final scores from `VspcCommitted` and its
 cached block metadata; storage sends no level-score delta. Historical
 DAA/window responses are not cached in v2.
@@ -408,12 +530,14 @@ The public graph API has conceptually:
 Exact endpoint URLs, HTTP methods, the final wire schema, and the graph wire
 format remain deferred in the [decision register](../decisions/deferred.md).
 
-Every graph response carries its hash dictionary. A window fully served by HGC
-has a live cursor and `HeadGraphCoverage` in addition to its
-`GraphWindowResolution`. A historical DB-backed window is a static image
-without a cursor, capped by `MAX_WINDOW_DEPTH`. Requests crossing HGC's lower
-bound take the consistent DB path; head depth itself never forces this
-fallback.
+Every graph response carries its hash dictionary. A window extracted from a
+`GraphPublication` carries that publication's ID and the extracted view's
+revision in addition to `GraphWindowResolution`. A view constructed directly
+from a database starts at revision zero and has no publication ID unless it is
+placed in a `GraphPublication`; this is not a distinct view status and does not
+prevent later updates. Database-backed windows remain capped by
+`MAX_WINDOW_DEPTH`. Requests crossing the current head view's lower bound take
+the consistent DB path; head depth itself never forces this fallback.
 
 ## Resource isolation and saturation — settled
 
@@ -425,7 +549,8 @@ priority:
 - bounded HTTP concurrency, query duration, response bytes and serialization
   CPU;
 - bounded SSE clients and per-client buffers;
-- bounded delta history, cache memory, and historical-read work;
+- level-scoped delta history, bounded cache memory, and bounded historical-read
+  work;
 - a separate memory-only status/info admission lane, so graph saturation
   cannot hide service state; and
 - distinct budgets for head delivery and historical database reads.

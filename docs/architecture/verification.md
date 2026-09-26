@@ -603,21 +603,41 @@ with:
 
 ## API and Web
 
-Verify the [graph observer feed](api.md#in-process-api-and-graph-observer-feed--settled)
-and [snapshot contract](api.md#snapshot-revision-delta-sse-and-etags--settled)
+Verify the [graph observer feed](api.md#in-process-api-and-graph-observer-feed--partially-open)
+and [graph publication contract](api.md#graph-views-publication-revision-and-history--incomplete-working-contract)
 for causal order, a loss flag even when the terminal message is lost,
-snapshot/replay with a represented VSPC prefix, source continuity, complete
-cached levels, external parent-edge endpoints and level sizes, actual parent
+complete view levels, external parent-edge endpoints and level sizes, actual parent
 presence independent of visible edges, and one Reset-driven replacement
-GraphEpoch per prepared processing session.
+`GraphPublication` per prepared processing session.
 
 For below-range block updates, verify that every delivered `BlockCommitted` is
 consumed, a referenced external level size grows monotonically from the
 committed coordinate, and the resulting endpoint change is published as one
-atomic revision. The update must neither expand `HeadGraphCoverage` nor restore
-the below-range block or level as HGC content. An update for a level with no
+atomic revision. The update must neither expand the view extent nor restore
+the below-range block or level as head-view content. An update for a level with no
 retained crossing-edge endpoint produces no visible revision, and unreferenced
 external endpoint metadata can be discarded.
+
+Verify the settled graph-model core with a view and history initially at
+revision `n`. A retained mutation advances the view to `n+1` and returns
+`GraphDelta(n,n+1)` before history append. During that interval, a view read may
+return `n+1` while a history request exposes only `n`; appending the delta then
+advances history to `n+1`. A no-effect update returns no delta and advances
+neither revision. History rejects a nongapless append.
+
+Level-change cases cover create, update, remove, and no-net-change composition;
+`before` mismatch on application; a size-only external-level mutation; and DAA
+score changes. Every API delta carries its target `high_level` and no lower
+coverage object. Retain all deltas whose `high_level` remains in the retained
+head window, including multiple revisions at one level, and make them eligible
+for pruning only after that level leaves the window. No count or byte pressure
+may prune them earlier.
+
+Verify the [graph-view edge and absolute-map contract](api.md#graph-views-publication-revision-and-history--incomplete-working-contract)
+with zero, one, and two endpoint blocks retained; child addition and removal;
+parent-only removal; outside-extent parent levels under both tracking policies;
+and PP-boundary sentinel links. Cover absolute block/edge map composition,
+key/value identity agreement, and conflicting immutable values.
 
 Verify [DAA navigation and graph windows](api.md#daa-navigation-and-graph-windows--settled)
 for floor selection and tie break, the sentinel result, a reorg-created
@@ -627,50 +647,46 @@ reject the no-VSPC sentinel as a real DAA query.
 
 Verify successful level, block-hash, and DAA anchors return a
 `GraphWindowResolution` whose resolved level lies in its effective capped
-range and whose resolution and graph contents come from the same HGC image or
-database transaction. Browser cases retain the original anchor, keep the
+range and whose resolution and graph contents come from the same immutable
+graph view or database transaction. Browser cases retain the original anchor, keep the
 returned level fixed across deltas, and re-resolve only when explicit refresh
 resubmits that anchor.
 
 Verify deltas and client behavior across
-[API publication](api.md#snapshot-revision-delta-sse-and-etags--settled) and
-[Web update acquisition](web.md#update-acquisition--settled): sequential delta
+[API publication](api.md#graph-views-publication-revision-and-history--incomplete-working-contract) and
+[Web update acquisition](web.md#update-acquisition--partially-open): sequential delta
 composition and expiry, response-local hash dictionaries,
-`Stale -> Synchronizing -> Live`, same-epoch atomic Live revision, SSE slow
-clients, fixed-view freeze, DAA focus, and Live arriving during PostSeal load.
+`Stale -> Synchronizing -> Live`, SSE slow clients, fixed-view freeze, DAA
+focus, and Live arriving during PostSeal load.
 The latter must publish the completed image directly as Live.
 
-Delta cases cover idempotent replay of absolute patches; equality between
-sequential application and a directly or incrementally composed interval;
+Delta cases cover revision compatibility and level-change pre-state validation;
+equality between sequential application and a directly or incrementally
+composed interval;
 associative graph-state effects across three adjacent intervals; later-value,
-insertion-folding, target-coverage, and response-dictionary composition; and
-rejection of cross-epoch or nongapless composition. Under a small response
+insertion-folding, final `high_level`, and response-dictionary composition; and
+rejection of cross-publication or nongapless composition. Under a small response
 budget, verify advancement through complete intermediate intervals and that no
-block, VSPC, lifecycle-state, or coverage revision is split. A first atomic
+block, VSPC, lifecycle-state, or level-change revision is split. A first atomic
 revision that cannot fit requires a fresh snapshot rather than a partial
 delta.
 
 For encoded head-response reuse, issue concurrent identical snapshot requests
 at one cursor and effective window and verify that they share one construction,
 serialization, and compression result. Do the same for an exact delta
-interval. Requests differing in epoch, revision or interval, publication
-state, effective window, response format, `representation_version`, or content
-encoding must not share encoded bytes. A "to current" request must capture an
+interval. Requests differing in publication ID, revision, interval,
+publication state, effective window, response format,
+`representation_version`, or content encoding must not share encoded bytes. A
+"to current" request must capture an
 exact target before reuse; a bounded complete-prefix response is cached by its
 actual returned interval. Eviction must reconstruct an equivalent response
-from HGC or retained deltas, historical DB windows must bypass this cache, and
-cache pressure must not delay or fault processing.
+from the current graph view or retained deltas. Historical DB windows bypass
+this cache, and cache pressure must not delay or fault processing.
 
-Coverage cases require snapshots and deltas to carry their target revision's
-complete HGC boundary independently of the response's effective window. Verify
-the inclusive coverage invariant and monotonicity of both bounds within an
-epoch; that a head view evicts block and level contents below an advancing
-boundary while retaining required crossing-edge endpoint metadata; that a
-partially covered fixed view preserves its frozen prefix while applying patches
-affecting its live suffix and advancing its cursor; and that a fixed view stops
-catch-up only after its visible end falls below the boundary. An off-window
-parent endpoint below the boundary must not extend the fixed block window or
-prevent that transition.
+Add the precise subview, remaining block/edge composition, VSPC-delta,
+publication-state, and database-construction cases when the corresponding
+[open graph-model items](../decisions/open.md#api-graph-model-completion) are
+settled. This working verification section does not choose their behavior.
 
 Verify [Reset and recovery-time availability](api.md#reset-and-recovery-time-availability--settled)
 with ordinary Resync and Rebuild integration scenarios. Resync preserves

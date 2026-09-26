@@ -201,7 +201,7 @@ VspcProcessor and OrphanManager. This preserves graph observer causal order.
 `AlreadyMaterialized` produces no graph mutation but still delivers
 `PersistedBlock`. If observer delivery fails, BlockProcessor sets the API
 invalid flag and continues with `PersistedBlock` delivery; the
-[API contract](api.md#in-process-api-and-graph-observer-feed--settled) owns the
+[API contract](api.md#in-process-api-and-graph-observer-feed--partially-open) owns the
 resulting reload behavior.
 
 `PersistedBlock` delivery is asynchronous but cannot be silently lost after a

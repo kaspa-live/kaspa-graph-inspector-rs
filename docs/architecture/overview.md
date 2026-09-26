@@ -63,7 +63,7 @@ loss, reload, and publication behavior.
 | OrphanManager | In-memory orphan topology and dependency demand | [Block processing](block-processing.md) |
 | DependencyResolver | Bounded node retrieval for requested dependencies | [Block processing](block-processing.md) |
 | VspcProcessor | VSPC sequencing, readiness, and coloring coordination | [VSPC processing](vspc-processing.md) |
-| ApiService | HeadGraphCache, graph publication epochs, and graph API serving | [API](api.md) |
+| ApiService | Graph publications, views, delta history, and graph API serving | [API](api.md) |
 
 NodeService, StorageService, ResyncEngine, and Supervisor each own their
 respective service, processing, or orchestration state. Published statuses are

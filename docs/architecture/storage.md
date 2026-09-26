@@ -771,7 +771,7 @@ persists its hash, selected parent, direct parents, merge sets, timestamp, and
 DAA score; blue score and blue work remain available to processing but are not
 duplicated in the block row. Storage owns transactional ID resolution,
 coordinate allocation, initial color, persistence, and construction of the
-API-owned [`BlockCommitted`](api.md#in-process-api-and-graph-observer-feed--settled)
+API-owned [`BlockCommitted`](api.md#in-process-api-and-graph-observer-feed--partially-open)
 value for a new insertion.
 
 For every materialization, intern hashes in this order:

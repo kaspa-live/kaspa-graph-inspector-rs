@@ -12,9 +12,9 @@ mechanics.
 | Block processing | Phase-aware block admission, materialization, and dependency recovery. | [Block processing](../architecture/block-processing.md), [storage](../architecture/storage.md) |
 | VSPC processing | Ordered readiness-gated VSPC processing and publication. | [VSPC processing](../architecture/vspc-processing.md) |
 | Recovery lifecycle | Explicit Resync/Rebuild coordination and overlap-based Live admission. | [Processing lifecycle](../architecture/processing-lifecycle.md) |
-| API publication | Epoch-based graph publication, bounded caching, and historical reads. | [API](../architecture/api.md) |
+| API publication | Publication-identified graph views, composable revision deltas, and historical reads. | [API](../architecture/api.md) |
 | Resource isolation | Processing-priority resource isolation and bounded API load. | [Overview](../architecture/overview.md), [API](../architecture/api.md) |
-| Web behavior | Epoch-aware, hash-identified live and fixed graph views. | [Web](../architecture/web.md) |
+| Web behavior | Publication-aware, hash-identified live and fixed graph views. | [Web](../architecture/web.md) |
 | Verification | Accepted pinned upstream review and executable KGI verification. | [Verification](../architecture/verification.md#current-puar-result) |
 
 Later standalone accepted ADRs may be added to this directory and indexed here.

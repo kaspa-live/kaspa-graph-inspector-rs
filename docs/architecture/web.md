@@ -7,53 +7,36 @@ public block identity. [The API architecture](api.md) owns the graph wire
 contract, snapshots, deltas, SSE cursor delivery, and response-local hash
 dictionaries.
 
-## Update acquisition — settled
+## Update acquisition — partially open
 
 The v1 Web's fast repeated polling is replaced by SSE cursor wakeups and HTTP
 delta/snapshot catch-up for cached views. The Web keeps one in-flight catch-up
 loop and coalesces desired cursors. Because SSE reconnection is not
-exactly-once, each wakeup is a desired `(GraphEpoch, revision)` cursor; graph
+exactly-once, each wakeup is a desired `(publication_id, revision)` cursor; graph
 state comes from HTTP delta or snapshot responses.
 
-Head-following stays prompt. On GraphEpoch change, a head-following view
+Head-following stays prompt. On publication change, a head-following view
 automatically reloads.
 
 A delta response may end at an intermediate revision below the Web's desired
 cursor. The single catch-up loop applies that complete interval, adopts its
 `to` cursor, and requests the next interval until it reaches the desired cursor
 or the API requires a snapshot. It never assumes one response reaches the
-original target. Reapplying an already received absolute delta is harmless.
+original target. It applies a delta only when the view's current revision equals
+the delta's `from_revision_id`.
 
-For every accepted head delta, the Web adopts its target
-`HeadGraphCoverage`. It removes block and level contents below
-`retain_from_level`, while preserving reference-only endpoint metadata still
-required by an edge intersecting the visible window. It then applies its
-selected display depth within the advertised complete range. A snapshot's
-coverage establishes the same initial boundary.
+The exact application of the new `GraphView`/`GraphDelta` model to browser
+head and fixed views depends on the
+[open subview-extraction contract](../decisions/open.md#api-graph-model-completion).
+No Web implementation may invent a lower-bound rule while that item remains
+open.
 
-## Fixed views — settled
+## Fixed views — partially open
 
-For a fixed block window `[visible_start_level, visible_end_level]`, continue
-delta catch-up while it intersects the target revision's HGC coverage:
-
-```text
-visible_end_level >= coverage.retain_from_level
-```
-
-When the HGC boundary advances into the window, preserve the prefix below
-`retain_from_level` unchanged and apply absolute patches that affect the
-covered visible suffix, including crossing-edge endpoint metadata needed by
-that suffix. Do not apply an HGC eviction instruction to the preserved prefix.
-The view advances its delta cursor after consuming the revision even though
-its preserved prefix reflects the last revision that covered it. Track the
-coverage boundary so the presentation can distinguish that frozen prefix from
-the live suffix.
-
-Once `visible_end_level < coverage.retain_from_level`, stop delta catch-up and
-retain the fixed view as frozen; do not silently refresh or recenter it.
-Off-window parent endpoints do not extend the fixed block window for this
-test. On GraphEpoch change, a fixed view retains its current image marked
-frozen/stale. Explicit refresh reruns the original anchor query.
+The fixed-view extraction, update, and freeze boundary will be restored here
+when the linked subview contract is settled. On publication change, a fixed
+view retains its current image marked frozen/stale. Explicit refresh reruns
+the original anchor query.
 
 For every successful level, block-hash, or DAA window request, the Web retains
 the original anchor and adopts the response's `GraphWindowResolution`.

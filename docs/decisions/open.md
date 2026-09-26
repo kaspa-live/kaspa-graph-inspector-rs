@@ -3,4 +3,23 @@
 These items require an Architecture decision. They are not implementation
 freedom and do not weaken any settled contract.
 
-No architecture decisions are currently open.
+## API graph model completion
+
+The settled core [`GraphView`, `GraphDelta`, `GraphHistory`, and
+`GraphPublication` model](../architecture/api.md#graph-views-publication-revision-and-history--incomplete-working-contract)
+remains incomplete in five areas. Numbering continues from the settled edge
+lifecycle item:
+
+2. subview extraction, including crossing edges and endpoint metadata;
+3. complete block and edge mutation application and composition, including
+   coordination with level changes;
+4. VSPC membership, color and level mutations, absent-block handling, and
+   composition;
+5. publication lifecycle-state changes and their relationship to view and
+   history revisions; and
+6. the consistent database query and projection that constructs a revision-zero
+   `GraphView`, based on KGI v1.
+
+Settle these parts one at a time in the API architecture. The completed design
+must preserve the already settled graph-model core linked above and the public
+API resource-isolation contract.

@@ -558,7 +558,7 @@ Reset -> PublishPostSeal -> PublishLive
 ```
 
 The effects of these controls, including historical-read availability and
-GraphEpoch behavior, are defined in
+GraphPublication behavior, are defined in
 [api.md](api.md#reset-and-recovery-time-availability--settled). This document
 owns their send points. `Reset` has a completed-effect acknowledgement;
 `PublishPostSeal` and `PublishLive` are reliable and exact-once, but processing
@@ -845,4 +845,4 @@ Exact shutdown timeouts and escalation policy remain deferred in the
 
 The graph observer path is deliberately separate: observer loss invalidates
 and reloads the API image without interrupting processing. Its behavior is
-defined in [api.md](api.md#in-process-api-and-graph-observer-feed--settled).
+defined in [api.md](api.md#in-process-api-and-graph-observer-feed--partially-open).

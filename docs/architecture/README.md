@@ -64,7 +64,7 @@ restating it.
 | `block-processing.md` | BlockProcessor, OrphanManager, DependencyResolver, block admission, and PP-boundary sealing behavior. |
 | `vspc-processing.md` | VSPC normalization, readiness, sequencing, coloring, and VSPC-specific behavior during recovery and Live. |
 | `processing-lifecycle.md` | Supervisor, recovery intent, ResyncEngine, Resync/Rebuild preparation, the common pump, Catchup and Live admission, fault policy, retries, and teardown. |
-| `api.md` | In-process graph publication, API epochs and Reset, snapshots, revisions, deltas, SSE, ETags, DAA navigation, graph-window APIs, and API resource bulkheads. |
+| `api.md` | In-process graph publication, publication identity and Reset, views, revisions, deltas, SSE, ETags, DAA navigation, graph-window APIs, and API resource bulkheads. |
 | `web.md` | Browser client behavior and presentation requirements. |
 | `verification.md` | Required fixtures, integration scenarios, acceptance checks, and upstream assumptions. It references contracts without redefining them. |
 
