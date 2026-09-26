@@ -152,7 +152,7 @@ struct GraphDelta {
     block_changes: HashMap<BlockHash, Option<GraphBlock>>,
     edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
     level_changes: Vec<LevelChange>,
-    // Remaining block and VSPC mutation details remain to settle.
+    // VSPC mutation fields remain to settle.
 }
 
 struct GraphHistory {
@@ -264,11 +264,21 @@ Some(value) => ensure the identified edge or block value is present
 None        => ensure the identified edge or block is absent
 ```
 
-Composition is right-biased for each identity. A repeated present edge must be
-the same immutable edge. A repeated present block must have the same immutable
-block and graph fields; VSPC projection composition belongs to completion item
-4. Add-then-remove and remove-then-add therefore compose without reading the
-starting view.
+Block and edge composition is a pure right-biased map merge performed in
+revision order. For each identity, the last entry replaces every earlier entry:
+
+```text
+Some(a), Some(b) => Some(b)
+Some(a), None    => None
+None,    Some(b) => Some(b)
+None,    None    => None
+```
+
+No block or edge value comparison, equality validation, or conflict fault is
+performed. An earlier addition or removal is canceled by the later resulting
+state, but the last entry remains in the composed map: omission means untouched,
+whereas `None` explicitly means absent. This composition is associative and
+requires no starting view.
 
 An edge belongs to an extent `[low_level, high_level]` when its level span
 intersects that extent:
@@ -319,7 +329,7 @@ behavior and cannot justify an additional history cap. A cursor whose required
 deltas left with their level normally requires a fresh view.
 
 The remaining graph-model work is intentionally incomplete in this working
-contract. Completion items 2 through 6 are owned by the
+contract. Completion items 2, 4, 5, and 6 are owned by the
 [open decision register](../decisions/open.md#api-graph-model-completion).
 
 Gapless delta intervals from one publication compose sequentially:

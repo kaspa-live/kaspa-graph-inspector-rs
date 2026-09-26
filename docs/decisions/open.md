@@ -7,12 +7,10 @@ freedom and do not weaken any settled contract.
 
 The settled core [`GraphView`, `GraphDelta`, `GraphHistory`, and
 `GraphPublication` model](../architecture/api.md#graph-views-publication-revision-and-history--incomplete-working-contract)
-remains incomplete in five areas. Numbering continues from the settled edge
-lifecycle item:
+remains incomplete in four areas. Original completion-item numbering is
+preserved:
 
 2. subview extraction, including crossing edges and endpoint metadata;
-3. complete block and edge mutation application and composition, including
-   coordination with level changes;
 4. VSPC membership, color and level mutations, absent-block handling, and
    composition;
 5. publication lifecycle-state changes and their relationship to view and

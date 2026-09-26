@@ -646,9 +646,10 @@ may prune them earlier.
 Verify the [graph-view edge and absolute-map contract](api.md#graph-views-publication-revision-and-history--incomplete-working-contract)
 with zero, one, and two endpoint blocks retained; child addition and removal;
 parent-only removal; outside-extent parent levels under both tracking policies;
-and PP-boundary sentinel links. Cover absolute block/edge map composition,
-key/value identity agreement, conflicting immutable edge or block data, and
-separate VSPC projection treatment.
+and PP-boundary sentinel links. Cover all four right-biased `Some`/`None`
+block/edge composition pairs, retention of the final explicit entry, map-key
+construction from the value identity, and composition without value comparison
+or a starting view. Keep VSPC projection treatment separate.
 
 Verify [DAA navigation and graph windows](api.md#daa-navigation-and-graph-windows--settled)
 for floor selection and tie break, the sentinel result, a reorg-created
