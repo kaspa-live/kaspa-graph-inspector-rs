@@ -97,6 +97,16 @@ work below.
 enum TrackingPolicy {
     Head,
     Fixed,
+    Frozen,
+}
+
+enum GraphViewUpdateError {
+    Frozen,
+}
+
+enum GraphViewExtractError {
+    InvalidExtent,
+    OutsideSourceExtent,
 }
 
 struct Level {
@@ -169,9 +179,62 @@ struct GraphPublication {
 
 Only `GraphPublication` has a `publication_id`. A `GraphView` has no origin,
 liveness, database, or publication status. A view constructed from a database
-starts at revision zero. An extract inherits its source view's revision. Any
-view may subsequently receive updates; `Head` and `Fixed` govern extent and
-pruning behavior rather than whether updates are permitted.
+starts at revision zero. A subview extract inherits its source view's revision
+and has `TrackingPolicy::Frozen`. `Head` and `Fixed` views accept updates;
+`Head` advances its extent while `Fixed` retains its configured extent.
+`Frozen` retains both its captured contents and revision.
+
+### Frozen subview extraction — settled
+
+```rust
+impl GraphView {
+    fn extract_subview(
+        &self,
+        low_level: u64,
+        high_level: u64,
+    ) -> Result<GraphView, GraphViewExtractError>;
+}
+```
+
+Extraction requires `low_level <= high_level` and the requested nominal extent
+to be fully contained in the source's nominal `[low_level, high_level]` extent.
+An invalid order returns `InvalidExtent`; a well-ordered range outside the
+source extent returns `OutsideSourceExtent`. Additional endpoint levels retained
+outside the source's nominal extent do not expand the extractable range.
+
+The operation reads one coherent source state, does not mutate the source, and
+returns a view with:
+
+```text
+low_level           = requested low_level
+high_level          = requested high_level
+max_depth           = high_level - low_level + 1
+current_revision_id = source.current_revision_id
+tracking_policy     = Frozen
+```
+
+The result includes every source block whose coordinate level lies in the
+requested inclusive extent. Each block retains its complete direct-parent and
+merge-set arrays; an edge endpoint outside the extent does not cause its block
+to be included.
+
+Edges are selected with the settled span-intersection predicate below. The
+result therefore includes crossing edges with both, one, or neither endpoint
+block present. Because the requested extent is contained in the source extent,
+the complete source edge set already contains every edge eligible for the
+extract.
+
+The result includes every level in the requested extent and every parent or
+child endpoint level referenced by a selected edge, with the source level's
+complete `size` and `daa_score`. Derived `usage_count` values are recomputed
+from the selected edges rather than copied from the source. The nominal
+`max_depth` does not include these additional endpoint levels.
+
+Extraction produces no delta or history and does not advance either revision.
+It can read a `Head`, `Fixed`, or `Frozen` source. Nested extraction is allowed
+when the next requested extent is contained in the frozen source's nominal
+extent. Concrete indexes, lock types, and immutable backing-data sharing remain
+implementation choices.
 
 The `publication_id` is a fresh random nonzero `u64` for each publication.
 Together `(publication_id, revision)` form the public cursor. If the selected
@@ -208,11 +271,15 @@ owning `publication_id`. A published view response pairs it with the view's
 current revision; a delta response pairs it with the history interval actually
 returned.
 
-`GraphView` owns application of `BlockCommitted` and `VspcCommitted`. An update
-that changes no retained block, edge, or level returns no delta and leaves the
-revision unchanged. Any retained change advances the view revision and returns
-the corresponding `GraphDelta`; a retained level-size or DAA-score change is
-sufficient even when the triggering block itself is outside the block extent.
+`GraphView` owns application of `BlockCommitted`, `VspcCommitted`, and
+`GraphDelta`. A `Frozen` view refuses each mutation entry point with
+`GraphViewUpdateError::Frozen` before inspecting whether the input would have a
+visible effect; its contents and revision remain unchanged. For `Head` and
+`Fixed`, an update that changes no retained block, edge, or level returns no
+delta and leaves the revision unchanged. Any retained change advances the view
+revision and returns the corresponding `GraphDelta`; a retained level-size or
+DAA-score change is sufficient even when the triggering block itself is outside
+the block extent. Frozen refusal is distinct from an accepted no-effect update.
 
 The view advances before its returned delta is appended to `GraphHistory`:
 
@@ -329,7 +396,7 @@ behavior and cannot justify an additional history cap. A cursor whose required
 deltas left with their level normally requires a fresh view.
 
 The remaining graph-model work is intentionally incomplete in this working
-contract. Completion items 2, 4, 5, and 6 are owned by the
+contract. Completion items 4, 5, and 6 are owned by the
 [open decision register](../decisions/open.md#api-graph-model-completion).
 
 Gapless delta intervals from one publication compose sequentially:
@@ -522,12 +589,13 @@ format remain deferred in the [decision register](../decisions/deferred.md).
 
 Every graph response carries its hash dictionary. A window extracted from a
 `GraphPublication` carries that publication's ID and the extracted view's
-revision in addition to `GraphWindowResolution`. A view constructed directly
-from a database starts at revision zero and has no publication ID unless it is
-placed in a `GraphPublication`; this is not a distinct view status and does not
-prevent later updates. Database-backed windows remain capped by
-`MAX_WINDOW_DEPTH`. Requests crossing the current head view's lower bound take
-the consistent DB path; head depth itself never forces this fallback.
+revision in addition to `GraphWindowResolution`; that extracted view is
+`Frozen`. A view constructed directly from a database starts at revision zero
+and has no publication ID unless it is placed in a `GraphPublication`; its
+chosen tracking policy determines whether it accepts updates. Database-backed
+windows remain capped by `MAX_WINDOW_DEPTH`. Requests crossing the current head
+view's lower bound take the consistent DB path; head depth itself never forces
+this fallback.
 
 ## Resource isolation and saturation — settled
 

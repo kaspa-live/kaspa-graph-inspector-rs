@@ -25,26 +25,27 @@ or the API requires a snapshot. It never assumes one response reaches the
 original target. It applies a delta only when the view's current revision equals
 the delta's `from_revision_id`.
 
-The exact application of the new `GraphView`/`GraphDelta` model to browser
-head and fixed views depends on the
-[open subview-extraction contract](../decisions/open.md#api-graph-model-completion).
-No Web implementation may invent a lower-bound rule while that item remains
-open.
+The Web consumes serialized head, delta, and graph-window responses. It never
+receives an internal `GraphView`, observes `TrackingPolicy`, or applies updates
+to an ApiService subview. Internal subview extraction belongs exclusively to
+the [API contract](api.md#frozen-subview-extraction--settled).
+Serialized graph-window contents follow the API-owned extraction contract.
 
 ## Fixed views — partially open
 
-The fixed-view extraction, update, and freeze boundary will be restored here
-when the linked subview contract is settled. On publication change, a fixed
-view retains its current image marked frozen/stale. Explicit refresh reruns
-the original anchor query.
+A browser fixed view is presentation state built from serialized API responses;
+it is not an internal `GraphView` and has no API `TrackingPolicy`. It consumes
+public deltas under the revision catch-up policy below. On publication change,
+a fixed view retains its current image marked frozen/stale. Explicit refresh
+reruns the original anchor query.
 
 For every successful level, block-hash, or DAA window request, the Web retains
 the original anchor and adopts the response's `GraphWindowResolution`.
-`resolved_level` is the fixed focus for that image and subsequent deltas do not
-re-resolve the original anchor. Explicit refresh resubmits that anchor and
-replaces the stored resolution with the new response. In particular, if later
-reorgs change a DAA-resolved level's score, keep focus on the resolved level
-rather than resolving the original DAA score again.
+`resolved_level` is the fixed focus for that image; subsequent public deltas
+update the image without re-resolving the original anchor. Explicit refresh
+resubmits that anchor and replaces the stored resolution with the new response.
+In particular, if later reorgs change a DAA-resolved level's score, keep focus
+on the resolved level rather than resolving the original DAA score again.
 
 Fixed-view revision catch-up is distance-adaptive, not a blanket slow path.
 Define:

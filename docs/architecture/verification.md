@@ -635,6 +635,19 @@ return `n+1` while a history request exposes only `n`; appending the delta then
 advances history to `n+1`. A no-effect update returns no delta and advances
 neither revision. History rejects a nongapless append.
 
+Verify every subview extract inherits its source revision with
+`TrackingPolicy::Frozen`. Each `BlockCommitted`, `VspcCommitted`, and
+`GraphDelta` mutation entry point must return `GraphViewUpdateError::Frozen`
+without inspecting the input or changing contents or revision. Keep this
+distinct from a no-effect update accepted by `Head` or `Fixed`.
+
+Verify [frozen subview extraction](api.md#frozen-subview-extraction--settled)
+from `Head`, `Fixed`, and `Frozen` sources, including nested extraction. Cover
+invalid and outside extents; inherited revision and calculated nominal depth;
+complete in-range blocks; crossing edges with zero, one, and two endpoint
+blocks; all nominal and endpoint levels with exact state; recomputed derived
+counters; and absence of source mutation, delta production, or history.
+
 Level-change cases cover create, update, remove, and no-net-change composition;
 `before` mismatch on application; a size-only external-level mutation; and DAA
 score changes. Every API delta carries its target `high_level` and no lower
@@ -645,7 +658,7 @@ may prune them earlier.
 
 Verify the [graph-view edge and absolute-map contract](api.md#graph-views-publication-revision-and-history--incomplete-working-contract)
 with zero, one, and two endpoint blocks retained; child addition and removal;
-parent-only removal; outside-extent parent levels under both tracking policies;
+parent-only removal; outside-extent parent levels under `Head` and `Fixed`;
 and PP-boundary sentinel links. Cover all four right-biased `Some`/`None`
 block/edge composition pairs, retention of the final explicit entry, map-key
 construction from the value identity, and composition without value comparison
@@ -695,10 +708,9 @@ actual returned interval. Eviction must reconstruct an equivalent response
 from the current graph view or retained deltas. Historical DB windows bypass
 this cache, and cache pressure must not delay or fault processing.
 
-Add the precise subview, remaining block/edge composition, VSPC-delta,
-publication-state, and database-construction cases when the corresponding
-[open graph-model items](../decisions/open.md#api-graph-model-completion) are
-settled. This working verification section does not choose their behavior.
+Add the VSPC-delta, publication-state, and database-construction cases when the
+corresponding [open graph-model items](../decisions/open.md#api-graph-model-completion)
+are settled. This working verification section does not choose their behavior.
 
 Verify [Reset and recovery-time availability](api.md#reset-and-recovery-time-availability--settled)
 with ordinary Resync and Rebuild integration scenarios. Resync preserves

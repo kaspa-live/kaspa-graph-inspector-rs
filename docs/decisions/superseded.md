@@ -16,5 +16,5 @@ explain why older handoffs or implementation notes may use different terms.
 | Use an `Auto` recovery mode that falls through from Resync to Rebuild. | Explicit Resync and Rebuild obligations. | [Processing lifecycle](../architecture/processing-lifecycle.md) |
 | Defer the API outside KGI v2. | In-process API and Web-facing graph contract in v2. | [API](../architecture/api.md) |
 | Identify API continuity with `GraphEpoch` stored on every graph image. | `GraphPublication.publication_id`, with views carrying only their own revision. | [API](../architecture/api.md) |
-| Carry `HeadGraphCoverage` in every delta. | Explicit graph mutations plus the delta target `high_level`; subview boundary behavior remains open. | [API](../architecture/api.md), [open decisions](open.md#api-graph-model-completion) |
+| Carry `HeadGraphCoverage` in every delta. | Explicit graph mutations plus the delta target `high_level`. | [API](../architecture/api.md) |
 | Recheck VSPC source/sink continuity inside ApiService. | Trust the ordered, continuity-certified `VspcProcessor` output. | [API](../architecture/api.md) |
