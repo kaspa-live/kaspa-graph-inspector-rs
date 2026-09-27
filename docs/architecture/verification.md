@@ -664,6 +664,17 @@ block/edge composition pairs, retention of the final explicit entry, map-key
 construction from the value identity, and composition without value comparison
 or a starting view. Keep VSPC projection treatment separate.
 
+Verify the settled
+[VSPC projection and composition contract](api.md#vspc-projection-and-delta-composition--settled)
+with removed and added membership, removal-to-Gray, blue/red overlap, one hash
+changed in both field maps, and mutation targets absent from the receiving
+view. Cover independent field-map composition, net no-op removal, field changes
+overriding an absolute block addition, a final absolute removal, and an empty
+composed mutation that still advances its revision interval. Level cases cover
+removed-only VSPC-empty state, remove/add replacement at one level, restored
+original score, block-created level followed by VSPC scoring, and a level-only
+graph revision.
+
 Verify [DAA navigation and graph windows](api.md#daa-navigation-and-graph-windows--settled)
 for floor selection and tie break, the sentinel result, a reorg-created
 VSPC-empty level, atomic level-score publication, and navigation plus window
@@ -708,9 +719,9 @@ actual returned interval. Eviction must reconstruct an equivalent response
 from the current graph view or retained deltas. Historical DB windows bypass
 this cache, and cache pressure must not delay or fault processing.
 
-Add the VSPC-delta, publication-state, and database-construction cases when the
-corresponding [open graph-model items](../decisions/open.md#api-graph-model-completion)
-are settled. This working verification section does not choose their behavior.
+Add the publication-state and database-construction cases when the corresponding
+[open graph-model items](../decisions/open.md#api-graph-model-completion) are
+settled. This working verification section does not choose their behavior.
 
 Verify [Reset and recovery-time availability](api.md#reset-and-recovery-time-availability--settled)
 with ordinary Resync and Rebuild integration scenarios. Resync preserves

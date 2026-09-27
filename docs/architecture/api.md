@@ -48,16 +48,10 @@ retention and removal.
 
 Ordered `VspcProcessor` delivery certifies VSPC sequencing for ApiService.
 `GraphView` does not retain a committed VSPC sink and ApiService does not repeat
-the processor's source/destination continuity check. From the removed/added
-vectors and retained block metadata, the view updates VSPC membership, colors,
-and level DAA scores.
-Processing/storage need not return a list of DAA-score changes or track them
-for the API. Only actual final level-score changes matter: a remove/add pair
-may temporarily change then restore a level's original score. An added
-block's merge-set hash absent from complete view levels has no impact on
-retained levels by definition; ignore it rather than invalidating cache.
-The remaining absent-block behavior is part of the incomplete VSPC-delta design
-listed below.
+the processor's source/destination continuity check. The settled
+[VSPC projection contract](#vspc-projection-and-delta-composition--settled)
+owns how the removed/added vectors and retained block metadata update the view
+and produce a delta.
 
 `MAX_CACHE_DEPTH = 1000` complete levels. Define a separate
 `MAX_WINDOW_DEPTH <= MAX_CACHE_DEPTH`; its exact value remains deferred in the
@@ -120,6 +114,11 @@ struct LevelChange {
     after: Option<Level>,
 }
 
+struct FieldChange<T> {
+    before: T,
+    after: T,
+}
+
 struct EdgeId {
     parent: BlockHash,
     child: BlockHash,
@@ -162,7 +161,8 @@ struct GraphDelta {
     block_changes: HashMap<BlockHash, Option<GraphBlock>>,
     edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
     level_changes: Vec<LevelChange>,
-    // VSPC mutation fields remain to settle.
+    is_in_vspc_changes: HashMap<BlockHash, FieldChange<bool>>,
+    color_changes: HashMap<BlockHash, FieldChange<BlockColor>>,
 }
 
 struct GraphHistory {
@@ -321,8 +321,7 @@ every `Some(edge)` in `edge_changes`, the map key equals `edge.id`. Likewise,
 for every `Some(block)` in `block_changes`, the map key equals `block.hash`.
 `GraphBlock` combines immutable block and graph data with the view's current
 mutable `color` and `is_in_vspc` projection. Block add/remove changes carry the
-complete value; dedicated VSPC mutations will update only that projection under
-completion item 4.
+complete value; dedicated VSPC mutations update only that projection.
 
 The absolute map semantics are:
 
@@ -346,6 +345,58 @@ performed. An earlier addition or removal is canceled by the later resulting
 state, but the last entry remains in the composed map: omission means untouched,
 whereas `None` explicitly means absent. This composition is associative and
 requires no starting view.
+
+### VSPC projection and delta composition — settled
+
+`GraphView` applies one `VspcCommitted` in the same mutation order as the
+storage transaction, projected onto its retained blocks:
+
+1. each present removed block leaves VSPC and is reset to `Gray`;
+2. each present added block enters VSPC;
+3. for every present added block in order, each present blue merge-set member
+   becomes `Blue`, then each present red merge-set member becomes `Red`; and
+4. affected retained levels receive their final current-VSPC DAA score.
+
+Membership and color are separate mutable fields. The two change maps are
+independent and may contain the same block hash. Each atomic update records the
+field's value before the complete VSPC transition and its final value after all
+steps; it omits a field whose final value equals its original value. Temporary
+states within the transition never enter the delta.
+
+An absent mutation target is ignored without a placeholder, deferred mutation,
+storage lookup, or fault. The normal absent case is a block already in the past
+below the view extent; its merge-set members are also in its past and cannot
+affect the retained graph. A later absolute `Some(GraphBlock)` carries that
+block's complete then-current projection and needs no replay of ignored field
+changes. If all projected field and level effects are absent or no-ops, the
+atomic VSPC update returns no delta and advances no view revision.
+
+Gapless composition treats `block_changes`, `is_in_vspc_changes`, and
+`color_changes` as independent collections. Block changes keep their
+right-biased absolute semantics. For each field map, composition retains the
+earliest `before` and latest `after`, omitting the entry when those values are
+equal. It does not compare or validate intermediate values and requires no
+starting view.
+
+Delta application processes `block_changes` first, then
+`is_in_vspc_changes`, then `color_changes`. A present field target adopts
+`after` without validating `before`; an absent target is ignored. Field changes
+therefore supersede the projection embedded in a `Some(GraphBlock)`. If the
+absolute result is `None`, the later field applications have no effect. No
+cross-collection cleanup or conflict validation is required. A composed
+interval whose mutations cancel completely still advances from its recorded
+`from_revision_id` to `to_revision_id`.
+
+VSPC DAA-score projection uses the existing `level_changes` collection. After
+capturing each affected retained level's original value, process every present
+removed block as a final-score candidate of `None`, then every present added
+block as `Some(block.daa_score)`. Addition therefore supplies the final score
+when both paths affect one level. Emit one `LevelChange` per level only after
+the complete transition. Both sides remain `Some(Level)` with identical
+`size`; only `daa_score` changes. Omit the entry when the final score equals the
+original score. Existing `LevelChange` composition then combines block-level
+creation or size changes with the VSPC result and removes composed no-ops. A
+retained level-score change alone is sufficient to produce a graph revision.
 
 An edge belongs to an extent `[low_level, high_level]` when its level span
 intersects that extent:
@@ -396,7 +447,7 @@ behavior and cannot justify an additional history cap. A cursor whose required
 deltas left with their level normally requires a fresh view.
 
 The remaining graph-model work is intentionally incomplete in this working
-contract. Completion items 4, 5, and 6 are owned by the
+contract. Completion items 5 and 6 are owned by the
 [open decision register](../decisions/open.md#api-graph-model-completion).
 
 Gapless delta intervals from one publication compose sequentially:
