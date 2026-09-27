@@ -692,9 +692,21 @@ Verify deltas and client behavior across
 [API publication](api.md#graph-views-publication-revision-and-history--incomplete-working-contract) and
 [Web update acquisition](web.md#update-acquisition--partially-open): sequential delta
 composition and expiry, response-local hash dictionaries,
-`Stale -> Synchronizing -> Live`, SSE slow clients, fixed-view freeze, DAA
-focus, and Live arriving during PostSeal load.
-The latter must publish the completed image directly as Live.
+terminal Stale state, replacement publication identity, SSE slow clients,
+fixed-view freeze, DAA focus, and Live arriving during PostSeal load. The latter
+must publish the completed image directly as Live.
+
+Verify the settled
+[publication-state contract](api.md#publication-state-and-revision--settled):
+initial Synchronizing, direct initial Live, visible `Synchronizing -> Live`,
+and terminal Stale transitions leave graph view and history revisions
+unchanged. Cover Reset acknowledgement after state and routing effects,
+cancellation of unpublished construction, no additional effect for an already
+Stale publication, delta rejection for Stale, head-snapshot state and ETag
+changes, and immutable delta bytes across later state changes. SSE cases cover
+state-only wakeups repeating one graph cursor, reconnect reporting current
+state, Web adoption without a delta request, and a fresh publication ID for a
+replacement image.
 
 Delta cases cover revision compatibility and level-change pre-state validation;
 equality between sequential application and a directly or incrementally
@@ -703,7 +715,7 @@ associative graph-state effects across three adjacent intervals; later-value,
 insertion-folding, final `high_level`, and response-dictionary composition; and
 rejection of cross-publication or nongapless composition. Under a small response
 budget, verify advancement through complete intermediate intervals and that no
-block, VSPC, lifecycle-state, or level-change revision is split. A first atomic
+block, VSPC, or level-change revision is split. A first atomic
 revision that cannot fit requires a fresh snapshot rather than a partial
 delta.
 
@@ -711,17 +723,18 @@ For encoded head-response reuse, issue concurrent identical snapshot requests
 at one cursor and effective window and verify that they share one construction,
 serialization, and compression result. Do the same for an exact delta
 interval. Requests differing in publication ID, revision, interval,
-publication state, effective window, response format,
-`representation_version`, or content encoding must not share encoded bytes. A
-"to current" request must capture an
+effective window, response format, `representation_version`, or content
+encoding must not share encoded bytes. Head-view requests differing in
+publication state must not share encoded bytes; one immutable delta interval
+may reuse its bytes across later state changes. A "to current" request must capture an
 exact target before reuse; a bounded complete-prefix response is cached by its
 actual returned interval. Eviction must reconstruct an equivalent response
 from the current graph view or retained deltas. Historical DB windows bypass
 this cache, and cache pressure must not delay or fault processing.
 
-Add the publication-state and database-construction cases when the corresponding
-[open graph-model items](../decisions/open.md#api-graph-model-completion) are
-settled. This working verification section does not choose their behavior.
+Add the database-construction cases when the remaining
+[open graph-model item](../decisions/open.md#api-graph-model-completion) is
+settled. This working verification section does not choose its behavior.
 
 Verify [Reset and recovery-time availability](api.md#reset-and-recovery-time-availability--settled)
 with ordinary Resync and Rebuild integration scenarios. Resync preserves

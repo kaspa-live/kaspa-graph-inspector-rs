@@ -7,11 +7,9 @@ freedom and do not weaken any settled contract.
 
 The settled core [`GraphView`, `GraphDelta`, `GraphHistory`, and
 `GraphPublication` model](../architecture/api.md#graph-views-publication-revision-and-history--incomplete-working-contract)
-remains incomplete in two areas. Original completion-item numbering is
+remains incomplete in one area. Original completion-item numbering is
 preserved:
 
-5. publication lifecycle-state changes and their relationship to view and
-   history revisions; and
 6. the consistent database query and projection that constructs a revision-zero
    `GraphView`, based on KGI v1.
 

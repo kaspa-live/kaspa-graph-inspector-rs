@@ -25,10 +25,11 @@ blocks it depends on.
 
 The observer channel is nonblocking from the processing viewpoint:
 failed/full delivery sets an out-of-band invalid flag; ApiService stops
-publishing deltas and reloads from DB. No processing recovery or producer
-sequence number is needed for observer-only continuity. The invalid flag also
-catches loss of the **last** update that no later sequence number could
-expose.
+publishing deltas, marks the current publication Stale, and reloads from DB.
+Any coherent replacement uses a fresh publication ID and the session's current
+lifecycle target. No processing recovery or producer sequence number is needed
+for observer-only continuity. The invalid flag also catches loss of the
+**last** update that no later sequence number could expose.
 
 ApiService consumes storage's
 [`BlockCommitted`](storage.md#block-materialization-transaction--settled) and
@@ -92,6 +93,12 @@ enum TrackingPolicy {
     Head,
     Fixed,
     Frozen,
+}
+
+enum GraphPublicationState {
+    Synchronizing,
+    Live,
+    Stale,
 }
 
 enum GraphViewUpdateError {
@@ -172,6 +179,7 @@ struct GraphHistory {
 
 struct GraphPublication {
     publication_id: u64,
+    state: GraphPublicationState,
     view: GraphView,
     history: GraphHistory,
 }
@@ -246,14 +254,16 @@ from one consistent database snapshot. On every new processing session it
 reconstructs the view because the previous session may have committed data
 without delivering its observer update. A coherent replacement creates a new
 `GraphPublication` with a new `publication_id`; an old coherent publication can
-remain readable as explicitly Stale, but it receives no further deltas.
+remain readable as explicitly Stale, but it receives no later deltas.
 
 The database projection contains the complete view levels and blocks, every
 required crossing-edge endpoint and its level size, current colors and VSPC
 membership, and the data required for DAA resolution. Buffered updates are
 then applied in their certified delivery order. The precise database projection
-and VSPC replay treatment remain the sixth and fourth open graph-model items,
-respectively.
+and initial construction/replay boundary remain the sixth open graph-model
+item.
+
+### Publication state and revision — settled
 
 ApiService has three externally meaningful publication states:
 
@@ -261,15 +271,45 @@ ApiService has three externally meaningful publication states:
 Stale | Synchronizing | Live
 ```
 
-Reset makes the old publication Stale. PostSeal constructs and publishes its
-coherent replacement in Synchronizing state. Live updates that same
-publication without another database reconstruction. The exact relationship
-between those lifecycle changes and graph revisions remains open.
+Publication construction establishes its initial state without inventing a
+lifecycle delta. PostSeal normally publishes the coherent replacement as
+`Synchronizing`. If the reliable Live control arrived while construction was
+still pending, record that newer target and publish the completed image
+directly as `Live`.
+
+Once a publication is visible, the state-specific controls admit only
+`Synchronizing -> Live`, `Synchronizing -> Stale`, and `Live -> Stale`.
+`Stale` is terminal; a replacement always has a fresh `publication_id`. These
+control-plane transitions do not modify `GraphView`, create `GraphDelta`, or
+advance either view or history revision. A control that finds no publication,
+or finds the current publication already `Stale`, creates no additional state
+effect.
+
+SSE carries the current state beside the graph cursor:
+
+```rust
+struct PublicationWakeup {
+    publication_id: u64,
+    revision: u64,
+    state: GraphPublicationState,
+}
+```
+
+The graph cursor remains `(publication_id, revision)`. A state-only transition
+emits another wakeup with the same cursor and the new state. Reconnection emits
+the latest cursor and current state. Graph data still comes exclusively from
+HTTP snapshot or delta responses.
+
+Head snapshots carry the current `GraphPublicationState`; their ETags vary with
+it. Immutable delta payloads contain graph changes only and do not vary when
+the publication state later changes. `GraphPublication` owns lifecycle state
+while `GraphView` and `GraphHistory` remain free of origin, liveness, and
+publication state.
 
 The API response envelope, rather than `GraphView` or `GraphDelta`, carries the
 owning `publication_id`. A published view response pairs it with the view's
-current revision; a delta response pairs it with the history interval actually
-returned.
+current revision and publication state; a delta response pairs it with the
+history interval actually returned.
 
 `GraphView` owns application of `BlockCommitted`, `VspcCommitted`, and
 `GraphDelta`. A `Frozen` view refuses each mutation entry point with
@@ -447,7 +487,7 @@ behavior and cannot justify an additional history cap. A cursor whose required
 deltas left with their level normally requires a fresh view.
 
 The remaining graph-model work is intentionally incomplete in this working
-contract. Completion items 5 and 6 are owned by the
+contract. Completion item 6 is owned by the
 [open decision register](../decisions/open.md#api-graph-model-completion).
 
 Gapless delta intervals from one publication compose sequentially:
@@ -478,12 +518,12 @@ requires a fresh view. Whether an interval is encoded as individual retained
 revisions or one composed patch remains an implementation choice under the
 composition contract.
 
-SSE is only an ordered cursor wakeup `(publication_id, revision)`, not the graph
-data channel. Reconnection is not exactly-once. Each client has a bounded
-cursor buffer. On connection the server emits the latest history cursor;
-subsequent history advancement emits updated cursors. Slow clients receive
-coalesced cursor notifications and, if persistently behind, are disconnected
-and recover through HTTP delta or view requests.
+SSE is only an ordered `PublicationWakeup`, not the graph data channel.
+Reconnection is not exactly-once. Each client has a bounded wakeup buffer. On
+connection the server emits the latest history cursor and publication state;
+subsequent history advancement, state change, or replacement publication emits
+an updated wakeup. Slow clients receive coalesced wakeups and, if persistently
+behind, are disconnected and recover through HTTP delta or view requests.
 
 `representation_version` is the settled term for the graph payload schema.
 An ETag for a head view distinguishes publication ID, revision, effective
@@ -499,11 +539,12 @@ effective window, and for a delta over one exact
 `(publication_id,from,to)` interval. Concurrent requests for the same absent
 variant are single-flight. A view variant is identified by publication ID,
 revision, publication state, effective window, negotiated response format,
-`representation_version`, and content encoding. A delta variant uses the same
-representation fields and its exact `from` and `to` revisions. A "to current"
-request captures an exact target before it can join shared construction or use
-an encoded entry; a bounded complete-prefix response is keyed by its actual
-returned interval.
+`representation_version`, and content encoding. A delta variant is identified
+by publication ID, its exact `from` and `to` revisions, negotiated response
+format, `representation_version`, and content encoding; publication state is
+not part of the immutable graph interval. A "to current" request captures an
+exact target before it can join shared construction or use an encoded entry; a
+bounded complete-prefix response is keyed by its actual returned interval.
 
 An encoded-cache miss or eviction affects performance only: reconstruct the
 response from the current `GraphView` or retained `GraphHistory`. Historical
@@ -525,27 +566,29 @@ ordering belong to
 ApiService accepts exactly one Reset for each prepared processing session.
 Common Reset effects are:
 
-- mark the previously published graph view Stale while allowing that coherent
-  old image to remain readable;
-- stop deltas for the old publication;
+- mark a non-Stale previous publication Stale while allowing that coherent old
+  image to remain readable;
+- stop delta production for the old publication;
 - prevent pending observer updates from the previous processing session from
   entering the replacement publication; and
 - arm buffering for the new session before processor Begin.
 
 Reset has a completed-effect acknowledgement. The acknowledgement establishes
 those effects but does not mean that a replacement image has been published.
-Ordinary graph-update loss semantics do not weaken this reliable control
-barrier.
+A previous publication already Stale and a still-pending unpublished
+construction require no additional graph or history action. Ordinary
+graph-update loss semantics do not weaken this reliable control barrier.
 PostSeal and Live are reliable, exact-once, state-specific controls, but they
 are not processing barriers and have no publication-completion
 acknowledgement.
 
 `InvalidateSession` is a reliable, exact-once terminal control for a recoverably
-aborted processing session. It marks that session's published image Stale,
-stops its deltas, cancels any pending publication, and rejects later observer
-updates from the invalidated session. It creates no `GraphPublication`, performs no DB
-reload, and does not arm buffering for a replacement session. The next
-prepared session still begins with its own Reset. Invalidation leaves
+aborted processing session. It gives that session's active publication its
+terminal Stale state without changing its graph revision, stops later deltas,
+cancels any pending publication, and rejects later observer updates from the
+invalidated session. It creates no `GraphPublication`, performs no DB reload,
+and does not arm buffering for a replacement session. The next prepared session
+still begins with its own Reset. Invalidation leaves
 historical reads available unless the invalidated session's database-rebuild
 Reset had already closed them; in that case they remain closed until a later
 PostSeal publication reopens them.
@@ -565,15 +608,15 @@ otherwise cancel it and return 503. API reads cannot indefinitely delay
 processing.
 
 PostSeal starts the consistent snapshot plus buffered-update replay. Once
-coherent, ApiService publishes a new `GraphPublication` in Synchronizing state; this
-publication reopens historical reads after Rebuild. Processing does not wait
-for it to complete.
+coherent, ApiService publishes a new `GraphPublication` in the current target
+state. This is normally `Synchronizing`; it is initially `Live` when that
+control arrived during loading. Publication reopens historical reads after
+Rebuild. Processing does not wait for it to complete.
 
 The Live trigger updates the same publication without another database reload.
 If PostSeal loading has not finished, ApiService records the newer target and
-publishes the completed image directly as Live. Whether and how lifecycle-only
-state changes advance view and history revisions remains the fifth
-[open graph-model item](../decisions/open.md#api-graph-model-completion).
+publishes the completed image directly as Live. Otherwise it changes the
+publication state to Live without changing the graph revision or history.
 
 If `TRUNCATE` is used inside the atomic rebuild, its transactional rollback
 does **not** make it generally MVCC-safe for concurrent pre-existing

@@ -18,6 +18,12 @@ state comes from HTTP delta or snapshot responses.
 Head-following stays prompt. On publication change, a head-following view
 automatically reloads.
 
+A state-only wakeup can repeat the current graph cursor. The Web adopts its
+publication state without requesting or applying a graph delta. On a Stale
+state, it keeps the coherent image visibly marked stale. A head-following view
+reloads when a replacement publication ID appears; until then it does not
+pretend that the old image remains Live.
+
 A delta response may end at an intermediate revision below the Web's desired
 cursor. The single catch-up loop applies that complete interval, adopts its
 `to` cursor, and requests the next interval until it reaches the desired cursor
