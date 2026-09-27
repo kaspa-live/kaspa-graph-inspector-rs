@@ -608,8 +608,8 @@ with:
 
 ## API and Web
 
-Verify the [graph observer feed](api.md#in-process-api-and-graph-observer-feed--partially-open)
-and [graph publication contract](api.md#graph-views-publication-revision-and-history--incomplete-working-contract)
+Verify the [graph observer feed](api.md#in-process-api-and-graph-observer-feed--settled)
+and [graph publication contract](api.md#graph-views-publication-revision-and-history--settled)
 for causal order, a loss flag even when the terminal message is lost,
 complete view levels, external parent-edge endpoints and level sizes, actual parent
 presence independent of visible edges, and one Reset-driven replacement
@@ -656,7 +656,7 @@ head window, including multiple revisions at one level, and make them eligible
 for pruning only after that level leaves the window. No count or byte pressure
 may prune them earlier.
 
-Verify the [graph-view edge and absolute-map contract](api.md#graph-views-publication-revision-and-history--incomplete-working-contract)
+Verify the [graph-view edge and absolute-map contract](api.md#graph-views-publication-revision-and-history--settled)
 with zero, one, and two endpoint blocks retained; child addition and removal;
 parent-only removal; outside-extent parent levels under `Head` and `Fixed`;
 and PP-boundary sentinel links. Cover all four right-biased `Some`/`None`
@@ -689,7 +689,7 @@ returned level fixed across deltas, and re-resolve only when explicit refresh
 resubmits that anchor.
 
 Verify deltas and client behavior across
-[API publication](api.md#graph-views-publication-revision-and-history--incomplete-working-contract) and
+[API publication](api.md#graph-views-publication-revision-and-history--settled) and
 [Web update acquisition](web.md#update-acquisition--partially-open): sequential delta
 composition and expiry, response-local hash dictionaries,
 terminal Stale state, replacement publication identity, SSE slow clients,
@@ -732,9 +732,33 @@ actual returned interval. Eviction must reconstruct an equivalent response
 from the current graph view or retained deltas. Historical DB windows bypass
 this cache, and cache pressure must not delay or fault processing.
 
-Add the database-construction cases when the remaining
-[open graph-model item](../decisions/open.md#api-graph-model-completion) is
-settled. This working verification section does not choose its behavior.
+Verify the settled
+[database-seed projection](api.md#database-seed-extent-and-projection--settled),
+[observer replay](api.md#seed-construction-and-observer-replay--settled), and
+[storage read operation](storage.md#api-graph-projection-reads--settled).
+Cover a `MAX_CACHE_DEPTH` head seed; odd and even anchored depths; shifting at
+level 1 and the database head; level, block-hash, and DAA anchors; and a retained
+range shorter than the requested depth. Resolution and every projected row must
+come from one read-only stable snapshot.
+
+Projection cases cover complete nominal blocks; crossing edges with zero, one,
+and two endpoint blocks; all nominal and endpoint levels; exclusion of the
+outside-PP sentinel edge; complete direct-parent and merge-set hashes; local
+`selected_parent_index`; Genesis without ORIGIN; current color and VSPC state;
+and the construction-only snapshot sink. Recompute derived level usage from
+edges. Exercise the separate capped API pool and prove its saturation or
+generation loss cannot consume or retire a processing-pool connection.
+
+Replay cases cover present blocks, absent blocks with no retained effect, an
+absent block whose returned delta finds the boundary, a VSPC source that finds
+the boundary first, and a buffer ending while boundary detection remains
+pending. After either boundary, apply all later interleaved updates in channel
+order. Cover staging that publishes at revision zero and above zero, plus
+independently atomic view and history visibility at adjacent revisions.
+Overflow, observer invalidation, query/generation/projection failure,
+superseding controls, and update-application failure must abandon only the API
+attempt while preserving the applicable Stale publication or clean 503 and the
+status/info lane.
 
 Verify [Reset and recovery-time availability](api.md#reset-and-recovery-time-availability--settled)
 with ordinary Resync and Rebuild integration scenarios. Resync preserves

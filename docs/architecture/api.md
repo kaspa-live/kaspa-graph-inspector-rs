@@ -9,7 +9,7 @@ send API controls. [Storage](storage.md) owns database transaction and query
 implementation. Web client behavior belongs to the
 [Web architecture](web.md).
 
-## In-process API and graph observer feed — partially open
+## In-process API and graph observer feed — settled
 
 KGI v2 includes an in-process `ApiService` and a complete bounded-by-level
 head-tracking `GraphView`, rather than directing each head request to expensive
@@ -63,7 +63,7 @@ windowed endpoint caps requested depth to `MAX_WINDOW_DEPTH` and reports
 the effective range. An oversized `/graph/head` request cannot fall back to
 DB; it is capped.
 
-The [graph-view contract](#graph-views-publication-revision-and-history--incomplete-working-contract)
+The [graph-view contract](#graph-views-publication-revision-and-history--settled)
 owns edge representation, window inclusion, endpoint retention, and lifetime.
 The observer payload above supplies the committed parent information required
 to apply that contract.
@@ -81,12 +81,10 @@ direct-parent list. The public projection and Web client do not need to expose
 or consult the persisted `NodeMetadata.genesis_hash`, and no dedicated
 Genesis-hash API endpoint is required.
 
-## Graph views, publication, revision, and history — incomplete working contract
+## Graph views, publication, revision, and history — settled
 
-The following conceptual shapes record the settled portion of the graph model.
-Container and collection types remain implementation choices, and the mutation
-fields explicitly marked pending will be completed through the numbered design
-work below.
+The following conceptual shapes define the graph model. Container and
+collection types remain implementation choices.
 
 ```rust
 enum TrackingPolicy {
@@ -183,6 +181,35 @@ struct GraphPublication {
     view: GraphView,
     history: GraphHistory,
 }
+
+enum GraphWindowAnchor {
+    Level(u64),
+    BlockHash(BlockHash),
+    DaaScore(u64),
+}
+
+enum GraphViewSeedRequest {
+    HeadPublication,
+    AnchoredWindow {
+        anchor: GraphWindowAnchor,
+        max_depth: u64,
+    },
+}
+
+struct GraphWindowResolution {
+    resolved_level: u64,
+    effective_start_level: u64,
+    effective_end_level: u64,
+}
+
+struct GraphViewSeed {
+    resolution: GraphWindowResolution,
+    max_depth: u64,
+    levels: LevelSet,
+    blocks: BlockSet,
+    edges: EdgeSet,
+    snapshot_vspc_sink: BlockHash,
+}
 ```
 
 Only `GraphPublication` has a `publication_id`. A `GraphView` has no origin,
@@ -249,19 +276,123 @@ Together `(publication_id, revision)` form the public cursor. If the selected
 wire format cannot represent every `u64` exactly, its encoding must preserve
 the complete integer domain.
 
-ApiService begins buffering graph updates before constructing a `GraphView`
-from one consistent database snapshot. On every new processing session it
-reconstructs the view because the previous session may have committed data
-without delivering its observer update. A coherent replacement creates a new
-`GraphPublication` with a new `publication_id`; an old coherent publication can
-remain readable as explicitly Stale, but it receives no later deltas.
+### Database seed extent and projection — settled
 
-The database projection contains the complete view levels and blocks, every
-required crossing-edge endpoint and its level size, current colors and VSPC
-membership, and the data required for DAA resolution. Buffered updates are
-then applied in their certified delivery order. The precise database projection
-and initial construction/replay boundary remain the sixth open graph-model
-item.
+ApiService obtains a `GraphViewSeed` through storage's
+[`ValidatedApiDbClient`](storage.md#api-graph-projection-reads--settled). The
+API-specific handle uses the separate capped read-only API pool; the processing
+`ValidatedDbClient` is never used for graph loads or historical requests.
+
+`HeadPublication` constructs the complete cache image. Its resolved and high
+level are the current highest materialized database level, its `max_depth` is
+exactly `MAX_CACHE_DEPTH`, and its low level is:
+
+```text
+max(1, high_level - MAX_CACHE_DEPTH + 1)
+```
+
+An `AnchoredWindow` accepts `max_depth` only in
+`1..=MAX_WINDOW_DEPTH`. Storage resolves its level, block-hash, or DAA anchor
+inside the same consistent read as the projection. For a requested depth `d`,
+the nominal extent initially allocates:
+
+```text
+levels_above = (d - 1) / 2
+levels_below = (d - 1) - levels_above
+```
+
+An even depth therefore puts its additional level on the lower historical
+side. At level 1 or the current database head, shift unused capacity to the
+opposite side so the extent contains up to `d` levels when the retained
+database range permits it. Never extend outside that range. The returned
+`GraphWindowResolution` records the resolved level and final inclusive bounds.
+
+The seed contains every materialized block in the nominal extent as a complete
+`GraphBlock`. Resolve every actual direct-parent and merge-set ID to its hash,
+including references whose blocks are outside the extent. Direct parents use a
+local vector order chosen by the projection; that order has no separate
+semantic meaning.
+For a non-Genesis block, `selected_parent_index` is the index of the stored
+selected-parent hash in that local vector. No parent ordinal is persisted.
+Genesis has an empty vector and `selected_parent_index = None`; synthetic
+ORIGIN is not a direct parent.
+
+Select every materialized child-parent edge whose span intersects the nominal
+extent under the settled predicate below. The seed therefore retains crossing
+edges with zero, one, or two endpoint blocks in its block set. Each edge carries
+both hashes and coordinates. An outside-PP sentinel parent produces no public
+edge.
+
+The seed's levels are the union of every nominal level and every child or
+parent endpoint level referenced by a selected edge. Each entry carries its
+complete stored `size` and optional DAA score. `usage_count` is not loaded; the
+`GraphView` constructor derives it from the selected edges. The same snapshot
+also returns the committed materialized VSPC sink as
+`snapshot_vspc_sink`. This is construction metadata only and never enters a
+public graph payload, `GraphView`, `GraphDelta`, or `GraphHistory`.
+
+### Seed construction and observer replay — settled
+
+ApiService begins buffering graph updates before loading a head-publication
+seed. On every new processing session it reconstructs the publication because
+the previous session may have committed data without delivering its observer
+update. Construct the seed as a revision-zero `Head` view and a revision-zero
+history, then scan buffered updates for the snapshot boundary.
+
+Before that boundary, classify `BlockCommitted` as follows:
+
+```text
+block hash is present in the view
+    -> skip it
+
+block hash is absent
+    -> apply it
+    -> no delta: keep searching
+    -> delta returned: this update is the boundary
+```
+
+The alternative boundary is the first `VspcCommitted` whose `source` equals
+`snapshot_vspc_sink`; apply that update as the boundary. Before either rule
+succeeds, skip other VSPC updates as already represented. The first of the two
+rules to succeed wins. From that update onward, apply every remaining buffered
+and newly received update in channel order without further snapshot
+classification or API-side VSPC continuity checking.
+
+An absent block outside retained state can produce no delta and therefore does
+not establish the boundary. If the buffer ends first, the seed is already a
+coherent publishable image and the private boundary detector remains active
+for later updates. Discard `snapshot_vspc_sink` when either rule eventually
+succeeds.
+
+Every applied visible update uses the ordinary mutation path: advance the view,
+return its delta, then append that delta to history. Staging can therefore make
+the first visible publication revision greater than zero. An update with no
+retained effect advances neither revision. View replacement and history
+replacement each become visible atomically to their own readers, but there is
+no joint view-history snapshot or revision-equality invariant. Readers can
+observe a complete view at revision `n + 1` while history independently remains
+complete through revision `n`.
+
+Successful head construction creates a fresh random nonzero publication ID and
+uses the newest reliable lifecycle target: normally `Synchronizing`, or `Live`
+when Live arrived while construction was pending. Readers never observe a
+partly constructed view or a partly appended history. The previous coherent
+publication remains terminally Stale and receives no later deltas.
+
+An `AnchoredWindow` seed constructs a revision-zero `Fixed` view whose
+`max_depth` is its effective nominal level count. It has no history or
+publication ID and is discarded after the coherent HTTP response is built.
+Database construction alone does not imply `Frozen`; that policy remains
+reserved for subview extraction.
+
+An API-pool or query failure, API database-generation loss, observer-invalid
+flag, staging-buffer overflow, superseding Reset or `InvalidateSession`, seed
+construction failure, or update-application failure abandons only the current
+API attempt. Retry from a newer consistent snapshot while the processing
+session remains current; never request processing Resync or Rebuild for an API
+read-model failure. A previous coherent publication remains readable as Stale.
+Without one, graph endpoints return `503 Service Unavailable`, while the
+separate status/info lane remains available.
 
 ### Publication state and revision — settled
 
@@ -486,10 +617,6 @@ hypothetical infinite activity stream at one level is not a valid Kaspa
 behavior and cannot justify an additional history cap. A cursor whose required
 deltas left with their level normally requires a fresh view.
 
-The remaining graph-model work is intentionally incomplete in this working
-contract. Completion item 6 is owned by the
-[open decision register](../decisions/open.md#api-graph-model-completion).
-
 Gapless delta intervals from one publication compose sequentially:
 
 ```text
@@ -630,14 +757,6 @@ detailed cancellation and transaction mechanism remains deferred in the
 [decision register](../decisions/deferred.md).
 
 ## DAA navigation and graph windows — settled
-
-```rust
-struct GraphWindowResolution {
-    resolved_level: u64,
-    effective_start_level: u64,
-    effective_end_level: u64,
-}
-```
 
 Every successful anchored window response carries `GraphWindowResolution`,
 independently of whether its one anchor is a level, block hash, or DAA score.

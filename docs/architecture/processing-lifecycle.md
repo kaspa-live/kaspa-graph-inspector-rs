@@ -845,4 +845,4 @@ Exact shutdown timeouts and escalation policy remain deferred in the
 
 The graph observer path is deliberately separate: observer loss invalidates
 and reloads the API image without interrupting processing. Its behavior is
-defined in [api.md](api.md#in-process-api-and-graph-observer-feed--partially-open).
+defined in [api.md](api.md#in-process-api-and-graph-observer-feed--settled).

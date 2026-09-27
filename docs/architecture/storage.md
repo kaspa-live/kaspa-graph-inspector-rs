@@ -36,6 +36,7 @@ enum StorageServiceState {
 }
 
 wait_until_usable() -> Result<Arc<ValidatedDbClient>, StorageWaitError>
+wait_until_api_usable() -> Result<Arc<ValidatedApiDbClient>, StorageWaitError>
 initialize_if_uninitialized(
     network_id: NetworkId,
     genesis_hash: BlockHash,
@@ -56,6 +57,14 @@ Service state outlives individual validated DB generations.
 generation and owns that generation's caches. A processing run receives one
 exact client generation; StorageService never rebinds the client underneath
 the run. A replacement generation starts with fresh caches.
+
+`ValidatedApiDbClient` is the storage handle for the read-only pool required by
+the [API resource contract](api.md#resource-isolation-and-saturation--settled).
+It exposes no processing mutation or processing cache. ApiService obtains it
+through `wait_until_api_usable()`. Network binding, schema, and generation
+validation precede publication of either handle. The
+[API Reset contract](api.md#reset-and-recovery-time-availability--settled) owns
+when new API reads close, drain, and reopen around Rebuild.
 
 Callers receive semantic read operations and complete domain transactions.
 Storage exposes no connection pool, database connection, transaction object,
@@ -1042,6 +1051,45 @@ Materialized node PP as `node_pp` and the committed sink needed to construct
 `MaterializedSyncAnchor`. The result contains no node-derived blue work or
 blue score. ResyncEngine uses the run's exact validated RPC generation to
 enrich and validate the stored sink before constructing the anchor.
+
+## API graph projection reads — settled
+
+The API-owned [database seed contract](api.md#database-seed-extent-and-projection--settled)
+defines `GraphViewSeedRequest`, `GraphViewSeed`, its effective extent, and the
+contents of the returned projection. Storage exposes that semantic read only
+through the separate read-only API handle:
+
+```rust
+enum ApiReadError {
+    QueryFailed,
+    GenerationLost,
+    InconsistentProjection,
+}
+
+impl ValidatedApiDbClient {
+    async fn load_graph_view_seed(
+        &self,
+        request: GraphViewSeedRequest,
+    ) -> Result<GraphViewSeed, ApiReadError>;
+}
+```
+
+`load_graph_view_seed` resolves the requested anchor and materializes the
+complete projection in one stable PostgreSQL snapshot, using one read-only
+`REPEATABLE READ` transaction when more than one statement is required. It
+finishes that transaction and releases its API connection before response
+serialization or compression. The operation maps stored identities, blocks,
+parents, merge sets, coordinates, levels, coloring, VSPC membership, and the
+committed sink into the API-owned result; it exposes no compact ID or database
+transaction object to ApiService.
+
+A query or pool failure reports `QueryFailed`. Loss of this API pool generation
+reports `GenerationLost` and retires that API handle without retiring the
+independent processing handle. A structurally incomplete or internally
+incoherent result reports `InconsistentProjection`; it never returns a partial
+seed. The [ApiService construction contract](api.md#seed-construction-and-observer-replay--settled)
+owns retry, publication, and service-availability effects for all three
+outcomes.
 
 ## Historical read contracts — settled
 
