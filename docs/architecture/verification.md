@@ -646,6 +646,22 @@ content. An update for a level with no retained crossing-edge endpoint produces
 no visible revision, and unreferenced external endpoint metadata can be
 discarded.
 
+Verify the settled [head block mutation](api.md#head-block-mutation--settled)
+below and at full depth, at the existing high level, at a new high level, and
+with a below-range commit. Cases cover block and child-owned edge pruning,
+existing and new endpoint counters, multiple edges sharing a parent level,
+counter-only maintenance, and removal or survival of an external level.
+
+Verify [Fixed updates through Head](api.md#fixed-updates-through-the-head-cache--settled)
+with both crossing orders at the overlap boundary, an original update that
+produces no Head delta but changes Fixed, block metadata split between the two
+views, an above-Fixed added member that recolors a retained merge-set block,
+and a retained endpoint-level DAA change. Cover independent revisions, missing
+required metadata, and the first post-update disjoint extent. The latter two
+must preserve the last coherent image and make every later mutation fail under
+the Frozen rule. No case may apply a Head-generated delta to Fixed or perform a
+storage read.
+
 Verify the settled graph-model core with a view and history initially at
 revision `n`. A retained mutation advances the view to `n+1` and returns
 `GraphDelta(n,n+1)` before history append. During that interval, a view read may
@@ -675,12 +691,13 @@ for pruning only after that level leaves the window. No count or byte pressure
 may prune them earlier.
 
 Verify the [graph-view edge and absolute-map contract](api.md#graph-views-publication-revision-and-history--settled)
-with zero, one, and two endpoint blocks retained; child addition and removal;
-parent-only removal; outside-extent parent levels under `Head` and `Fixed`;
-and PP-boundary sentinel links. Cover all four right-biased `Some`/`None`
-block/edge composition pairs, retention of the final explicit entry, map-key
-construction from the value identity, and composition without value comparison
-or a starting view. Keep VSPC projection treatment separate.
+with zero, one, and two endpoint blocks retained; Head child addition and
+removal; parent-only removal under Head pruning; Fixed crossing-edge addition;
+outside-extent parent levels under both policies; and PP-boundary sentinel
+links. Cover all four right-biased `Some`/`None` block/edge composition pairs,
+retention of the final explicit entry, map-key construction from the value
+identity, and composition without value comparison or a starting view. Keep
+VSPC projection treatment separate.
 
 Verify the settled
 [VSPC projection and composition contract](api.md#vspc-projection-and-delta-composition--settled)

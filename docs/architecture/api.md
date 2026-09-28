@@ -319,9 +319,10 @@ struct GraphViewSeed {
 Only `GraphPublication` has a `publication_id`. A `GraphView` has no origin,
 liveness, database, or publication status. A view constructed from a database
 starts at revision zero. A subview extract inherits its source view's revision
-and has `TrackingPolicy::Frozen`. `Head` and `Fixed` views accept updates;
-`Head` advances its extent while `Fixed` retains its configured extent.
-`Frozen` retains both its captured contents and revision.
+and has `TrackingPolicy::Frozen`. `Head` accepts updates and advances its
+extent. `Fixed` accepts original committed updates only with the post-update
+Head view as its metadata cache while their extents overlap. `Frozen` retains
+both its captured contents and revision.
 
 ### Frozen subview extraction — settled
 
@@ -627,12 +628,107 @@ history interval actually returned.
 `GraphView` owns application of `BlockCommitted`, `VspcCommitted`, and
 `GraphDelta`. A `Frozen` view refuses each mutation entry point with
 `GraphViewUpdateError::Frozen` before inspecting whether the input would have a
-visible effect; its contents and revision remain unchanged. For `Head` and
-`Fixed`, an update that changes no retained block, edge, or level returns no
-delta and leaves the revision unchanged. Any retained change advances the view
-revision and returns the corresponding `GraphDelta`; a retained level-size or
-DAA-score change is sufficient even when the triggering block itself is outside
-the block extent. Frozen refusal is distinct from an accepted no-effect update.
+visible effect; its contents and revision remain unchanged. For `Head` and an
+updating `Fixed` view, an update that changes no retained block, edge, or level
+returns no delta and leaves the revision unchanged. Any retained change
+advances that view's revision and returns the corresponding `GraphDelta`; a
+retained level-size or DAA-score change is sufficient even when the triggering
+block itself is outside the block extent. Frozen refusal is distinct from an
+accepted no-effect update.
+
+### Head block mutation — settled
+
+For a `Head` view, applying one `BlockCommitted` first calculates the target
+nominal extent:
+
+```text
+target_high = max(current_high, block.coordinate.level)
+target_low  = max(1, target_high - max_depth + 1)
+```
+
+The operation then performs one atomic graph-state transition:
+
+1. Convert the committed block to a complete `GraphBlock` and retain it when
+   its level lies in the target extent.
+2. For each actual direct parent with a coordinate, construct the immutable
+   `GraphEdge` and retain it when its span intersects the target extent under
+   the predicate owned below. An outside-PP parent has no coordinate and
+   produces no edge.
+3. Apply every relevant `LevelCommitted` snapshot to the inserted block level
+   or a retained parent endpoint level. A snapshot replaces only the public
+   `Level { size, daa_score }` value. It preserves an existing derived
+   `usage_count`; a newly retained level starts with `usage_count = 0`.
+4. Each retained edge addition increments the referenced parent level's
+   `usage_count`. Multiple edges to one parent level contribute separately.
+5. When `target_low` advances, remove every block below it. Removing a child
+   removes each edge owned by that child and decrements the corresponding
+   parent-level counters. A level that left the nominal extent is removed only
+   when its counter is zero; otherwise it remains as an external endpoint.
+
+The returned delta is the exact visible difference between the complete state
+before and after that transition: retained block and edge additions or
+removals, every created, changed, or removed public level value, and
+`high_level = target_high`. Counter-only changes are derived maintenance and do
+not enter `LevelChange`. If every public change collection is empty, the
+operation returns `None` and does not advance the revision. Otherwise it
+advances `n` to `n + 1` and returns `GraphDelta(n, n + 1)`.
+
+This procedure also covers a committed block below `target_low`: its block and
+edges are not reintroduced, while a supplied level snapshot can still update
+an already retained external endpoint. Concrete indexes, collection types,
+mutation staging, and lock boundaries remain implementation choices.
+
+### Fixed updates through the Head cache — settled
+
+An independently maintained `Fixed` view consumes the original ordered
+`BlockCommitted` and `VspcCommitted` values, never a delta produced by Head.
+For each such value, ApiService first applies it to Head and captures an
+immutable reference to the resulting complete Head state. It then offers the
+same original value and that post-update Head reference to Fixed even when Head
+produced no visible delta. Head and Fixed revisions remain independent.
+
+Before applying the value, evaluate the post-update nominal extents:
+
+```text
+fixed.low_level <= head.high_level
+AND
+head.low_level <= fixed.high_level
+```
+
+If they are disjoint, change the tracking policy from `Fixed` to `Frozen`
+without applying that value or advancing the graph revision. Head bounds never
+decrease, so this transition is terminal. Every later mutation entry point
+then follows the ordinary Frozen refusal rule.
+
+While the extents overlap, `BlockCommitted` keeps the Fixed nominal bounds
+unchanged. It retains the complete block only when the block lies inside those
+bounds, retains every parent edge whose span intersects them, and applies the
+supplied snapshots to nominal or retained endpoint levels. Level values and
+derived parent-level counters follow the Head mutation rules, but head movement
+never prunes Fixed graph structure.
+
+For `VspcCommitted`, resolve immutable metadata needed to project the
+transition from the union of Fixed and post-update Head blocks. This lets an
+added chain member above the Fixed extent supply its merge sets, coordinate,
+and DAA score while mutations apply only to blocks and levels retained by
+Fixed. Apply the storage-owned remove-then-add ordering: retained removed
+members leave VSPC and become Gray; retained added members enter VSPC; every
+resolved added member's blue and red merge sets recolor matching retained Fixed
+blocks; and affected retained levels receive their final DAA score after the
+complete transition.
+
+If metadata required for the complete Fixed projection is absent from both
+views, change Fixed to `Frozen` before applying any part of that value. Do not
+partially mutate it, query storage implicitly, or advance its revision. The
+same terminal transition preserves the last coherent Fixed image.
+
+A `GraphDelta` produced by this Fixed lineage can still be applied to a
+matching Fixed view under the general absolute-map and revision rules.
+Applying a standalone Head-generated delta to Fixed is prohibited by the
+[rejected-design register](../decisions/rejected.md): it lacks the original
+committed event and does not guarantee all projection context.
+
+### Revision and history advancement — settled
 
 The view advances before its returned delta is appended to `GraphHistory`:
 
@@ -701,8 +797,8 @@ requires no starting view.
 
 ### VSPC projection and delta composition — settled
 
-`GraphView` applies one `VspcCommitted` in the same mutation order as the
-storage transaction, projected onto its retained blocks:
+A mutable `Head` `GraphView` applies one `VspcCommitted` in the same mutation
+order as the storage transaction, projected onto its retained blocks:
 
 1. each present removed block leaves VSPC and is reset to `Gray`;
 2. each present added block enters VSPC;
@@ -779,8 +875,8 @@ rule above.
 public `Level` value and from `LevelChange`; applying edge changes maintains it
 locally. A level inside the view extent remains regardless of its counter. In a
 head-tracking view, an outside-extent parent level becomes removable when its
-counter reaches zero. A fixed view never removes levels through this mechanism,
-though updates can add referenced levels.
+counter reaches zero. A Fixed view keeps its nominal extent and retained graph
+structure until its terminal transition to Frozen under the contract above.
 
 `GraphView` and `GraphDelta` contain no committed VSPC sink. ApiService trusts
 the ordered, continuity-certified `VspcProcessor` output and does not duplicate

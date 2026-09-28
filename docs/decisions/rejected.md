@@ -35,6 +35,7 @@ These proposals were considered and not accepted.
 | Assume coordinates are stable across instances. | Coordinates belong to one database allocation. | [Domain model](../architecture/domain-model.md), [API](../architecture/api.md) |
 | Permit partially populated retained head-view levels. | It breaks the view-completeness invariant. | [API](../architecture/api.md) |
 | Add a revision-count or byte-size cap to `GraphHistory`. | History is level-scoped, and Kaspa cannot produce unbounded revisions while remaining indefinitely at one fixed level. | [API](../architecture/api.md) |
+| Apply a standalone Head-generated `GraphDelta` to a `Fixed` view. | It lacks the original committed event and can omit unchanged endpoint or VSPC projection context required by Fixed; Fixed updates from the original event plus the post-update Head cache. | [API](../architecture/api.md) |
 | Escalate API graph-update loss directly into processing recovery. | API projection availability is outside processing correctness. | [API](../architecture/api.md) |
 | Serve API reads from a partially rebuilt database. | It can expose mixed database generations. | [API](../architecture/api.md) |
 | Move pruning-point or reconciliation preparation into Supervisor. | It violates recovery-component ownership. | [Processing lifecycle](../architecture/processing-lifecycle.md) |
