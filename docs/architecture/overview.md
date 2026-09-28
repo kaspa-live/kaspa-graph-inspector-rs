@@ -36,7 +36,7 @@ BlockProcessor/VspcProcessor
     ── per-session ordered graph updates ──► ApiService
 BlockProcessor ── lifecycle markers ──► ApiService
 ResyncEngine ── lifecycle milestones ──► Supervisor
-Supervisor ── Reset(fresh graph-update input) ──► ApiService
+Supervisor ── Reset(fresh graph-update input) / Shutdown ──► ApiService
 ```
 
 Autonomous long-lived workers form a control tree. `ResyncEngine` owns both

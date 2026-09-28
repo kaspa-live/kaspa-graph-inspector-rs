@@ -853,12 +853,16 @@ implementation, and graph wire format remain deferred in the
 ## Reset and recovery-time availability — settled
 
 `Reset` is the sole out-of-band ApiService session-supersession control because
-it replaces the graph-update input topology. Its semantic payload is:
+it replaces the graph-update input topology. ApiService's semantic commands
+are:
 
 ```rust
-Reset {
-    graph_updates: GraphUpdateReceiver,
-    recovery_mode: RecoveryMode,
+enum ApiServiceCommand {
+    Reset {
+        graph_updates: GraphUpdateReceiver,
+        recovery_mode: RecoveryMode,
+    },
+    Shutdown,
 }
 ```
 
@@ -922,6 +926,36 @@ publication state without another database load or graph revision.
 
 The storage owner defines the `TRUNCATE`/MVCC safety requirement and detailed
 gate boundary. Reset does not participate in that exclusion mechanism.
+
+### ApiService shutdown — settled
+
+`Shutdown` is a reliable completed-barrier command. It is terminal,
+idempotent, valid from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`, and
+`Active`, and supersedes Reset processing, publication construction,
+alignment, reconstruction, and Active update application. ApiService performs
+the local barrier in order:
+
+1. close public HTTP and status/info admission;
+2. close every SSE stream;
+3. drop the installed `GraphUpdateReceiver` and stop gap observation;
+4. cancel publication construction, alignment, reconstruction, staging, and
+   background encoding or cache work;
+5. cancel and join every admitted request, serialization, delivery, and other
+   API-owned task;
+6. release every API DB permit, transaction, connection, validated client,
+   pool handle, publication, and cache reference; and
+7. acknowledge `Shutdown` and enter terminal `Stopped`.
+
+The acknowledgement proves that no API admission, task, graph-update receiver,
+or API database resource remains. A repeated `Shutdown` acknowledges the
+already completed state; no Reset is accepted after shutdown begins. Exact
+shutdown timeouts and forced escalation remain deferred under the shared
+shutdown policy.
+
+Shutdown creates no publication, `Stale` transition, graph revision, or SSE
+wakeup because external admission closes first. `ReceiverClosed` caused by
+this barrier is expected cancellation for the concurrently stopping processing
+session and must not request API reconstruction, Resync, or Rebuild.
 
 ## DAA navigation and graph windows — settled
 

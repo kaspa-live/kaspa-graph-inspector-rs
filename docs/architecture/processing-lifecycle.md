@@ -869,11 +869,21 @@ On Deactivate, ResyncEngine performs this barrier in order:
 7. drop `ProcessingSession`; and
 8. emit `Deactivated` and enter Idle.
 
-The owning services may retain their validated generations. Shutdown stops
-engine and processors before NodeService and then StorageService. Channel
-failures follow the bounded-delivery and ownership semantics above;
-component-specific draining duties remain in the focused processor documents.
-Exact shutdown timeouts and escalation policy remain deferred in the
+The owning services may retain their validated generations after Deactivate.
+For global Shutdown, Supervisor first enters terminal shutdown and starts no
+new recovery attempt. It sends ApiService `Shutdown` and then ResyncEngine
+`Shutdown` without waiting for the API acknowledgement between those sends.
+It awaits both completed barriers before shutting down NodeService and then
+StorageService. This releases every processing and API client before their
+owning services stop and keeps StorageService last.
+
+Dropping the graph-update receiver during this coordinated barrier unblocks a
+marker worker awaiting lossless delivery. Resulting producer closure is
+expected teardown cancellation rather than a processing fault. ApiService owns
+the local effects and acknowledgement of its
+[shutdown barrier](api.md#apiservice-shutdown--settled); processor-specific
+draining duties remain in their focused documents. Exact shutdown timeouts and
+escalation policy remain deferred in the
 [decision register](../decisions/deferred.md).
 
 The graph-update path is deliberately separate: a reported stream gap rebuilds

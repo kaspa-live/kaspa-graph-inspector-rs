@@ -814,6 +814,18 @@ signal, and a marker worker with an accepted delivery may outlive
 BlockProcessor Deactivate without retaining an RPC or DB client, then exits
 after delivery or receiver replacement.
 
+Verify the [ApiService shutdown barrier](api.md#apiservice-shutdown--settled)
+from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`, and `Active`, including
+races with Reset, marker delivery, gap reconstruction, database projection,
+serialization, detached response delivery, and SSE wakeups. Admission and SSE
+close first; the graph receiver drop unblocks a waiting marker worker; every
+API task and database resource ends before acknowledgement; no publication or
+revision mutation is emitted; and repeated Shutdown is idempotent. Supervisor
+sends ApiService Shutdown before ResyncEngine Shutdown without awaiting the
+first acknowledgement, awaits both barriers, and only then shuts down
+NodeService followed by StorageService. Producer closure during that barrier
+requests no reconstruction or processing recovery.
+
 Graph-update and API projection tests cover a non-Genesis block whose selected
 parent index addresses the expected member of `direct_parents`, plus Genesis
 with `selected_parent_index = None`, an empty `direct_parents` list, and no
