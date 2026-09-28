@@ -2,9 +2,9 @@
 
 ## Scope and ownership
 
-This document owns the system boundary, component ownership, direction of
-control and data flow, and system-wide resource isolation. Shared identities
-and graph terminology belong to
+This document owns the system boundary, component ownership, core crate
+structure, direction of control and data flow, and system-wide resource
+isolation. Shared identities and graph terminology belong to
 the [domain model](domain-model.md). Component behavior belongs to the linked
 focused document.
 
@@ -72,6 +72,60 @@ graph-update loss, reconstruction, and publication behavior.
 NodeService, StorageService, ResyncEngine, and Supervisor each own their
 respective service, processing, or orchestration state. Published statuses are
 observations of those owners, never a second source of lifecycle authority.
+
+## Core crate structure — settled
+
+Architectural contract ownership and Rust crate placement are independent.
+Focused architecture documents remain the semantic owners of their contracts
+even when a value type lives in a shared crate.
+
+The core crate structure fixes these acyclic boundaries. An arrow points from
+a crate to one of its dependencies:
+
+```text
+kgi-api-model  ──► kgi-model
+kgi-api-feed   ──► kgi-model
+kgi-node       ──► kgi-model
+kgi-storage    ──► kgi-model + kgi-api-model
+kgi-processing ──► kgi-model + kgi-api-feed + kgi-node + kgi-storage
+kgi-api-core   ──► kgi-model + kgi-api-model + kgi-api-feed + kgi-storage
+```
+
+`kgi-model` contains shared domain values and cross-component message values,
+including `ParentCommitted`, `LevelCommitted`, `BlockCommitted`,
+`VspcCommitted`, and `GraphUpdate`. Their focused component documents still
+own their semantics.
+
+`kgi-api-model` is a pure graph-projection contract crate. It contains shared
+API graph values and request/result values such as `Level`, `GraphBlock`,
+`EdgeId`, `GraphEdge`, `GraphWindowAnchor`, `GraphViewSeedRequest`,
+`GraphWindowResolution`, `GraphViewSeed`, and public delta value shapes. It has
+no service workers, database implementation, HTTP server, channel runtime, or
+PostgreSQL types.
+
+`kgi-api-feed` owns the runtime graph-update ingress: `GraphUpdateProducer`,
+`GraphUpdateReceiver`, `GraphUpdateGate`, gap signaling, bounded-channel
+construction, and producer-gate behavior. It depends on the async runtime and
+`kgi-model`, but not on `kgi-api-model`, `kgi-storage`, or `kgi-api-core`.
+
+`kgi-node` owns NodeService, `ValidatedRpcClient`, NotificationRouter, RPC
+normalization, and subscription handling. It depends on `kgi-model` and the
+node/RPC libraries, but not on `kgi-processing`, storage, or either API crate.
+The composition root constructs the processor notification channels and passes
+only their sender handles to `kgi-node`. Their payload types belong to
+`kgi-model`, so `kgi-node` does not depend on concrete processor types from
+`kgi-processing`.
+
+`kgi-storage` implements StorageService, validated database clients,
+persistence, and the API projection read against `kgi-api-model` contracts. It
+must not depend on `kgi-api-core` or `kgi-api-feed`. `kgi-api-core` owns
+ApiService, graph publication behavior, HTTP/SSE, and API runtime state.
+`kgi-processing` owns the processing workers and consumes the graph-update
+producer without depending on `kgi-api-core`.
+
+The binary/composition crate, migrations, Web assets, and internal module
+boundaries remain deferred in the
+[decision register](../decisions/deferred.md).
 
 ## Interaction rules — settled
 

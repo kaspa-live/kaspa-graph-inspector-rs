@@ -23,8 +23,9 @@ defined in [`AGENTS.md`](../../AGENTS.md). Within architecture documents:
 
 - text marked **settled** is a requirement;
 - Rust, SQL, and message fragments fix semantic shape only and need not compile
-  as written; workspace, crate, and module layout remain deferred in the
-  [decision register](../decisions/deferred.md);
+  as written; the [core crate structure](overview.md#core-crate-structure--settled)
+  is fixed while the remaining workspace and module layout stays deferred in
+  the [decision register](../decisions/deferred.md);
 - mechanics not fixed by a contract remain implementation choices; and
 - a conflict must be reported and resolved in the owning architecture or an
   accepted ADR, never blended silently.
@@ -57,7 +58,7 @@ restating it.
 | Document | Sole concern |
 |---|---|
 | `README.md` | Architecture authority, reading order, ownership boundaries, and navigation. It contains no system behavior. |
-| `overview.md` | System boundary, component ownership, process and data-flow shape, and system-wide resource isolation. |
+| `overview.md` | System boundary, component ownership, core crate structure, process and data-flow shape, and system-wide resource isolation. |
 | `domain-model.md` | Shared identities and graph vocabulary: hashes, compact IDs, coordinates, consensus order, materiality, PP boundary, and common value types. |
 | `node-service.md` | Node connection lifecycle, validated RPC generations, subscriptions, notification routing, and RPC normalization. |
 | `storage.md` | Database lifecycle, schema and metadata, persistent identities, transactions, caches, and PostgreSQL behavior. |

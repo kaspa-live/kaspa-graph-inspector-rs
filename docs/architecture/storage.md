@@ -1096,7 +1096,10 @@ enrich and validate the stored sink before constructing the anchor.
 The API-owned [database seed contract](api.md#database-seed-extent-and-projection--settled)
 defines `GraphViewSeedRequest`, `GraphViewSeed`, its effective extent, and the
 contents of the returned projection. Storage exposes that semantic read only
-through the separate read-only API handle:
+through the separate read-only API handle. Under the
+[core crate structure](overview.md#core-crate-structure--settled),
+these shared values come from `kgi-api-model`; `kgi-storage` does not depend on
+`kgi-api-core`:
 
 ```rust
 enum ApiReadError {

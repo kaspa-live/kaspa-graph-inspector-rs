@@ -4,7 +4,10 @@ These choices are deliberately left to implementation work. Implementations
 must stay within the linked settled architecture and record choices where they
 become durable project constraints.
 
-1. Cargo workspace, crate, and module layout.
+1. Cargo workspace and module layout outside the settled
+   [core crate structure](../architecture/overview.md#core-crate-structure--settled),
+   including the binary/composition crate, migrations, Web assets, and internal
+   module boundaries.
 2. PostgreSQL Rust client, migration framework, and concrete SQL types.
 3. Exact capacities for processor channels, the per-session graph-update
    channel and ApiService staging buffer, orphan and VSPC pending memory,
