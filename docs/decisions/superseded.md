@@ -18,3 +18,8 @@ explain why older handoffs or implementation notes may use different terms.
 | Identify API continuity with `GraphEpoch` stored on every graph image. | `GraphPublication.publication_id`, with views carrying only their own revision. | [API](../architecture/api.md) |
 | Carry `HeadGraphCoverage` in every delta. | Explicit graph mutations plus the delta target `high_level`. | [API](../architecture/api.md) |
 | Recheck VSPC source/sink continuity inside ApiService. | Trust the ordered, continuity-certified `VspcProcessor` output. | [API](../architecture/api.md) |
+| Use a cross-session observer stream, global invalid flag, and `InvalidateSession` control. | Fresh per-session graph-update ingress and Reset-owned supersession. | [API](../architecture/api.md) |
+| Publish a database seed before locating its graph-update boundary and keep a private detector active. | Explicit construction and alignment before activation. | [API](../architecture/api.md) |
+| Treat graph-update channel closure as an ApiService session event. | Reset is the sole ApiService session-supersession mechanism. | [API](../architecture/api.md) |
+| Have ResyncEngine send Reset and lifecycle markers directly to ApiService. | Supervisor installs the session ingress; BlockProcessor owns lifecycle-marker delivery. | [Processing lifecycle](../architecture/processing-lifecycle.md), [block processing](../architecture/block-processing.md) |
+| Use an acknowledged Rebuild Reset as the database-replacement barrier. | Reset is unacknowledged; StorageService excludes API database phases with its replacement gate. | [Storage](../architecture/storage.md) |

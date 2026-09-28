@@ -3,33 +3,134 @@
 ## Scope and ownership
 
 This document owns ApiService, `GraphView`, `GraphDelta`, `GraphHistory`,
-`GraphPublication`, API resource bulkheads, and the public graph API contract. The
-[processing lifecycle](processing-lifecycle.md) owns when recovery milestones
-send API controls. [Storage](storage.md) owns database transaction and query
-implementation. Web client behavior belongs to the
-[Web architecture](web.md).
+`GraphPublication`, API resource bulkheads, and the public graph API contract.
+The [processing lifecycle](processing-lifecycle.md) owns when Supervisor sends
+Reset and when processor phase commands occur. [Block processing](block-processing.md)
+owns lifecycle-marker production. [Storage](storage.md) owns database
+transactions, query implementation, and database-replacement exclusion. Web
+client behavior belongs to the [Web architecture](web.md).
 
-## In-process API and graph observer feed — settled
+## In-process API and graph-update feed — settled
 
 KGI v2 includes an in-process `ApiService` and a complete bounded-by-level
 head-tracking `GraphView`, rather than directing each head request to expensive
 PostgreSQL graph queries. The [system overview](overview.md#resource-isolation-and-scalability--settled)
 owns deployment evolution and the single-writer constraint.
 
-Processors send `BlockCommitted`/`VspcCommitted` through **one ordered,
-bounded graph-update channel**, after their respective DB commits. The
+Every processing session owns one fresh ordered, bounded graph-update channel. The
+channel topology is the session boundary: graph updates carry no session ID,
+or cross-session stale-message filter. Processors offer
+`BlockCommitted`/`VspcCommitted` only after their respective DB commits. The
 [BlockProcessor delivery contract](block-processing.md#committed-block-delivery)
 and [VspcProcessor producer contract](vspc-processing.md#commit-and-graph-publication--settled)
 establish causal order, so a VSPC update cannot reach this channel ahead of
 blocks it depends on.
 
-The observer channel is nonblocking from the processing viewpoint:
-failed/full delivery sets an out-of-band invalid flag; ApiService stops
-publishing deltas, marks the current publication Stale, and reloads from DB.
-Any coherent replacement uses a fresh publication ID and the session's current
-lifecycle target. No processing recovery or producer sequence number is needed
-for observer-only continuity. The invalid flag also catches loss of the
-**last** update that no later sequence number could expose.
+The ordered stream has this semantic shape:
+
+```rust
+enum GraphUpdate {
+    PublishPostSeal,
+    BlockCommitted(BlockCommitted),
+    VspcCommitted(VspcCommitted),
+    Live,
+}
+
+struct GraphUpdateProducer {
+    tx: Sender<GraphUpdate>,
+    gate: Arc<GraphUpdateGate>,
+}
+
+struct GraphUpdateReceiver {
+    rx: Receiver<GraphUpdate>,
+    gap: GraphUpdateGap,
+}
+
+struct GraphUpdateGate {
+    state: Mutex<GraphUpdateGateState>,
+    gap: GraphUpdateGapReporter,
+}
+
+enum GraphUpdateGateState {
+    PreSeal,
+    Open,
+}
+
+enum GraphUpdateOfferOutcome {
+    SuppressedPreSeal,
+    Enqueued,
+    GapReported,
+}
+
+enum GraphUpdateProducerError {
+    ReceiverClosed,
+}
+
+impl GraphUpdateProducer {
+    fn offer_block_committed(
+        &self,
+        update: BlockCommitted,
+    ) -> Result<GraphUpdateOfferOutcome, GraphUpdateProducerError>;
+
+    fn offer_vspc_committed(
+        &self,
+        update: VspcCommitted,
+    ) -> Result<GraphUpdateOfferOutcome, GraphUpdateProducerError>;
+
+    fn publish_post_seal(
+        &self,
+    ) -> Result<(), GraphUpdateProducerError>;
+
+    async fn publish_live(
+        &self,
+    ) -> Result<(), GraphUpdateProducerError>;
+}
+```
+
+`GraphUpdateProducer` is the cloneable session-scoped producer capability that
+Supervisor supplies through ResyncEngine to both processors.
+`GraphUpdateReceiver` is the corresponding single-consumer session capability
+that Supervisor supplies to ApiService in `Reset`. Every producer clone shares
+one `GraphUpdateGate`, initially `PreSeal`; the receiver does not expose that
+producer-side gate.
+`GraphUpdateGapReporter` and the consumer-side `GraphUpdateGap` refer to the
+same session-local continuity state. These names fix the semantic capability
+split. The mutex around `GraphUpdateGateState` is settled; concrete channel,
+gap-counter, and wakeup types remain deferred.
+
+The producer exposes distinct nonblocking operations for `BlockCommitted` and
+`VspcCommitted`. Each operation holds the state mutex through classification
+and `try_send`. A closed receiver returns `ReceiverClosed`. Otherwise, in
+`PreSeal`, the operation discards the API projection update, returns
+`SuppressedPreSeal`, and does not advance the gap. The underlying database
+commit and processing-tier delivery remain valid. In `Open`, successful
+delivery returns `Enqueued`; `Full` discards that delivery, advances the
+session's reliable, coalescing gap generation, and returns `GapReported`.
+
+The marker worker's `publish_post_seal` operation holds the same state mutex,
+requires `PreSeal`, enqueues `GraphUpdate::PublishPostSeal`, changes the state
+to `Open`, and releases the mutex. No ordinary value can enter before the
+marker or race between its enqueue and the state transition. Because pre-seal
+ordinary values are suppressed, this marker is the first value in the fresh
+positive-capacity channel and cannot encounter `Full`; receiver closure leaves
+the gate in `PreSeal` and reports supersession.
+
+The marker worker's `publish_live` operation requires `Open`, releases the
+state mutex, and then uses lossless delivery, awaiting channel capacity instead
+of reporting an ordinary-update gap. Its command FIFO preserves
+`PublishPostSeal` before `Live`; unrelated ordinary graph updates may
+interleave before `Live`. ApiService uses the gap signal only to reconstruct
+its derived read model; it never requests processing Resync or Rebuild.
+
+The [BlockProcessor marker contract](block-processing.md#graph-lifecycle-marker-delivery--settled)
+owns its worker and marker-command enqueue points. The
+[processing lifecycle](processing-lifecycle.md#live-admission) owns the global
+causality before the Live command. ApiService consumes the resulting channel
+order without reconstructing those producer decisions. If an earlier causal
+ordinary update reported `Full`, the advanced gap generation makes ApiService
+reconstruct instead of treating that segment as gapless. Exact channel and
+wakeup primitives remain deferred in the
+[decision register](../decisions/deferred.md).
 
 ApiService consumes storage's
 [`BlockCommitted`](storage.md#block-materialization-transaction--settled) and
@@ -65,7 +166,7 @@ DB; it is capped.
 
 The [graph-view contract](#graph-views-publication-revision-and-history--settled)
 owns edge representation, window inclusion, endpoint retention, and lifetime.
-The observer payload above supplies the committed parent information required
+The graph-update payload above supplies the committed parent information required
 to apply that contract.
 
 `CompactId` is private to storage/processing. Each HTTP graph response has
@@ -331,68 +432,136 @@ also returns the committed materialized VSPC sink as
 `snapshot_vspc_sink`. This is construction metadata only and never enters a
 public graph payload, `GraphView`, `GraphDelta`, or `GraphHistory`.
 
-### Seed construction and observer replay — settled
+### Head-publication lifecycle and stream alignment — settled
 
-ApiService begins buffering graph updates before loading a head-publication
-seed. On every new processing session it reconstructs the publication because
-the previous session may have committed data without delivering its observer
-update. Construct the seed as a revision-zero `Head` view and a revision-zero
-history, then scan buffered updates for the snapshot boundary.
-
-Before that boundary, classify `BlockCommitted` as follows:
+ApiService projects one processing session through these internal states:
 
 ```text
-block hash is present in the view
-    -> skip it
+AwaitReset -- Reset --> PreSeal
+    -- PublishPostSeal --> Constructing
+    -- seed succeeds --> Aligning
+    -- boundary found --> Active
+```
+
+`Reset` may preempt every installed-session state. Its complete topology and
+state effects are owned by the
+[Reset contract](#reset-and-recovery-time-availability--settled).
+
+In `PreSeal`, ApiService waits for the mandatory `PublishPostSeal` marker; the
+producer gate prevents ordinary committed updates from entering the channel.
+The marker establishes the reconstruction cut, initializes the target
+publication state to `Synchronizing`, starts an empty staging buffer and a
+fresh database seed, and enters `Constructing`. Every intentionally suppressed
+update committed before this cut is covered by that newer database snapshot.
+`Live` before `PublishPostSeal` violates the settled marker order. The
+producer-side PostSeal precondition belongs to the
+[BlockProcessor marker contract](block-processing.md#graph-lifecycle-marker-delivery--settled).
+
+`Constructing` has exactly one responsibility: obtain a coherent revision-zero
+`Head` view and revision-zero history while staging every subsequently received
+`BlockCommitted` and `VspcCommitted`. A `Live` marker changes the
+sticky target publication state to `Live`; it is not staged as graph data.
+Construction never searches for the database/stream boundary. A successful
+seed always enters `Aligning`.
+
+`Aligning` alone connects the completed database candidate to the ordered
+stream. Before the boundary, classify `BlockCommitted` as follows:
+
+```text
+block hash is present in GraphView
+    -> skip
 
 block hash is absent
-    -> apply it
-    -> no delta: keep searching
-    -> delta returned: this update is the boundary
+    -> GraphView::apply(BlockCommitted)
+    -> None: keep searching
+    -> Some(GraphDelta): apply it and establish the boundary
 ```
 
 The alternative boundary is the first `VspcCommitted` whose `source` equals
-`snapshot_vspc_sink`; apply that update as the boundary. Before either rule
-succeeds, skip other VSPC updates as already represented. The first of the two
-rules to succeed wins. From that update onward, apply every remaining buffered
-and newly received update in channel order without further snapshot
-classification or API-side VSPC continuity checking.
+`snapshot_vspc_sink`; apply it and establish the boundary. Before either rule
+succeeds, skip other VSPC updates as already represented by the seed. Whichever
+rule succeeds first wins. An absent block outside retained state can produce no
+delta and therefore cannot establish the boundary.
 
-An absent block outside retained state can produce no delta and therefore does
-not establish the boundary. If the buffer ends first, the seed is already a
-coherent publishable image and the private boundary detector remains active
-for later updates. Discard `snapshot_vspc_sink` when either rule eventually
-succeeds.
+Exhausting the current staging buffer without a boundary is normal. ApiService
+remains in `Aligning` and applies the same classification to later updates.
+`Live` only updates the sticky target state and does not establish a boundary.
+There is no alignment timeout and no direct `Constructing -> Active`
+transition.
 
-Every applied visible update uses the ordinary mutation path: advance the view,
-return its delta, then append that delta to history. Staging can therefore make
-the first visible publication revision greater than zero. An update with no
-retained effect advances neither revision. View replacement and history
-replacement each become visible atomically to their own readers, but there is
-no joint view-history snapshot or revision-equality invariant. Readers can
-observe a complete view at revision `n + 1` while history independently remains
-complete through revision `n`.
+After the boundary update, discard `snapshot_vspc_sink`, stop all
+snapshot-relative classification, apply every later staged graph update in
+channel order, and advance through a captured activation frontier. Updates
+arriving after that frontier remain for ordinary Active processing; activation
+does not require an empty channel. Publish the completed view and history
+independently and atomically, assign a fresh publication ID, use the sticky
+target state, and enter `Active`. Neither the candidate nor its partially
+replayed state is externally visible before activation.
 
-Successful head construction creates a fresh random nonzero publication ID and
-uses the newest reliable lifecycle target: normally `Synchronizing`, or `Live`
-when Live arrived while construction was pending. Readers never observe a
-partly constructed view or a partly appended history. The previous coherent
-publication remains terminally Stale and receives no later deltas.
+An `Active` publication has no snapshot sink, alignment state, or database
+matching duty. Each ordinary graph update goes directly through
+`GraphView::apply`. `None` produces no revision. `Some(delta)` first publishes
+the new complete view revision and then appends and publishes the corresponding
+complete history revision. Ordinary graph updates, Live, revision advancement,
+and retained head-window movement keep the same publication ID. Only a later
+session's Reset or a gap or failure that prevents the Active projection from
+advancing leads to a replacement publication. API database-generation change
+by itself does not invalidate Active; continuity then comes from the ordered
+session stream rather than the seed generation.
+
+### Universal API reconstruction — settled
+
+Every graph update is emitted only after the database commit it represents is
+definite. ApiService therefore uses one lossless reconstruction primitive for
+graph-update gaps, staging overflow, construction or projection failure,
+construction-side API query or pool failure, construction-side API
+database-generation loss, and alignment invariant failure:
+
+```text
+restart_construction():
+    abandon the unpublished candidate, if any
+    discard the current staging buffer
+    drain the current session channel through the first observed Empty
+    discard drained BlockCommitted and VspcCommitted values
+    retain Live as a sticky target state
+    record the current GraphUpdateGap generation
+    start a newer database seed
+    enter Constructing
+```
+
+Drained and dropped updates are covered by the newer database snapshot because
+their commits precede that snapshot. Updates received after the observed empty
+frontier are staged for the new attempt. A later gap-generation change invokes
+the same primitive again. Before activation, ApiService requires the recorded
+generation still to be current.
+
+`PublishPostSeal` is not tracked during reconstruction. Entering
+`Constructing` already proves that the session consumed its mandatory marker;
+API-local reconstruction in that session remains post-seal and requires no
+second marker.
+
+The primitive is identical from `Constructing`, `Aligning`, and `Active`.
+`Constructing` or `Aligning` first abandons its unpublished candidate. `Active`
+first marks its current publication terminally `Stale` and stops applying
+updates to it. A previously Live target, or `Live` encountered while draining,
+remains sticky, so its replacement is initially Live. API-local reconstruction
+never requests processing Resync or Rebuild.
+
+The staging buffer is bounded by update count. It never drops one staged entry
+in isolation. Reaching its implementation-selected capacity invokes
+`restart_construction()`, making the current receive frontier the newer cut.
 
 An `AnchoredWindow` seed constructs a revision-zero `Fixed` view whose
 `max_depth` is its effective nominal level count. It has no history or
 publication ID and is discarded after the coherent HTTP response is built.
 Database construction alone does not imply `Frozen`; that policy remains
-reserved for subview extraction.
+reserved for subview extraction. Its request-local failures return their
+ordinary API result and do not participate in the head-publication state
+machine.
 
-An API-pool or query failure, API database-generation loss, observer-invalid
-flag, staging-buffer overflow, superseding Reset or `InvalidateSession`, seed
-construction failure, or update-application failure abandons only the current
-API attempt. Retry from a newer consistent snapshot while the processing
-session remains current; never request processing Resync or Rebuild for an API
-read-model failure. A previous coherent publication remains readable as Stale.
-Without one, graph endpoints return `503 Service Unavailable`, while the
-separate status/info lane remains available.
+Throughout reconstruction, a previous coherent publication remains readable
+as Stale. Without one, graph endpoints return `503 Service Unavailable`, while
+the separate status/info lane remains available.
 
 ### Publication state and revision — settled
 
@@ -402,19 +571,17 @@ ApiService has three externally meaningful publication states:
 Stale | Synchronizing | Live
 ```
 
-Publication construction establishes its initial state without inventing a
-lifecycle delta. PostSeal normally publishes the coherent replacement as
-`Synchronizing`. If the reliable Live control arrived while construction was
-still pending, record that newer target and publish the completed image
-directly as `Live`.
+Publication activation establishes its initial state without inventing a
+lifecycle delta. The aligned replacement is normally `Synchronizing`. If the
+ordered Live marker arrived while construction or alignment was pending,
+publish the completed image directly as `Live`.
 
-Once a publication is visible, the state-specific controls admit only
+Once a publication is visible, lifecycle events admit only
 `Synchronizing -> Live`, `Synchronizing -> Stale`, and `Live -> Stale`.
 `Stale` is terminal; a replacement always has a fresh `publication_id`. These
-control-plane transitions do not modify `GraphView`, create `GraphDelta`, or
-advance either view or history revision. A control that finds no publication,
-or finds the current publication already `Stale`, creates no additional state
-effect.
+state transitions do not modify `GraphView`, create `GraphDelta`, or advance
+either view or history revision. Repeating a terminal Stale transition creates
+no additional state effect.
 
 SSE carries the current state beside the graph cursor:
 
@@ -685,76 +852,76 @@ implementation, and graph wire format remain deferred in the
 
 ## Reset and recovery-time availability — settled
 
-The existing reliable processing-to-ApiService control path carries
-conceptual `Reset`, `PublishPostSeal`, `PublishLive`, and `InvalidateSession`
-controls; no new recovery component is needed. The exact send points and
-ordering belong to
-[processing-lifecycle.md](processing-lifecycle.md#api-session-replacement-and-publication).
-ApiService accepts exactly one Reset for each prepared processing session.
-Common Reset effects are:
+`Reset` is the sole out-of-band ApiService session-supersession control because
+it replaces the graph-update input topology. Its semantic payload is:
 
-- mark a non-Stale previous publication Stale while allowing that coherent old
-  image to remain readable;
-- stop delta production for the old publication;
-- prevent pending observer updates from the previous processing session from
-  entering the replacement publication; and
-- arm buffering for the new session before processor Begin.
+```rust
+Reset {
+    graph_updates: GraphUpdateReceiver,
+    recovery_mode: RecoveryMode,
+}
+```
 
-Reset has a completed-effect acknowledgement. The acknowledgement establishes
-those effects but does not mean that a replacement image has been published.
-A previous publication already Stale and a still-pending unpublished
-construction require no additional graph or history action. Ordinary
-graph-update loss semantics do not weaken this reliable control barrier.
-PostSeal and Live are reliable, exact-once, state-specific controls, but they
-are not processing barriers and have no publication-completion
-acknowledgement.
+The `GraphUpdateReceiver` is fresh and belongs to exactly one processing
+session. `RecoveryMode` is the Resync/Rebuild value owned by the
+[processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
+No Reset or graph update carries a session ID. The gap
+signal exposes a monotonically advancing generation and a wakeup; the exact
+atomic and notification primitives remain implementation choices.
 
-`InvalidateSession` is a reliable, exact-once terminal control for a recoverably
-aborted processing session. It gives that session's active publication its
-terminal Stale state without changing its graph revision, stops later deltas,
-cancels any pending publication, and rejects later observer updates from the
-invalidated session. It creates no `GraphPublication`, performs no DB reload,
-and does not arm buffering for a replacement session. The next prepared session
-still begins with its own Reset. Invalidation leaves
-historical reads available unless the invalidated session's database-rebuild
-Reset had already closed them; in that case they remain closed until a later
-PostSeal publication reopens them.
+ApiService accepts exactly one Reset for each processing attempt.
+Reset globally preempts `PreSeal`, `Constructing`, `Aligning`, or `Active`:
 
-An ordinary Resync Reset leaves new and in-flight historical DB reads
-available.
+1. abandon any unpublished candidate and reconstruction state;
+2. mark any current non-Stale publication terminally Stale;
+3. drop the old `GraphUpdateReceiver` and install the fresh one;
+4. establish the recovery-mode-specific historical-read effects below; and
+5. enter `PreSeal`.
 
-The database-rebuild Reset has the additional completed effect of closing new
-historical DB reads and boundedly draining or cancelling existing ones before
-processing data is cleared.
-Historical window requests during `RebuildingDatabase` and `PreSeal` fail
-cleanly with `503 Service Unavailable` and a short `Retry-After`. Merely
-catching SQL errors is insufficient: a query against a partly reconstructed
-DB can succeed but return an incomplete graph. A read already in flight may
-return its old coherent snapshot if it completes before the reset barrier;
-otherwise cancel it and return 503. API reads cannot indefinitely delay
-processing.
+Reset is reliable but has no acknowledgement. Supervisor may continue session
+startup immediately after sending it; Reset is not a processing barrier or a
+database-replacement barrier. A previous publication already Stale needs no
+additional graph or history mutation.
 
-PostSeal starts the consistent snapshot plus buffered-update replay. Once
-coherent, ApiService publishes a new `GraphPublication` in the current target
-state. This is normally `Synchronizing`; it is initially `Live` when that
-control arrived during loading. Publication reopens historical reads after
-Rebuild. Processing does not wait for it to complete.
+`PublishPostSeal` and `Live` are graph-update-feed markers rather than
+out-of-band controls. They have no publication-completion acknowledgement. A
+later session's Reset is the only session-supersession mechanism visible to
+ApiService.
 
-The Live trigger updates the same publication without another database reload.
-If PostSeal loading has not finished, ApiService records the newer target and
-publishes the completed image directly as Live. Otherwise it changes the
-publication state to Live without changing the graph revision or history.
+Ordinary teardown may drop the session's last producer and close the installed
+receiver. Channel closure is not an ApiService lifecycle signal and does not
+replace, invalidate, or reconstruct a publication. ApiService retains its
+current state until the next Reset or another defined state transition.
 
-If `TRUNCATE` is used inside the atomic rebuild, its transactional rollback
-does **not** make it generally MVCC-safe for concurrent pre-existing
-snapshots. Implementation must prove pre-reset reads return one old coherent
-image or get canceled, never mixed old/new tables. See PostgreSQL's
-[`TRUNCATE`](https://www.postgresql.org/docs/current/sql-truncate.html) and
-[MVCC caveat](https://www.postgresql.org/docs/current/mvcc-caveats.html)
-documentation. The API read barrier and bounded queries serve this contract;
-the selected reset mechanism must preserve the same observable behavior. Its
-detailed cancellation and transaction mechanism remains deferred in the
-[decision register](../decisions/deferred.md).
+An ordinary Resync Reset leaves historical DB reads available. During Rebuild,
+public historical-window requests in `PreSeal`, `Constructing`, and `Aligning`
+fail cleanly with `503 Service Unavailable` and a short `Retry-After`.
+ApiService's private construction reads remain allowed when StorageService
+publishes a usable API DB generation.
+
+ApiService never rebinds public historical requests implicitly to whatever API
+DB generation StorageService most recently published. A Rebuild construction
+captures its replacement generation privately; only activation installs that
+same generation for public historical requests. If Reset processing lags
+behind storage replacement, retirement of the previously installed generation
+still makes new database phases fail rather than crossing into the replacement
+generation.
+
+StorageService, rather than Reset, owns database-replacement exclusion. Its
+[replacement gate](storage.md#api-read-exclusion-during-database-replacement--settled)
+governs the API database phase. On the ApiService side, a request that already
+detached its complete in-memory projection may finish delivering the old
+coherent response; a request whose database phase the gate denies or cancels
+returns `503`. ApiService neither coordinates replacement nor waits for the
+remaining delivery of detached responses.
+
+After Rebuild, historical reads reopen only when alignment completes and the
+replacement publication becomes Active. Processing does not wait for that
+publication. An ordered Live marker changes the sticky target or the Active
+publication state without another database load or graph revision.
+
+The storage owner defines the `TRUNCATE`/MVCC safety requirement and detailed
+gate boundary. Reset does not participate in that exclusion mechanism.
 
 ## DAA navigation and graph windows — settled
 
@@ -827,9 +994,11 @@ priority:
 - distinct budgets for head delivery and historical database reads.
 
 API snapshot reload ranks above historical queries and below processing. On
-saturation, reject or degrade API work explicitly. Do not block processing,
-truncate a response or cache image presented as complete, or silently drop a
-processing notification.
+saturation, reject or degrade API work explicitly. HTTP, database,
+serialization, cache, and client saturation must not block processing,
+truncate a response or cache image presented as complete, or silently lose a
+graph update. Ordinary graph-update delivery remains nonblocking and reports
+loss through the session gap signal owned above.
 
 Every historical database-backed HTTP request separates database work from
 response construction in this order:
@@ -854,11 +1023,10 @@ recovery. A connection-level failure during the database phase retains
 StorageService's
 [storage-generation failure classification](storage.md#storageservice-lifecycle--settled).
 
-Releasing database resources does not complete the HTTP request for purposes
-of the acknowledged Rebuild Reset. The request remains tracked until delivery
-or cancellation under the
-[Reset contract](#reset-and-recovery-time-availability--settled), and response
-construction cannot issue follow-up database reads.
+Releasing database resources and detaching the complete projection ends the
+request's participation in StorageService's replacement gate. Response
+construction cannot issue follow-up database reads. Reset need not wait for or
+cancel the remaining serialization and delivery work.
 
 If all `MAX_CACHE_DEPTH = 1000` complete levels exceed the cache memory
 allowance, first drop an optional stale image when useful. Otherwise mark head

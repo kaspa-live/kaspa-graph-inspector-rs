@@ -102,7 +102,7 @@ behavior.
 | §0, Reading rules and scope | `README.md` for architecture authority and navigation; `../README.md` for repository-wide document classes. Scope constraints on future work go to `../future-work.md`. | Verified and cut over |
 | §1, System shape and ownership | `overview.md`. Shared type names introduced only as vocabulary go to `domain-model.md`. | Verified and cut over |
 | §2, Shared identities and graph vocabulary | `domain-model.md`. Persistence-specific enforcement and schema representation go to `storage.md`. | Verified and cut over |
-| §3, Lifecycle, intent, commands, and channels | `processing-lifecycle.md` for lifecycle, command direction, channel semantics, fault classification, retries, and milestones. Reusable identity/value definitions go to `domain-model.md`; service-specific reconnect rules go to `node-service.md` or `storage.md`. | Verified and cut over |
+| §3, Lifecycle, intent, commands, and channels | `processing-lifecycle.md` for lifecycle, command direction, cross-worker channel defaults, fault classification, retries, and milestones. The per-session API graph-update feed belongs to `api.md`. Reusable identity/value definitions go to `domain-model.md`; service-specific reconnect rules go to `node-service.md` or `storage.md`. | Verified and cut over |
 | §4, NodeService and validated RPC | `node-service.md`. | Verified and cut over |
 | §5, StorageService lifecycle and DB bootstrap | `storage.md`. Supervisor reactions to StorageService state link to `processing-lifecycle.md`. | Verified and cut over |
 | §6, Retained persistence model and cache | `storage.md`. Shared materiality vocabulary links to `domain-model.md`. | Verified and cut over |
@@ -112,9 +112,9 @@ behavior.
 | §10, ResyncEngine preparation and common pump | `processing-lifecycle.md`. Node RPC normalization used by the pump links to `node-service.md`; component-local admission behavior links to `block-processing.md` and `vspc-processing.md`. | Verified and cut over |
 | §11, Catchup, overlap, Live, and late transport messages | `processing-lifecycle.md` owns phase transitions, overlap-based admission, timing, and global Live entry. `block-processing.md` and `vspc-processing.md` own their local phase behavior. `node-service.md` owns routing and transport-message handling. | Verified and cut over |
 | §12, Teardown and delivery/failure semantics | `processing-lifecycle.md` owns teardown order, barriers, owner-directed faults, and session completion. Component-specific draining duties remain in the relevant component document. | Verified and cut over |
-| §13, In-process API and graph observer feed | `api.md`. Producer-side observer publication guarantees remain in the relevant processor document and are referenced by `api.md`. | Verified and cut over |
+| §13, In-process API and graph-update feed | `api.md`. Producer-side graph-update delivery guarantees remain in the relevant processor document and are referenced by `api.md`. | Verified and cut over |
 | §14, API snapshot, revision, delta, SSE, and ETags | `api.md`. | Verified and cut over |
-| §15, Reset and recovery-time API availability | `api.md` owns Reset and publication behavior; `processing-lifecycle.md` owns when lifecycle milestones trigger those API operations. | Verified and cut over |
+| §15, Reset and recovery-time API availability | `api.md` owns Reset and publication behavior; `processing-lifecycle.md` owns the Supervisor Reset send point and processor phase ordering; `block-processing.md` owns lifecycle-marker production; `storage.md` owns API-read exclusion during database replacement. | Verified and cut over |
 | §16, DAA navigation and window API | `api.md`. Storage query semantics needed by these endpoints remain in `storage.md`. | Verified and cut over |
 | §17, Web behavior | `web.md`. Wire contracts consumed by the browser remain in `api.md`. | Verified and cut over |
 | §18, Resource isolation and scalability | `overview.md` owns the system-wide isolation model. Concrete component budgets and saturation behavior remain with each component; API budgets remain in `api.md`. | Verified and cut over |

@@ -21,6 +21,7 @@ subscription, and normalization rules belong to
 struct ProcessingSession {
     rpc: Arc<ValidatedRpcClient>,
     db: Arc<ValidatedDbClient>,
+    graph_updates: GraphUpdateProducer,
 }
 ```
 
@@ -38,9 +39,11 @@ Before starting, recheck that the captured recovery obligation is still the
 latest `desired_recovery`, the engine is Idle, and both services still publish
 those exact acquired RPC and DB `Arc` generations as Ready.
 
-The exact `Arc<ValidatedRpcClient>` and `Arc<ValidatedDbClient>` are
-passed in `Start` and then through the session to all consumers, including
-DependencyResolver. This guarantees one resource generation per run.
+The exact `Arc<ValidatedRpcClient>`, `Arc<ValidatedDbClient>`, and session
+`GraphUpdateProducer` are passed in `Start` and then through the session to
+their consumers, including DependencyResolver for the validated clients and
+both processors for graph updates. This guarantees one resource and update
+generation per run.
 Before sending `Start`, require the validated node's `(network_id,
 genesis_hash)` to equal the immutable binding exposed by that DB generation.
 A mismatch is terminal pairing rejection: never rebind the database or infer
@@ -346,8 +349,9 @@ worker. They do not impose data-channel backpressure. Data, notification, and
 worker-to-worker channels are bounded and cancellation-aware. Full means
 `Require(Resync)` when ordered session continuity may have been lost;
 closed/unavailable means a session ownership fault; cancellation during
-expected teardown is not a fault. The graph observer feed is the exception:
-its loss invalidates the API image without disrupting processing.
+expected teardown is not a fault. The graph-update feed is the exception:
+the [API-owned graph-update gap contract](api.md#in-process-api-and-graph-update-feed--settled)
+reconstructs the derived image without requesting processing recovery.
 Detailed Tokio fairness and drain mechanics remain deferred in the
 [decision register](../decisions/deferred.md).
 
@@ -364,9 +368,11 @@ Fatal while its worker is meant to live.
 `PpBoundarySealed` is an exact-once upward milestone event, never a command to
 BlockProcessor. BlockProcessor emits it under its
 [PP-boundary contract](block-processing.md#pp-boundary-phase-behavior--settled).
-ResyncEngine observes it before permitting Catchup, sends ApiService the
-PostSeal publication trigger, and propagates the milestone to Supervisor.
-Supervisor then downgrades both desired and active recovery to `Resync`.
+ResyncEngine observes it before permitting Catchup and propagates the milestone
+to Supervisor. BlockProcessor has already enqueued `PublishPostSeal` to its
+lifecycle-marker worker under its
+[marker-delivery contract](block-processing.md#graph-lifecycle-marker-delivery--settled).
+Supervisor only downgrades both desired and active recovery to `Resync`.
 Duplicate or invalid-state milestone delivery is Fatal. Entering Live satisfies
 and clears the remaining recovery requirement.
 
@@ -375,7 +381,7 @@ and clears the remaining recovery requirement.
 Commands:
 
 ```text
-Start { mode, rpc, db }
+Start { mode, rpc, db, graph_updates }
 Deactivate
 Shutdown
 ```
@@ -399,21 +405,24 @@ struct BlockProcessorBegin {
     db: Arc<ValidatedDbClient>,
     anchor: MaterializedSyncAnchor,
     boundary_seal_blue_score: u64,
+    graph_updates: GraphUpdateProducer,
 }
 
 struct VspcProcessorBegin {
     rpc: Arc<ValidatedRpcClient>,
     db: Arc<ValidatedDbClient>,
     anchor: MaterializedSyncAnchor,
+    graph_updates: GraphUpdateProducer,
 }
 ```
 
-After preparation and the applicable API Reset/publication ordering below,
-ResyncEngine constructs both Begin payloads from the same `PreparedSync` and
+After preparation, ResyncEngine constructs both Begin payloads from the same
+`PreparedSync` and the `GraphUpdateProducer` received in `Start`, and
 sends the mode-specific `BeginResync` or `BeginRebuild` command to each
 processor. BlockProcessor receives the exact RPC and DB generations, the
-committed anchor, and the seal threshold. VspcProcessor receives the same RPC
-and DB generations and anchor; it uses the RPC client only for the
+committed anchor, the seal threshold, and its producer handle for the run's
+fresh graph-update channel. VspcProcessor receives the same RPC and DB
+generations, anchor, and another producer handle for that channel; it uses the RPC client only for the
 selected-parent attribution contract owned by VspcProcessor. Both commands are
 exact-once and have no acknowledgement. Once both have been enqueued, the
 common pump may start.
@@ -453,8 +462,8 @@ otherwise:
 The Genesis branch consumes the zero-blue-score invariant already established
 by either NodeService's normalized block or StorageService's processing-valid
 database snapshot; it does not accept an arbitrary Genesis score. A malformed
-node Genesis is rejected before this function and therefore before API Reset
-or database replacement.
+node Genesis is rejected before this function and therefore before database
+replacement.
 
 The result must be at most the shared `MAX_BLUE_SCORE`. `Overflow` or
 `AboveMaximum` reports `ScoreOutOfRange(BoundarySealThreshold)` with Fatal
@@ -465,8 +474,8 @@ persisted node metadata or a database-compatibility field.
 
 For Resync, invoke the function with the database PP hash and persisted
 `db_pp_blue_score` returned by reconciliation. For Rebuild, invoke it with the
-normalized current node pruning-point hash and blue score before the API Reset
-barrier or any storage replacement. Only a successful result may populate
+normalized current node pruning-point hash and blue score before any storage
+replacement. Only a successful result may populate
 `PreparedSync.boundary_seal_blue_score` and the BlockProcessor Begin payload.
 The valid Genesis boundary score is zero under the storage invariants, so its
 threshold is zero and requires no addition.
@@ -531,9 +540,10 @@ malformed-recovery-input policy above. Rebuild occurs as a separate run.
 ResyncEngine obtains the mandatory current pruning-point block once through
 `ValidatedRpcClient::current_pruning_point_block()` on the Rebuild run's exact
 validated RPC generation. It constructs the boundary seal threshold from that
-block under the common contract above. Only after successful construction and
-the API Reset barrier does it pass that same validated `ValidatedNodeBlock` to
-the only storage API that clears processing data:
+block under the common contract above. Only after successful construction does
+it pass that same validated `ValidatedNodeBlock` to the only storage API that
+clears processing data; StorageService establishes the API-read replacement
+gate owned by the storage contract:
 
 ```rust
 let anchor = db.rebuild_from_pruning_point(pp).await?;
@@ -549,45 +559,57 @@ anchor with the already constructed threshold and exact clients to publish
 
 ### API session replacement and publication
 
-Every prepared processing run replaces API publication continuity through the
-existing reliable processing-to-ApiService control path. The lifecycle sends
-these controls in session order:
+For every processing run, Supervisor creates one fresh paired
+`GraphUpdateProducer` and `GraphUpdateReceiver`. It sends ApiService the
+receiver and current `RecoveryMode` in one reliable Reset, then passes the
+producer to ResyncEngine in `Start`. ResyncEngine only clones that producer
+into both processor Begin payloads; it never sends ApiService controls or
+lifecycle markers. BlockProcessor consumes its clone under the linked marker
+contract.
+
+The session order is:
 
 ```text
-Reset -> PublishPostSeal -> PublishLive
+Reset(graph_updates, recovery_mode)
+    -> GraphUpdate::PublishPostSeal
+    -> GraphUpdate::Live
 ```
 
-The effects of these controls, including historical-read availability and
-GraphPublication behavior, are defined in
+ApiService owns the complete Reset effects, gap handling, marker consumption,
+reconstruction, and publication effects in
 [api.md](api.md#reset-and-recovery-time-availability--settled). This document
-owns their send points. `Reset` has a completed-effect acknowledgement;
-`PublishPostSeal` and `PublishLive` are reliable and exact-once, but processing
-does not wait for publication completion.
+owns Supervisor's Reset send point and processor command ordering;
+[BlockProcessor](block-processing.md#graph-lifecycle-marker-delivery--settled)
+owns marker-command enqueue points. Reset has no acknowledgement and processing
+never waits for publication completion. A recoverably aborted session sends no
+invalidation control; the next processing attempt's Reset is the sole
+ApiService session-supersession event. Resync-to-Rebuild escalation therefore
+legitimately sends a second Reset with a fresh ingress.
 
-When a recoverable fault terminates a processing session after its Reset has
-completed, send one reliable `InvalidateSession` control. Send it as soon as
-the fault is accepted and before any later session's Reset. It is unnecessary
-for a pre-Reset preparation failure or Fatal shutdown. This prevents an
-aborted session from retaining an active publication state; ApiService owns
-the control's complete effects, including historical-read availability.
+For ordinary Resync, Supervisor sends `Reset(Resync)` and
+`Start(Resync, ...)`. After successful reconciliation, `BeginResync` starts
+BlockProcessor in PostSeal; its
+[Begin behavior](block-processing.md#graph-lifecycle-marker-delivery--settled)
+owns the `PublishPostSeal` command enqueue. If reconciliation instead requests
+Rebuild, complete teardown and start the distinct Rebuild attempt with another
+Reset; no special API invalidation is required.
 
-For ordinary Resync, perform read-only reconciliation first. A failed
-reconciliation requests Rebuild without resetting the API. After successful
-reconciliation, send the session-replacement Reset and await its
-acknowledgement, then send the PostSeal publication trigger before processor
-Begin.
-
-For Rebuild, obtain the pruning point, send the database-rebuild Reset, and
-await its acknowledgement before `rebuild_from_pruning_point`. After processor
-Begin, ResyncEngine sends the PostSeal publication trigger only when it
-observes BlockProcessor's definitely committed `PpBoundarySealed` event.
+For Rebuild, Supervisor sends `Reset(Rebuild)` and `Start(Rebuild, ...)` without
+waiting for ApiService. StorageService's replacement gate, rather than Reset,
+excludes API database phases before `rebuild_from_pruning_point` changes data.
+After processor Begin, ResyncEngine permits no Catchup until it observes
+BlockProcessor's definitely committed `PpBoundarySealed` event and forwards it
+to Supervisor. The BlockProcessor seal contract owns its preceding marker
+command enqueue.
 For Genesis, BlockProcessor emits that milestone while handling `BeginRebuild`
 under its [PP-boundary contract](block-processing.md#pp-boundary-phase-behavior--settled).
-ResyncEngine handles it through the ordinary path, including the PostSeal
-publication and Supervisor's `Rebuild -> Resync` downgrade.
+ResyncEngine handles it through the same forwarding path, including
+Supervisor's `Rebuild -> Resync` downgrade.
 
-When the global `EnteredLive` conditions are satisfied, ResyncEngine sends the
-Live publication trigger.
+When the global Live conditions are satisfied, ResyncEngine sends the existing
+processor Live commands and emits `EnteredLive`. The BlockProcessor marker
+contract owns the effect of its Live command; Supervisor does not produce the
+marker.
 
 ## Resync block/VSPC pump — settled
 
@@ -641,9 +663,11 @@ redispatches them.
 Before a fresh Begin:
 
 1. disable/unsubscribe processing notifications;
-2. complete the API Reset acknowledgement; for Resync also send
-   `PublishPostSeal`, while Rebuild waits for the post-Begin seal event;
-3. send Begin to BlockProcessor and VspcProcessor.
+2. ensure Supervisor has installed the fresh graph-update topology through
+   Reset and passed its producer in `Start`; and
+3. send Begin to BlockProcessor and VspcProcessor. `BeginResync` enqueues the
+   `PublishPostSeal` worker command, while Rebuild waits for the post-Begin
+   seal point.
 
 Begin needs no acknowledgement. Before Catchup:
 
@@ -788,13 +812,19 @@ page boundary. It does not certify that KGI has copied the node's entire
 retained body DAG or that no callback was dropped during subscription
 activation.
 
-Once the predicate holds, perform the transition in order:
+When the predicate becomes true, the producer gate is open and every graph
+update causally establishing it has already completed its offer. Only then
+perform the transition in order:
 
 1. stop issuing synthetic RPC requests and stop/join both synthetic producers;
 2. successfully enqueue VspcProcessor's existing Live command;
 3. successfully enqueue BlockProcessor's existing Live command;
-4. send ApiService the Live publication trigger; and
-5. emit `EnteredLive`.
+4. emit `EnteredLive`.
+
+The [BlockProcessor marker contract](block-processing.md#graph-lifecycle-marker-delivery--settled)
+owns the API effect of its Live command.
+`EnteredLive` remains the Supervisor milestone for recovery intent and retry
+state; it has no API-marker role.
 
 VspcProcessor's reaction and readiness behavior are defined in its focused
 contract. BlockProcessor retains valid queued and orphan work. `EnteredLive`
@@ -831,7 +861,10 @@ On Deactivate, ResyncEngine performs this barrier in order:
 2. cancel and join synchronization producers;
 3. clear engine-local buffers;
 4. send `Deactivate` to processors;
-5. await processor acknowledgements, including descendant barriers;
+5. await processor acknowledgements, including their teardown-barrier
+   descendants; BlockProcessor's already accepted marker delivery follows its
+   [separate drain rule](block-processing.md#graph-lifecycle-marker-delivery--settled)
+   and is not part of this barrier;
 6. release every processing-session clone of the validated RPC and DB handles;
 7. drop `ProcessingSession`; and
 8. emit `Deactivated` and enter Idle.
@@ -843,6 +876,6 @@ component-specific draining duties remain in the focused processor documents.
 Exact shutdown timeouts and escalation policy remain deferred in the
 [decision register](../decisions/deferred.md).
 
-The graph observer path is deliberately separate: observer loss invalidates
-and reloads the API image without interrupting processing. Its behavior is
-defined in [api.md](api.md#in-process-api-and-graph-observer-feed--settled).
+The graph-update path is deliberately separate: a reported stream gap rebuilds
+the API image without interrupting processing. Its behavior is defined in
+[api.md](api.md#in-process-api-and-graph-update-feed--settled).

@@ -22,7 +22,8 @@ Supervisor
 ├── Arc<ResyncEngine>
 │   ├── Arc<BlockProcessor>
 │   │   ├── OrphanManager
-│   │   └── DependencyResolver
+│   │   ├── DependencyResolver
+│   │   └── lifecycle-marker worker
 │   └── Arc<VspcProcessor>
 └── Arc<ApiService> ────────────► HeadGraphCache
 
@@ -31,25 +32,28 @@ NotificationRouter (implements Notify)
 └── VirtualChainChanged ──────► VspcProcessor notification input
 
 BlockProcessor ── PersistedBlock ──► OrphanManager, VspcProcessor
-BlockProcessor/VspcProcessor ── ordered graph updates ──► ApiService
-ResyncEngine ── Reset/PublishPostSeal/PublishLive controls ──► ApiService
+BlockProcessor/VspcProcessor
+    ── per-session ordered graph updates ──► ApiService
+BlockProcessor ── lifecycle markers ──► ApiService
+ResyncEngine ── lifecycle milestones ──► Supervisor
+Supervisor ── Reset(fresh graph-update input) ──► ApiService
 ```
 
 Autonomous long-lived workers form a control tree. `ResyncEngine` owns both
 processors and a run's `ProcessingSession`; `BlockProcessor` owns
-OrphanManager and DependencyResolver. Parent components command their
-children. Children report reliable faults and milestones upward. Strong
-reference cycles are forbidden. `Arc<Component>` is a valid initial shape;
-thin handles are not required.
+OrphanManager, DependencyResolver, and its lifecycle-marker worker. Parent
+components command their children. Children report reliable faults and
+milestones upward. Strong reference cycles are forbidden. `Arc<Component>` is
+a valid initial shape; thin handles are not required.
 
 Every worker serializes its local state changes in one event loop despite
 concurrent inputs. Live ingestion remains subscription-based. Notifications
 travel directly from NotificationRouter to the processors and never pass
 through ResyncEngine.
 
-ApiService is an in-process, read-only observer. Its work and freshness have
-lower priority than processing. The [API contract](api.md) owns graph-update
-loss, reload, and publication behavior.
+ApiService is an in-process, derived read-model service. Its work and freshness
+have lower priority than processing. The [API contract](api.md) owns
+graph-update loss, reconstruction, and publication behavior.
 
 ## Responsibility boundaries — settled
 
@@ -86,7 +90,7 @@ observations of those owners, never a second source of lifecycle authority.
   the validated node identity and the immutable binding exposed by the
   validated DB generation. A mismatch is rejected rather than rebound or
   recovered through Rebuild.
-- Processing commits precede their graph observer updates. Observer behavior
+- Processing commits precede their graph updates. API projection behavior
   cannot redefine processing commit semantics.
 - Web is an API consumer outside the worker control tree; its behavior is
   defined in the [Web architecture](web.md).
@@ -94,11 +98,12 @@ observations of those owners, never a second source of lifecycle authority.
 ## Resource isolation and scalability — settled
 
 Processing has reserved database connections and execution capacity and keeps
-priority over every read-only API workload. API saturation, cache reload, and
-client fan-out must never block processing, silently drop a processing
-notification, or turn API observer failure into processing recovery. The
-[API resource contract](api.md#resource-isolation-and-saturation--settled)
-owns the concrete pools, admission lanes, limits, and saturation behavior.
+priority over every read-only API workload. API projection failure never
+becomes processing recovery. The
+[API feed contract](api.md#in-process-api-and-graph-update-feed--settled) owns
+graph-update gap signaling. The
+[API resource contract](api.md#resource-isolation-and-saturation--settled) owns
+the concrete pools, admission lanes, limits, and saturation behavior.
 
 KGI v2 starts with one in-process ApiService and one processing stack. This
 shape may later evolve into separate stateless or read-only API replicas with

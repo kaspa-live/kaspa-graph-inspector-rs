@@ -203,7 +203,9 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
    exact-Genesis response with blue score one is
    `RecoveryInputInvalid(MalformedPruningPointResponse)`, retires the producing
    RPC generation, consumes the shared malformed-input budget, and produces no
-   boundary threshold, `PreparedSync`, API Reset, or storage mutation.
+   boundary threshold, `PreparedSync`, or storage mutation. Supervisor may
+   already have installed that attempt's Reset; the next attempt supersedes it
+   with a fresh ingress.
 10. Verify the
     [Catchup sink-sample contract](node-service.md#catchup-sink-sample) with
     ordinary and exact-Genesis success, ORIGIN, an advertised sink that is
@@ -317,12 +319,15 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
 Verify the [block materialization transaction](storage.md#block-materialization-transaction--settled)
 and [PP seal behavior](block-processing.md#pp-boundary-phase-behavior--settled)
 with an ordering fixture for a non-Genesis PP: the threshold block commits
-before BlockProcessor enters PostSeal or emits `PpBoundarySealed`. For Genesis,
-verify that the rebuild transaction establishes an intrinsically sealed
-boundary, `BeginRebuild` enters PostSeal directly, and the same exact-once
-milestone follows Begin without ordinary Genesis materialization. Inject crash
-and ambiguous-commit outcomes around both paths; an unproven non-Genesis seal
-emits no milestone, while restart after a committed Genesis rebuild derives
+before BlockProcessor enters PostSeal, enqueues `PublishPostSeal` to its
+lifecycle-marker worker, or emits `PpBoundarySealed`. The sealing block's graph
+offer returns `SuppressedPreSeal` before the marker-command enqueue, which
+precedes the milestone. For Genesis, verify that the rebuild transaction
+establishes an intrinsically sealed boundary, `BeginRebuild` enters PostSeal
+directly, enqueues `PublishPostSeal` to the worker, and then emits the same
+exact-once milestone without ordinary Genesis materialization. Inject crash and
+ambiguous-commit outcomes around both paths; an unproven non-Genesis seal emits
+no marker or milestone, while restart after a committed Genesis rebuild derives
 PostSeal from storage and proceeds through ordinary Resync.
 
 Verify the rebuild pruning point establishes the Materialized base case and
@@ -346,11 +351,11 @@ non-repeating `level_snapshots` must contain the complete resulting block level
 and every distinct materialized parent level, preserve an existing level's DAA
 score while its size changes, translate the no-VSPC sentinel to `None`, and
 exclude outside-boundary parents. Cover the selected-parent index and committed
-initial color and VSPC membership. `AlreadyMaterialized` returns no observer
+initial color and VSPC membership. `AlreadyMaterialized` returns no graph-update
 payload.
 Verify BlockProcessor forwards the inserted payload before `PersistedBlock`;
-failed observer delivery invalidates the API image but does not suppress the
-later `PersistedBlock` delivery.
+full-channel delivery advances the session gap signal but does not suppress the
+later `PersistedBlock` delivery or request processing recovery.
 
 Verify the [atomic VSPC transaction](storage.md#atomic-vspc-transaction--settled)
 for source continuity, every removed and added selected-parent relationship,
@@ -404,14 +409,14 @@ representable sum above that maximum. Both failures report
 `ScoreOutOfRange(BoundarySealThreshold)` without wrapping or saturation and
 produce no `PreparedSync` or processor Begin. Resync uses the reconciled DB PP
 hash and score. Rebuild uses the normalized node PP hash and score and performs
-this check before API Reset or database replacement. The Genesis branch returns
+this check before database replacement. The Genesis branch returns
 the constant zero from an input whose owning source has already established the
 shared Genesis invariant.
 
 Verify Rebuild obtains one normalized current pruning-point block, completes
-the API Reset barrier, and passes that same `ValidatedNodeBlock` to
-`rebuild_from_pruning_point` rather than rediscovering it or mixing RPC
-generations. Its successful threshold and returned anchor populate the same
+StorageService's API-read replacement gate, and passes that same
+`ValidatedNodeBlock` to `rebuild_from_pruning_point` rather than rediscovering
+it or mixing RPC generations. Its successful threshold and returned anchor populate the same
 `PreparedSync` and exact BlockProcessor Begin payload. Malformed pruning-point
 responses use the shared malformed-input budget; transport and generation loss
 retain their session-fault disposition.
@@ -485,10 +490,8 @@ with injected clocks and deterministic jitter:
   `DefiniteFailure`, retained Resync and Rebuild obligations, DB-generation
   retention versus retirement, complete session teardown, and the prohibition
   on reissuing an ambiguous transaction;
-- `InvalidateSession` after recoverable failure of an already-reset recovery or
-  Live session: the image becomes Stale, later observer updates are rejected,
-  Rebuild historical reads remain closed, and the next prepared session still
-  performs its own Reset; pre-Reset and Fatal failures send no invalidation;
+- a recoverable failure after Reset sends no API invalidation control; only the
+  next processing attempt's Reset supersedes the installed ApiService session;
 - whole-attempt recovery Retry rather than in-place page/RPC retry;
 - the general delay sequence and 30-second cap;
 - no second delay while awaiting a replacement service generation;
@@ -608,12 +611,26 @@ with:
 
 ## API and Web
 
-Verify the [graph observer feed](api.md#in-process-api-and-graph-observer-feed--settled)
+Verify the [graph-update feed](api.md#in-process-api-and-graph-update-feed--settled)
 and [graph publication contract](api.md#graph-views-publication-revision-and-history--settled)
-for causal order, a loss flag even when the terminal message is lost,
-complete view levels, external parent-edge endpoints and level sizes, actual parent
-presence independent of visible edges, and one Reset-driven replacement
-`GraphPublication` per prepared processing session.
+for causal order, one fresh ingress per processing session, no cross-session
+message tagging, the mutex-protected `PreSeal -> Open` producer gate,
+nonblocking ordinary delivery, a reliable coalescing gap generation even when
+the final open-gate ordinary update is lost, and lossless causal
+`PublishPostSeal` and `Live` markers. Verify all producer clones share the gate;
+pre-seal block and VSPC offers return `SuppressedPreSeal` without entering the
+channel or advancing the gap; `PublishPostSeal` is the first channel value and
+opens the gate without a racing ordinary offer; and later `Full` outcomes
+advance the gap. Verify BlockProcessor's dedicated marker worker absorbs Live
+marker backpressure without blocking its main loop, preserves PostSeal before
+Live, and permits unrelated open-gate graph updates to interleave before Live.
+`BeginResync` enqueues `PublishPostSeal`, a Rebuild seal enqueues it before the
+upward milestone, and handling BlockProcessor's Live command enqueues `Live`
+without using `EnteredLive` as an API trigger. After the gate opens, a causal
+graph offer must complete before its dependent processing delivery; on `Full`,
+the gap generation must advance first. Cover complete view levels, external
+parent-edge endpoints and level sizes, actual parent presence independent of
+visible edges, and fresh publication identity after each replacement.
 
 Cover `BlockCommitted` conversion to `GraphBlock`, including the selected-parent
 index for an ordinary block, the Genesis `None` case, and propagation of the
@@ -693,14 +710,14 @@ Verify deltas and client behavior across
 [Web update acquisition](web.md#update-acquisition--partially-open): sequential delta
 composition and expiry, response-local hash dictionaries,
 terminal Stale state, replacement publication identity, SSE slow clients,
-fixed-view freeze, DAA focus, and Live arriving during PostSeal load. The latter
-must publish the completed image directly as Live.
+fixed-view freeze, DAA focus, and Live arriving during construction or
+alignment. The latter must publish the completed image directly as Live.
 
 Verify the settled
 [publication-state contract](api.md#publication-state-and-revision--settled):
 initial Synchronizing, direct initial Live, visible `Synchronizing -> Live`,
 and terminal Stale transitions leave graph view and history revisions
-unchanged. Cover Reset acknowledgement after state and routing effects,
+unchanged. Cover reliable Reset processing without an acknowledgement,
 cancellation of unpublished construction, no additional effect for an already
 Stale publication, delta rejection for Stale, head-snapshot state and ETag
 changes, and immutable delta bytes across later state changes. SSE cases cover
@@ -734,7 +751,7 @@ this cache, and cache pressure must not delay or fault processing.
 
 Verify the settled
 [database-seed projection](api.md#database-seed-extent-and-projection--settled),
-[observer replay](api.md#seed-construction-and-observer-replay--settled), and
+[head-publication lifecycle](api.md#head-publication-lifecycle-and-stream-alignment--settled), and
 [storage read operation](storage.md#api-graph-projection-reads--settled).
 Cover a `MAX_CACHE_DEPTH` head seed; odd and even anchored depths; shifting at
 level 1 and the database head; level, block-hash, and DAA anchors; and a retained
@@ -749,26 +766,55 @@ and the construction-only snapshot sink. Recompute derived level usage from
 edges. Exercise the separate capped API pool and prove its saturation or
 generation loss cannot consume or retire a processing-pool connection.
 
-Replay cases cover present blocks, absent blocks with no retained effect, an
-absent block whose returned delta finds the boundary, a VSPC source that finds
-the boundary first, and a buffer ending while boundary detection remains
-pending. After either boundary, apply all later interleaved updates in channel
-order. Cover staging that publishes at revision zero and above zero, plus
-independently atomic view and history visibility at adjacent revisions.
-Overflow, observer invalidation, query/generation/projection failure,
-superseding controls, and update-application failure must abandon only the API
-attempt while preserving the applicable Stale publication or clean 503 and the
-status/info lane.
+Lifecycle cases cover `AwaitReset -> PreSeal`, waiting for the first-channel
+PostSeal marker while producer-side suppression remains active,
+`Constructing -> Aligning`, and the prohibition on direct
+construction-to-activation. Alignment covers present blocks, absent blocks with
+no retained effect, an absent block whose returned delta finds the boundary,
+and a VSPC source that finds the boundary first. Empty staging without a
+boundary remains Aligning and publishes no candidate. After either boundary,
+apply all later interleaved updates through a captured activation frontier and
+leave newer arrivals for Active. Cover first publication revisions zero and
+above zero, plus independently atomic view and history visibility at adjacent
+revisions.
+
+Pre-seal suppression produces no gap. Verify the database seed started after
+the marker covers every intentionally suppressed commit, including block and
+VSPC commits racing with the marker transition; an offer ordered after the
+transition enters the channel instead. No pre-seal seed or second marker is
+required.
+
+Exercise the universal reconstruction primitive from Constructing, Aligning,
+and Active. The first two abandon their candidate; Active first becomes
+terminally Stale. In every case, drain through the first observed channel
+Empty, discard graph mutations, preserve sticky Live, capture the newest gap
+generation, and start a newer seed. Updates after the empty frontier must be
+staged, while a later gap-generation change restarts reconstruction again.
+Cover staging overflow, query/generation/projection failure, alignment or
+application failure, and a gap during each state. None may request processing
+recovery. `PublishPostSeal` is not repeated during same-session reconstruction.
+Changing the API database generation alone must not replace an otherwise
+advancing Active publication.
 
 Verify [Reset and recovery-time availability](api.md#reset-and-recovery-time-availability--settled)
-with ordinary Resync and Rebuild integration scenarios. Resync preserves
-historical reads and orders Reset before PostSeal and processor Begin. Rebuild
-acknowledges Reset before DB clear, closes historical reads, permits only an
-old coherent in-flight result or a clean 503, and reopens reads after coherent
-PostSeal publication. Include query/reset races and PostgreSQL `TRUNCATE`; no
-request may observe a partial or mixed generation.
+with ordinary Resync and Rebuild integration scenarios. Verify the fresh
+`GraphUpdateReceiver` and exact recovery mode; global preemption from
+PreSeal, Constructing, Aligning, and Active; and old receiver replacement.
+Supervisor proceeds without waiting for ApiService. Resync preserves historical
+reads, and failed reconciliation followed by Rebuild installs a second fresh
+Reset. Rebuild relies on StorageService rather than Reset to close API database
+admission, retire the old API generation, and boundedly drain or cancel active
+database phases. Verify a detached old projection may complete delivery while
+an undetached request returns 503, public reads reopen only after the aligned
+replacement becomes Active, public reads never rebind implicitly to a newly
+published storage generation, and no request observes a partial or mixed
+generation, including with PostgreSQL `TRUNCATE`. Verify ordinary sender
+teardown may close the installed receiver, channel closure is not a lifecycle
+signal, and a marker worker with an accepted delivery may outlive
+BlockProcessor Deactivate without retaining an RPC or DB client, then exits
+after delivery or receiver replacement.
 
-Observer and API projection tests cover a non-Genesis block whose selected
+Graph-update and API projection tests cover a non-Genesis block whose selected
 parent index addresses the expected member of `direct_parents`, plus Genesis
 with `selected_parent_index = None`, an empty `direct_parents` list, and no
 synthetic ORIGIN parent.
@@ -800,9 +846,9 @@ complete database projection has been materialized and verify that no
 transaction, connection, row stream, or API DB permit remains held while
 processing obtains its reserved database capacity. Cover client disconnect,
 serialization or compression failure, and an oversized response after database
-release. Query/Reset races must retain the acknowledged Reset contract's old
-coherent result or clean 503 outcome even when database resources were released
-before response construction completed.
+release. Query/database-replacement races must retain the storage gate's old
+coherent detached result or clean 503 outcome even when database resources were
+released before response construction completed.
 
 Go KGI parity fixtures, rusty-kaspa RPC and notification fixtures, PostgreSQL
 integration tests, and browser graph tests accompany the applicable groups

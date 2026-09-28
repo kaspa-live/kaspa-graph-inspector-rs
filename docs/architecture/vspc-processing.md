@@ -364,16 +364,19 @@ transaction. Only definite commit advances its local committed sink and
 history. Storage returns the destination `VspcPoint`; no caller-side
 destination reconstruction or clone is required.
 
-After definite commit, VspcProcessor publishes the corresponding
-`VspcCommitted` update to the single ordered graph observer channel. The
+After definite commit, VspcProcessor offers the corresponding
+`VspcCommitted` update to the run's ordered graph-update producer. The
 [BlockProcessor delivery contract](block-processing.md#committed-block-delivery)
-sends each newly materialized block's graph update before the `PersistedBlock`
+offers each newly materialized block's graph update before the `PersistedBlock`
 that can make a VSPC transition ready. Therefore VspcProcessor cannot publish
-a VSPC mutation ahead of its causal block updates.
+a VSPC mutation ahead of its causal block updates once the shared producer gate
+is open. Before that cut, both processors' API projection offers are
+intentionally suppressed while their committed processing state continues.
 
-Graph observer delivery is nonblocking for processing. Failure invalidates
-ApiService's image under the [API contract](api.md), rather than rolling back
-the committed VSPC transaction or requesting processing recovery.
+Graph-update delivery is nonblocking for processing. A full channel reports a
+gap under the [API contract](api.md#in-process-api-and-graph-update-feed--settled)
+rather than rolling back the committed VSPC transaction or requesting
+processing recovery.
 
 The committed sink remains derived from materialized VSPC membership in
 storage. VspcProcessor does not persist a separate sink or checkpoint.

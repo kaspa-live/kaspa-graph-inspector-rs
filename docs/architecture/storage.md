@@ -62,9 +62,10 @@ the run. A replacement generation starts with fresh caches.
 the [API resource contract](api.md#resource-isolation-and-saturation--settled).
 It exposes no processing mutation or processing cache. ApiService obtains it
 through `wait_until_api_usable()`. Network binding, schema, and generation
-validation precede publication of either handle. The
-[API Reset contract](api.md#reset-and-recovery-time-availability--settled) owns
-when new API reads close, drain, and reopen around Rebuild.
+validation precede publication of either handle. StorageService owns API DB
+generation retirement and database-replacement exclusion; the
+[API lifecycle](api.md#reset-and-recovery-time-availability--settled) owns only
+public request availability and graph publication state.
 
 Callers receive semantic read operations and complete domain transactions.
 Storage exposes no connection pool, database connection, transaction object,
@@ -98,8 +99,43 @@ termination. Each operation reports its actual outcome:
   reported as `Persistence(AmbiguousCommit)`.
 
 All persistent mutations are transactional. Cache entries become visible
-only after definite commit. No connection epoch, revocation check, cache
-generation, or global operation-completion barrier is required.
+only after definite commit. Outside the database-replacement gate below, no
+connection epoch, per-operation revocation check, cache generation, or global
+operation-completion barrier is required.
+
+### API read exclusion during database replacement — settled
+
+Every database phase performed through `ValidatedApiDbClient` holds a shared
+database-replacement permit from before its read-only transaction begins until
+the complete bounded projection has been detached into memory and the
+transaction, connection, and permit have been released. Serialization,
+compression, and response delivery occur outside this permit and cannot issue
+follow-up database reads.
+
+Before `rebuild_from_pruning_point` clears or replaces processing data,
+StorageService atomically closes new API DB admission, retires the current
+`ValidatedApiDbClient` generation, and boundedly drains or cancels all database
+phases that still hold shared permits. It then acquires the exclusive
+replacement permit. A request that detached its projection before closure may
+finish returning that old coherent image. Every other affected request fails
+cleanly through the API as `503 Service Unavailable`; an API read cannot delay
+replacement without bound.
+
+The exclusive permit remains held through the atomic replacement outcome and
+cache publication or generation retirement. StorageService publishes no
+replacement `ValidatedApiDbClient` until the database is again one coherent,
+validated generation. ApiService may then use that generation for private
+publication construction; its recovery state independently controls public
+historical-request availability.
+
+If replacement uses PostgreSQL `TRUNCATE`, transactional rollback does **not**
+make it generally MVCC-safe for pre-existing snapshots. The gate must ensure a
+request returns one detached old image, one coherent replacement-generation
+image, or `503`, never mixed or partially rebuilt tables. See PostgreSQL's
+[`TRUNCATE`](https://www.postgresql.org/docs/current/sql-truncate.html) and
+[MVCC caveat](https://www.postgresql.org/docs/current/mvcc-caveats.html)
+documentation. Concrete permit, cancellation, and transaction primitives are
+deferred in the [decision register](../decisions/deferred.md).
 
 ### Transaction retries
 
@@ -588,15 +624,16 @@ these conditions:
   generation's immutable `NodeMetadata` binding;
 - the complete pruning-point block was obtained and validated through that RPC
   generation;
-- the API Reset barrier required before database replacement has completed;
 - both processors have completed Deactivate and no earlier processing session
   retains either validated client; and
 - StorageService still owns the database advisory lock through its dedicated
   lock connection.
 
-The method acquires the exclusive mutation guard without waiting. Failure to
-acquire it after completed processor deactivation is a lifecycle invariant
-violation; Rebuild must not wait behind an unexpected processor mutation.
+The method first establishes StorageService's API-read replacement exclusion
+above. It then acquires the exclusive processing mutation guard without
+waiting. Failure to acquire that guard after completed processor deactivation
+is a lifecycle invariant violation; Rebuild must not wait behind an unexpected
+processor mutation.
 
 ### Atomic replacement
 
@@ -729,11 +766,10 @@ not report success, publish cache changes, or retry blindly.
 StorageService reports `Persistence(AmbiguousCommit)` and retires the current
 `ValidatedDbClient` generation so a replacement generation rederives database
 truth. The processing lifecycle owns session termination, the retained Rebuild
-obligation, and API effects.
+obligation, and Supervisor's next API Reset.
 
-The [API Reset barrier](api.md#reset-and-recovery-time-availability--settled)
-and the [processing lifecycle](processing-lifecycle.md) own when this operation
-may start; storage owns the atomic replacement itself.
+The [processing lifecycle](processing-lifecycle.md) owns when this operation
+may start. Storage owns both API-read exclusion and the atomic replacement.
 
 ## Block materialization transaction — settled
 
@@ -916,7 +952,7 @@ the insertion; no post-commit projection read is allowed.
 An already materialized own hash returns `AlreadyMaterialized` with its ID and
 coordinate. It carries no `BlockCommitted` because deduplication creates no
 graph mutation. Either outcome is an authoritative materiality result.
-Processing owns publication of the returned observer payload, any resulting
+Processing owns delivery of the returned graph-update payload, any resulting
 `PersistedBlock`, and the PP-boundary phase transition.
 
 ## Atomic VSPC transaction — settled
@@ -1087,7 +1123,7 @@ A query or pool failure reports `QueryFailed`. Loss of this API pool generation
 reports `GenerationLost` and retires that API handle without retiring the
 independent processing handle. A structurally incomplete or internally
 incoherent result reports `InconsistentProjection`; it never returns a partial
-seed. The [ApiService construction contract](api.md#seed-construction-and-observer-replay--settled)
+seed. The [ApiService construction contract](api.md#head-publication-lifecycle-and-stream-alignment--settled)
 owns retry, publication, and service-availability effects for all three
 outcomes.
 
