@@ -169,11 +169,13 @@ owns edge representation, window inclusion, endpoint retention, and lifetime.
 The graph-update payload above supplies the committed parent information required
 to apply that contract.
 
-`CompactId` is private to storage/processing. Each HTTP graph response has
-its own small numeric references and an included local ID-to-hash dictionary
-covering **all** hashes it references, including off-window parent endpoints
-and merge-set members. These local IDs are not persistent across responses or
-instances; coordinates may diverge across independently allocated DBs.
+The domain-owned `CompactId` crosses into ApiService only as the private
+alignment cut and `BlockCommitted.id`; it is never a public block identity or
+wire value. Each HTTP graph response has its own small numeric references and
+an included local ID-to-hash dictionary covering **all** hashes it references,
+including off-window parent endpoints and merge-set members. These local IDs
+are not persistent across responses or instances; coordinates may diverge
+across independently allocated DBs.
 
 The public block projection preserves its **actual direct-parent list** even
 when some parents are outside the response or PP boundary and have no
@@ -309,6 +311,7 @@ struct GraphViewSeed {
     levels: LevelSet,
     blocks: BlockSet,
     edges: EdgeSet,
+    snapshot_max_materialized_id: CompactId,
     snapshot_vspc_sink: BlockHash,
 }
 ```
@@ -428,9 +431,11 @@ The seed's levels are the union of every nominal level and every child or
 parent endpoint level referenced by a selected edge. Each entry carries its
 complete stored `size` and optional DAA score. `usage_count` is not loaded; the
 `GraphView` constructor derives it from the selected edges. The same snapshot
-also returns the committed materialized VSPC sink as
-`snapshot_vspc_sink`. This is construction metadata only and never enters a
-public graph payload, `GraphView`, `GraphDelta`, or `GraphHistory`.
+also returns the global maximum materialized block ID as
+`snapshot_max_materialized_id` and the committed materialized VSPC sink as
+`snapshot_vspc_sink`. The maximum covers the complete `blocks` table rather
+than only the projected window. Both fields are private construction metadata
+consumed by alignment.
 
 ### Head-publication lifecycle and stream alignment — settled
 
@@ -440,7 +445,7 @@ ApiService projects one processing session through these internal states:
 AwaitReset -- Reset --> PreSeal
     -- PublishPostSeal --> Constructing
     -- seed succeeds --> Aligning
-    -- boundary found --> Active
+    -- block and VSPC cuts crossed --> Active
 ```
 
 `Reset` may preempt every installed-session state. Its complete topology and
@@ -464,39 +469,49 @@ sticky target publication state to `Live`; it is not staged as graph data.
 Construction never searches for the database/stream boundary. A successful
 seed always enters `Aligning`.
 
-`Aligning` alone connects the completed database candidate to the ordered
-stream. Before the boundary, classify `BlockCommitted` as follows:
+`Aligning` alone connects the completed database candidate to both ordered
+update sources. It tracks independent `block_cut_crossed` and
+`vspc_cut_crossed` conditions, initially false. Until the block cut crosses,
+classify `BlockCommitted` as follows:
 
 ```text
-block hash is present in GraphView
-    -> skip
+BlockCommitted.id <= snapshot_max_materialized_id
+    -> skip: the database snapshot already covers this commit
 
-block hash is absent
-    -> GraphView::apply(BlockCommitted)
-    -> None: keep searching
-    -> Some(GraphDelta): apply it and establish the boundary
+BlockCommitted.id > snapshot_max_materialized_id
+    -> apply and set block_cut_crossed = true
+    -> GraphView::apply may return None or Some(GraphDelta)
 ```
 
-The alternative boundary is the first `VspcCommitted` whose `source` equals
-`snapshot_vspc_sink`; apply it and establish the boundary. Before either rule
-succeeds, skip other VSPC updates as already represented by the seed. Whichever
-rule succeeds first wins. An absent block outside retained state can produce no
-delta and therefore cannot establish the boundary.
+Until the VSPC cut crosses, skip `VspcCommitted` updates whose `source` differs
+from `snapshot_vspc_sink` because the seed already represents their effects.
+Apply the first update whose `source` equals `snapshot_vspc_sink` and set
+`vspc_cut_crossed = true`. Block IDs do not order VSPC-only transactions, so
+neither condition substitutes for the other. Once one source has crossed its
+cut, apply every later update from that source normally while continuing the
+snapshot-relative classification for the other source.
 
-Exhausting the current staging buffer without a boundary is normal. ApiService
-remains in `Aligning` and applies the same classification to later updates.
-`Live` only updates the sticky target state and does not establish a boundary.
-There is no alignment timeout and no direct `Constructing -> Active`
-transition.
+The candidate may enter `Active` only after both conditions are true. A block
+with an ID above the snapshot cut satisfies the block condition even when it
+has no retained effect and `GraphView::apply` returns no delta. Observing only
+one cut is insufficient. Consequently, an otherwise coherent candidate remains
+in `Aligning` indefinitely if either source produces no qualifying
+post-snapshot update; this idle-source delay is accepted and has no timeout or
+synthetic fence.
 
-After the boundary update, discard `snapshot_vspc_sink`, stop all
-snapshot-relative classification, apply every later staged graph update in
-channel order, and advance through a captured activation frontier. Updates
-arriving after that frontier remain for ordinary Active processing; activation
-does not require an empty channel. Publish the completed view and history
-independently and atomically, assign a fresh publication ID, use the sticky
-target state, and enter `Active`. Neither the candidate nor its partially
-replayed state is externally visible before activation.
+Exhausting the current staging buffer before both cuts cross is normal.
+ApiService remains in `Aligning` and applies the same per-source classification
+to later updates. `Live` only updates the sticky target state and crosses
+neither cut. There is no direct `Constructing -> Active` transition.
+
+After both crossing updates have been applied, discard `snapshot_vspc_sink`,
+stop all snapshot-relative classification, apply every later staged graph
+update in channel order, and advance through a captured activation frontier.
+Updates arriving after that frontier remain for ordinary Active processing;
+activation does not require an empty channel. Publish the completed view and
+history independently and atomically, assign a fresh publication ID, use the
+sticky target state, and enter `Active`. Neither the candidate nor its
+partially replayed state is externally visible before activation.
 
 An `Active` publication has no snapshot sink, alignment state, or database
 matching duty. Each ordinary graph update goes directly through

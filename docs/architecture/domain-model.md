@@ -110,8 +110,11 @@ invariant defined below. Its non-null `selected_parent` is the persisted
 selected-parent hash. For Genesis it is synthetic ORIGIN, which is not an
 actual direct parent.
 
-`CompactId` is an incremental positive signed 64-bit internal identifier. It
-is private to storage and processing and is not a public block identity.
+`CompactId` is an incremental positive signed 64-bit internal identifier.
+Storage assigns values strictly increasingly and never reuses a value within
+one database generation. Transaction rollback may leave gaps. The identifier
+may cross internal component boundaries where a database-generation cut must
+be represented.
 
 `BlockCoordinate` is a database-local display coordinate. Slot allocation
 order is not canonical across instances: the same block hash may have

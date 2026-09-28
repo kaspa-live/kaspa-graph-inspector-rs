@@ -344,15 +344,16 @@ the block's own hash. Under `AllowBoundaryIdentities`, existing identity-only
 references and newly absent references succeed as boundary leaves and do not
 produce that strict-policy result.
 
-For an inserted block, verify that the returned `BlockCommitted` contains the
-new coordinate plus every direct parent's coordinate from the same committed
-transaction, with the coordinate absent for an outside-boundary parent. Its
-non-repeating `level_snapshots` must contain the complete resulting block level
-and every distinct materialized parent level, preserve an existing level's DAA
-score while its size changes, translate the no-VSPC sentinel to `None`, and
-exclude outside-boundary parents. Cover the selected-parent index and committed
-initial color and VSPC membership. `AlreadyMaterialized` returns no graph-update
-payload.
+For an inserted block, verify that the returned `BlockCommitted` contains its
+committed ID and new coordinate plus every direct parent's coordinate from the
+same committed transaction, with the coordinate absent for an outside-boundary
+parent. Its non-repeating `level_snapshots` must contain the complete resulting
+block level and every distinct materialized parent level, preserve an existing
+level's DAA score while its size changes, translate the no-VSPC sentinel to
+`None`, and exclude outside-boundary parents. Cover the selected-parent index
+and committed initial color and VSPC membership. Inserted outcomes and their
+BlockProcessor offers preserve increasing IDs while permitting allocation
+gaps; `AlreadyMaterialized` returns no graph-update payload.
 Verify BlockProcessor forwards the inserted payload before `PersistedBlock`;
 full-channel delivery advances the session gap signal but does not suppress the
 later `PersistedBlock` delivery or request processing recovery.
@@ -762,21 +763,25 @@ Projection cases cover complete nominal blocks; crossing edges with zero, one,
 and two endpoint blocks; all nominal and endpoint levels; exclusion of the
 outside-PP sentinel edge; complete direct-parent and merge-set hashes; local
 `selected_parent_index`; Genesis without ORIGIN; current color and VSPC state;
-and the construction-only snapshot sink. Recompute derived level usage from
+and both construction-only alignment values. Verify that the ID cut is the
+maximum over the complete materialized block table, including an ID whose
+block is outside the projected window. Recompute derived level usage from
 edges. Exercise the separate capped API pool and prove its saturation or
 generation loss cannot consume or retire a processing-pool connection.
 
 Lifecycle cases cover `AwaitReset -> PreSeal`, waiting for the first-channel
 PostSeal marker while producer-side suppression remains active,
 `Constructing -> Aligning`, and the prohibition on direct
-construction-to-activation. Alignment covers present blocks, absent blocks with
-no retained effect, an absent block whose returned delta finds the boundary,
-and a VSPC source that finds the boundary first. Empty staging without a
-boundary remains Aligning and publishes no candidate. After either boundary,
-apply all later interleaved updates through a captured activation frontier and
-leave newer arrivals for Active. Cover first publication revisions zero and
-above zero, plus independently atomic view and history visibility at adjacent
-revisions.
+construction-to-activation. Alignment covers block IDs at and below the
+snapshot cut, a first greater ID with no retained effect, a first greater ID
+that returns a delta, and the matching VSPC source. Exercise both crossing
+orders. After one cut crosses, later updates from that source apply while the
+other source continues its snapshot-relative filtering. Empty staging and
+either single-cut state remain Aligning and publish no candidate, including an
+indefinitely idle second source. Only after both cuts cross, apply all later
+interleaved updates through a captured activation frontier and leave newer
+arrivals for Active. Cover first publication revisions zero and above zero,
+plus independently atomic view and history visibility at adjacent revisions.
 
 Pre-seal suppression produces no gap. Verify the database seed started after
 the marker covers every intentionally suppressed commit, including block and

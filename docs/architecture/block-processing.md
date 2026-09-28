@@ -241,7 +241,8 @@ value to the run's graph-update producer before delivering `PersistedBlock` to
 VspcProcessor and OrphanManager. `SuppressedPreSeal` intentionally omits only
 the API projection update; processing delivery continues. Once the producer
 gate is open, completing the offer before `PersistedBlock` preserves
-graph-update causal order.
+graph-update causal order. BlockProcessor preserves the storage materialization
+lane's returned order when offering newly inserted `BlockCommitted` values.
 `AlreadyMaterialized` produces no graph mutation but still delivers
 `PersistedBlock`. A full graph-update channel does not delay or roll back the
 committed block and does not suppress `PersistedBlock`; the session producer

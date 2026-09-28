@@ -786,6 +786,7 @@ struct LevelCommitted {
 }
 
 struct BlockCommitted {
+    id: CompactId,
     hash: BlockHash,
     coordinate: BlockCoordinate,
     timestamp: Timestamp,
@@ -806,7 +807,6 @@ enum ReferencePolicy {
 
 enum MaterializeBlockOutcome {
     Inserted {
-        id: CompactId,
         committed: BlockCommitted,
     },
     AlreadyMaterialized {
@@ -841,7 +841,8 @@ persists its hash, selected parent, direct parents, merge sets, timestamp, and
 DAA score; blue score and blue work remain available to processing but are not
 duplicated in the block row. Storage owns transactional ID resolution,
 coordinate allocation, initial color, persistence, and construction of the
-`BlockCommitted` value for a new insertion.
+`BlockCommitted` value for a new insertion. Its `id` is the inserted block's
+committed `CompactId`.
 
 The parent payload contains actual direct parents only. For every non-Genesis
 block, `selected_parent_index` is `Some(index)`, the index is representable as
@@ -947,7 +948,9 @@ persisted initial color and VSPC membership. The inserted block's resulting
 level snapshot reflects every size or DAA-score value stored by the transaction.
 Return the `Inserted` outcome, including that complete payload, only after
 definite commit. The payload therefore describes the same committed state as
-the insertion; no post-commit projection read is allowed.
+the insertion; no post-commit projection read is allowed. The sequential
+materialization lane returns definite inserted outcomes in increasing
+`BlockCommitted.id` order.
 
 An already materialized own hash returns `AlreadyMaterialized` with its ID and
 coordinate. It carries no `BlockCommitted` because deduplication creates no
@@ -1113,11 +1116,13 @@ impl ValidatedApiDbClient {
 `load_graph_view_seed` resolves the requested anchor and materializes the
 complete projection in one stable PostgreSQL snapshot, using one read-only
 `REPEATABLE READ` transaction when more than one statement is required. It
-finishes that transaction and releases its API connection before response
-serialization or compression. The operation maps stored identities, blocks,
-parents, merge sets, coordinates, levels, coloring, VSPC membership, and the
-committed sink into the API-owned result; it exposes no compact ID or database
-transaction object to ApiService.
+also obtains the API-owned construction metadata, including the materialized-ID
+cut, in that same snapshot. It finishes that transaction and releases its API
+connection before response serialization or compression. The operation maps
+stored identities, blocks, parents, merge sets, coordinates, levels, coloring,
+VSPC membership, and construction metadata into the API-owned result. The
+materialized-ID cut is the only compact ID exposed by this operation; no
+database transaction object is exposed to ApiService.
 
 A query or pool failure reports `QueryFailed`. Loss of this API pool generation
 reports `GenerationLost` and retires that API handle without retiring the
