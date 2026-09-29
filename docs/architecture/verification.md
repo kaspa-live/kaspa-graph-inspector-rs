@@ -736,6 +736,15 @@ keep the returned level fixed across eligible projected deltas, and re-resolve
 only when explicit refresh resubmits that anchor. A database-backed window has
 no public delta lineage and remains frozen until that refresh.
 
+For database-backed anchor misses, verify exact-level absence returns
+`LevelNotRetained`, an unknown or identity-only block hash returns
+`BlockNotMaterialized`, and a DAA score before every retained VSPC score returns
+`NoRetainedDaaMatch`. Each is an ordinary `AnchorUnavailable` result from the
+same stable transaction, produces `404`, and changes no API DB generation,
+publication, or processing state. Level zero, out-of-range DAA, invalid depth,
+and malformed hash input produce `400` without a storage call. A DAA score
+beyond the current VSPC score remains a successful current-VSPC resolution.
+
 Verify the settled
 [Head-bounded Fixed projection](api.md#head-bounded-fixed-delta-projection--settled)
 from a Head-extracted anchored window. Cover a fully contained extent, an empty

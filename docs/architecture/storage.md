@@ -1144,9 +1144,10 @@ enrich and validate the stored sink before constructing the anchor.
 ## API graph projection reads — settled
 
 The API-owned [database seed contract](api.md#database-seed-extent-and-projection--settled)
-defines `GraphViewSeedRequest`, `GraphViewSeed`, its effective extent, and the
-contents of the returned projection. Storage exposes that semantic read only
-through the separate read-only API handle. Under the
+defines `GraphViewSeedRequest`, `GraphViewSeedOutcome`, `GraphViewSeed`, the
+typed anchor-unavailability values, its effective extent, and the contents of
+the returned projection. Storage exposes that semantic read only through the
+separate read-only API handle. Under the
 [core crate structure](overview.md#core-crate-structure--settled),
 these shared values come from `kgi-api-model`; `kgi-storage` does not depend on
 `kgi-api-core`:
@@ -1162,7 +1163,7 @@ impl ValidatedApiDbClient {
     async fn load_graph_view_seed(
         &self,
         request: GraphViewSeedRequest,
-    ) -> Result<GraphViewSeed, ApiReadError>;
+    ) -> Result<GraphViewSeedOutcome, ApiReadError>;
 }
 ```
 
@@ -1177,13 +1178,33 @@ VSPC membership, and construction metadata into the API-owned result. The
 materialized-ID cut is the only compact ID exposed by this operation; no
 database transaction object is exposed to ApiService.
 
+`HeadPublication` returns `Loaded` or an `ApiReadError`; it has no anchor-miss
+outcome. For a valid `AnchoredWindow`, resolve the anchor inside the same
+stable transaction used for projection and return these normal outcomes before
+constructing any partial seed:
+
+- `LevelNotRetained { requested_level }` when no retained level row exists for
+  that exact requested level;
+- `BlockNotMaterialized { requested_hash }` when the hash is absent or resolves
+  only to an identity without a materialized block row; and
+- `NoRetainedDaaMatch { requested_score }` when the current-VSPC floor query
+  finds no retained score at or below the requested score.
+
+An anchor beyond the current VSPC DAA still resolves to the current VSPC level.
+Successful resolution and the complete returned projection observe the same
+snapshot. `AnchorUnavailable` is not `ApiReadError`, and no miss returns a
+partial `GraphViewSeed`. `InconsistentProjection` applies only after an anchor
+resolved and the requested complete projection proved structurally incoherent;
+it never substitutes for an unavailable anchor.
+
 A query or pool failure reports `QueryFailed`. Loss of this API pool generation
 reports `GenerationLost` and retires that API handle without retiring the
 independent processing handle. A structurally incomplete or internally
 incoherent result reports `InconsistentProjection`; it never returns a partial
 seed. The [ApiService construction contract](api.md#head-publication-lifecycle-and-stream-alignment--settled)
-owns retry, publication, and service-availability effects for all three
-outcomes.
+owns those errors during Head construction; the
+[API contract](api.md#daa-navigation-and-graph-windows--settled) owns public
+anchored-window dispositions.
 
 ## Historical read contracts — settled
 
@@ -1200,7 +1221,7 @@ LIMIT 1;
 ```
 
 The sentinel is excluded naturally because no valid query reaches
-`i64::MAX`. If no retained floor exists, return an explicit no-retained-match
-result. A query beyond the current VSPC DAA resolves to the current VSPC
+`i64::MAX`. If no retained floor exists, return `NoRetainedDaaMatch`. A query
+beyond the current VSPC DAA resolves to the current VSPC
 level. Resolve a historical anchor and read its graph window in one consistent
 database transaction, never from different revisions.

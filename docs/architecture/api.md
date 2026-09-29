@@ -370,6 +370,18 @@ enum GraphViewSeedRequest {
     },
 }
 
+enum GraphWindowAnchorUnavailable {
+    LevelNotRetained {
+        requested_level: u64,
+    },
+    BlockNotMaterialized {
+        requested_hash: BlockHash,
+    },
+    NoRetainedDaaMatch {
+        requested_score: u64,
+    },
+}
+
 struct GraphWindowResolution {
     resolved_level: u64,
     effective_start_level: u64,
@@ -384,6 +396,11 @@ struct GraphViewSeed {
     edges: EdgeSet,
     snapshot_max_materialized_id: CompactId,
     snapshot_vspc_sink: BlockHash,
+}
+
+enum GraphViewSeedOutcome {
+    Loaded(GraphViewSeed),
+    AnchorUnavailable(GraphWindowAnchorUnavailable),
 }
 ```
 
@@ -1453,14 +1470,27 @@ score ties. The
 indexed database lookup and consistent historical transaction.
 
 There may be VSPC-empty levels after reorg. If `q` precedes the retained PP
-and no floor exists, report explicit no-retained-match. A `q` beyond the
-current VSPC DAA resolves the current VSPC level. If `q` is at or above the
+and no floor exists, return `NoRetainedDaaMatch`. A `q` beyond the current VSPC
+DAA resolves the current VSPC level. If `q` is at or above the
 DAA of the current head view's lowest cached VSPC level, that view can resolve it; otherwise use the
 storage lookup. Level resolution and its window must come from **one immutable
 graph view** or one consistent DB transaction, never different revisions.
 ApiService obtains cached levels' authoritative final scores from the complete
 level snapshots carried by `VspcCommitted`. Historical DAA/window responses
 are not cached in v2.
+
+For a database-backed anchored window, each
+`GraphWindowAnchorUnavailable` variant is a normal request-local `404 Not
+Found` response. It does not retire the API database generation, change
+`ApiDbReadState`, reconstruct or stale a publication, or request processing
+recovery. The [storage operation](storage.md#api-graph-projection-reads--settled)
+owns the exact database condition producing each variant.
+
+Reject invalid anchor input before storage access with `400 Bad Request`. This
+includes level zero, a DAA score outside the shared range, an invalid
+`max_depth`, and a block hash that cannot be decoded into `BlockHash`. These
+input errors are distinct from a valid typed anchor that has no retained
+match.
 
 ## Status observation — settled
 

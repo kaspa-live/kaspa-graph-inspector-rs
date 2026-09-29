@@ -108,9 +108,10 @@ values. Their focused component documents still own their semantics.
 `kgi-api-model` is a pure graph-projection contract crate. It contains shared
 API graph values and request/result values such as `Level`, `GraphBlock`,
 `EdgeId`, `GraphEdge`, `GraphWindowAnchor`, `GraphViewSeedRequest`,
-`GraphWindowResolution`, `GraphViewSeed`, `SystemStatus`, and public delta value
-shapes. It has no service workers, database implementation, HTTP server,
-channel runtime, or PostgreSQL types.
+`GraphWindowAnchorUnavailable`, `GraphWindowResolution`, `GraphViewSeed`,
+`GraphViewSeedOutcome`, `SystemStatus`, and public delta value shapes. It has no
+service workers, database implementation, HTTP server, channel runtime, or
+PostgreSQL types.
 
 `kgi-api-ingress` owns the graph-update ingress: `GraphUpdateProducer`,
 `GraphUpdateReceiver`, `GraphUpdateGate`, gap signaling, bounded-channel
