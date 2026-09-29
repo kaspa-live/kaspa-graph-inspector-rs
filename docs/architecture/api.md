@@ -1298,8 +1298,7 @@ implementation, and graph wire format remain deferred in the
 
 ### Public API database generation adoption — settled
 
-ApiService independently maintains this private database-read state for public
-requests:
+ApiService independently maintains this private API database-read state:
 
 ```rust
 enum ApiDbReadState {
@@ -1308,26 +1307,38 @@ enum ApiDbReadState {
     AwaitingReplacement {
         lost: Arc<ValidatedApiDbClient>,
     },
-    ClosedForRebuild,
+    ClosedForRebuild {
+        candidate: Option<Arc<ValidatedApiDbClient>>,
+    },
+}
+
+enum ApiDbInstallContext {
+    Ordinary,
+    Rebuild,
+}
+
+enum ApiServiceEvent {
+    ApiDbGenerationLost,
 }
 ```
 
-ApiService stores this state as `public_db_reads`. It governs only public
-database-backed requests. Head views, Head deltas, projected Fixed deltas, SSE,
-and private publication construction do not acquire their database capability
-through this state. Construction captures its own exact
-`ValidatedApiDbClient` for one attempt.
+ApiService stores this state as `api_db_reads`. It governs public
+database-backed request admission and the exact database capability available
+to publication construction. Head views, Head deltas, projected Fixed deltas,
+SSE, and publication continuity remain independent of ordinary generation
+changes. Publication construction captures one exact installed
+`ValidatedApiDbClient` for each attempt. If no usable client is installed, that
+construction remains pending rather than calling StorageService.
 
-ApiService initializes `public_db_reads` to `AwaitingInitial` and owns exactly
-one internal startup task that calls
-`StorageService::wait_until_api_usable()`. A successful wait installs
-`Available(initial)` only while the state remains `AwaitingInitial`. It changes
-no graph publication ID, state, revision, history, or SSE cursor. Supervisor
-does not acquire or pass this handle, and neither the first `reset` nor the
-first public request initiates the wait. A terminal `StorageWaitError` ends the
-task without spinning and leaves the state `AwaitingInitial` until shutdown.
+ApiService initializes `api_db_reads` to `AwaitingInitial`. It never calls
+`StorageService::wait_until_api_usable()` or otherwise acquires a sibling
+service generation. Supervisor owns initial and replacement acquisition under
+the [processing lifecycle](processing-lifecycle.md#api-session-replacement-and-publication)
+and supplies the resulting validated handle through
+`install_api_db_generation` below. Neither the first `reset` nor the first
+public request initiates acquisition.
 
-A public database-backed request briefly reads `public_db_reads`. From
+A public database-backed request briefly reads `api_db_reads`. From
 `Available(client)`, it clones that `Arc`, releases the ApiService state lock,
 and performs its complete database phase against that exact generation. It
 never holds the state lock across database work, switches generations, or
@@ -1339,23 +1350,27 @@ storage-owned replacement gate.
 
 When a public operation through the currently installed client returns
 `GenerationLost`, that request returns `503` and ApiService atomically changes
-`Available(lost)` to `AwaitingReplacement { lost }`. Exactly one ApiService
-task then awaits `StorageService::wait_until_api_usable()`. Concurrent or late
-loss reports for the same retired handle create no additional task. A report
-from a handle that is no longer installed cannot change the current state.
+`Available(lost)` to `AwaitingReplacement { lost }` and emits exactly one
+reliable `ApiDbGenerationLost` event to Supervisor. Concurrent or late loss
+reports for the same retired handle emit no additional event. A report from a
+handle that is no longer installed cannot change the current state.
 `QueryFailed` is request-local and does not replace or retire the installed
 binding.
 
-When the wait returns a usable replacement, ApiService installs it as
-`Available(replacement)` only if the same replacement attempt still owns
-`AwaitingReplacement`. A late completion cannot overwrite a newer binding,
-`ClosedForRebuild`, or shutdown. The exact internal attempt identity and task
-cancellation primitive remain implementation choices. Successful ordinary
-adoption changes no graph publication ID, state, view revision, history, or
-SSE cursor and does not invoke `reset`, reconstruction, Supervisor, Resync, or
-Rebuild. A terminal `StorageWaitError` ends that wait without spinning and
-leaves public database-backed reads unavailable; StorageService status exposes
-the terminal condition until ApiService shutdown.
+An `Ordinary` installation changes `AwaitingInitial` or
+`AwaitingReplacement` to `Available(replacement)` using a capability that
+satisfies the [storage-owned generation contract](storage.md#storageservice-lifecycle--settled).
+A duplicate or obsolete ordinary installation cannot overwrite a newer binding,
+`ClosedForRebuild`, or shutdown. A `Rebuild` installation is accepted only in
+`ClosedForRebuild`, where it becomes the private construction candidate while
+public database-backed reads remain closed. An installation whose context no
+longer matches the current API state has no effect.
+
+Successful ordinary adoption changes no graph publication ID, state, view
+revision, history, or SSE cursor and does not invoke `reset`, reconstruction,
+Resync, or Rebuild. ApiService never starts a replacement task and never
+interprets StorageService availability itself; Supervisor owns the wait and
+its service-level outcome.
 
 ### Reset control and recovery effects — settled
 
@@ -1365,6 +1380,12 @@ Supervisor owns `Arc<ApiService>` and uses this public control surface:
 
 ```rust
 impl ApiService {
+    async fn install_api_db_generation(
+        &self,
+        client: Arc<ValidatedApiDbClient>,
+        context: ApiDbInstallContext,
+    ) -> Result<(), ApiServiceError>;
+
     async fn reset(
         &self,
         graph_updates: GraphUpdateReceiver,
@@ -1377,11 +1398,12 @@ impl ApiService {
 
 The methods are ApiService's complete Supervisor-facing control interface.
 Their private mailbox or event-loop mechanics remain internal to
-`kgi-api-core`. Successful `reset` means the operation was reliably accepted
-for ordered processing; it does not wait for application. Successful
-`shutdown` means ApiService completed the shutdown barrier. An unavailable
-component returns `ApiServiceError` under the parent-to-child failure semantics
-owned by the
+`kgi-api-core`. Successful `install_api_db_generation` returns after the local
+state transition or obsolete-context no-op is complete. Successful `reset`
+means the operation was reliably accepted for ordered processing; it does not
+wait for application. Successful `shutdown` means ApiService completed the
+shutdown barrier. An unavailable component returns `ApiServiceError` under the
+parent-to-child failure semantics owned by the
 [processing lifecycle](processing-lifecycle.md#teardown-and-delivery-semantics--settled).
 
 The `GraphUpdateReceiver` is fresh and belongs to exactly one processing
@@ -1397,7 +1419,7 @@ globally preempts `PreSeal`, `Constructing`, `Aligning`, or `Active`:
 1. abandon any unpublished candidate and reconstruction state;
 2. mark any current non-Stale publication terminally Stale;
 3. drop the old `GraphUpdateReceiver` and install the fresh one;
-4. establish the recovery-mode-specific `public_db_reads` effects below; and
+4. establish the recovery-mode-specific `api_db_reads` effects below; and
 5. enter `PreSeal`.
 
 The call is reliable but has no application-completion barrier. Supervisor may
@@ -1415,32 +1437,34 @@ receiver. Channel closure is not an ApiService lifecycle signal and does not
 replace, invalidate, or reconstruct a publication. ApiService retains its
 current state until the next `reset` call or another defined state transition.
 
-An ordinary Resync `reset` preserves `public_db_reads`, including
-`AwaitingInitial` or an in-progress ordinary replacement wait. A Rebuild
-`reset` changes any of `AwaitingInitial`, `Available`, or
-`AwaitingReplacement` to `ClosedForRebuild` and makes the initial or ordinary
-replacement wait obsolete. During Rebuild, public database-backed requests in
-`PreSeal`, `Constructing`, and `Aligning` fail cleanly with `503 Service
-Unavailable` and a short `Retry-After`. ApiService's private construction reads
-remain allowed when StorageService publishes a usable API DB generation.
+An ordinary Resync `reset` preserves `api_db_reads`, including
+`AwaitingInitial` or `AwaitingReplacement`. A Rebuild `reset` changes any of
+`AwaitingInitial`, `Available`, or `AwaitingReplacement` to
+`ClosedForRebuild { candidate: None }`; a repeated Rebuild reset clears any
+candidate from the superseded attempt. During Rebuild, public database-backed
+requests in `PreSeal`, `Constructing`, and `Aligning` fail cleanly with `503
+Service Unavailable` and a short `Retry-After`. Private construction remains
+pending until Supervisor supplies the validated replacement with `Rebuild`
+installation context.
 
-On ordinary initialized startup, the initial wait installs the first usable
-generation and the normal Resync reset preserves it. A coherent network-bound
-Empty database may likewise supply that initial generation; its valid anchored
-requests produce ordinary typed anchor-unavailability outcomes. If the initial
-Resync then leads to a distinct Rebuild run under the
+On ordinary initialized startup, Supervisor's initial `Ordinary` installation
+provides the first usable generation and the normal Resync reset preserves it.
+A coherent network-bound Empty database may likewise supply that initial
+generation; its valid anchored requests produce ordinary typed
+anchor-unavailability outcomes. If the initial Resync then leads to a distinct
+Rebuild run under the
 [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled),
-that run's Rebuild reset closes public database reads as above. If the reset
-wins the race with initial acquisition, the late initial completion cannot
-escape `ClosedForRebuild`.
+that run's Rebuild reset closes public database reads as above. An obsolete
+`Ordinary` installation arriving after that reset cannot populate the Rebuild
+candidate or escape `ClosedForRebuild`.
 
-ApiService never rebinds an in-flight public request to whatever API DB
-generation StorageService most recently published. A Rebuild construction
-captures its replacement generation privately; only activation installs that
-exact generation as `Available` for later public database-backed requests. If
-`reset` processing lags behind storage replacement, retirement of the
-previously installed generation still makes new database phases fail rather
-than crossing into the replacement generation.
+ApiService never rebinds an in-flight public request to a newly installed API
+DB generation. A Rebuild construction captures the installed candidate
+privately; only activation installs that exact generation as `Available` for
+later public database-backed requests. If `reset` processing lags behind
+storage replacement, retirement of the previously installed generation still
+makes new database phases fail rather than crossing into the replacement
+generation.
 
 StorageService, rather than `reset`, owns database-replacement exclusion. Its
 [replacement gate](storage.md#api-read-exclusion-during-database-replacement--settled)
@@ -1452,10 +1476,10 @@ remaining delivery of detached responses.
 
 After Rebuild, public database-backed reads reopen only when alignment
 completes and the replacement publication becomes Active; that activation
-changes `ClosedForRebuild` to `Available` with the candidate's privately
-captured client. Processing does not wait for that publication. An ordered
-Live marker changes the sticky target or the Active publication state without
-another database load or graph revision.
+changes `ClosedForRebuild { candidate: Some(client) }` to `Available(client)`.
+Processing does not wait for that publication. An ordered Live marker changes
+the sticky target or the Active publication state without another database
+load or graph revision.
 
 The storage owner defines the `TRUNCATE`/MVCC safety requirement and detailed
 gate boundary. `reset` does not participate in that exclusion mechanism.

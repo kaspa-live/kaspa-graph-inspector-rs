@@ -21,6 +21,7 @@ StorageService
     -> initialize or migrate when authorized
     -> validate schema, network binding, and processing state
     -> publish Arc<ValidatedDbClient>
+    -> publish Arc<ValidatedApiDbClient>
 ```
 
 Conceptual state and Supervisor-facing operations are:
@@ -95,9 +96,14 @@ the run. A replacement generation starts with fresh caches.
 
 `ValidatedApiDbClient` is the storage handle for the read-only pool required by
 the [API resource contract](api.md#resource-isolation-and-saturation--settled).
-It exposes no processing mutation or processing cache. ApiService obtains it
-through `wait_until_api_usable()`. Network binding, schema, and generation
-validation precede publication of either handle. StorageService owns API DB
+It exposes no processing mutation or processing cache.
+`wait_until_api_usable()` is its Supervisor-facing capability-publication
+operation; subsequent acquisition and forwarding belong to the
+[processing lifecycle](processing-lifecycle.md#api-session-replacement-and-publication).
+Network binding, schema, and generation validation precede publication of
+either handle. StorageService autonomously opens, reconnects, validates,
+retires, and republishes both pool generations; waiting for a handle only
+observes that lifecycle and never initiates it. StorageService owns API DB
 generation retirement and database-replacement exclusion; the
 [API lifecycle](api.md#reset-and-recovery-time-availability--settled) owns only
 public request availability and graph publication state.
@@ -159,8 +165,8 @@ replacement without bound.
 The exclusive permit remains held through the atomic replacement outcome and
 cache publication or generation retirement. StorageService publishes no
 replacement `ValidatedApiDbClient` until the database is again one coherent,
-validated generation. ApiService may then use that generation for private
-publication construction; its recovery state independently controls public
+validated generation. Subsequent orchestration belongs to the linked
+processing and API lifecycle owners; publication itself does not open public
 historical-request availability.
 
 If replacement uses PostgreSQL `TRUNCATE`, transactional rollback does **not**

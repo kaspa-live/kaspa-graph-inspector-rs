@@ -609,6 +609,23 @@ anchor with the already constructed threshold and exact clients to publish
 
 ### API session replacement and publication
 
+Supervisor owns API database-capability acquisition. At startup it maintains
+one nonblocking wait on `StorageService::wait_until_api_usable()` and passes the
+result to `ApiService::install_api_db_generation` with `Ordinary` context.
+The [StorageService lifecycle](storage.md#storageservice-lifecycle--settled)
+owns autonomous generation publication; Supervisor's wait only observes the
+published capability. ApiService never calls StorageService.
+
+When ApiService reports `ApiDbGenerationLost`, Supervisor ignores the event if
+Rebuild or shutdown has already made ordinary replacement obsolete. Otherwise
+it coalesces repeated notification into at most one ordinary replacement
+acquisition, waits for the next usable API generation, and installs it with
+`Ordinary` context. This path does not change processing recovery intent,
+invoke `reset`, replace a graph publication, or interrupt an advancing
+processing session. An acquisition result made obsolete by Rebuild, a newer
+acquisition, or shutdown is discarded instead of being relabeled for another
+purpose.
+
 For every processing run, Supervisor creates one fresh paired
 `GraphUpdateProducer` and `GraphUpdateReceiver`. It calls `ApiService::reset`
 with the receiver and current `RecoveryMode`, then calls
@@ -659,6 +676,15 @@ For Genesis, BlockProcessor emits that milestone while handling `BeginRebuild`
 under its [PP-boundary contract](block-processing.md#pp-boundary-phase-behavior--settled).
 ResyncEngine handles it through the same forwarding path, including
 Supervisor's `Rebuild -> Resync` downgrade.
+
+`PpBoundarySealed` also authorizes Supervisor to wait for the coherent API
+generation published after database replacement and install it with `Rebuild`
+context. This wait is distinct from and supersedes any outstanding ordinary
+acquisition. `PublishPostSeal` may already be queued or delivered; ApiService
+keeps construction pending until the Rebuild generation is installed. The
+installed handle remains private to construction, and the API owner alone
+opens public database-backed reads when the replacement publication becomes
+Active.
 
 When the global Live conditions are satisfied, ResyncEngine sends the existing
 processor Live commands and emits `EnteredLive`. The BlockProcessor marker
@@ -925,7 +951,9 @@ On Deactivate, ResyncEngine performs this barrier in order:
 
 The owning services may retain their validated generations after Deactivate.
 For global shutdown, Supervisor first enters terminal shutdown and starts no
-new recovery attempt. It starts `ApiService::shutdown` and
+new recovery attempt. It cancels and joins any Supervisor-owned API DB
+acquisition without installing its result. It then starts
+`ApiService::shutdown` and
 `ResyncEngine::shutdown` without waiting for either method to complete before
 starting the other. It awaits both completed method barriers before calling
 `NodeService::shutdown` and then `StorageService::shutdown`. This releases every

@@ -891,25 +891,30 @@ advancing Active publication.
 
 Verify `ApiDbReadState` independently from graph publication. From an Active
 publication with `Available(G1)`, make a public database operation report
-`GenerationLost`: that request returns `503`, exactly one replacement wait
-starts, and later database-backed requests remain unavailable until `G2` is
-installed for future requests. An in-flight request never switches or retries
-generations; stale `G1` loss reports and stale replacement completions cannot
+`GenerationLost`: that request returns `503`, ApiService emits exactly one
+`ApiDbGenerationLost` event, and Supervisor starts exactly one ordinary
+replacement wait. Later database-backed requests remain unavailable until
+Supervisor installs `G2`. An in-flight request never switches or retries
+generations; stale `G1` loss reports and obsolete acquisition results cannot
 displace `G2`. Adoption leaves publication ID, state, view and history
 revisions, and SSE cursor unchanged. Ordinary Resync preserves both Available
 and AwaitingReplacement states. A racing Rebuild reset wins by entering
-`ClosedForRebuild`; no ordinary completion can reopen reads, and only
-activation of the rebuilt candidate installs its privately captured generation.
+`ClosedForRebuild`; an `Ordinary` installation cannot reopen reads or populate
+its candidate, and only activation of the rebuilt candidate installs its
+privately captured generation.
 
 Cover initial API database acquisition separately. ApiService starts in
-`AwaitingInitial`, owns exactly one `wait_until_api_usable()` task, and returns
-`503` for public database-backed requests until that task installs
-`Available(G1)`. An ordinary initialized startup followed by `reset(Resync)`
+`AwaitingInitial`, Supervisor owns exactly one nonblocking
+`wait_until_api_usable()` task, and database-backed requests return `503` until
+Supervisor installs `G1` with `Ordinary` context. Prove ApiService never calls
+StorageService and StorageService reconnects and publishes generations without
+an API request. An ordinary initialized startup followed by `reset(Resync)`
 preserves `G1`; neither initial installation nor reset changes a graph
 publication. For an Empty database, allow initial `Available(G1)` and typed
 anchor misses, then verify the distinct Rebuild reset enters
-`ClosedForRebuild`. Also race that reset ahead of initial-wait completion and
-prove the late completion cannot reopen public reads.
+`ClosedForRebuild { candidate: None }`. Race that reset ahead of initial
+acquisition completion and prove the obsolete `Ordinary` result cannot reopen
+public reads.
 
 Verify [Reset and recovery-time availability](api.md#reset-and-recovery-time-availability--settled)
 with ordinary Resync and Rebuild integration scenarios. Verify the fresh
@@ -922,9 +927,12 @@ StorageService rather than `reset` to close API database admission, retire the
 old API generation, and boundedly drain or cancel active database phases.
 Verify a detached old projection may complete delivery while
 an undetached request returns 503, public reads reopen only after the aligned
-replacement becomes Active, no in-flight request rebinds to a newly published
-storage generation, and no request observes a partial or mixed generation,
-including with PostgreSQL `TRUNCATE`. Verify ordinary sender
+replacement becomes Active, and `PpBoundarySealed` causes Supervisor to
+acquire and install the replacement with `Rebuild` context. Cover
+`PublishPostSeal` arriving before that installation and construction remaining
+pending. No in-flight request rebinds to a newly published storage generation,
+and no request observes a partial or mixed generation, including with
+PostgreSQL `TRUNCATE`. Verify ordinary sender
 teardown may close the installed receiver, channel closure is not a lifecycle
 signal, and a marker worker with an accepted delivery may outlive
 BlockProcessor Deactivate without retaining an RPC or DB client, then exits
@@ -941,6 +949,9 @@ Supervisor starts ApiService and ResyncEngine shutdown without waiting for one
 to complete before starting the other, awaits both method barriers, and only
 then calls NodeService shutdown followed by StorageService shutdown. Producer
 closure during that barrier requests no reconstruction or processing recovery.
+An outstanding initial, ordinary replacement, or Rebuild API DB acquisition is
+cancelled and joined without installing its result before component shutdown
+continues.
 
 Graph-update and API projection tests cover a non-Genesis block whose selected
 parent index addresses the expected member of `direct_parents`, plus Genesis
