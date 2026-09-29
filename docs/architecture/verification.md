@@ -969,10 +969,15 @@ after delivery or receiver replacement.
 Verify the [ApiService shutdown barrier](api.md#apiservice-shutdown--settled)
 from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`, and `Active`, including
 races with `reset`, marker delivery, gap reconstruction, database projection,
-serialization, detached response delivery, and SSE wakeups. Admission and SSE
-close first; the graph receiver drop unblocks a waiting marker worker; every
-API task and database resource ends before method completion; no publication
-or revision mutation is emitted; and repeated `shutdown` is idempotent.
+serialization, detached response delivery, SSE wakeups, and API-generation
+publication on either side of Supervisor's terminal-shutdown cutoff. An update
+completed before the cutoff is cleared by shutdown; an event observed after
+the cutoff is discarded without an `update_api_db_generation` call, and a
+direct update call after ApiService shutdown begins is rejected. Admission and
+SSE close first; the graph receiver drop unblocks a waiting marker worker;
+every API task and database resource ends before method completion; no
+publication or revision mutation is emitted; and repeated `shutdown` is
+idempotent.
 Supervisor starts ApiService and ResyncEngine shutdown without waiting for one
 to complete before starting the other, awaits both method barriers, and only
 then calls NodeService shutdown followed by StorageService shutdown. Producer

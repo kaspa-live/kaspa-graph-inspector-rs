@@ -1512,7 +1512,9 @@ the local barrier in order:
 
 Successful method completion proves that no API admission, task, graph-update
 receiver, or API database resource remains. A repeated `shutdown` returns
-success for the already completed state; no `reset` is accepted after shutdown begins. Exact
+success for the already completed state. Once shutdown begins, ApiService
+accepts neither `reset` nor `update_api_db_generation`; an update completed
+before shutdown began is subsequently cleared by the shutdown barrier. Exact
 shutdown timeouts and forced escalation remain deferred under the shared
 shutdown policy.
 

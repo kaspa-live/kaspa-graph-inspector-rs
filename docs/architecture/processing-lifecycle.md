@@ -651,9 +651,11 @@ generation-loss event.
 
 Supervisor does not start, coalesce, cancel, or classify API-generation
 acquisition tasks. Forwarding a generation event changes neither processing
-recovery intent nor the current processing run. Shutdown stops forwarding only
-after ApiService completes its shutdown barrier; StorageService is shut down
-later under the global teardown order.
+recovery intent nor the current processing run. Supervisor's transition into
+terminal shutdown is the forwarding cutoff: it starts no new
+`update_api_db_generation` call after that transition. StorageService is shut
+down later under the global teardown order, and its subsequent events follow
+the drain-and-discard rule below.
 
 For every processing run, Supervisor creates one fresh paired
 `GraphUpdateProducer` and `GraphUpdateReceiver`. It calls `ApiService::reset`
