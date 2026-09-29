@@ -242,6 +242,10 @@ Use injected clocks and deterministic jitter to verify the independent
 sequences: nominal exponential slots through the 30-second cap, reset only
 after 60 seconds continuously Ready, shutdown cancellation, and terminal
 rejection without retry. Exercise the inclusive 50% through 100% jitter range.
+Install the reliable ordered `StorageServiceEvent` path before either initial
+DB generation can be published. Verify initial and replacement processing and
+API publications, exact-`Arc` retirements, suppression of repeated retirement,
+and a terminal `Rejected` event without relying on lossy status.
 
 ## Domain, storage, and PostgreSQL
 
@@ -272,7 +276,9 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
    the database. Unknown tables are never claimed or destroyed, and neither
    form can expose a partially recreated schema.
 6. Advisory-lock contention rejects with `DatabaseAlreadyInUse`, and lock loss
-   retires the DB generation. Compatible v2 migrations are ordered,
+   retires both DB generations and emits their exact retirement events without
+   directly changing processing-session or API publication state. Compatible
+   v2 migrations are ordered,
    transactional, revalidated, and finish before client publication. Cover
    newer-schema and v1/unsupported rejection, failed migration without client
    publication, and the prohibition on automatic down or online migration.
@@ -379,8 +385,10 @@ nonretryable failure with proven rollback maps to `DefiniteFailure` without
 retiring a still-valid generation; connection loss before commit maps to
 `ServiceGenerationLost(Storage)` and retires it; connection loss with unknown
 commit outcome maps to `AmbiguousCommit`, publishes no cache state, performs no
-local retry, and retires it. Exercise both actual commit and rollback behind
-that ambiguous result and require the replacement generation to derive the
+local retry, and retires it. Each retirement emits exactly one
+`ProcessingDbRetired`, and the validated replacement emits
+`ProcessingDbPublished`. Exercise both actual commit and rollback behind that
+ambiguous result and require the replacement generation to derive the
 resulting database truth. Retry exhaustion leaves the generation valid.
 
 ## Recovery lifecycle and Catchup
@@ -490,6 +498,11 @@ together. Required cases are:
 Verify the [fault and retry policy](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
 with injected clocks and deterministic jitter:
 
+- `ProcessingDbPublished(G1)` supplies the exact DB client for a new session
+  but never rebinds an existing one; `ProcessingDbRetired(G1)` clears only the
+  matching Supervisor binding and requests at most one deactivation when an
+  operation fault reports the same loss concurrently; a later
+  `ProcessingDbPublished(G2)` is retained until the engine is Idle;
 - every persistence-fault row in recovery and Live, including Fatal
   `DefiniteFailure`, retained Resync and Rebuild obligations, DB-generation
   retention versus retirement, complete session teardown, and the prohibition
@@ -902,15 +915,16 @@ Verify `ApiDbState` independently from graph publication. Install the reliable
 StorageService-to-Supervisor event path before initial generation publication.
 ApiService starts with no current client and public reads enabled, so a
 database-backed request returns `503`. StorageService publishes `G1`, emits
-`Published(G1)`, Supervisor forwards it through
-`update_api_db_generation`, and ApiService adopts it without changing
-publication ID, state, view or history revisions, or SSE cursor. An ordinary
-Resync preserves both local fields.
+`ApiDbPublished(G1)`, and Supervisor maps it to `Published(G1)` for
+`update_api_db_generation`. ApiService adopts it without changing publication
+ID, state, view or history revisions, or SSE cursor. An ordinary Resync
+preserves both local fields.
 
 From an Active publication using `G1`, make a public database operation report
 `GenerationLost`. StorageService must atomically retire `G1`, emit exactly one
-ordered `Retired(G1)`, start autonomous reacquisition, and later emit
-`Published(G2)` without an ApiService request. The failed operation returns
+ordered `ApiDbRetired(G1)`, start autonomous reacquisition, and later emit
+`ApiDbPublished(G2)` without an ApiService request. Supervisor maps those to
+the corresponding API control events. The failed operation returns
 `503` and clears `G1` locally when it is still current; forwarding the retirement
 is idempotent. A late `Retired(G1)` after `G2` cannot clear `G2`, and an in-flight
 operation never switches or retries generations. Exercise the same loss from a
@@ -920,7 +934,7 @@ no reverse generation-loss event and Supervisor creates no acquisition task.
 
 For Rebuild, verify `reset(Rebuild)` disables public reads without clearing the
 current client. StorageService retirement prevents the old client from reading
-replaced contents, emits `Retired`, and autonomously publishes the coherent
+replaced contents, emits `ApiDbRetired`, and autonomously publishes the coherent
 replacement. Supervisor forwards both events in order. `Published(G2)` makes
 `G2` available to construction while public reads remain disabled; replacement
 publication activation enables reads. If the current generation is lost after
@@ -963,8 +977,10 @@ Supervisor starts ApiService and ResyncEngine shutdown without waiting for one
 to complete before starting the other, awaits both method barriers, and only
 then calls NodeService shutdown followed by StorageService shutdown. Producer
 closure during that barrier requests no reconstruction or processing recovery.
-StorageService may continue its autonomous API generation lifecycle until its
-later shutdown barrier.
+StorageService may continue either autonomous DB generation lifecycle until
+its later shutdown barrier. Supervisor drains and discards its reliable events
+after terminal shutdown rather than starting recovery or forwarding another
+API generation.
 
 Graph-update and API projection tests cover a non-Genesis block whose selected
 parent index addresses the expected member of `direct_parents`, plus Genesis

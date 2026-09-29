@@ -24,7 +24,7 @@ StorageService
     -> publish Arc<ValidatedApiDbClient>
 ```
 
-Conceptual state and Supervisor-facing operations are:
+Conceptual state, lifecycle events, and Supervisor-facing operations are:
 
 ```rust
 enum StorageServiceState {
@@ -49,16 +49,15 @@ struct StorageServiceStatus {
     state: StorageServiceStatusState,
 }
 
-enum ApiDbGenerationEvent {
-    Retired(Arc<ValidatedApiDbClient>),
-    Published(Arc<ValidatedApiDbClient>),
+enum StorageServiceEvent {
+    ProcessingDbRetired(Arc<ValidatedDbClient>),
+    ProcessingDbPublished(Arc<ValidatedDbClient>),
+    ApiDbRetired(Arc<ValidatedApiDbClient>),
+    ApiDbPublished(Arc<ValidatedApiDbClient>),
+    Rejected(StorageRejection),
 }
 
 impl StorageService {
-    async fn wait_until_usable(
-        &self,
-    ) -> Result<Arc<ValidatedDbClient>, StorageWaitError>;
-
     async fn initialize_if_uninitialized(
         &self,
         network_id: NetworkId,
@@ -69,13 +68,16 @@ impl StorageService {
 }
 ```
 
-`wait_until_usable()` waits through transient `Connecting`,
-`AwaitingInitialization`, and `Unavailable` states.
 `AwaitingInitialization` means StorageService has opened, locked, and inspected
 a never-initialized database but cannot yet publish it as usable. The state
 remains pending until initialization is authorized and a validated node
-identity supplies the complete immutable network binding. Permanent
-`Rejected`, `Stopped`, or closed service state is returned to the caller.
+identity supplies the complete immutable network binding.
+`initialize_if_uninitialized` performs the authorized atomic transition from
+`Uninitialized` when required. For an already compatible `Empty`,
+`Initialized`, or `Inconsistent` database it is an idempotent no-op; it never
+rebinds or erases that database. Its successful return does not carry a
+validated client: usable generations are published only through the ordered
+event stream.
 Service state outlives individual validated DB generations.
 `shutdown` is terminal and idempotent; successful completion means
 StorageService is `Stopped` and has released its owned pools, database lock,
@@ -95,19 +97,32 @@ the [API resource contract](api.md#resource-isolation-and-saturation--settled).
 It exposes no processing mutation or processing cache.
 Network binding, schema, and generation validation precede publication of
 either handle. StorageService autonomously opens, reconnects, validates,
-retires, and republishes both pool generations. It emits one reliable ordered
-`ApiDbGenerationEvent::Published` after each initial or replacement API
-generation becomes usable, and one `Retired` event when it retires the current
-API generation because of Rebuild or a generation-level query/pool failure.
-Repeated failure reports for an already retired handle emit no duplicate event
-or replacement attempt. A replacement is a newly validated generation and is
-never a republication of the retired `Arc`.
+retires, and republishes both pool generations. It reports every lifecycle
+transition through one reliable ordered `StorageServiceEvent` stream. The
+event path must be installed before StorageService can publish either initial
+generation or enter `Rejected`.
 
-StorageService owns the complete API DB generation lifecycle: retirement
-immediately starts autonomous reconnection and validation, without a request
-from Supervisor or ApiService. Events report the resulting state transition;
-they do not initiate it. Event-path installation and forwarding belong to the
-[processing lifecycle](processing-lifecycle.md#api-session-replacement-and-publication).
+`ProcessingDbPublished` and `ApiDbPublished` carry the newly usable exact
+generation. `ProcessingDbRetired` and `ApiDbRetired` carry the exact generation
+that ceased to be usable. Repeated failure reports for an already retired
+handle emit no duplicate retirement event or replacement attempt. A
+replacement is newly validated and never republishes a retired `Arc`. For each
+pool kind, StorageService never publishes a different generation while the
+currently published generation remains usable; replacement publication follows
+retirement of the prior generation.
+`Rejected` reports the terminal service state and its typed reason; status
+observation alone never substitutes for that event.
+Entering `Rejected` retires any currently published processing and API
+generations, emits their retirement events first, and then emits `Rejected`.
+For an operation-detected generation failure, StorageService completes the
+retirement and enqueues its event before returning the corresponding typed
+operation error.
+
+StorageService owns both generation lifecycles: retirement immediately starts
+autonomous reconnection and validation, without a request from Supervisor,
+ResyncEngine, or ApiService. Events report transitions; they do not initiate
+them. Supervisor event handling and API forwarding belong to the
+[processing lifecycle](processing-lifecycle.md#processing-session-and-resource-acquisition--settled).
 StorageService also owns database-replacement exclusion; the
 [API lifecycle](api.md#reset-and-recovery-time-availability--settled) owns only
 its local generation binding, public request availability, and graph
@@ -135,7 +150,8 @@ configuration.
 A connection-level storage failure retires the validated generation, but does
 not retroactively revoke independent operations already in flight. The
 [processing lifecycle](processing-lifecycle.md) owns the resulting session
-termination. Each operation reports its actual outcome:
+termination. Retirement emits the applicable exact-generation event before a
+replacement can be published. Each operation reports its actual outcome:
 
 - a definitely committed transaction remains successful and authoritative;
 - connection loss before commit with a proven rollback is
@@ -162,7 +178,7 @@ Before `rebuild_from_pruning_point` clears or replaces processing data,
 StorageService atomically closes new API DB admission, retires the current
 `ValidatedApiDbClient` generation, and boundedly drains or cancels all database
 phases that still hold shared permits. Retirement emits the ordered
-`ApiDbGenerationEvent::Retired` and starts autonomous replacement of the API
+`StorageServiceEvent::ApiDbRetired` and starts autonomous replacement of the API
 pool. StorageService then acquires the exclusive replacement permit. A request
 that detached its projection before closure may finish returning that old
 coherent image. Every other affected request fails cleanly through the API as
@@ -171,7 +187,7 @@ coherent image. Every other affected request fails cleanly through the API as
 The exclusive permit remains held through the atomic replacement outcome and
 cache publication or generation retirement. StorageService publishes no
 replacement `ValidatedApiDbClient` until the database is again one coherent,
-validated generation. It then emits `ApiDbGenerationEvent::Published` for that
+validated generation. It then emits `StorageServiceEvent::ApiDbPublished` for that
 generation. Subsequent forwarding and public-read admission belong to the
 linked processing and API lifecycle owners; publication itself does not open
 public historical-request availability.
@@ -274,11 +290,14 @@ contract below.
 StorageService acquires a dedicated PostgreSQL session advisory lock before
 initialization, migration, or validation and holds it throughout the
 validated-client lifetime. It rechecks state under that lock before first
-initialization. Losing the lock connection retires the client and active
-processing session; no replacement client is published until StorageService
-reconnects and reacquires the lock. Failure to acquire the lock is terminal
-`Rejected(DatabaseAlreadyInUse)`. Process-local mutation guards and lane locks
-cannot replace this database-wide ownership proof.
+initialization. Losing the lock connection retires the current processing
+and API generations and emits both exact retirement events; the processing
+lifecycle alone owns termination of a session using the processing generation.
+No replacement generation is published until StorageService reconnects and
+reacquires the lock. Failure to acquire the lock enters terminal
+`Rejected(DatabaseAlreadyInUse)` and emits the corresponding `Rejected` event.
+Process-local mutation guards and lane locks cannot replace this database-wide
+ownership proof.
 
 Schema migration versioning belongs to the selected migration framework's own
 table, outside `NodeMetadata`. Under the advisory lock and before publishing a
@@ -800,6 +819,9 @@ threshold; its committed boundary is intrinsically sealed.
 Storage does not emit `PpBoundarySealed`. A successful rebuild commit alone
 does not consume Supervisor's retained Rebuild requirement; the processing
 lifecycle owns the subsequent exact-once milestone and recovery-intent change.
+A definite successful rebuild replaces the database contents and publishes the
+new processing caches within the same `ValidatedDbClient` generation. It emits
+no processing-generation retirement or publication event.
 
 ### Failure outcomes
 
@@ -812,10 +834,11 @@ publishes no replacement cache state, and returns the typed database error.
 
 If commit acknowledgement is lost, the outcome is ambiguous. The method does
 not report success, publish cache changes, or retry blindly.
-StorageService reports `Persistence(AmbiguousCommit)` and retires the current
-`ValidatedDbClient` generation so a replacement generation rederives database
-truth. The processing lifecycle owns session termination, the retained Rebuild
-obligation, and the resulting recovery disposition.
+The operation returns `Persistence(AmbiguousCommit)`. StorageService retires
+the current `ValidatedDbClient`, emits `ProcessingDbRetired`, and derives the
+replacement generation from database truth. The processing lifecycle owns
+session termination, the retained Rebuild obligation, and the resulting
+recovery disposition.
 
 The [processing lifecycle](processing-lifecycle.md) owns when this operation
 may start. Storage owns both API-read exclusion and the atomic replacement.
@@ -1212,10 +1235,10 @@ it never substitutes for an unavailable anchor.
 
 A query failure that leaves the pool generation usable reports `QueryFailed`.
 Loss of this API pool generation atomically retires that handle, emits the
-ordered `ApiDbGenerationEvent::Retired`, starts autonomous reacquisition, and
+ordered `StorageServiceEvent::ApiDbRetired`, starts autonomous reacquisition, and
 reports `GenerationLost` to the operation without retiring the independent
 processing handle. Publication of the validated replacement emits
-`ApiDbGenerationEvent::Published`. A structurally incomplete or internally
+`StorageServiceEvent::ApiDbPublished`. A structurally incomplete or internally
 incoherent result reports `InconsistentProjection`; it never returns a partial
 seed. The [ApiService construction contract](api.md#head-publication-lifecycle-and-stream-alignment--settled)
 owns those errors during Head construction; the

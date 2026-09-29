@@ -41,7 +41,7 @@ BlockProcessor/VspcProcessor
     ── per-session ordered graph updates ──► ApiService
 BlockProcessor ── lifecycle markers ──► ApiService
 ResyncEngine ── lifecycle milestones ──► Supervisor
-StorageService ── API DB generation retired/published ──► Supervisor
+StorageService ── ordered DB generation events ──► Supervisor
 Supervisor ── update API DB generation / reset / shutdown ──► ApiService
 ```
 
@@ -130,10 +130,11 @@ only their sender handles to `kgi-node`. Their payload types belong to
 `kgi-processing`.
 
 `kgi-storage` implements StorageService, validated database clients,
-persistence, the API generation event value, and the API projection read
-against `kgi-api-model` contracts. It must not depend on `kgi-api-core` or
-`kgi-api-ingress`. `kgi-api-core` owns
-ApiService, graph publication behavior, HTTP/SSE, and API runtime state.
+persistence, `StorageServiceEvent`, and the API projection read against
+`kgi-api-model` contracts. It must not depend on `kgi-api-core` or
+`kgi-api-ingress`. `kgi-api-core` owns ApiService,
+`ApiDbGenerationEvent`, graph publication behavior, HTTP/SSE, and API runtime
+state.
 `kgi-processing` owns ResyncEngine and the processing workers, consumes the
 graph-update producer, and does not depend on `kgi-api-core`.
 
@@ -150,8 +151,10 @@ deferred in the
 - Internal lifecycle control flows from parent to child.
 - Reliable faults and milestones flow from child to parent.
 - Managed sibling components do not acquire one another's validated service
-  generations. An owning service publishes generation events to Supervisor,
-  which forwards the capability through the consumer's public control surface.
+  generations. StorageService publishes both DB generation lifecycles to
+  Supervisor. Supervisor retains the current processing generation only for a
+  future `ProcessingSession` and maps API-generation events through
+  ApiService's public control surface.
 - Data channels connect the explicit producers and consumers shown above;
   they do not create lifecycle ownership.
 - The exact validated RPC and DB generations acquired for a processing run

@@ -1326,9 +1326,14 @@ implementation, and graph wire format remain deferred in the
 
 ### API database generation binding — settled
 
-ApiService maintains only this local database state:
+ApiService owns its generation-update control value and local database state:
 
 ```rust
+enum ApiDbGenerationEvent {
+    Retired(Arc<ValidatedApiDbClient>),
+    Published(Arc<ValidatedApiDbClient>),
+}
+
 struct ApiDbState {
     current: Option<Arc<ValidatedApiDbClient>>,
     public_reads_enabled: bool,
@@ -1338,7 +1343,8 @@ struct ApiDbState {
 It initializes as `current = None` and `public_reads_enabled = true`.
 StorageService owns generation retirement and autonomous replacement under the
 [storage lifecycle](storage.md#storageservice-lifecycle--settled). Supervisor
-forwards each ordered `ApiDbGenerationEvent` through the control method below;
+maps StorageService's ordered API-generation variants to
+`ApiDbGenerationEvent` and forwards them through the control method below.
 ApiService never calls StorageService, requests reacquisition, or emits a
 generation-loss event.
 

@@ -23,22 +23,41 @@ struct ProcessingSession {
     db: Arc<ValidatedDbClient>,
     graph_updates: GraphUpdateProducer,
 }
+
+struct SupervisorStorageState {
+    processing_db: Option<Arc<ValidatedDbClient>>,
+}
 ```
 
-Supervisor waits for usable node and storage generations only when a recovery
-is desired and the engine is idle. The two waits are polled concurrently with
-Supervisor method requests and incoming events; the Supervisor main loop must
-not block.
+Supervisor installs the reliable ordered `StorageServiceEvent` path before
+StorageService can publish either initial database generation or reject the
+database. It initializes `processing_db = None`.
+`ProcessingDbPublished(client)` sets it to that exact client.
+`ProcessingDbRetired(client)` clears it only when it still holds that exact
+`Arc`; a late retirement cannot clear a newer generation. `Rejected(reason)`
+is a terminal StorageService failure and enters Supervisor's Fatal lifecycle.
+The API variants follow the forwarding contract below.
 
-Partial acquisition may be retained while waiting for the other resource.
+StorageService events are the sole authority for Supervisor's processing DB
+binding. Supervisor never requests publication or reconnection and does not
+call a DB-generation wait operation. StorageService autonomously replaces a
+retired generation; Supervisor retains a published replacement for the next
+processing run and never injects it into an existing `ProcessingSession`.
+
+Supervisor waits for a usable node generation only when recovery is desired
+and the engine is idle. That wait is polled concurrently with Supervisor
+method requests and incoming events; the Supervisor main loop must not block.
+The acquired RPC client may be retained while `processing_db` is absent.
 StorageService can open, lock, and inspect an Uninitialized database while the
 node wait continues. Once the validated RPC generation is available,
-Supervisor supplies its `(network_id, genesis_hash)` to StorageService for the
-authorized atomic first initialization. StorageService alone performs the
-`Uninitialized -> Empty` transition and publishes the resulting DB generation.
+Supervisor supplies its `(network_id, genesis_hash)` through the idempotent
+`initialize_if_uninitialized` operation when initialization is authorized.
+StorageService alone performs any required `Uninitialized -> Empty` transition
+and later publishes the resulting DB generations through its event stream.
 Before starting, recheck that the captured recovery obligation is still the
-latest `desired_recovery`, the engine is Idle, and both services still publish
-those exact acquired RPC and DB `Arc` generations as Ready.
+latest `desired_recovery`, the engine is Idle, NodeService still publishes the
+exact acquired RPC `Arc` as Ready, and `processing_db` still holds the exact DB
+`Arc` selected for the run.
 
 The exact `Arc<ValidatedRpcClient>`, `Arc<ValidatedDbClient>`, and session
 `GraphUpdateProducer` are passed through `ResyncEngine::start` and then through the session to
@@ -49,6 +68,13 @@ Before calling `start`, require the validated node's `(network_id,
 genesis_hash)` to equal the immutable binding exposed by that DB generation.
 A mismatch is terminal pairing rejection: never rebind the database or infer
 that Rebuild can repair it.
+
+When `ProcessingDbRetired(client)` names the DB generation used by the active
+session, Supervisor applies the existing generation-loss disposition exactly
+once: active recovery retains its current obligation and retries after
+deactivation; Live establishes `Require(Resync)`. A concurrent operation may
+report the same loss first. The operation fault and retirement event coalesce,
+request at most one deactivation, and never weaken `desired_recovery`.
 
 ## Supervisor and recovery intent — settled
 
@@ -303,13 +329,15 @@ the corresponding `DuplicateChainMember` or `RemovedAddedIntersection`
 variant. Apply the same recovery-response or notification-source disposition
 defined above; storage does not decide it.
 
-When the same validated RPC and DB generations remain Ready, whole-attempt
-recovery retries use nominal delays `1s, 2s, 4s, 8s, 16s, 30s`, capped at
-`30s`, with equal jitter from 50% through 100%. Reset that general backoff on
-`EnteredLive`, a new validated RPC or DB generation, or a stronger recovery
-obligation. Generation loss waits for the corresponding service reconnect
-loop without adding this delay. `Require(Resync)` and `Require(Rebuild)` do not
-consume or wait on the Retry sequence. All waits are lifecycle-cancellable.
+When the same validated RPC remains Ready and Supervisor still holds the same
+published processing DB generation, whole-attempt recovery retries use nominal
+delays `1s, 2s, 4s, 8s, 16s, 30s`, capped at `30s`, with equal jitter from 50%
+through 100%. Reset that general backoff on `EnteredLive`, a new validated RPC
+generation, `ProcessingDbPublished` with a new DB generation, or a stronger
+recovery obligation. RPC generation loss waits for NodeService reconnection;
+DB generation loss waits for `ProcessingDbPublished`. Neither adds this delay.
+`Require(Resync)` and `Require(Rebuild)` do not consume or wait on the Retry
+sequence. All waits are lifecycle-cancellable.
 
 Malformed recovery RPC responses use a separate shared budget across
 `MalformedPruningPointResponse`, `MalformedCatchupSinkResponse`,
@@ -355,8 +383,10 @@ lifecycle applies this exhaustive persistence-fault policy:
 
 `ServiceGenerationLost(Storage)` aborts active recovery with `Retry` while
 retaining its current obligation; in Live it requires Resync. Both it and
-`AmbiguousCommit` wait for StorageService replacement rather than reusing the
-retired generation, without adding the general recovery Retry delay.
+`AmbiguousCommit` wait for a later `ProcessingDbPublished` event rather than
+reusing the retired generation, without adding the general recovery Retry
+delay. Their operation faults coalesce with the exact-generation retirement
+event as defined by the session-acquisition contract.
 
 Every `Retry` or `Require` row performs ordinary complete session teardown; it
 never reissues the failed operation. An ambiguous Rebuild transaction or an
@@ -610,10 +640,11 @@ anchor with the already constructed threshold and exact clients to publish
 ### API session replacement and publication
 
 The [StorageService lifecycle](storage.md#storageservice-lifecycle--settled)
-owns API database-generation retirement, autonomous reacquisition, and the
-reliable ordered `ApiDbGenerationEvent` stream. Supervisor installs that event
-path before StorageService can publish its initial API generation and forwards
-each `Retired` or `Published` event in order through
+owns API database-generation retirement and autonomous reacquisition. From the
+already installed ordered `StorageServiceEvent` stream, Supervisor maps
+`ApiDbRetired(client)` to `ApiDbGenerationEvent::Retired(client)` and
+`ApiDbPublished(client)` to `ApiDbGenerationEvent::Published(client)`, then
+forwards each result in order through
 `ApiService::update_api_db_generation`. This is a normal downward control call,
 like `reset`; ApiService never calls StorageService and sends no reverse
 generation-loss event.
@@ -952,7 +983,10 @@ new recovery attempt. It then starts `ApiService::shutdown` and
 starting the other. It awaits both completed method barriers before calling
 `NodeService::shutdown` and then `StorageService::shutdown`. This releases every
 processing and API client before their owning services stop and keeps
-StorageService last.
+StorageService last. Supervisor continues draining `StorageServiceEvent` until
+StorageService completes shutdown; after entering terminal shutdown it
+discards those events instead of starting recovery or forwarding a new API
+generation.
 
 Dropping the graph-update receiver during this coordinated barrier unblocks a
 marker worker awaiting lossless delivery. Resulting producer closure is
