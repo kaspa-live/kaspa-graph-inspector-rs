@@ -690,13 +690,14 @@ counters; and absence of source mutation, delta production, or history.
 
 Level-change cases cover create, update, remove, and no-net-change composition;
 application of `after` without validating `before`; a size-only external-level
-mutation; and DAA score changes. Every API delta carries its target
-`high_level` and no lower coverage object. Retain all deltas whose `high_level`
-remains in the retained head window, including multiple revisions at one
-level, and make them eligible for pruning only after that level leaves the
-window. Cover indivisible aggregated entries, longest-prefix pruning, derived
-oldest available revision, and unchanged current revision. No count or byte
-pressure may prune history earlier.
+mutation; and DAA score changes. Verify each delta carries the `high_level` of
+the lineage that owns its revision interval and carries no lower coverage
+object. Retain all Head deltas whose `high_level` remains in the retained head
+window, including multiple revisions at one level, and make them eligible for
+pruning only after that level leaves the window. Cover indivisible aggregated
+entries, longest-prefix pruning, derived oldest available revision, and
+unchanged current revision. No count or byte pressure may prune history
+earlier.
 
 Verify the [graph-view edge and absolute-map contract](api.md#graph-views-publication-revision-and-history--settled)
 with zero, one, and two endpoint blocks retained; Head child addition and
@@ -751,7 +752,12 @@ from a Head-extracted anchored window. Cover a fully contained extent, an empty
 projected mutation that still advances the Head cursor, blocks inside the
 extent, crossing edges with neither endpoint block present, nominal and
 external endpoint levels, and retained VSPC-membership and color changes. A raw
-Head delta must never be delivered as the projected response.
+Head delta must never be delivered as the projected response. Verify the
+initial extracted response supplies the source Head high level, every projected
+`GraphDelta.high_level` is the source Head high level at its returned `to`
+revision, the browser adopts it for pacing, and neither value changes the fixed
+effective bounds. An SSE wakeup alone must not change the browser's known Head
+level.
 
 Advance Head until the fixed lower bound leaves its nominal extent. Verify an
 indivisible crossing history entry is not projected, any earlier complete
@@ -759,10 +765,13 @@ prefix is returned and applied, and the browser then freezes. Also cover no
 valid prefix, publication replacement, Stale publication, and expired history.
 When a retained edge needs an unchanged endpoint level, fetch it from the
 current Head view; accept that this level can be newer than the returned
-cursor, but never use it for coverage or cursor decisions. Absence of that
-required level freezes only the browser fixed image. Head pruning removals
-outside the fixed projection are discarded without affecting Head or the
-browser image.
+cursor, but never use it for coverage or cursor decisions. Encode the
+synthesized absolute upsert as `before = None` and `after = Some(level)`, apply
+it successfully whether the browser previously lacked or retained that level,
+and do not interpret its `before` as an absence assertion. Verify enrichment
+occurs after canonical projected composition. Absence of that required level
+freezes only the browser fixed image. Head pruning removals outside the fixed
+projection are discarded without affecting Head or the browser image.
 
 Exercise the Fixed response budget after projection and endpoint-level
 enrichment. Cover a complete interval that fits, a largest complete-entry

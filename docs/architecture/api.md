@@ -669,7 +669,8 @@ result and do not participate in the head-publication state machine.
 
 The Head-extracted window path is separate. A window whose complete effective
 extent is extracted from the active Head publication carries that
-publication's ID and revision and can use the Head-bounded projection contract.
+publication's lineage metadata and can use the
+[Head-bounded projection contract](#head-bounded-fixed-delta-projection--settled).
 Database construction alone does not imply `Frozen`; that policy remains
 reserved for subview extraction.
 
@@ -893,20 +894,28 @@ already aggregated delta. Consecutive stored entries remain gapless by their
 outer interval boundaries; history neither requires nor reconstructs internal
 revision boundaries within an aggregate.
 
-`GraphDelta.high_level` is the target view's high level. It is retained in the
-internal history and included in the API delta payload. It is the semantic key
-for history pruning and lets the Web consume the target head level without
-deriving it from mutation contents. A delta does not carry `low_level` or a
-separate coverage object; explicit graph mutations drive the receiving view's
+`GraphDelta.high_level` is the high level of the revision lineage that owns the
+delta at `to_revision_id`. A canonical Head delta therefore carries the target
+Head high level. A delta from an internal Fixed lineage carries that Fixed
+view's high level. A Head-bounded projected delta still carries the source
+Head high level because its public cursor belongs to the Head publication;
+the receiving browser window keeps its fixed effective bounds. This field is
+retained in internal history, included in the API delta payload, provides the
+semantic key for Head-history pruning, and lets the Web consume the Head level
+without deriving it from mutation contents. A delta does not carry `low_level`
+or a separate coverage object; explicit graph mutations drive a Head view's
 lower-bound changes.
 
-`level_changes` contains only levels whose `size` or `daa_score` actually
-changed. `None` represents absence, so one shape covers creation, update, and
-removal. Application installs `after` without comparing the current value to
-`before`; `before` exists for composition. Gapless composition folds
-consecutive changes from the first `before` to the last `after` and omits a
-level whose composed change has no net effect. Because each change carries its
-pre-state, this composition does not require the starting view.
+In canonical and internal lineage deltas, `level_changes` contains only levels
+whose `size` or `daa_score` actually changed. There, `None` represents absence,
+so one shape covers creation, update, and removal. Application installs `after`
+without comparing the current value to `before`; `before` exists for
+composition. Gapless composition folds consecutive changes from the first
+`before` to the last `after` and omits a level whose composed change has no net
+effect. Because each change carries its pre-state, this composition does not
+require the starting view. Head-bounded projection has one explicit
+presentation-only use of `before = None` for an absolute endpoint-level upsert,
+owned by that projection contract below.
 
 Within the API graph model, `EdgeId` is the canonical immutable identity of a
 child-parent link. `GraphEdge` adds the complete coordinates required for
@@ -1131,9 +1140,11 @@ patch remain implementation choices under the wire-format decision.
 A public anchored window extracted from the active Head publication can follow
 that publication without acquiring its own server-side `GraphPublication` or
 `GraphHistory`. Its serialized response carries the Head `publication_id` and
-source revision together with its fixed effective level extent. A
-database-backed window has no such lineage and remains a non-updating
-serialized snapshot until explicit refresh.
+source revision, the source Head `high_level` at that revision, and its fixed
+effective level extent. The two level values have different roles: the source
+Head level drives pacing, while the effective extent remains the browser
+window. A database-backed window has no such lineage and remains a
+non-updating serialized snapshot until explicit refresh.
 
 The public projection operation is conceptually:
 
@@ -1183,7 +1194,24 @@ discarded by the extent filter.
 A newly retained edge may require an endpoint `Level` that did not change in
 Head and therefore is absent from the stored Head delta. In that case,
 ApiService copies the complete current `Level` from the active Head view into
-the projected result. If that level is unavailable, return
+the projected result as:
+
+```text
+LevelChange {
+    level,
+    before: None,
+    after: Some(current_level),
+}
+```
+
+Within a Head-bounded projected response, this `before = None` means that the
+receiver's previous value is unspecified; it does not assert that the level
+was absent. The browser installs `after` as an absolute upsert without checking
+`before`. Canonical and internal deltas retain the ordinary absence meaning of
+`None`. ApiService adds this presentation-only change after composing the
+canonical projected interval, so it never participates in canonical delta
+composition or changes its no-net-change rules. If that level is unavailable,
+return
 `Freeze { reason: RequiredLevelUnavailable, .. }`. This lookup never consults
 PostgreSQL.
 
@@ -1194,14 +1222,14 @@ affects cursor continuity, containment, or mutation selection, and later
 absolute level changes converge the browser image.
 
 Budget selection treats every stored Head-history entry as an indivisible
-unit. For each eligible entry, ApiService projects the complete entry, adds
-every required endpoint `Level`, composes it with the already accepted
-projected prefix, and measures the resulting complete response. The measured
-representation includes the projected mutations, synthesized endpoint levels,
-response-local hash dictionary, and response envelope. An entry is accepted
-only when that final representation fits the Fixed response budget. Projection
-never splits an aggregated entry, drops an endpoint level, or presents a
-truncated entry as complete.
+unit. For each candidate prefix, ApiService projects and composes its complete
+entries, then adds every required endpoint `Level` to that candidate result and
+measures the resulting complete response. The measured representation includes
+the projected mutations, synthesized endpoint levels, response-local hash
+dictionary, and response envelope. An entry is accepted only when that final
+representation fits the Fixed response budget. Projection never splits an
+aggregated entry, drops an endpoint level, or presents a truncated entry as
+complete.
 
 If all eligible entries fit, return `Complete`. If at least one fits but the
 next complete projected entry does not, return the accepted entries as
@@ -1216,10 +1244,12 @@ response must remain within the configured byte limit.
 Every projected response uses a self-contained response-local hash dictionary.
 The browser uses the Head `(publication_id, revision)` as its source cursor. A
 projected interval may contain no retained mutation and still advance that
-cursor. This derived response is not a Head-history entry or an internal Fixed
-lineage delta: do not append it to `GraphHistory`, apply it to ApiService's
-internal `GraphView`, or use it as an input to canonical delta composition.
-The internal updating-`Fixed` contract above remains unchanged.
+cursor. Every returned projected `GraphDelta.high_level` is the source Head
+high level at the returned `to_revision_id`; it does not move either bound of
+the fixed browser extent. This derived response is not a Head-history entry or
+an internal Fixed lineage delta: do not append it to `GraphHistory`, apply it
+to ApiService's internal `GraphView`, or use it as an input to canonical delta
+composition. The internal updating-`Fixed` contract above remains unchanged.
 
 Projected Fixed delta responses are generated on demand and are never cached.
 They carry `Cache-Control: no-store`, have no ETag, do not enter encoded-body
@@ -1603,15 +1633,16 @@ Exact endpoint URLs, HTTP methods, the final wire schema, and the graph wire
 format remain deferred in the [decision register](../decisions/deferred.md).
 
 Every graph response carries its hash dictionary. A window extracted from a
-`GraphPublication` carries that publication's ID and the extracted view's
-revision in addition to `GraphWindowResolution`; that extracted view is
-`Frozen` internally, while its serialized browser image is eligible for the
-Head-bounded projected lineage owned above. A view constructed directly from a
-database starts at revision zero and has no publication ID unless it is placed
-in a `GraphPublication`; its chosen tracking policy determines whether it
-accepts updates. Database-backed windows remain capped by `MAX_WINDOW_DEPTH`
-and have no public delta lineage. Requests crossing the current head view's
-lower bound take the consistent DB path; head depth itself never forces this
+`GraphPublication` carries the lineage metadata required by the
+[Head-bounded projection contract](#head-bounded-fixed-delta-projection--settled)
+in addition to `GraphWindowResolution`; that extracted view is `Frozen`
+internally, while its serialized browser image is eligible for that projected
+lineage. A view constructed directly from a database starts at revision zero
+and has no publication ID unless it is placed in a `GraphPublication`; its
+chosen tracking policy determines whether it accepts updates. Database-backed
+windows remain capped by `MAX_WINDOW_DEPTH` and have no public delta lineage.
+Requests crossing the current head view's lower bound take the consistent DB
+path; head depth itself never forces this
 fallback.
 
 ## Resource isolation and saturation — settled

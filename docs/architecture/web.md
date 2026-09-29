@@ -57,10 +57,15 @@ reorgs change a DAA-resolved level's score, keep focus on the resolved level
 rather than resolving the original DAA score again.
 
 An eligible fixed view retains its Head `(publication_id, revision)` source
-cursor and exact effective level extent. Each catch-up request supplies that
-extent to the API projection operation. The Web never applies a raw Head delta.
-It applies any valid projected prefix, advances to its actual `to` cursor, and
-continues until the desired Head cursor is reached.
+cursor, the source Head `high_level` supplied with the initial extracted
+window, and the exact effective level extent. Each catch-up request supplies
+that extent to the API projection operation. The Web never applies a raw Head
+delta. It applies any valid projected prefix, advances to its actual `to`
+cursor, and adopts that projected `GraphDelta.high_level` as the Head level for
+pacing. The projected value does not move the fixed window bounds. The Web
+continues until the desired Head cursor is reached. An SSE wakeup updates the
+desired cursor and publication state only; it does not itself change the
+known Head level.
 
 If the API reports that the extent left Head, required projection context is
 unavailable, the publication became Stale or changed, or retained Head history
