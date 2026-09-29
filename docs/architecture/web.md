@@ -7,7 +7,7 @@ public block identity. [The API architecture](api.md) owns the graph wire
 contract, snapshots, deltas, SSE cursor delivery, and response-local hash
 dictionaries.
 
-## Update acquisition — partially open
+## Update acquisition — settled
 
 The v1 Web's fast repeated polling is replaced by SSE cursor wakeups and HTTP
 delta/snapshot catch-up for cached views. The Web keeps one in-flight catch-up
