@@ -1371,9 +1371,9 @@ ApiService immediately clears the client only when it is still current. The
 public request returns `503`; construction invokes `restart_construction()` and
 waits for or uses the latest binding. StorageService has already retired the
 failed generation and started autonomous reacquisition, so the later forwarded
-`Retired` event is an idempotent confirmation. `QueryFailed` is request-local
-for a public operation and invokes ordinary construction restart for a seed
-attempt without clearing a still-current client.
+`Retired` event is an idempotent confirmation. For a construction seed attempt,
+`QueryFailed` and `InconsistentProjection` both abandon that attempt and invoke
+ordinary `restart_construction()` without clearing a still-current client.
 
 Generation events by themselves change no graph publication ID, state, view
 revision, history, or SSE cursor and do not invoke processing Resync or Rebuild.
@@ -1562,6 +1562,21 @@ Found` response. It does not retire the API database generation, change
 `ApiDbState`, reconstruct or stale a publication, or request processing
 recovery. The [storage operation](storage.md#api-graph-projection-reads--settled)
 owns the exact database condition producing each variant.
+
+Public database-backed `ApiReadError` outcomes are exhaustive:
+
+| Error | Public response | Local effect |
+|---|---|---|
+| `QueryFailed` | `500 Internal Server Error` | Keep the exact API DB client |
+| `GenerationLost` | `503 Service Unavailable` with a short `Retry-After` | Clear the client only if it is still current |
+| `InconsistentProjection` | `500 Internal Server Error` | Keep the exact API DB client |
+
+No error returns a partial graph or transparently retries the failed request.
+For `QueryFailed` and `InconsistentProjection`, the public failure changes no
+`ApiDbState` field, publication ID or state, view or history revision, SSE
+cursor, or processing recovery obligation. It neither stales nor reconstructs
+an Active Head. `GenerationLost` has the client-binding effect defined above
+but likewise leaves graph publication and processing recovery unchanged.
 
 Reject invalid anchor input before storage access with `400 Bad Request`. This
 includes level zero, a DAA score outside the shared range, an invalid

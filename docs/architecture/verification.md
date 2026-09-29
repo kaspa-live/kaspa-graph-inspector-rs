@@ -947,6 +947,14 @@ construction seed attempt: it invokes reconstruction, waits while no client is
 available, and resumes with the forwarded replacement. Prove ApiService emits
 no reverse generation-loss event and Supervisor creates no acquisition task.
 
+For both a public database-backed anchored window and a Head seed attempt,
+exercise `QueryFailed` and `InconsistentProjection`. A public request returns
+`500` with no partial graph, transparent retry, client clearing, `ApiDbState`
+change, publication mutation, SSE wakeup, or processing recovery. A seed
+attempt abandons that candidate and invokes ordinary reconstruction while
+retaining the exact current API DB client. `InconsistentProjection` never
+substitutes for an anchor-unavailability result.
+
 For Rebuild, verify `reset(Rebuild)` disables public reads without clearing the
 current client. StorageService retirement prevents the old client from reading
 replaced contents, emits `ApiDbRetired`, and autonomously publishes the coherent
