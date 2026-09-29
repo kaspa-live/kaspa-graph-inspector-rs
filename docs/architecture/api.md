@@ -1140,6 +1140,24 @@ it replaces the graph-update input topology. ApiService's semantic commands
 are:
 
 ```rust
+struct ApiServiceControl {
+    // reliable command sender
+}
+
+enum ApiServiceControlError {
+    Closed,
+}
+
+impl ApiServiceControl {
+    async fn reset(
+        &self,
+        graph_updates: GraphUpdateReceiver,
+        recovery_mode: RecoveryMode,
+    ) -> Result<(), ApiServiceControlError>;
+
+    async fn shutdown(&self) -> Result<(), ApiServiceControlError>;
+}
+
 enum ApiServiceCommand {
     Reset {
         graph_updates: GraphUpdateReceiver,
@@ -1148,6 +1166,16 @@ enum ApiServiceCommand {
     Shutdown,
 }
 ```
+
+`ApiServiceControl`, the command values, and the graph-update channel
+capabilities live together in `kgi-api-ingress`. The control capability is the
+only ApiService dependency exposed to Supervisor; neither `kgi-processing` nor
+the composition root reaches into `kgi-api-core` state. A closed control path
+has the reliable parent-to-child command failure semantics owned by the
+[processing lifecycle](processing-lifecycle.md#teardown-and-delivery-semantics--settled).
+Successful `reset` means the reliable command was accepted for ordered
+processing; it does not wait for Reset application. Successful `shutdown`
+means ApiService completed the shutdown barrier.
 
 The `GraphUpdateReceiver` is fresh and belongs to exactly one processing
 session. `RecoveryMode` is the Resync/Rebuild value owned by the
@@ -1273,13 +1301,42 @@ ApiService derives cached levels' final scores from `VspcCommitted` and its
 cached block metadata; storage sends no level-score delta. Historical
 DAA/window responses are not cached in v2.
 
+## Status observation — settled
+
+ApiService receives one observation source from each component under the
+[shared status-delivery contract](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
+and constructs:
+
+```rust
+struct SystemStatus {
+    supervisor: SupervisorStatus,
+    node: NodeServiceStatus,
+    storage: StorageServiceStatus,
+    processing: ProcessingStatus,
+}
+```
+
+The composition root wires these sources without creating a dependency from
+`kgi-api-core` to `kgi-node` or `kgi-processing`. Exact watch primitives remain
+an implementation choice. Reads do not wait for a cross-component barrier, so
+`SystemStatus` is eventually consistent and must never drive synchronization,
+recovery, command admission, or resource selection.
+
+`SystemStatus` is an API projection value in `kgi-api-model`; its component
+values live in `kgi-model` and retain their focused component owners. The node
+observation exposes the sticky `last_validated` value owned by NodeService.
+When NodeService is `Ready`, that value describes the current connection;
+otherwise the response presents it as last successfully validated rather than
+currently usable. ApiService does not call NodeService or persist this
+observation.
+
 The public graph API has conceptually:
 
 - head snapshot, depth-independent delta, and SSE cursor wakeup;
 - one capped window operation with exactly one anchor: level, block hash, or
   DAA score; the anchor resolves once to a fixed level; and
-- status/info covering network, processing/API versions, node state, and
-  current validated node server version.
+- status/info covering network, processing/API versions, component state, and
+  the current or last successfully validated node server version.
 
 Exact endpoint URLs, HTTP methods, the final wire schema, and the graph wire
 format remain deferred in the [decision register](../decisions/deferred.md).

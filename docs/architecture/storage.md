@@ -35,6 +35,19 @@ enum StorageServiceState {
     Stopped,
 }
 
+enum StorageServiceStatusState {
+    Connecting,
+    AwaitingInitialization,
+    Ready,
+    Unavailable,
+    Rejected,
+    Stopped,
+}
+
+struct StorageServiceStatus {
+    state: StorageServiceStatusState,
+}
+
 wait_until_usable() -> Result<Arc<ValidatedDbClient>, StorageWaitError>
 wait_until_api_usable() -> Result<Arc<ValidatedApiDbClient>, StorageWaitError>
 initialize_if_uninitialized(
@@ -52,6 +65,10 @@ remains pending until initialization is authorized and a validated node
 identity supplies the complete immutable network binding. Permanent
 `Rejected`, `Stopped`, or closed service state is returned to the caller.
 Service state outlives individual validated DB generations.
+`StorageServiceStatus` is the component observation consumed by the
+[API status contract](api.md#status-observation--settled). It contains no
+validated database capability and never authorizes a database operation or
+lifecycle transition.
 
 `ValidatedDbClient` represents exactly one validated connection-pool
 generation and owns that generation's caches. A processing run receives one
@@ -290,8 +307,9 @@ in `NodeMetadata`. They do not participate in database compatibility: only the
 immutable `(network_id, genesis_hash)` binding does. The processing lifecycle
 does use the current node PP and the current session's consensus parameters for
 reconciliation and recovery without persisting them as node metadata.
-ApiService obtains the currently validated node server version from NodeService
-without requiring last-observed node metadata in PostgreSQL.
+The node-version observation used by ApiService comes through the
+[NodeService status contract](node-service.md#nodeservice--settled). It is not
+`NodeMetadata` and is not persisted in PostgreSQL.
 
 An initialized database whose PP hash equals `NodeMetadata.genesis_hash` is a
 valid Genesis anchor only when all of these invariants hold:

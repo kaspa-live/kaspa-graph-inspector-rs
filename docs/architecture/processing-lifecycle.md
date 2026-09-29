@@ -175,12 +175,41 @@ struct SupervisorStatus {
     desired_recovery: Option<RecoveryMode>,
     active_recovery: Option<RecoveryMode>,
 }
+
+enum SupervisorLifecycle {
+    Running,
+    Fatal,
+    ShuttingDown,
+    Stopped,
+}
+
+enum ProcessingState {
+    Idle,
+    Reconciling { mode: RecoveryMode },
+    RebuildingDatabase,
+    ResyncingDag,
+    CatchingUp,
+    Live,
+    Deactivating,
+    Stopped,
+}
+
+struct ProcessingStatus {
+    state: ProcessingState,
+}
 ```
 
 `deactivation_requested` is internal and absent from public status.
-`SystemStatus` combines Supervisor, NodeService, StorageService, and processing
-observations; it is eventually consistent and never a synchronization or
-recovery input.
+Supervisor and ResyncEngine publish their respective status values under the
+shared delivery contract below. The
+[API status-observation contract](api.md#status-observation--settled) owns only
+their composite public projection.
+
+All component status publication is latest-value and lossy: each publication
+replaces the previously observable value, and consumers may skip intermediate
+states. Status never replaces commands, milestones, faults, acknowledgements,
+or validated capabilities as a lifecycle input. Exact watch primitives remain
+deferred.
 
 `ComponentFault` is the cross-worker control envelope. Component-local errors
 may retain richer library-specific sources, but must be classified before
@@ -337,9 +366,8 @@ BlockProcessor / VspcProcessor     -> ResyncEngine
 ResyncEngine                       -> Supervisor
 ```
 
-Faults and milestones use reliable owner-directed events; latest-value
-status may skip intermediate states. Each run retains its first causal fault
-diagnostically. Unexpected permanent-worker exit, panic, closed command
+Faults and milestones use reliable owner-directed events. Each run retains its
+first causal fault diagnostically. Unexpected permanent-worker exit, panic, closed command
 channel, or invalid forward command is a typed ownership/session or fatal
 fault, not ordinary DAG discontinuity. A dropped barrier acknowledgement
 receiver does not cancel the worker's completed teardown transition.
@@ -566,6 +594,11 @@ producer to ResyncEngine in `Start`. ResyncEngine only clones that producer
 into both processor Begin payloads; it never sends ApiService controls or
 lifecycle markers. BlockProcessor consumes its clone under the linked marker
 contract.
+
+The composition root supplies Supervisor the `ApiServiceControl` capability
+defined by the [API Reset contract](api.md#reset-and-recovery-time-availability--settled).
+This lets Supervisor send Reset and Shutdown without `kgi-processing`
+depending on `kgi-api-core`.
 
 The session order is:
 

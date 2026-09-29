@@ -19,10 +19,10 @@ become durable project constraints.
 4. Orphan occupancy threshold within the settled range of approximately one
    quarter through one third.
 5. Detailed Tokio fairness, drain, graph-update gap counter/wakeup primitives,
-   BlockProcessor marker-worker primitives, ApiService task structure, and
-   concrete storage synchronization mechanics. A shared mutation lock plus
-   per-lane mutexes is one valid storage shape; exact lock types remain an
-   implementation choice.
+   component-status watch primitives, BlockProcessor marker-worker primitives,
+   ApiService task structure, and concrete storage synchronization mechanics.
+   A shared mutation lock plus per-lane mutexes is one valid storage shape;
+   exact lock types remain an implementation choice.
 6. API endpoint URLs, HTTP methods, and final wire schema. The exact graph
    response format is intentionally not chosen yet. Benchmark JSON against
    appropriate binary formats such as CBOR, MessagePack, and Protobuf across

@@ -32,12 +32,41 @@ enum NodeServiceState {
     Rejected(NodeRejection),
     Stopped,
 }
+
+enum NodeServiceStatusState {
+    Connecting,
+    Ready,
+    Unavailable,
+    Rejected,
+    Stopped,
+}
+
+struct ValidatedNodeStatus {
+    network_id: NetworkId,
+    server_version: String,
+    rpc_api_version: Option<u16>,
+    rpc_api_revision: Option<u16>,
+}
+
+struct NodeServiceStatus {
+    state: NodeServiceStatusState,
+    last_validated: Option<ValidatedNodeStatus>,
+}
 ```
 
 `NodeServiceState` and published status outlive individual validated client
 generations. `wait_until_usable()` waits through transient `Connecting` and
 `Unavailable` states, but returns permanent `Rejected`, `Stopped`, or closed
 service state to its caller.
+
+`NodeServiceStatus` is the component observation consumed by the
+[API status contract](api.md#status-observation--settled). It never carries
+`ValidatedRpcClient`. Initially `last_validated` is `None`. Every
+successful validation replaces it before publishing `Ready`; leaving `Ready`
+preserves it through `Connecting`, `Unavailable`, `Rejected`, and `Stopped`.
+In `Ready` it describes the current connection, while every other state
+identifies it as the last successfully validated node. The observation is
+process-local and is never persisted.
 
 Transient connection, transport, and validation-RPC failures enter
 `Unavailable` and are retried indefinitely with nominal delays:

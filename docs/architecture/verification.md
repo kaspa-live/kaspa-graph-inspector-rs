@@ -747,6 +747,17 @@ state-only wakeups repeating one graph cursor, reconnect reporting current
 state, Web adoption without a delta request, and a fresh publication ID for a
 replacement image.
 
+Verify the [ApiService control boundary](api.md#reset-and-recovery-time-availability--settled)
+through the shared ingress capability: Supervisor can deliver Reset and await
+the Shutdown barrier without a `kgi-processing -> kgi-api-core` dependency;
+Reset retains its no-acknowledgement behavior. Verify status observations are
+latest-value and lossy, remain available through the separate memory-only
+lane, and never influence lifecycle decisions. Node status begins without a
+validated observation, replaces it before each Ready publication, and
+preserves it with explicit last-successfully-validated meaning through every
+non-Ready state, including Stopped. No status path reads or writes PostgreSQL
+or gives ApiService a NodeService dependency.
+
 Delta cases cover Frozen and revision compatibility as the only application
 checks, direct target-state installation, Head bound recalculation, fixed-bound
 retention, and equality between sequential application and a directly or
