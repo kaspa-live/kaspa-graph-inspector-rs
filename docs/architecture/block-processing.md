@@ -120,7 +120,7 @@ Live
 
 The local command handoff cannot apply graph-update-channel backpressure to
 BlockProcessor. The worker invokes the
-[API feed's lossless marker operation](api.md#in-process-api-and-graph-update-feed--settled)
+[API feed's lossless marker operation](api-ingress.md#in-process-graph-update-feed--settled)
 serially in its command FIFO. The API feed contract owns channel delivery,
 interleaving, and gap semantics.
 
@@ -248,7 +248,7 @@ lane's returned order when offering newly inserted `BlockCommitted` values.
 `PersistedBlock`. A full graph-update channel does not delay or roll back the
 committed block and does not suppress `PersistedBlock`; the session producer
 reports the gap under the
-[API contract](api.md#in-process-api-and-graph-update-feed--settled).
+[API ingress contract](api-ingress.md#in-process-graph-update-feed--settled).
 
 `PersistedBlock` delivery is asynchronous but cannot be silently lost after a
 successful commit. A full bounded destination loses session continuity and

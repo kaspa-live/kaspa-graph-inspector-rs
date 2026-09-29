@@ -644,7 +644,7 @@ with:
 
 ## API and Web
 
-Verify the [graph-update feed](api.md#in-process-api-and-graph-update-feed--settled)
+Verify the [graph-update feed](api-ingress.md#in-process-graph-update-feed--settled)
 and [graph publication contract](api.md#graph-views-publication-revision-and-history--settled)
 for causal order, one fresh ingress per processing session, no cross-session
 message tagging, the mutex-protected `PreSeal -> Open` producer gate,

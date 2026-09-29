@@ -181,7 +181,7 @@ deferred in the
 Processing has reserved database connections and execution capacity and keeps
 priority over every read-only API workload. API projection failure never
 becomes processing recovery. The
-[API feed contract](api.md#in-process-api-and-graph-update-feed--settled) owns
+[API feed contract](api-ingress.md#in-process-graph-update-feed--settled) owns
 graph-update gap signaling. The
 [API resource contract](api.md#resource-isolation-and-saturation--settled) owns
 the concrete pools, admission lanes, limits, and saturation behavior.

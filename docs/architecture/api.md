@@ -4,133 +4,20 @@
 
 This document owns ApiService, `GraphView`, `GraphDelta`, `GraphHistory`,
 `GraphPublication`, API resource bulkheads, and the public graph API contract.
+The per-session graph-update channel, producer gate, lifecycle-marker delivery,
+and gap reporting belong to [API graph-update ingress](api-ingress.md).
 The [processing lifecycle](processing-lifecycle.md) owns when Supervisor calls
 `reset` and when processor phase commands occur. [Block processing](block-processing.md)
 owns lifecycle-marker production. [Storage](storage.md) owns database
 transactions, query implementation, and database-replacement exclusion. Web
 client behavior belongs to the [Web architecture](web.md).
 
-## In-process API and graph-update feed — settled
+## In-process API — settled
 
 KGI v2 includes an in-process `ApiService` and a complete bounded-by-level
 head-tracking `GraphView`, rather than directing each head request to expensive
 PostgreSQL graph queries. The [system overview](overview.md#resource-isolation-and-scalability--settled)
 owns deployment evolution and the single-writer constraint.
-
-Every processing session owns one fresh ordered, bounded graph-update channel. The
-channel topology is the session boundary: graph updates carry no session ID,
-or cross-session stale-message filter. Processors offer
-`BlockCommitted`/`VspcCommitted` only after their respective DB commits. The
-[BlockProcessor delivery contract](block-processing.md#committed-block-delivery)
-and [VspcProcessor producer contract](vspc-processing.md#commit-and-graph-publication--settled)
-establish causal order, so a VSPC update cannot reach this channel ahead of
-blocks it depends on.
-
-The ordered stream has this semantic shape:
-
-```rust
-enum GraphUpdate {
-    PublishPostSeal,
-    BlockCommitted(BlockCommitted),
-    VspcCommitted(VspcCommitted),
-    Live,
-}
-
-struct GraphUpdateProducer {
-    tx: Sender<GraphUpdate>,
-    gate: Arc<GraphUpdateGate>,
-}
-
-struct GraphUpdateReceiver {
-    rx: Receiver<GraphUpdate>,
-    gap: GraphUpdateGap,
-}
-
-struct GraphUpdateGate {
-    state: Mutex<GraphUpdateGateState>,
-    gap: GraphUpdateGapReporter,
-}
-
-enum GraphUpdateGateState {
-    PreSeal,
-    Open,
-}
-
-enum GraphUpdateOfferOutcome {
-    SuppressedPreSeal,
-    Enqueued,
-    GapReported,
-}
-
-enum GraphUpdateProducerError {
-    ReceiverClosed,
-}
-
-impl GraphUpdateProducer {
-    fn offer_block_committed(
-        &self,
-        update: BlockCommitted,
-    ) -> Result<GraphUpdateOfferOutcome, GraphUpdateProducerError>;
-
-    fn offer_vspc_committed(
-        &self,
-        update: VspcCommitted,
-    ) -> Result<GraphUpdateOfferOutcome, GraphUpdateProducerError>;
-
-    fn publish_post_seal(
-        &self,
-    ) -> Result<(), GraphUpdateProducerError>;
-
-    async fn publish_live(
-        &self,
-    ) -> Result<(), GraphUpdateProducerError>;
-}
-```
-
-`GraphUpdateProducer` is the cloneable session-scoped producer capability that
-Supervisor supplies through ResyncEngine to both processors.
-`GraphUpdateReceiver` is the corresponding single-consumer session capability
-that Supervisor supplies through `ApiService::reset`. Every producer clone shares
-one `GraphUpdateGate`, initially `PreSeal`; the receiver does not expose that
-producer-side gate.
-`GraphUpdateGapReporter` and the consumer-side `GraphUpdateGap` refer to the
-same session-local continuity state. These names fix the semantic capability
-split. The mutex around `GraphUpdateGateState` is settled; concrete channel,
-gap-counter, and wakeup types remain deferred.
-
-The producer exposes distinct nonblocking operations for `BlockCommitted` and
-`VspcCommitted`. Each operation holds the state mutex through classification
-and `try_send`. A closed receiver returns `ReceiverClosed`. Otherwise, in
-`PreSeal`, the operation discards the API projection update, returns
-`SuppressedPreSeal`, and does not advance the gap. The underlying database
-commit and processing-tier delivery remain valid. In `Open`, successful
-delivery returns `Enqueued`; `Full` discards that delivery, advances the
-session's reliable, coalescing gap generation, and returns `GapReported`.
-
-The marker worker's `publish_post_seal` operation holds the same state mutex,
-requires `PreSeal`, enqueues `GraphUpdate::PublishPostSeal`, changes the state
-to `Open`, and releases the mutex. No ordinary value can enter before the
-marker or race between its enqueue and the state transition. Because pre-seal
-ordinary values are suppressed, this marker is the first value in the fresh
-positive-capacity channel and cannot encounter `Full`; receiver closure leaves
-the gate in `PreSeal` and reports supersession.
-
-The marker worker's `publish_live` operation requires `Open`, releases the
-state mutex, and then uses lossless delivery, awaiting channel capacity instead
-of reporting an ordinary-update gap. Its command FIFO preserves
-`PublishPostSeal` before `Live`; unrelated ordinary graph updates may
-interleave before `Live`. ApiService uses the gap signal only to reconstruct
-its derived read model; it never requests processing Resync or Rebuild.
-
-The [BlockProcessor marker contract](block-processing.md#graph-lifecycle-marker-delivery--settled)
-owns its worker and marker-command enqueue points. The
-[processing lifecycle](processing-lifecycle.md#live-admission) owns the global
-causality before the Live command. ApiService consumes the resulting channel
-order without reconstructing those producer decisions. If an earlier causal
-ordinary update reported `Full`, the advanced gap generation makes ApiService
-reconstruct instead of treating that segment as gapless. Exact channel and
-wakeup primitives remain deferred in the
-[decision register](../decisions/deferred.md).
 
 ApiService consumes storage's
 [`BlockCommitted`](storage.md#block-materialization-transaction--settled) and
@@ -166,8 +53,8 @@ DB; it is capped.
 
 The [graph-view contract](#graph-views-publication-revision-and-history--settled)
 owns edge representation, window inclusion, endpoint retention, and lifetime.
-The graph-update payload above supplies the committed parent information required
-to apply that contract.
+The [graph-update ingress](api-ingress.md) supplies the committed parent
+information required to apply that contract.
 
 The domain-owned `CompactId` crosses into ApiService only as the private
 alignment cut and `BlockCommitted.id`; it is never a public block identity or
@@ -1413,12 +1300,10 @@ barrier. An unavailable component returns `ApiServiceError` under the
 parent-to-child failure semantics owned by the
 [processing lifecycle](processing-lifecycle.md#teardown-and-delivery-semantics--settled).
 
-The `GraphUpdateReceiver` is fresh and belongs to exactly one processing
-session. `RecoveryMode` is the Resync/Rebuild value owned by the
+`reset` installs the fresh session receiver supplied under the
+[graph-update ingress contract](api-ingress.md). `RecoveryMode` is the
+Resync/Rebuild value owned by the
 [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
-No `reset` call or graph update carries a session ID. The gap
-signal exposes a monotonically advancing generation and a wakeup; the exact
-atomic and notification primitives remain implementation choices.
 
 ApiService accepts exactly one `reset` call for each processing attempt. It
 globally preempts `PreSeal`, `Constructing`, `Aligning`, or `Active`:
@@ -1659,8 +1544,8 @@ API snapshot reload ranks above historical queries and below processing. On
 saturation, reject or degrade API work explicitly. HTTP, database,
 serialization, cache, and client saturation must not block processing,
 truncate a response or cache image presented as complete, or silently lose a
-graph update. Ordinary graph-update delivery remains nonblocking and reports
-loss through the session gap signal owned above.
+graph update. Ordinary graph-update delivery and loss reporting follow the
+[graph-update ingress contract](api-ingress.md).
 
 Every historical database-backed HTTP request separates database work from
 response construction in this order:

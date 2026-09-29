@@ -428,7 +428,7 @@ cancellation-aware. Full means
 `Require(Resync)` when ordered session continuity may have been lost;
 closed/unavailable means a session ownership fault; cancellation during
 expected teardown is not a fault. The graph-update feed is the exception:
-the [API-owned graph-update gap contract](api.md#in-process-api-and-graph-update-feed--settled)
+the [API-owned graph-update gap contract](api-ingress.md#in-process-graph-update-feed--settled)
 reconstructs the derived image without requesting processing recovery.
 Detailed Tokio fairness and drain mechanics remain deferred in the
 [decision register](../decisions/deferred.md).
@@ -1016,4 +1016,4 @@ escalation policy remain deferred in the
 
 The graph-update path is deliberately separate: a reported stream gap rebuilds
 the API image without interrupting processing. Its behavior is defined in
-[api.md](api.md#in-process-api-and-graph-update-feed--settled).
+[api-ingress.md](api-ingress.md#in-process-graph-update-feed--settled).

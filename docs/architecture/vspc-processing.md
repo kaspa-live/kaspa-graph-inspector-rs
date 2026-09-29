@@ -377,7 +377,7 @@ is open. Before that cut, both processors' API projection offers are
 intentionally suppressed while their committed processing state continues.
 
 Graph-update delivery is nonblocking for processing. A full channel reports a
-gap under the [API contract](api.md#in-process-api-and-graph-update-feed--settled)
+gap under the [API ingress contract](api-ingress.md#in-process-graph-update-feed--settled)
 rather than rolling back the committed VSPC transaction or requesting
 processing recovery.
 
