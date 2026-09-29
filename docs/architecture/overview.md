@@ -41,6 +41,7 @@ BlockProcessor/VspcProcessor
     ── per-session ordered graph updates ──► ApiService
 BlockProcessor ── lifecycle markers ──► ApiService
 ResyncEngine ── lifecycle milestones ──► Supervisor
+NodeService ── ordered RPC generation events ──► Supervisor
 StorageService ── ordered DB generation events ──► Supervisor
 Supervisor ── update API DB generation / reset / shutdown ──► ApiService
 ```
@@ -121,9 +122,10 @@ PostgreSQL types.
 construction, and producer-gate behavior. It depends on the async runtime and
 `kgi-model`, but not on `kgi-api-model`, `kgi-storage`, or `kgi-api-core`.
 
-`kgi-node` owns NodeService, `ValidatedRpcClient`, NotificationRouter, RPC
-normalization, and subscription handling. It depends on `kgi-model` and the
-node/RPC libraries, but not on `kgi-processing`, storage, or either API crate.
+`kgi-node` owns NodeService, `ValidatedRpcClient`, `NodeServiceEvent`,
+NotificationRouter, RPC normalization, and subscription handling. It depends
+on `kgi-model` and the node/RPC libraries, but not on `kgi-processing`, storage,
+or either API crate.
 The composition root constructs the processor notification channels and passes
 only their sender handles to `kgi-node`. Their payload types belong to
 `kgi-model`, so `kgi-node` does not depend on concrete processor types from
@@ -151,8 +153,9 @@ deferred in the
 - Internal lifecycle control flows from parent to child.
 - Reliable faults and milestones flow from child to parent.
 - Managed sibling components do not acquire one another's validated service
-  generations. StorageService publishes both DB generation lifecycles to
-  Supervisor. Supervisor retains the current processing generation only for a
+  generations. NodeService publishes the RPC generation lifecycle and
+  StorageService publishes both DB generation lifecycles to Supervisor.
+  Supervisor retains the current RPC and processing DB generations only for a
   future `ProcessingSession` and maps API-generation events through
   ApiService's public control surface.
 - Data channels connect the explicit producers and consumers shown above;

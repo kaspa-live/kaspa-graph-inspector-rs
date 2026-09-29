@@ -24,45 +24,44 @@ struct ProcessingSession {
     graph_updates: GraphUpdateProducer,
 }
 
-struct SupervisorStorageState {
-    processing_db: Option<Arc<ValidatedDbClient>>,
+struct SupervisorResourceState {
+    rpc: Option<Arc<ValidatedRpcClient>>,
+    db: Option<Arc<ValidatedDbClient>>,
 }
 ```
 
-Supervisor installs the reliable ordered `StorageServiceEvent` path before
-StorageService can publish either initial database generation or reject the
-database. It initializes `processing_db = None`.
+Supervisor installs the reliable ordered `NodeServiceEvent` and
+`StorageServiceEvent` paths before either service can publish an initial
+generation or rejection. It initializes both fields to `None`.
+`RpcPublished(client)` sets `rpc` to that exact client. `RpcRetired(client)`
+clears it only when it still holds that exact `Arc`; a late retirement cannot
+clear a newer generation. `NodeServiceEvent::Rejected(reason)` enters
+Supervisor's Fatal lifecycle.
 `ProcessingDbPublished(client)` sets it to that exact client.
 `ProcessingDbRetired(client)` clears it only when it still holds that exact
-`Arc`; a late retirement cannot clear a newer generation. `Rejected(reason)`
-is a terminal StorageService failure and enters Supervisor's Fatal lifecycle.
+`Arc`; a late retirement cannot clear a newer generation.
+`StorageServiceEvent::Rejected(reason)` enters Supervisor's Fatal lifecycle.
 The API variants follow the forwarding contract below.
 
-StorageService events are the sole authority for Supervisor's processing DB
-binding. Supervisor never requests publication or reconnection and does not
-call a DB-generation wait operation. StorageService autonomously replaces a
-retired generation; Supervisor retains a published replacement for the next
-processing run and never injects it into an existing `ProcessingSession`.
+Service events are the sole authority for Supervisor's RPC and processing DB
+bindings. Supervisor never requests publication or reconnection. Each service
+autonomously replaces its retired generation; Supervisor retains published
+replacements for the next processing run and never injects them into an
+existing `ProcessingSession`. Unexpected closure of either reliable event path
+while Supervisor is Running is a Fatal managed-service failure.
 
-Supervisor waits for a usable node generation only when recovery is desired
-and the engine is idle. That wait is polled concurrently with Supervisor
-method requests and incoming events; the Supervisor main loop must not block.
-The acquired RPC client may be retained while `processing_db` is absent.
-While Supervisor is Running, `NodeWaitError::Rejected(reason)`,
-`NodeWaitError::Stopped`, and `NodeWaitError::ServiceClosed` each enter the
-Fatal lifecycle; the latter two mean the managed NodeService ended
-unexpectedly. Transient node unavailability remains inside the wait and does
-not produce one of these results.
+When recovery is desired and the engine is Idle, Supervisor may retain either
+resource while the other is absent. It starts no run until both exact
+generations are present.
 StorageService can open, lock, and inspect an Uninitialized database while the
-node wait continues. Once the validated RPC generation is available,
+RPC generation is absent. Once an RPC generation is published,
 Supervisor supplies its `(network_id, genesis_hash)` through the idempotent
 `initialize_if_uninitialized` operation when initialization is authorized.
 StorageService alone performs any required `Uninitialized -> Empty` transition
 and later publishes the resulting DB generations through its event stream.
 Before starting, recheck that the captured recovery obligation is still the
-latest `desired_recovery`, the engine is Idle, NodeService still publishes the
-exact acquired RPC `Arc` as Ready, and `processing_db` still holds the exact DB
-`Arc` selected for the run.
+latest `desired_recovery`, the engine is Idle, and `SupervisorResourceState`
+still holds both exact `Arc` values selected for the run.
 
 The exact `Arc<ValidatedRpcClient>`, `Arc<ValidatedDbClient>`, and session
 `GraphUpdateProducer` are passed through `ResyncEngine::start` and then through the session to
@@ -74,12 +73,20 @@ genesis_hash)` to equal the immutable binding exposed by that DB generation.
 A mismatch is terminal pairing rejection: never rebind the database or infer
 that Rebuild can repair it.
 
-When `ProcessingDbRetired(client)` names the DB generation used by the active
-session, Supervisor applies the existing generation-loss disposition exactly
-once: active recovery retains its current obligation and retries after
-deactivation; Live establishes `Require(Resync)`. A concurrent operation may
-report the same loss first. The operation fault and retirement event coalesce,
-request at most one deactivation, and never weaken `desired_recovery`.
+When `RpcRetired(client)` or `ProcessingDbRetired(client)` names a generation
+used by the active session, Supervisor applies the corresponding
+generation-loss disposition exactly once: active recovery retains its current
+obligation and retries after deactivation; Live establishes `Require(Resync)`.
+A concurrent operation may report the same loss first. The operation fault and
+retirement event coalesce, request at most one deactivation, and never weaken
+`desired_recovery`. An owner-directed malformed-response fault remains
+admissible after its `RpcRetired` event has requested deactivation: Supervisor
+must still count it, apply any stronger recovery obligation, and preserve a
+fourth-occurrence Fatal disposition. Once the run's `ValidatedRpcClient` has
+classified that malformed response, the result is already produced for this
+purpose. ResyncEngine's deactivation barrier must allow its caller to report
+the corresponding typed fault before that caller is joined, and Supervisor
+continues accepting such a fault from the retiring session until `Deactivated`.
 
 ## Supervisor and recovery intent — settled
 
@@ -334,12 +341,12 @@ the corresponding `DuplicateChainMember` or `RemovedAddedIntersection`
 variant. Apply the same recovery-response or notification-source disposition
 defined above; storage does not decide it.
 
-When the same validated RPC remains Ready and Supervisor still holds the same
-published processing DB generation, whole-attempt recovery retries use nominal
+When Supervisor still holds the same published RPC and processing DB
+generations, whole-attempt recovery retries use nominal
 delays `1s, 2s, 4s, 8s, 16s, 30s`, capped at `30s`, with equal jitter from 50%
-through 100%. Reset that general backoff on `EnteredLive`, a new validated RPC
-generation, `ProcessingDbPublished` with a new DB generation, or a stronger
-recovery obligation. RPC generation loss waits for NodeService reconnection;
+through 100%. Reset that general backoff on `EnteredLive`, `RpcPublished` with
+a new RPC generation, `ProcessingDbPublished` with a new DB generation, or a
+stronger recovery obligation. RPC generation loss waits for `RpcPublished`;
 DB generation loss waits for `ProcessingDbPublished`. Neither adds this delay.
 `Require(Resync)` and `Require(Rebuild)` do not consume or wait on the Retry
 sequence. All waits are lifecycle-cancellable.
@@ -365,10 +372,10 @@ replacement RPC generations, so reconnecting repeatedly to the same
 incompatible node cannot loop forever. Only `EnteredLive` resets it; a new RPC
 generation or stronger recovery mode does not.
 
-Each permitted malformed-input Retry waits for NodeService to publish a new
-validated RPC generation and never reuses or reissues the operation on the
-retired handle. NodeService's reconnect backoff supplies the delay, so the
-general recovery Retry delay is not added. A malformed VSPC notification
+Each permitted malformed-input Retry waits for `RpcPublished` with a new
+validated generation and never reuses or reissues the operation on the retired
+handle. NodeService's reconnect backoff supplies the delay, so the general
+recovery Retry delay is not added. A malformed VSPC notification
 is a notification-input fault and therefore does not consume the malformed
 recovery-response budget.
 
@@ -972,7 +979,8 @@ settled recovery dispositions when violated.
 On Deactivate, ResyncEngine performs this barrier in order:
 
 1. close local routing gates and disable notifications;
-2. cancel and join synchronization producers;
+2. cancel and join synchronization producers under the already-produced RPC
+   fault-delivery rule above;
 3. clear engine-local buffers;
 4. send `Deactivate` to processors;
 5. await processor acknowledgements, including their teardown-barrier
@@ -985,19 +993,17 @@ On Deactivate, ResyncEngine performs this barrier in order:
 
 The owning services may retain their validated generations after Deactivate.
 For global shutdown, Supervisor first enters terminal shutdown and starts no
-new recovery attempt. At that transition it cancels or drops any outstanding
-node wait, starts no replacement wait, and ignores any concurrently completed
-wait result, including a successful client. This is expected caller
-cancellation and produces no fault or recovery request. Supervisor then starts
-`ApiService::shutdown` and
+new recovery attempt. Supervisor then starts `ApiService::shutdown` and
 `ResyncEngine::shutdown` without waiting for either method to complete before
 starting the other. It awaits both completed method barriers before calling
 `NodeService::shutdown` and then `StorageService::shutdown`. This releases every
 processing and API client before their owning services stop and keeps
-StorageService last. Supervisor continues draining `StorageServiceEvent` until
-StorageService completes shutdown; after entering terminal shutdown it
-discards those events instead of starting recovery or forwarding a new API
-generation.
+StorageService last. Supervisor continues draining each reliable service-event
+stream until its owning service completes shutdown. After entering terminal
+shutdown it discards those events instead of retaining a generation, starting
+recovery, or forwarding a new API generation. Closure of a service-event path
+after that service's completed shutdown is expected termination rather than a
+fault.
 
 Dropping the graph-update receiver during this coordinated barrier unblocks a
 marker worker awaiting lossless delivery. Resulting producer closure is

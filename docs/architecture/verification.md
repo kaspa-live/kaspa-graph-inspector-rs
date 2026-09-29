@@ -242,11 +242,11 @@ Use injected clocks and deterministic jitter to verify the independent
 sequences: nominal exponential slots through the 30-second cap, reset only
 after 60 seconds continuously Ready, shutdown cancellation, and terminal
 rejection without retry. Exercise the inclusive 50% through 100% jitter range.
-Exercise each typed `NodeWaitError`: rejection, unexpected Stopped state, and
-unexpected service closure enter Supervisor Fatal while Running. A still-pending
-wait and either a successful or failed completion racing with Supervisor's
-terminal-shutdown transition are cancelled or ignored without starting a
-session, reporting a fault, or requesting recovery.
+Install the reliable ordered `NodeServiceEvent` path before initial RPC
+publication or rejection. Verify initial and replacement `RpcPublished`, exact
+`RpcRetired`, suppression of repeated retirement, retirement before an
+operation returns its generation-ending error, terminal `Rejected`, and Fatal
+unexpected event-path closure while Supervisor is Running.
 Install the reliable ordered `StorageServiceEvent` path before either initial
 DB generation can be published. Verify initial and replacement processing and
 API publications, exact-`Arc` retirements, suppression of repeated retirement,
@@ -503,6 +503,16 @@ together. Required cases are:
 Verify the [fault and retry policy](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
 with injected clocks and deterministic jitter:
 
+- `RpcPublished(R1)` supplies the exact RPC client for a new session but never
+  rebinds an existing one; `RpcRetired(R1)` clears only the matching Supervisor
+  binding and requests at most one deactivation when an operation fault reports
+  the same loss concurrently; a later `RpcPublished(R2)` is retained until the
+  engine is Idle;
+- when a malformed-response retirement arrives before its owner-directed
+  fault, deactivation begins but preserves delivery of the already-produced
+  result; the later fault is accepted before `Deactivated`, consumes the shared
+  malformed-input budget, preserves any stronger recovery obligation, and
+  reaches Fatal on the fourth occurrence;
 - `ProcessingDbPublished(G1)` supplies the exact DB client for a new session
   but never rebinds an existing one; `ProcessingDbRetired(G1)` clears only the
   matching Supervisor binding and requests at most one deactivation when an
@@ -987,10 +997,11 @@ Supervisor starts ApiService and ResyncEngine shutdown without waiting for one
 to complete before starting the other, awaits both method barriers, and only
 then calls NodeService shutdown followed by StorageService shutdown. Producer
 closure during that barrier requests no reconstruction or processing recovery.
-StorageService may continue either autonomous DB generation lifecycle until
-its later shutdown barrier. Supervisor drains and discards its reliable events
-after terminal shutdown rather than starting recovery or forwarding another
-API generation.
+NodeService and StorageService may continue their autonomous generation
+lifecycles until their later shutdown barriers. Supervisor drains and discards
+both reliable event streams after terminal shutdown rather than retaining a
+generation, starting recovery, or forwarding another API generation. Event-path
+closure after its owning service completes shutdown is expected.
 
 Graph-update and API projection tests cover a non-Genesis block whose selected
 parent index addresses the expected member of `direct_parents`, plus Genesis

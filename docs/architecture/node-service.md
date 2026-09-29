@@ -53,27 +53,37 @@ struct NodeServiceStatus {
     last_validated: Option<ValidatedNodeStatus>,
 }
 
-enum NodeWaitError {
+enum NodeServiceEvent {
+    RpcRetired(Arc<ValidatedRpcClient>),
+    RpcPublished(Arc<ValidatedRpcClient>),
     Rejected(NodeRejection),
-    Stopped,
-    ServiceClosed,
 }
 
 impl NodeService {
-    async fn wait_until_usable(
-        &self,
-    ) -> Result<Arc<ValidatedRpcClient>, NodeWaitError>;
-
     async fn shutdown(&self) -> Result<(), NodeServiceError>;
 }
 ```
 
 `NodeServiceState` and published status outlive individual validated client
-generations. `wait_until_usable()` waits through transient `Connecting` and
-`Unavailable` states. It returns `Rejected(reason)` for permanent validation or
-configuration rejection, `Stopped` when the service has entered its terminal
-state, and `ServiceClosed` when its worker or control path closes without that
-state transition. Caller cancellation is not a `NodeWaitError`.
+generations. Connection validation precedes publication of every generation.
+NodeService autonomously connects, validates, retires, reconnects, and
+republishes without a request from Supervisor or ResyncEngine. It reports every
+generation transition through one reliable ordered `NodeServiceEvent` stream.
+The event path must be installed before NodeService can publish its initial
+generation or enter `Rejected`.
+
+`RpcPublished` carries the newly usable exact generation. `RpcRetired` carries
+the exact generation that ceased to be usable. Repeated failure reports for an
+already retired handle emit no duplicate retirement event or replacement
+attempt. A replacement is newly validated, never republishes a retired `Arc`,
+and is published only after retirement of the previous usable generation.
+`Rejected` reports permanent validation or configuration rejection. Entering
+`Rejected` retires any currently published generation, emits its retirement
+first, and then emits `Rejected`. For an operation-detected generation failure,
+NodeService completes retirement and enqueues `RpcRetired` before returning the
+typed operation result to its caller. Events report lifecycle transitions;
+they do not initiate reconnection.
+
 `shutdown` is terminal and idempotent; successful completion means
 NodeService is `Stopped` and has released its owned connection resources.
 
@@ -602,9 +612,11 @@ NodeService before reporting its owner-directed fault. NodeService atomically
 retires that exact published
 `ValidatedRpcClient`, retires its NotificationRouter, prevents all clones from
 starting further RPC or subscription work, closes the physical connection, and
-enters `Unavailable`. A stale report for a generation already replaced cannot
-retire the replacement. NodeService reconnects and performs complete validation
-before publishing another generation.
+enters `Unavailable`. It emits the exact `RpcRetired` event before returning the
+typed violation to the calling RPC owner. A stale report for a generation
+already replaced cannot retire the replacement. NodeService reconnects and
+performs complete validation before emitting `RpcPublished` for another
+generation.
 
 The malformed response is never retried in place. Supervisor owns the recovery
 budget and source/phase dispositions defined by the
