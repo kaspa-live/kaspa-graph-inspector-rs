@@ -667,13 +667,15 @@ revision `n`. A retained mutation advances the view to `n+1` and returns
 `GraphDelta(n,n+1)` before history append. During that interval, a view read may
 return `n+1` while a history request exposes only `n`; appending the delta then
 advances history to `n+1`. A no-effect update returns no delta and advances
-neither revision. History rejects a nongapless append.
+neither revision. History rejects a nongapless append and accepts a gapless
+aggregated interval without requiring internal one-step boundaries.
 
 Verify every subview extract inherits its source revision with
-`TrackingPolicy::Frozen`. Each `BlockCommitted`, `VspcCommitted`, and
-`GraphDelta` mutation entry point must return `GraphViewUpdateError::Frozen`
-without inspecting the input or changing contents or revision. Keep this
-distinct from a no-effect update accepted by `Head` or `Fixed`.
+`TrackingPolicy::Frozen`. `BlockCommitted` and `VspcCommitted` mutation entry
+points return `GraphViewUpdateError::Frozen`; delta application returns
+`GraphDeltaApplyError::Frozen`. Each refuses before inspecting the input or
+changing contents or revision. Keep this distinct from a no-effect update
+accepted by `Head` or `Fixed`.
 
 Verify [frozen subview extraction](api.md#frozen-subview-extraction--settled)
 from `Head`, `Fixed`, and `Frozen` sources, including nested extraction. Cover
@@ -683,12 +685,14 @@ blocks; all nominal and endpoint levels with exact state; recomputed derived
 counters; and absence of source mutation, delta production, or history.
 
 Level-change cases cover create, update, remove, and no-net-change composition;
-`before` mismatch on application; a size-only external-level mutation; and DAA
-score changes. Every API delta carries its target `high_level` and no lower
-coverage object. Retain all deltas whose `high_level` remains in the retained
-head window, including multiple revisions at one level, and make them eligible
-for pruning only after that level leaves the window. No count or byte pressure
-may prune them earlier.
+application of `after` without validating `before`; a size-only external-level
+mutation; and DAA score changes. Every API delta carries its target
+`high_level` and no lower coverage object. Retain all deltas whose `high_level`
+remains in the retained head window, including multiple revisions at one
+level, and make them eligible for pruning only after that level leaves the
+window. Cover indivisible aggregated entries, longest-prefix pruning, derived
+oldest available revision, and unchanged current revision. No count or byte
+pressure may prune history earlier.
 
 Verify the [graph-view edge and absolute-map contract](api.md#graph-views-publication-revision-and-history--settled)
 with zero, one, and two endpoint blocks retained; Head child addition and
@@ -743,15 +747,18 @@ state-only wakeups repeating one graph cursor, reconnect reporting current
 state, Web adoption without a delta request, and a fresh publication ID for a
 replacement image.
 
-Delta cases cover revision compatibility and level-change pre-state validation;
-equality between sequential application and a directly or incrementally
-composed interval;
+Delta cases cover Frozen and revision compatibility as the only application
+checks, direct target-state installation, Head bound recalculation, fixed-bound
+retention, and equality between sequential application and a directly or
+incrementally composed interval;
 associative graph-state effects across three adjacent intervals; later-value,
 insertion-folding, final `high_level`, and response-dictionary composition; and
 rejection of cross-publication or nongapless composition. Under a small response
-budget, verify advancement through complete intermediate intervals and that no
-block, VSPC, or level-change revision is split. A first atomic
-revision that cannot fit requires a fresh snapshot rather than a partial
+budget, verify advancement through complete stored entries. Cover a requested
+target inside an aggregate by extending through its right boundary, a future
+target by returning through current history, and a prefix ending at an earlier
+stored boundary. A starting cursor inside an aggregate is unavailable. A first
+stored entry that cannot fit requires a fresh snapshot rather than a partial
 delta.
 
 For encoded head-response reuse, issue concurrent identical snapshot requests

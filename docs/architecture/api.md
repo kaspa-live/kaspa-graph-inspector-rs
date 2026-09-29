@@ -206,6 +206,59 @@ enum GraphViewUpdateError {
     Frozen,
 }
 
+enum GraphDeltaApplyError {
+    Frozen,
+    RevisionMismatch {
+        view_revision: u64,
+        delta_from: u64,
+    },
+}
+
+enum GraphHistoryAppendError {
+    RevisionMismatch {
+        history_revision: u64,
+        delta_from: u64,
+    },
+}
+
+enum GraphHistoryRangeError {
+    StartPruned {
+        requested: u64,
+        oldest_available: u64,
+    },
+    StartUnavailable {
+        requested: u64,
+        current: u64,
+    },
+}
+
+enum GraphHistoryRange {
+    UpToDate {
+        revision: u64,
+    },
+    Deltas {
+        from: u64,
+        requested_target: u64,
+        actual_target: u64,
+        entries: GraphDeltaList,
+    },
+}
+
+enum FreshViewReason {
+    PublicationMismatch,
+    PublicationStale,
+    StartPruned,
+    StartUnavailable,
+    FirstStoredDeltaExceedsBudget,
+}
+
+enum DeltaResponseOutcome {
+    UpToDate,
+    Complete(GraphDelta),
+    Prefix(GraphDelta),
+    FreshViewRequired(FreshViewReason),
+}
+
 enum GraphViewExtractError {
     InvalidExtent,
     OutsideSourceExtent,
@@ -743,9 +796,54 @@ GraphView n+1 / GraphHistory n+1
 The intermediate state is valid. A view or subview request may therefore
 observe revision `n+1` while a delta-history request can reach only revision
 `n`. There is no equality invariant between the two current revision fields.
-`GraphHistory` nevertheless accepts a delta only when
-`delta.from_revision_id == history.current_revision_id`, preserving its own
-gapless sequence.
+
+Every `GraphDelta` is created with
+`to_revision_id > from_revision_id`. Direct view mutation produces one-step
+deltas; composition preserves a forward interval. Delta application and
+history append trust this construction invariant and do not check it again.
+
+```rust
+impl GraphView {
+    fn apply_delta(
+        &mut self,
+        delta: &GraphDelta,
+    ) -> Result<(), GraphDeltaApplyError>;
+}
+
+impl GraphHistory {
+    fn append(
+        &mut self,
+        delta: GraphDelta,
+    ) -> Result<(), GraphHistoryAppendError>;
+}
+```
+
+`apply_delta` first rejects `Frozen`, then requires
+`current_revision_id == delta.from_revision_id`. It performs no target-level,
+level-prestate, or mutation-content validation. After those checks, it applies
+the complete delta atomically. Absolute block and edge changes maintain the
+derived edge counters; every `LevelChange.after` directly supplies the public
+level result; membership changes precede color changes so those field maps
+supersede projection values carried by an added block. A Head view then sets:
+
+```text
+high_level = delta.high_level
+low_level  = max(1, high_level - max_depth + 1)
+```
+
+A Fixed view retains both nominal bounds. Every accepted view sets
+`current_revision_id = delta.to_revision_id`. An error leaves the complete view
+and revision unchanged. A standalone Head-generated delta remains prohibited
+for Fixed; only a delta from the same Fixed lineage has the required context.
+
+`append` requires only
+`history.current_revision_id == delta.from_revision_id`. On success, it takes
+ownership of the delta, appends it to the ordered list, and sets
+`current_revision_id = delta.to_revision_id` atomically. On mismatch, both
+remain unchanged. A stored entry may be either a direct one-step delta or an
+already aggregated delta. Consecutive stored entries remain gapless by their
+outer interval boundaries; history neither requires nor reconstructs internal
+revision boundaries within an aggregate.
 
 `GraphDelta.high_level` is the target view's high level. It is retained in the
 internal history and included in the API delta payload. It is the semantic key
@@ -756,11 +854,11 @@ lower-bound changes.
 
 `level_changes` contains only levels whose `size` or `daa_score` actually
 changed. `None` represents absence, so one shape covers creation, update, and
-removal. Applying a level change requires the current value to equal `before`
-before installing `after`. Gapless composition folds consecutive changes from
-the first `before` to the last `after` and omits a level whose composed change
-has no net effect. Because each change carries its pre-state, this composition
-does not require the starting view.
+removal. Application installs `after` without comparing the current value to
+`before`; `before` exists for composition. Gapless composition folds
+consecutive changes from the first `before` to the last `after` and omits a
+level whose composed change has no net effect. Because each change carries its
+pre-state, this composition does not require the starting view.
 
 Within the API graph model, `EdgeId` is the canonical immutable identity of a
 child-parent link. `GraphEdge` adds the complete coordinates required for
@@ -888,6 +986,39 @@ associated with that level becomes eligible for pruning only when the level
 itself leaves the retained window. No independent revision-count or memory-size
 cap is required or permitted by this design.
 
+```rust
+impl GraphHistory {
+    fn prune(&mut self, head_low_level: u64);
+
+    fn oldest_available_revision(&self) -> u64;
+
+    fn range(
+        &self,
+        from_revision_id: u64,
+        target_revision_id: u64,
+    ) -> Result<GraphHistoryRange, GraphHistoryRangeError>;
+}
+```
+
+Pruning removes the longest stored prefix for which:
+
+```text
+delta.high_level < head_low_level
+```
+
+It never removes a middle entry. An aggregated stored delta is indivisible and
+uses the `high_level` of its final constituent: retain the whole aggregate
+until that level leaves the Head extent, then remove the whole aggregate. This
+may retain older constituent history longer than necessary and is safe.
+Pruning never changes `current_revision_id`. If entries remain,
+`oldest_available_revision()` is the first entry's `from_revision_id`;
+otherwise it is `current_revision_id`.
+
+After append, ApiService may prune against the current complete Head
+`low_level` before publishing the new complete history value. A history reader
+therefore observes either the previous complete value or the appended and
+pruned complete value; pruning is never exposed halfway through.
+
 Kaspa does not permit unbounded revision production while the graph remains
 indefinitely at one fixed level. Therefore retaining all history for every
 level still inside the retained window is bounded by graph/window semantics. A
@@ -911,17 +1042,58 @@ must have the same graph-state effect. Every API delta response uses a
 self-contained response-local hash dictionary. Composition decodes the input
 dictionaries to hashes and constructs a new dictionary for the result.
 
-A request from revision `a` captures a desired history target `t`. If the
-complete `Delta(a,t)` exceeds the response budget, return the largest nonempty
-prefix `Delta(a,b)` that fits and ends at a complete revision boundary; the
-client continues from `b`. Never split one atomic revision. If the first
-required revision cannot fit, incremental advancement is unavailable and the
-response requires a fresh view. No response splits a revision or returns a
-structurally partial mutation. A publication mismatch, unavailable revision,
-Stale publication, or cursor pruned by the level-scoped retention rule also
-requires a fresh view. Whether an interval is encoded as individual retained
-revisions or one composed patch remains an implementation choice under the
-composition contract.
+For a range request, the starting revision must be an exact retained entry
+boundary. A start before `oldest_available_revision()` returns `StartPruned`;
+a start inside an aggregate, after current history, or otherwise absent returns
+`StartUnavailable`. When the requested target equals the start, return
+`UpToDate`. Otherwise, select gapless entries beginning exactly at the start.
+
+The target need not be a retained boundary. If it lies inside an aggregated
+entry, include that complete entry and set `actual_target` to its right
+boundary. If it is beyond current history, use the current history right
+boundary. The returned range always records both the requested and actual
+targets. If that available right boundary equals the start, return `UpToDate`.
+An aggregated entry is never split and its discarded internal boundaries are
+not reconstructed.
+
+ApiService rejects a publication mismatch or terminal Stale publication before
+range selection. It then composes selected entries in order under the response
+budget. Return `Complete` when the complete selected range fits. Otherwise
+return the largest nonempty `Prefix` that fits and ends at a stored entry's
+right boundary. If the first stored entry cannot fit, return
+`FreshViewRequired(FirstStoredDeltaExceedsBudget)`. A publication mismatch,
+Stale publication, `StartPruned`, or `StartUnavailable` maps to the matching
+fresh-view reason. `UpToDate` is an ordinary success.
+
+Every returned delta is structurally complete and reports its actual
+`to_revision_id`, which may be later than the requested target because an
+aggregate was indivisible, earlier because the response budget selected a
+prefix, or current because the requested target was in the future. Composition
+constructs a new response-local hash dictionary. Exact encoded-size measurement
+and whether a complete interval is transmitted as its entries or one composed
+patch remain implementation choices under the wire-format decision.
+
+### API projection failure ownership — settled
+
+The active Head consumes original committed updates and produces deltas; it
+never applies a delta to itself. Direct Head mutation failure, history append
+revision mismatch, unexpected failure to compose trusted retained history, or
+another Head/history invariant that prevents advancement is an API projection
+failure. In `Constructing` or `Aligning`, abandon the unpublished candidate and
+invoke `restart_construction()`. In `Active`, first mark the current publication
+terminally `Stale`, then invoke the same primitive.
+
+Fixed-view coherence failure is local. Disjoint extents, unavailable required
+Head-cache metadata, a same-lineage delta revision mismatch, or another failure
+to apply a complete Fixed mutation preserves the last coherent image and
+transitions Fixed to `Frozen`. It never invalidates Head or reconstructs
+ApiService.
+
+Fresh-view range outcomes affect only their request. Serialization,
+compression, response-size enforcement, client cancellation, and delivery
+failure likewise remain request-local under the resource contract below. No
+API projection, Fixed, cursor, or response failure requests processing Resync
+or Rebuild.
 
 SSE is only an ordered `PublicationWakeup`, not the graph data channel.
 Reconnection is not exactly-once. Each client has a bounded wakeup buffer. On
