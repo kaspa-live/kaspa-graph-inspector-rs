@@ -898,32 +898,37 @@ recovery. `PublishPostSeal` is not repeated during same-session reconstruction.
 Changing the API database generation alone must not replace an otherwise
 advancing Active publication.
 
-Verify `ApiDbReadState` independently from graph publication. From an Active
-publication with `Available(G1)`, make a public database operation report
-`GenerationLost`: that request returns `503`, ApiService emits exactly one
-`ApiDbGenerationLost` event, and Supervisor starts exactly one ordinary
-replacement wait. Later database-backed requests remain unavailable until
-Supervisor installs `G2`. An in-flight request never switches or retries
-generations; stale `G1` loss reports and obsolete acquisition results cannot
-displace `G2`. Adoption leaves publication ID, state, view and history
-revisions, and SSE cursor unchanged. Ordinary Resync preserves both Available
-and AwaitingReplacement states. A racing Rebuild reset wins by entering
-`ClosedForRebuild`; an `Ordinary` installation cannot reopen reads or populate
-its candidate, and only activation of the rebuilt candidate installs its
-privately captured generation.
+Verify `ApiDbState` independently from graph publication. Install the reliable
+StorageService-to-Supervisor event path before initial generation publication.
+ApiService starts with no current client and public reads enabled, so a
+database-backed request returns `503`. StorageService publishes `G1`, emits
+`Published(G1)`, Supervisor forwards it through
+`update_api_db_generation`, and ApiService adopts it without changing
+publication ID, state, view or history revisions, or SSE cursor. An ordinary
+Resync preserves both local fields.
 
-Cover initial API database acquisition separately. ApiService starts in
-`AwaitingInitial`, Supervisor owns exactly one nonblocking
-`wait_until_api_usable()` task, and database-backed requests return `503` until
-Supervisor installs `G1` with `Ordinary` context. Prove ApiService never calls
-StorageService and StorageService reconnects and publishes generations without
-an API request. An ordinary initialized startup followed by `reset(Resync)`
-preserves `G1`; neither initial installation nor reset changes a graph
-publication. For an Empty database, allow initial `Available(G1)` and typed
-anchor misses, then verify the distinct Rebuild reset enters
-`ClosedForRebuild { candidate: None }`. Race that reset ahead of initial
-acquisition completion and prove the obsolete `Ordinary` result cannot reopen
-public reads.
+From an Active publication using `G1`, make a public database operation report
+`GenerationLost`. StorageService must atomically retire `G1`, emit exactly one
+ordered `Retired(G1)`, start autonomous reacquisition, and later emit
+`Published(G2)` without an ApiService request. The failed operation returns
+`503` and clears `G1` locally when it is still current; forwarding the retirement
+is idempotent. A late `Retired(G1)` after `G2` cannot clear `G2`, and an in-flight
+operation never switches or retries generations. Exercise the same loss from a
+construction seed attempt: it invokes reconstruction, waits while no client is
+available, and resumes with the forwarded replacement. Prove ApiService emits
+no reverse generation-loss event and Supervisor creates no acquisition task.
+
+For Rebuild, verify `reset(Rebuild)` disables public reads without clearing the
+current client. StorageService retirement prevents the old client from reading
+replaced contents, emits `Retired`, and autonomously publishes the coherent
+replacement. Supervisor forwards both events in order. `Published(G2)` makes
+`G2` available to construction while public reads remain disabled; replacement
+publication activation enables reads. If the current generation is lost after
+the seed has detached but before activation, alignment may finish, activation
+still enables the gate, and database-backed requests remain `503` until a later
+`Published(G3)`. Repeated retirement/publication delivery is idempotent, and
+neither generation turnover nor an absent current client invalidates an
+otherwise advancing Active graph publication.
 
 Verify [Reset and recovery-time availability](api.md#reset-and-recovery-time-availability--settled)
 with ordinary Resync and Rebuild integration scenarios. Verify the fresh
@@ -936,10 +941,10 @@ StorageService rather than `reset` to close API database admission, retire the
 old API generation, and boundedly drain or cancel active database phases.
 Verify a detached old projection may complete delivery while
 an undetached request returns 503, public reads reopen only after the aligned
-replacement becomes Active, and `PpBoundarySealed` causes Supervisor to
-acquire and install the replacement with `Rebuild` context. Cover
-`PublishPostSeal` arriving before that installation and construction remaining
-pending. No in-flight request rebinds to a newly published storage generation,
+replacement becomes Active, and `PpBoundarySealed` has no API generation role.
+Cover `PublishPostSeal` arriving before StorageService's replacement
+`Published` event and construction remaining pending. No in-flight request
+rebinds to a newly published storage generation,
 and no request observes a partial or mixed generation, including with
 PostgreSQL `TRUNCATE`. Verify ordinary sender
 teardown may close the installed receiver, channel closure is not a lifecycle
@@ -958,9 +963,8 @@ Supervisor starts ApiService and ResyncEngine shutdown without waiting for one
 to complete before starting the other, awaits both method barriers, and only
 then calls NodeService shutdown followed by StorageService shutdown. Producer
 closure during that barrier requests no reconstruction or processing recovery.
-An outstanding initial, ordinary replacement, or Rebuild API DB acquisition is
-cancelled and joined without installing its result before component shutdown
-continues.
+StorageService may continue its autonomous API generation lifecycle until its
+later shutdown barrier.
 
 Graph-update and API projection tests cover a non-Genesis block whose selected
 parent index addresses the expected member of `direct_parents`, plus Genesis

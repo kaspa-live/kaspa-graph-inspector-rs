@@ -41,8 +41,8 @@ BlockProcessor/VspcProcessor
     ── per-session ordered graph updates ──► ApiService
 BlockProcessor ── lifecycle markers ──► ApiService
 ResyncEngine ── lifecycle milestones ──► Supervisor
-ApiService ── API DB generation loss ──► Supervisor
-Supervisor ── install API DB generation / reset / shutdown ──► ApiService
+StorageService ── API DB generation retired/published ──► Supervisor
+Supervisor ── update API DB generation / reset / shutdown ──► ApiService
 ```
 
 The top `kgi` crate is the binary, composition root, and home of Supervisor. It
@@ -105,9 +105,8 @@ kgi             ──► kgi-model + kgi-api-ingress + kgi-node + kgi-storage
 
 `kgi-model` contains shared domain values and cross-component message values,
 including `RecoveryMode`, `ParentCommitted`, `LevelCommitted`,
-`BlockCommitted`, `VspcCommitted`, `GraphUpdate`, `ApiServiceEvent`, and the
-component status values. Their focused component documents still own their
-semantics.
+`BlockCommitted`, `VspcCommitted`, `GraphUpdate`, and the component status
+values. Their focused component documents still own their semantics.
 
 `kgi-api-model` is a pure graph-projection contract crate. It contains shared
 API graph values and request/result values such as `Level`, `GraphBlock`,
@@ -131,8 +130,9 @@ only their sender handles to `kgi-node`. Their payload types belong to
 `kgi-processing`.
 
 `kgi-storage` implements StorageService, validated database clients,
-persistence, and the API projection read against `kgi-api-model` contracts. It
-must not depend on `kgi-api-core` or `kgi-api-ingress`. `kgi-api-core` owns
+persistence, the API generation event value, and the API projection read
+against `kgi-api-model` contracts. It must not depend on `kgi-api-core` or
+`kgi-api-ingress`. `kgi-api-core` owns
 ApiService, graph publication behavior, HTTP/SSE, and API runtime state.
 `kgi-processing` owns ResyncEngine and the processing workers, consumes the
 graph-update producer, and does not depend on `kgi-api-core`.
@@ -150,8 +150,8 @@ deferred in the
 - Internal lifecycle control flows from parent to child.
 - Reliable faults and milestones flow from child to parent.
 - Managed sibling components do not acquire one another's validated service
-  generations. Supervisor waits on the owning service and passes the resulting
-  capability through the consumer's public control surface.
+  generations. An owning service publishes generation events to Supervisor,
+  which forwards the capability through the consumer's public control surface.
 - Data channels connect the explicit producers and consumers shown above;
   they do not create lifecycle ownership.
 - The exact validated RPC and DB generations acquired for a processing run
