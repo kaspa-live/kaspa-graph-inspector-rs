@@ -724,9 +724,29 @@ reject the no-VSPC sentinel as a real DAA query.
 Verify successful level, block-hash, and DAA anchors return a
 `GraphWindowResolution` whose resolved level lies in its effective capped
 range and whose resolution and graph contents come from the same immutable
-graph view or database transaction. Browser cases retain the original anchor, keep the
-returned level fixed across deltas, and re-resolve only when explicit refresh
-resubmits that anchor.
+graph view or database transaction. Browser cases retain the original anchor,
+keep the returned level fixed across eligible projected deltas, and re-resolve
+only when explicit refresh resubmits that anchor. A database-backed window has
+no public delta lineage and remains frozen until that refresh.
+
+Verify the settled
+[Head-bounded Fixed projection](api.md#head-bounded-fixed-delta-projection--settled)
+from a Head-extracted anchored window. Cover a fully contained extent, an empty
+projected mutation that still advances the Head cursor, blocks inside the
+extent, crossing edges with neither endpoint block present, nominal and
+external endpoint levels, and retained VSPC-membership and color changes. A raw
+Head delta must never be delivered as the projected response.
+
+Advance Head until the fixed lower bound leaves its nominal extent. Verify an
+indivisible crossing history entry is not projected, any earlier complete
+prefix is returned and applied, and the browser then freezes. Also cover no
+valid prefix, publication replacement, Stale publication, and expired history.
+When a retained edge needs an unchanged endpoint level, fetch it from the
+current Head view; accept that this level can be newer than the returned
+cursor, but never use it for coverage or cursor decisions. Absence of that
+required level freezes only the browser fixed image. Head pruning removals
+outside the fixed projection are discarded without affecting Head or the
+browser image.
 
 Verify deltas and client behavior across
 [API publication](api.md#graph-views-publication-revision-and-history--settled) and
@@ -789,7 +809,10 @@ may reuse its bytes across later state changes. A "to current" request must capt
 exact target before reuse; a bounded complete-prefix response is cached by its
 actual returned interval. Eviction must reconstruct an equivalent response
 from the current graph view or retained deltas. Historical DB windows bypass
-this cache, and cache pressure must not delay or fault processing.
+this cache. Projected Fixed delta requests also bypass cache lookup, insertion,
+and cache single-flight, return `Cache-Control: no-store`, and produce no ETag.
+Repeated identical requests therefore execute independent on-demand
+projection. Cache pressure must not delay or fault processing.
 
 Verify the settled
 [database-seed projection](api.md#database-seed-extent-and-projection--settled),
@@ -885,8 +908,8 @@ fixed-view freeze and follow-live behavior, stable block identity, direct
 parent rendering, and Genesis recognition from zero actual direct parents.
 For distance-adaptive fixed views, verify no added throttling while the head is
 visible and at distances through 10, then verify that distance 11 enters the
-configured increasing-delay policy without breaking contiguous delta catch-up
-or snapshot fallback after delta retention expires.
+configured increasing-delay policy without breaking contiguous projected
+delta catch-up or explicit-refresh fallback after Head retention expires.
 
 ## Resource isolation and performance
 

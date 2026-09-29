@@ -259,6 +259,24 @@ enum DeltaResponseOutcome {
     FreshViewRequired(FreshViewReason),
 }
 
+enum FixedProjectionEndReason {
+    ExtentLeftHead,
+    RequiredLevelUnavailable,
+}
+
+enum FixedDeltaResponseOutcome {
+    UpToDate {
+        revision: u64,
+    },
+    Complete(GraphDelta),
+    Prefix(GraphDelta),
+    Freeze {
+        valid_prefix: Option<GraphDelta>,
+        reason: FixedProjectionEndReason,
+    },
+    FreshViewRequired(FreshViewReason),
+}
+
 enum GraphViewExtractError {
     InvalidExtent,
     OutsideSourceExtent,
@@ -620,13 +638,20 @@ The staging buffer is bounded by update count. It never drops one staged entry
 in isolation. Reaching its implementation-selected capacity invokes
 `restart_construction()`, making the current receive frontier the newer cut.
 
-An `AnchoredWindow` seed constructs a revision-zero `Fixed` view whose
-`max_depth` is its effective nominal level count. It has no history or
-publication ID and is discarded after the coherent HTTP response is built.
+For the database-backed window path, an `AnchoredWindow` seed constructs a
+request-local, revision-zero `Fixed` view whose `max_depth` is its effective
+nominal level count. `Fixed` selects its extent semantics; no updates are
+delivered to this request-local view. ApiService serializes it into one coherent
+HTTP response and then discards it. Because it is not placed in a
+`GraphPublication`, the response has no publication ID, history, SSE cursor,
+or public delta lineage. Its request-local failures return their ordinary API
+result and do not participate in the head-publication state machine.
+
+The Head-extracted window path is separate. A window whose complete effective
+extent is extracted from the active Head publication carries that
+publication's ID and revision and can use the Head-bounded projection contract.
 Database construction alone does not imply `Frozen`; that policy remains
-reserved for subview extraction. Its request-local failures return their
-ordinary API result and do not participate in the head-publication state
-machine.
+reserved for subview extraction.
 
 Throughout reconstruction, a previous coherent publication remains readable
 as Stale. Without one, graph endpoints return `503 Service Unavailable`, while
@@ -1026,7 +1051,8 @@ hypothetical infinite activity stream at one level is not a valid Kaspa
 behavior and cannot justify an additional history cap. A cursor whose required
 deltas left with their level normally requires a fresh view.
 
-Gapless delta intervals from one publication compose sequentially:
+Gapless canonical intervals selected from one `GraphHistory` compose
+sequentially:
 
 ```text
 apply(Delta(a,b), image_at_a) = image_at_b
@@ -1038,9 +1064,9 @@ Composition requires exact equality between the left `to` and right `from`
 revisions. The result uses `a` as `from`, `c` as `to`, and delta `c`'s
 `high_level`. Composition is associative by graph-state effect. A composed
 encoding need not be byte-identical to a directly constructed interval, but it
-must have the same graph-state effect. Every API delta response uses a
-self-contained response-local hash dictionary. Composition decodes the input
-dictionaries to hashes and constructs a new dictionary for the result.
+must have the same graph-state effect. Every canonical Head delta response uses
+a self-contained response-local hash dictionary. Composition decodes the
+input dictionaries to hashes and constructs a new dictionary for the result.
 
 For a range request, the starting revision must be an exact retained entry
 boundary. A start before `oldest_available_revision()` returns `StartPruned`;
@@ -1065,13 +1091,96 @@ right boundary. If the first stored entry cannot fit, return
 Stale publication, `StartPruned`, or `StartUnavailable` maps to the matching
 fresh-view reason. `UpToDate` is an ordinary success.
 
-Every returned delta is structurally complete and reports its actual
+Every canonical range delta is structurally complete and reports its actual
 `to_revision_id`, which may be later than the requested target because an
 aggregate was indivisible, earlier because the response budget selected a
 prefix, or current because the requested target was in the future. Composition
 constructs a new response-local hash dictionary. Exact encoded-size measurement
 and whether a complete interval is transmitted as its entries or one composed
 patch remain implementation choices under the wire-format decision.
+
+### Head-bounded Fixed delta projection — settled
+
+A public anchored window extracted from the active Head publication can follow
+that publication without acquiring its own server-side `GraphPublication` or
+`GraphHistory`. Its serialized response carries the Head `publication_id` and
+source revision together with its fixed effective level extent. A
+database-backed window has no such lineage and remains a non-updating
+serialized snapshot until explicit refresh.
+
+The public projection operation is conceptually:
+
+```rust
+fn range_for_extent(
+    publication_id: u64,
+    from_revision_id: u64,
+    requested_to_revision_id: u64,
+    low_level: u64,
+    high_level: u64,
+) -> FixedDeltaResponseOutcome;
+```
+
+ApiService first invokes the ordinary Head-history range selection. It then
+projects the selected complete entries to `[low_level, high_level]`. The fixed
+extent must remain inside the Head nominal extent throughout every returned
+entry:
+
+```text
+head.low_level <= low_level
+AND
+high_level <= head.high_level
+```
+
+The initial Head extraction establishes the upper-bound condition at
+`from_revision_id`. Because Head bounds never decrease, each selected entry's
+`high_level` and the Head `max_depth` determine whether its resulting lower
+bound still covers `low_level`. An aggregated history entry is indivisible. If
+one would move the Head lower bound above `low_level`, do not project that
+entry. Return earlier complete entries as `Freeze.valid_prefix`, when present,
+and `ExtentLeftHead`; otherwise return that terminal reason without a prefix.
+The current active Head view used for endpoint-level enrichment must also still
+contain the fixed extent. Once it does not, return `ExtentLeftHead`; never use a
+database read to reconstruct a departed extent.
+
+Projection retains blocks whose coordinates lie in the fixed extent; edges
+whose level spans intersect it under the settled edge predicate; nominal
+levels in the extent; external endpoint levels required by retained edges; and
+VSPC-membership or color changes for retained blocks. Head pruning cannot
+remove a retained fixed block or edge while the containment predicate holds.
+Its block and edge removals therefore lie outside the fixed projection and are
+discarded by the extent filter.
+
+A newly retained edge may require an endpoint `Level` that did not change in
+Head and therefore is absent from the stored Head delta. In that case,
+ApiService copies the complete current `Level` from the active Head view into
+the projected result. If that level is unavailable, return
+`Freeze { reason: RequiredLevelUnavailable, .. }`. This lookup never consults
+PostgreSQL.
+
+The endpoint level may be newer than the returned `to_revision_id`; this is an
+accepted presentation approximation. Block, edge, VSPC-membership, and color
+mutations remain exact for the returned interval. A synthesized level never
+affects cursor continuity, containment, or mutation selection, and later
+absolute level changes converge the browser image.
+
+Every projected response uses a self-contained response-local hash dictionary.
+The browser uses the Head `(publication_id, revision)` as its source cursor. A
+projected interval may contain no retained mutation and still advance that
+cursor. This derived response is not a Head-history entry or an internal Fixed
+lineage delta: do not append it to `GraphHistory`, apply it to ApiService's
+internal `GraphView`, or use it as an input to canonical delta composition.
+The internal updating-`Fixed` contract above remains unchanged.
+
+Projected Fixed delta responses are generated on demand and are never cached.
+They carry `Cache-Control: no-store`, have no ETag, do not enter encoded-body
+caches or cache single-flight construction, and have no immutable interval
+cache identity. The browser may retain the graph state obtained by applying
+one, but not the response as a reusable cached delta artifact.
+
+Publication mismatch, terminal Stale state, and unavailable Head history use
+the ordinary fresh-view outcomes. Every `FixedProjectionEndReason` preserves
+the last coherent browser image and ends its projected lineage. Explicit
+refresh reruns the original anchor request.
 
 ### API projection failure ownership — settled
 
@@ -1105,10 +1214,10 @@ behind, are disconnected and recover through HTTP delta or view requests.
 `representation_version` is the settled term for the graph payload schema.
 An ETag for a head view distinguishes publication ID, revision, effective
 window, negotiated response format, `representation_version`, and publication
-state; `Cache-Control: no-cache` allows cheap revalidation/304. A fixed delta
-interval `(publication_id,from,to)` is immutable and cacheable. A "to current"
-query must revalidate. Historical database windows have no ETag in v2, and SSE
-has no ETag.
+state; `Cache-Control: no-cache` allows cheap revalidation/304. A "to current"
+Head-delta query must revalidate. Historical database windows, projected Fixed
+deltas, and SSE have no ETag; projected Fixed deltas additionally require
+`Cache-Control: no-store` under their owning contract.
 
 ApiService maintains bounded server-side reuse of encoded head responses. It
 caches immutable encoded bodies for a head view at one exact revision and
@@ -1116,12 +1225,14 @@ effective window, and for a delta over one exact
 `(publication_id,from,to)` interval. Concurrent requests for the same absent
 variant are single-flight. A view variant is identified by publication ID,
 revision, publication state, effective window, negotiated response format,
-`representation_version`, and content encoding. A delta variant is identified
-by publication ID, its exact `from` and `to` revisions, negotiated response
-format, `representation_version`, and content encoding; publication state is
-not part of the immutable graph interval. A "to current" request captures an
-exact target before it can join shared construction or use an encoded entry; a
-bounded complete-prefix response is keyed by its actual returned interval.
+`representation_version`, and content encoding. A canonical Head-delta variant
+is identified by publication ID, its exact `from` and `to` revisions,
+negotiated response format, `representation_version`, and content encoding;
+publication state is not part of the immutable graph interval. A "to current"
+request captures an exact target before it can join shared construction or use
+an encoded entry; a bounded complete-prefix response is keyed by its actual
+returned interval.
+Projected Fixed delta requests bypass this cache and its single-flight path.
 
 An encoded-cache miss or eviction affects performance only: reconstruct the
 response from the current `GraphView` or retained `GraphHistory`. Historical
@@ -1317,7 +1428,9 @@ The public graph API has conceptually:
 
 - head snapshot, depth-independent delta, and SSE cursor wakeup;
 - one capped window operation with exactly one anchor: level, block hash, or
-  DAA score; the anchor resolves once to a fixed level; and
+  DAA score; the anchor resolves once to a fixed level;
+- on-demand Head-bounded delta projection for a window extracted from the
+  active Head publication; and
 - status/info covering network, processing/API versions, component state, and
   the current or last successfully validated node server version.
 
@@ -1327,12 +1440,14 @@ format remain deferred in the [decision register](../decisions/deferred.md).
 Every graph response carries its hash dictionary. A window extracted from a
 `GraphPublication` carries that publication's ID and the extracted view's
 revision in addition to `GraphWindowResolution`; that extracted view is
-`Frozen`. A view constructed directly from a database starts at revision zero
-and has no publication ID unless it is placed in a `GraphPublication`; its
-chosen tracking policy determines whether it accepts updates. Database-backed
-windows remain capped by `MAX_WINDOW_DEPTH`. Requests crossing the current head
-view's lower bound take the consistent DB path; head depth itself never forces
-this fallback.
+`Frozen` internally, while its serialized browser image is eligible for the
+Head-bounded projected lineage owned above. A view constructed directly from a
+database starts at revision zero and has no publication ID unless it is placed
+in a `GraphPublication`; its chosen tracking policy determines whether it
+accepts updates. Database-backed windows remain capped by `MAX_WINDOW_DEPTH`
+and have no public delta lineage. Requests crossing the current head view's
+lower bound take the consistent DB path; head depth itself never forces this
+fallback.
 
 ## Resource isolation and saturation — settled
 
