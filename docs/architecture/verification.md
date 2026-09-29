@@ -204,8 +204,8 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
    `RecoveryInputInvalid(MalformedPruningPointResponse)`, retires the producing
    RPC generation, consumes the shared malformed-input budget, and produces no
    boundary threshold, `PreparedSync`, or storage mutation. Supervisor may
-   already have installed that attempt's Reset; the next attempt supersedes it
-   with a fresh ingress.
+   already have completed that attempt's `reset` call; the next attempt
+   supersedes it with a fresh ingress.
 10. Verify the
     [Catchup sink-sample contract](node-service.md#catchup-sink-sample) with
     ordinary and exact-Genesis success, ORIGIN, an advertised sink that is
@@ -491,8 +491,9 @@ with injected clocks and deterministic jitter:
   `DefiniteFailure`, retained Resync and Rebuild obligations, DB-generation
   retention versus retirement, complete session teardown, and the prohibition
   on reissuing an ambiguous transaction;
-- a recoverable failure after Reset sends no API invalidation control; only the
-  next processing attempt's Reset supersedes the installed ApiService session;
+- a recoverable failure after `reset` sends no API invalidation control; only
+  the next processing attempt's `reset` call supersedes the installed
+  ApiService session;
 - whole-attempt recovery Retry rather than in-place page/RPC retry;
 - the general delay sequence and 30-second cap;
 - no second delay while awaiting a replacement service generation;
@@ -739,7 +740,7 @@ Verify the settled
 [publication-state contract](api.md#publication-state-and-revision--settled):
 initial Synchronizing, direct initial Live, visible `Synchronizing -> Live`,
 and terminal Stale transitions leave graph view and history revisions
-unchanged. Cover reliable Reset processing without an acknowledgement,
+unchanged. Cover reliable `reset` processing without an application-completion barrier,
 cancellation of unpublished construction, no additional effect for an already
 Stale publication, delta rejection for Stale, head-snapshot state and ETag
 changes, and immutable delta bytes across later state changes. SSE cases cover
@@ -747,10 +748,15 @@ state-only wakeups repeating one graph cursor, reconnect reporting current
 state, Web adoption without a delta request, and a fresh publication ID for a
 replacement image.
 
-Verify the [ApiService control boundary](api.md#reset-and-recovery-time-availability--settled)
-through the shared ingress capability: Supervisor can deliver Reset and await
-the Shutdown barrier without a `kgi-processing -> kgi-api-core` dependency;
-Reset retains its no-acknowledgement behavior. Verify status observations are
+Verify the settled [core composition](overview.md#core-crate-structure--settled)
+and [Supervisor control](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
+boundaries: the top `kgi` crate owns the four component `Arc` values and uses
+their public async methods without a Supervisor-facing command handle or
+command enum. In particular, verify the
+[ApiService control boundary](api.md#reset-and-recovery-time-availability--settled):
+Supervisor can call `reset` and await the `shutdown` barrier while
+`kgi-processing` remains independent of `kgi-api-core`; `reset` returns after
+reliable acceptance without waiting for application. Verify status observations are
 latest-value and lossy, remain available through the separate memory-only
 lane, and never influence lifecycle decisions. Node status begins without a
 validated observation, replaces it before each Ready publication, and
@@ -840,11 +846,12 @@ Verify [Reset and recovery-time availability](api.md#reset-and-recovery-time-ava
 with ordinary Resync and Rebuild integration scenarios. Verify the fresh
 `GraphUpdateReceiver` and exact recovery mode; global preemption from
 PreSeal, Constructing, Aligning, and Active; and old receiver replacement.
-Supervisor proceeds without waiting for ApiService. Resync preserves historical
-reads, and failed reconciliation followed by Rebuild installs a second fresh
-Reset. Rebuild relies on StorageService rather than Reset to close API database
-admission, retire the old API generation, and boundedly drain or cancel active
-database phases. Verify a detached old projection may complete delivery while
+Supervisor proceeds after `reset` returns without waiting for its application.
+Resync preserves historical reads, and failed reconciliation followed by
+Rebuild calls `reset` again with a fresh ingress. Rebuild relies on
+StorageService rather than `reset` to close API database admission, retire the
+old API generation, and boundedly drain or cancel active database phases.
+Verify a detached old projection may complete delivery while
 an undetached request returns 503, public reads reopen only after the aligned
 replacement becomes Active, public reads never rebind implicitly to a newly
 published storage generation, and no request observes a partial or mixed
@@ -856,15 +863,15 @@ after delivery or receiver replacement.
 
 Verify the [ApiService shutdown barrier](api.md#apiservice-shutdown--settled)
 from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`, and `Active`, including
-races with Reset, marker delivery, gap reconstruction, database projection,
+races with `reset`, marker delivery, gap reconstruction, database projection,
 serialization, detached response delivery, and SSE wakeups. Admission and SSE
 close first; the graph receiver drop unblocks a waiting marker worker; every
-API task and database resource ends before acknowledgement; no publication or
-revision mutation is emitted; and repeated Shutdown is idempotent. Supervisor
-sends ApiService Shutdown before ResyncEngine Shutdown without awaiting the
-first acknowledgement, awaits both barriers, and only then shuts down
-NodeService followed by StorageService. Producer closure during that barrier
-requests no reconstruction or processing recovery.
+API task and database resource ends before method completion; no publication
+or revision mutation is emitted; and repeated `shutdown` is idempotent.
+Supervisor starts ApiService and ResyncEngine shutdown without waiting for one
+to complete before starting the other, awaits both method barriers, and only
+then calls NodeService shutdown followed by StorageService shutdown. Producer
+closure during that barrier requests no reconstruction or processing recovery.
 
 Graph-update and API projection tests cover a non-Genesis block whose selected
 parent index addresses the expected member of `direct_parents`, plus Genesis

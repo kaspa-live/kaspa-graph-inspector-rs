@@ -4,8 +4,8 @@
 
 This document owns ApiService, `GraphView`, `GraphDelta`, `GraphHistory`,
 `GraphPublication`, API resource bulkheads, and the public graph API contract.
-The [processing lifecycle](processing-lifecycle.md) owns when Supervisor sends
-Reset and when processor phase commands occur. [Block processing](block-processing.md)
+The [processing lifecycle](processing-lifecycle.md) owns when Supervisor calls
+`reset` and when processor phase commands occur. [Block processing](block-processing.md)
 owns lifecycle-marker production. [Storage](storage.md) owns database
 transactions, query implementation, and database-replacement exclusion. Web
 client behavior belongs to the [Web architecture](web.md).
@@ -90,7 +90,7 @@ impl GraphUpdateProducer {
 `GraphUpdateProducer` is the cloneable session-scoped producer capability that
 Supervisor supplies through ResyncEngine to both processors.
 `GraphUpdateReceiver` is the corresponding single-consumer session capability
-that Supervisor supplies to ApiService in `Reset`. Every producer clone shares
+that Supervisor supplies through `ApiService::reset`. Every producer clone shares
 one `GraphUpdateGate`, initially `PreSeal`; the receiver does not expose that
 producer-side gate.
 `GraphUpdateGapReporter` and the consumer-side `GraphUpdateGap` refer to the
@@ -496,15 +496,15 @@ consumed by alignment.
 ApiService projects one processing session through these internal states:
 
 ```text
-AwaitReset -- Reset --> PreSeal
+AwaitReset -- reset() --> PreSeal
     -- PublishPostSeal --> Constructing
     -- seed succeeds --> Aligning
     -- block and VSPC cuts crossed --> Active
 ```
 
-`Reset` may preempt every installed-session state. Its complete topology and
+`reset` may preempt every installed-session state. Its complete topology and
 state effects are owned by the
-[Reset contract](#reset-and-recovery-time-availability--settled).
+[reset contract](#reset-and-recovery-time-availability--settled).
 
 In `PreSeal`, ApiService waits for the mandatory `PublishPostSeal` marker; the
 producer gate prevents ordinary committed updates from entering the channel.
@@ -573,7 +573,7 @@ matching duty. Each ordinary graph update goes directly through
 the new complete view revision and then appends and publishes the corresponding
 complete history revision. Ordinary graph updates, Live, revision advancement,
 and retained head-window movement keep the same publication ID. Only a later
-session's Reset or a gap or failure that prevents the Active projection from
+session's `reset` call or a gap or failure that prevents the Active projection from
 advancing leads to a replacement publication. API database-generation change
 by itself does not invalidate Active; continuity then comes from the ordered
 session stream rather than the seed generation.
@@ -1135,57 +1135,40 @@ implementation, and graph wire format remain deferred in the
 
 ## Reset and recovery-time availability — settled
 
-`Reset` is the sole out-of-band ApiService session-supersession control because
-it replaces the graph-update input topology. ApiService's semantic commands
-are:
+`reset` is the sole out-of-band ApiService session-supersession operation
+because it replaces the graph-update input topology. Supervisor owns
+`Arc<ApiService>` and uses this public control surface:
 
 ```rust
-struct ApiServiceControl {
-    // reliable command sender
-}
-
-enum ApiServiceControlError {
-    Closed,
-}
-
-impl ApiServiceControl {
+impl ApiService {
     async fn reset(
         &self,
         graph_updates: GraphUpdateReceiver,
         recovery_mode: RecoveryMode,
-    ) -> Result<(), ApiServiceControlError>;
+    ) -> Result<(), ApiServiceError>;
 
-    async fn shutdown(&self) -> Result<(), ApiServiceControlError>;
-}
-
-enum ApiServiceCommand {
-    Reset {
-        graph_updates: GraphUpdateReceiver,
-        recovery_mode: RecoveryMode,
-    },
-    Shutdown,
+    async fn shutdown(&self) -> Result<(), ApiServiceError>;
 }
 ```
 
-`ApiServiceControl`, the command values, and the graph-update channel
-capabilities live together in `kgi-api-ingress`. The control capability is the
-only ApiService dependency exposed to Supervisor; neither `kgi-processing` nor
-the composition root reaches into `kgi-api-core` state. A closed control path
-has the reliable parent-to-child command failure semantics owned by the
+The methods are ApiService's complete Supervisor-facing control interface.
+Their private mailbox or event-loop mechanics remain internal to
+`kgi-api-core`. Successful `reset` means the operation was reliably accepted
+for ordered processing; it does not wait for application. Successful
+`shutdown` means ApiService completed the shutdown barrier. An unavailable
+component returns `ApiServiceError` under the parent-to-child failure semantics
+owned by the
 [processing lifecycle](processing-lifecycle.md#teardown-and-delivery-semantics--settled).
-Successful `reset` means the reliable command was accepted for ordered
-processing; it does not wait for Reset application. Successful `shutdown`
-means ApiService completed the shutdown barrier.
 
 The `GraphUpdateReceiver` is fresh and belongs to exactly one processing
 session. `RecoveryMode` is the Resync/Rebuild value owned by the
 [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
-No Reset or graph update carries a session ID. The gap
+No `reset` call or graph update carries a session ID. The gap
 signal exposes a monotonically advancing generation and a wakeup; the exact
 atomic and notification primitives remain implementation choices.
 
-ApiService accepts exactly one Reset for each processing attempt.
-Reset globally preempts `PreSeal`, `Constructing`, `Aligning`, or `Active`:
+ApiService accepts exactly one `reset` call for each processing attempt. It
+globally preempts `PreSeal`, `Constructing`, `Aligning`, or `Active`:
 
 1. abandon any unpublished candidate and reconstruction state;
 2. mark any current non-Stale publication terminally Stale;
@@ -1193,22 +1176,22 @@ Reset globally preempts `PreSeal`, `Constructing`, `Aligning`, or `Active`:
 4. establish the recovery-mode-specific historical-read effects below; and
 5. enter `PreSeal`.
 
-Reset is reliable but has no acknowledgement. Supervisor may continue session
-startup immediately after sending it; Reset is not a processing barrier or a
-database-replacement barrier. A previous publication already Stale needs no
-additional graph or history mutation.
+The call is reliable but has no application-completion barrier. Supervisor may
+continue session startup after it returns; `reset` is not a processing barrier
+or a database-replacement barrier. A previous publication already Stale needs
+no additional graph or history mutation.
 
 `PublishPostSeal` and `Live` are graph-update-feed markers rather than
 out-of-band controls. They have no publication-completion acknowledgement. A
-later session's Reset is the only session-supersession mechanism visible to
-ApiService.
+later session's `reset` call is the only session-supersession mechanism visible
+to ApiService.
 
 Ordinary teardown may drop the session's last producer and close the installed
 receiver. Channel closure is not an ApiService lifecycle signal and does not
 replace, invalidate, or reconstruct a publication. ApiService retains its
-current state until the next Reset or another defined state transition.
+current state until the next `reset` call or another defined state transition.
 
-An ordinary Resync Reset leaves historical DB reads available. During Rebuild,
+An ordinary Resync `reset` leaves historical DB reads available. During Rebuild,
 public historical-window requests in `PreSeal`, `Constructing`, and `Aligning`
 fail cleanly with `503 Service Unavailable` and a short `Retry-After`.
 ApiService's private construction reads remain allowed when StorageService
@@ -1217,12 +1200,12 @@ publishes a usable API DB generation.
 ApiService never rebinds public historical requests implicitly to whatever API
 DB generation StorageService most recently published. A Rebuild construction
 captures its replacement generation privately; only activation installs that
-same generation for public historical requests. If Reset processing lags
+same generation for public historical requests. If `reset` processing lags
 behind storage replacement, retirement of the previously installed generation
 still makes new database phases fail rather than crossing into the replacement
 generation.
 
-StorageService, rather than Reset, owns database-replacement exclusion. Its
+StorageService, rather than `reset`, owns database-replacement exclusion. Its
 [replacement gate](storage.md#api-read-exclusion-during-database-replacement--settled)
 governs the API database phase. On the ApiService side, a request that already
 detached its complete in-memory projection may finish delivering the old
@@ -1236,13 +1219,13 @@ publication. An ordered Live marker changes the sticky target or the Active
 publication state without another database load or graph revision.
 
 The storage owner defines the `TRUNCATE`/MVCC safety requirement and detailed
-gate boundary. Reset does not participate in that exclusion mechanism.
+gate boundary. `reset` does not participate in that exclusion mechanism.
 
 ### ApiService shutdown — settled
 
-`Shutdown` is a reliable completed-barrier command. It is terminal,
+`shutdown` is a reliable completed-barrier operation. It is terminal,
 idempotent, valid from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`, and
-`Active`, and supersedes Reset processing, publication construction,
+`Active`, and supersedes `reset` processing, publication construction,
 alignment, reconstruction, and Active update application. ApiService performs
 the local barrier in order:
 
@@ -1255,15 +1238,15 @@ the local barrier in order:
    API-owned task;
 6. release every API DB permit, transaction, connection, validated client,
    pool handle, publication, and cache reference; and
-7. acknowledge `Shutdown` and enter terminal `Stopped`.
+7. enter terminal `Stopped` and complete the `shutdown` call.
 
-The acknowledgement proves that no API admission, task, graph-update receiver,
-or API database resource remains. A repeated `Shutdown` acknowledges the
-already completed state; no Reset is accepted after shutdown begins. Exact
+Successful method completion proves that no API admission, task, graph-update
+receiver, or API database resource remains. A repeated `shutdown` returns
+success for the already completed state; no `reset` is accepted after shutdown begins. Exact
 shutdown timeouts and forced escalation remain deferred under the shared
 shutdown policy.
 
-Shutdown creates no publication, `Stale` transition, graph revision, or SSE
+`shutdown` creates no publication, `Stale` transition, graph revision, or SSE
 wakeup because external admission closes first. `ReceiverClosed` caused by
 this barrier is expected cancellation for the concurrently stopping processing
 session and must not request API reconstruction, Resync, or Rebuild.
@@ -1399,7 +1382,7 @@ StorageService's
 
 Releasing database resources and detaching the complete projection ends the
 request's participation in StorageService's replacement gate. Response
-construction cannot issue follow-up database reads. Reset need not wait for or
+construction cannot issue follow-up database reads. `reset` need not wait for or
 cancel the remaining serialization and delivery work.
 
 If all `MAX_CACHE_DEPTH = 1000` complete levels exceed the cache memory

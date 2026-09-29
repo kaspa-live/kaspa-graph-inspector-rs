@@ -48,13 +48,23 @@ struct StorageServiceStatus {
     state: StorageServiceStatusState,
 }
 
-wait_until_usable() -> Result<Arc<ValidatedDbClient>, StorageWaitError>
-wait_until_api_usable() -> Result<Arc<ValidatedApiDbClient>, StorageWaitError>
-initialize_if_uninitialized(
-    network_id: NetworkId,
-    genesis_hash: BlockHash,
-) -> Result<(), StorageError>
-shutdown() -> Result<(), StorageError>
+impl StorageService {
+    async fn wait_until_usable(
+        &self,
+    ) -> Result<Arc<ValidatedDbClient>, StorageWaitError>;
+
+    async fn wait_until_api_usable(
+        &self,
+    ) -> Result<Arc<ValidatedApiDbClient>, StorageWaitError>;
+
+    async fn initialize_if_uninitialized(
+        &self,
+        network_id: NetworkId,
+        genesis_hash: BlockHash,
+    ) -> Result<(), StorageError>;
+
+    async fn shutdown(&self) -> Result<(), StorageError>;
+}
 ```
 
 `wait_until_usable()` waits through transient `Connecting`,
@@ -65,6 +75,9 @@ remains pending until initialization is authorized and a validated node
 identity supplies the complete immutable network binding. Permanent
 `Rejected`, `Stopped`, or closed service state is returned to the caller.
 Service state outlives individual validated DB generations.
+`shutdown` is terminal and idempotent; successful completion means
+StorageService is `Stopped` and has released its owned pools, database lock,
+clients, and caches.
 `StorageServiceStatus` is the component observation consumed by the
 [API status contract](api.md#status-observation--settled). It contains no
 validated database capability and never authorizes a database operation or
@@ -367,7 +380,7 @@ schema, replace its migration history, and change the immutable network
 binding. It has two entry forms:
 
 ```text
-kgi-processing database reinitialize --network-id <network> [--yes]
+kgi database reinitialize --network-id <network> [--yes]
 --reinitialize-db-token=<token>
 ```
 
@@ -784,7 +797,7 @@ not report success, publish cache changes, or retry blindly.
 StorageService reports `Persistence(AmbiguousCommit)` and retires the current
 `ValidatedDbClient` generation so a replacement generation rederives database
 truth. The processing lifecycle owns session termination, the retained Rebuild
-obligation, and Supervisor's next API Reset.
+obligation, and the resulting recovery disposition.
 
 The [processing lifecycle](processing-lifecycle.md) owns when this operation
 may start. Storage owns both API-read exclusion and the atomic replacement.

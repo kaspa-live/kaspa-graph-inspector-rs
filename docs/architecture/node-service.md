@@ -52,12 +52,22 @@ struct NodeServiceStatus {
     state: NodeServiceStatusState,
     last_validated: Option<ValidatedNodeStatus>,
 }
+
+impl NodeService {
+    async fn wait_until_usable(
+        &self,
+    ) -> Result<Arc<ValidatedRpcClient>, NodeWaitError>;
+
+    async fn shutdown(&self) -> Result<(), NodeServiceError>;
+}
 ```
 
 `NodeServiceState` and published status outlive individual validated client
 generations. `wait_until_usable()` waits through transient `Connecting` and
 `Unavailable` states, but returns permanent `Rejected`, `Stopped`, or closed
 service state to its caller.
+`shutdown` is terminal and idempotent; successful completion means
+NodeService is `Stopped` and has released its owned connection resources.
 
 `NodeServiceStatus` is the component observation consumed by the
 [API status contract](api.md#status-observation--settled). It never carries

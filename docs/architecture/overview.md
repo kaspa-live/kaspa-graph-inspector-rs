@@ -16,6 +16,9 @@ templates.
 ## System shape — settled
 
 ```text
+kgi (binary and composition root)
+└── Supervisor (control tree below)
+
 Supervisor
 ├── Arc<NodeService> ───────────► Arc<ValidatedRpcClient> (one connection)
 ├── Arc<StorageService> ────────► Arc<ValidatedDbClient> (one DB generation)
@@ -29,22 +32,26 @@ Supervisor
 
 NotificationRouter (implements Notify)
 ├── BlockAdded ────────────────► BlockProcessor notification input
-└── VirtualChainChanged ──────► VspcProcessor notification input
+└── VirtualChainChanged ───────► VspcProcessor notification input
 
 BlockProcessor ── PersistedBlock ──► OrphanManager, VspcProcessor
 BlockProcessor/VspcProcessor
     ── per-session ordered graph updates ──► ApiService
 BlockProcessor ── lifecycle markers ──► ApiService
 ResyncEngine ── lifecycle milestones ──► Supervisor
-Supervisor ── Reset(fresh graph-update input) / Shutdown ──► ApiService
+Supervisor ── reset(fresh graph-update input) / shutdown ──► ApiService
 ```
 
+The top `kgi` crate is the binary, composition root, and home of Supervisor. It
+constructs the long-lived components and gives Supervisor their `Arc` values.
 Autonomous long-lived workers form a control tree. `ResyncEngine` owns both
 processors and a run's `ProcessingSession`; `BlockProcessor` owns
-OrphanManager, DependencyResolver, and its lifecycle-marker worker. Parent
-components command their children. Children report reliable faults and
-milestones upward. Strong reference cycles are forbidden. `Arc<Component>` is
-a valid initial shape; thin handles are not required.
+OrphanManager, DependencyResolver, and its lifecycle-marker worker. Supervisor
+invokes public control methods on the four components it manages. Internal
+owners may retain explicit child-worker command protocols. Children report
+reliable faults and milestones upward. Strong reference cycles are forbidden.
+`Arc<Component>` is the settled Supervisor-facing shape; separate control
+handles are unnecessary.
 
 Every worker serializes its local state changes in one event loop despite
 concurrent inputs. Live ingestion remains subscription-based. Notifications
@@ -89,6 +96,8 @@ kgi-node        ──► kgi-model
 kgi-storage     ──► kgi-model + kgi-api-model
 kgi-processing  ──► kgi-model + kgi-api-ingress + kgi-node + kgi-storage
 kgi-api-core    ──► kgi-model + kgi-api-model + kgi-api-ingress + kgi-storage
+kgi             ──► kgi-model + kgi-api-ingress + kgi-node + kgi-storage
+                  + kgi-processing + kgi-api-core
 ```
 
 `kgi-model` contains shared domain values and cross-component message values,
@@ -103,13 +112,10 @@ API graph values and request/result values such as `Level`, `GraphBlock`,
 shapes. It has no service workers, database implementation, HTTP server,
 channel runtime, or PostgreSQL types.
 
-`kgi-api-ingress` owns the in-process control and graph-update ingress:
-`ApiServiceControl`, `ApiServiceCommand`, `GraphUpdateProducer`,
+`kgi-api-ingress` owns the graph-update ingress: `GraphUpdateProducer`,
 `GraphUpdateReceiver`, `GraphUpdateGate`, gap signaling, bounded-channel
-construction, and producer-gate behavior. Reliable control and bounded graph
-updates retain their distinct delivery contracts inside the same crate. It
-depends on the async runtime and `kgi-model`, but not on `kgi-api-model`,
-`kgi-storage`, or `kgi-api-core`.
+construction, and producer-gate behavior. It depends on the async runtime and
+`kgi-model`, but not on `kgi-api-model`, `kgi-storage`, or `kgi-api-core`.
 
 `kgi-node` owns NodeService, `ValidatedRpcClient`, NotificationRouter, RPC
 normalization, and subscription handling. It depends on `kgi-model` and the
@@ -123,17 +129,20 @@ only their sender handles to `kgi-node`. Their payload types belong to
 persistence, and the API projection read against `kgi-api-model` contracts. It
 must not depend on `kgi-api-core` or `kgi-api-ingress`. `kgi-api-core` owns
 ApiService, graph publication behavior, HTTP/SSE, and API runtime state.
-`kgi-processing` owns Supervisor and the processing workers, uses the API
-control capability and graph-update producer, and does not depend on
-`kgi-api-core`.
+`kgi-processing` owns ResyncEngine and the processing workers, consumes the
+graph-update producer, and does not depend on `kgi-api-core`.
 
-The binary/composition crate, migrations, Web assets, and internal module
-boundaries remain deferred in the
+The top `kgi` crate owns Supervisor, process composition, CLI entry points, and
+global shutdown. Migrations, Web assets, and internal module boundaries remain
+deferred in the
 [decision register](../decisions/deferred.md).
 
 ## Interaction rules — settled
 
-- Lifecycle control flows from parent to child.
+- Supervisor invokes public control methods on its managed `Arc<Component>`
+  values; their private mailbox or event-loop implementation is not an
+  architectural interface.
+- Internal lifecycle control flows from parent to child.
 - Reliable faults and milestones flow from child to parent.
 - Data channels connect the explicit producers and consumers shown above;
   they do not create lifecycle ownership.

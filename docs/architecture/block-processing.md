@@ -130,7 +130,8 @@ that command, no later marker exists for the session.
 
 Deactivate closes the local marker-command input but does not wait for a
 marker command already accepted there. The worker drains its accepted commands
-and exits after delivery, or exits when a later Reset drops the old receiver.
+and exits after delivery, or exits when a later `ApiService::reset` call drops
+the old receiver.
 It holds no validated RPC or DB client and therefore cannot delay processing
 session teardown or resource-generation replacement. If no marker is pending,
 it exits immediately.
