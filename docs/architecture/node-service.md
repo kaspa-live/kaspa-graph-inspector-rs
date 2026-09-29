@@ -53,6 +53,12 @@ struct NodeServiceStatus {
     last_validated: Option<ValidatedNodeStatus>,
 }
 
+enum NodeWaitError {
+    Rejected(NodeRejection),
+    Stopped,
+    ServiceClosed,
+}
+
 impl NodeService {
     async fn wait_until_usable(
         &self,
@@ -64,8 +70,10 @@ impl NodeService {
 
 `NodeServiceState` and published status outlive individual validated client
 generations. `wait_until_usable()` waits through transient `Connecting` and
-`Unavailable` states, but returns permanent `Rejected`, `Stopped`, or closed
-service state to its caller.
+`Unavailable` states. It returns `Rejected(reason)` for permanent validation or
+configuration rejection, `Stopped` when the service has entered its terminal
+state, and `ServiceClosed` when its worker or control path closes without that
+state transition. Caller cancellation is not a `NodeWaitError`.
 `shutdown` is terminal and idempotent; successful completion means
 NodeService is `Stopped` and has released its owned connection resources.
 

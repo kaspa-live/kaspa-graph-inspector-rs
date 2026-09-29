@@ -48,6 +48,11 @@ Supervisor waits for a usable node generation only when recovery is desired
 and the engine is idle. That wait is polled concurrently with Supervisor
 method requests and incoming events; the Supervisor main loop must not block.
 The acquired RPC client may be retained while `processing_db` is absent.
+While Supervisor is Running, `NodeWaitError::Rejected(reason)`,
+`NodeWaitError::Stopped`, and `NodeWaitError::ServiceClosed` each enter the
+Fatal lifecycle; the latter two mean the managed NodeService ended
+unexpectedly. Transient node unavailability remains inside the wait and does
+not produce one of these results.
 StorageService can open, lock, and inspect an Uninitialized database while the
 node wait continues. Once the validated RPC generation is available,
 Supervisor supplies its `(network_id, genesis_hash)` through the idempotent
@@ -980,7 +985,11 @@ On Deactivate, ResyncEngine performs this barrier in order:
 
 The owning services may retain their validated generations after Deactivate.
 For global shutdown, Supervisor first enters terminal shutdown and starts no
-new recovery attempt. It then starts `ApiService::shutdown` and
+new recovery attempt. At that transition it cancels or drops any outstanding
+node wait, starts no replacement wait, and ignores any concurrently completed
+wait result, including a successful client. This is expected caller
+cancellation and produces no fault or recovery request. Supervisor then starts
+`ApiService::shutdown` and
 `ResyncEngine::shutdown` without waiting for either method to complete before
 starting the other. It awaits both completed method barriers before calling
 `NodeService::shutdown` and then `StorageService::shutdown`. This releases every

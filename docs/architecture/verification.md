@@ -242,6 +242,11 @@ Use injected clocks and deterministic jitter to verify the independent
 sequences: nominal exponential slots through the 30-second cap, reset only
 after 60 seconds continuously Ready, shutdown cancellation, and terminal
 rejection without retry. Exercise the inclusive 50% through 100% jitter range.
+Exercise each typed `NodeWaitError`: rejection, unexpected Stopped state, and
+unexpected service closure enter Supervisor Fatal while Running. A still-pending
+wait and either a successful or failed completion racing with Supervisor's
+terminal-shutdown transition are cancelled or ignored without starting a
+session, reporting a fault, or requesting recovery.
 Install the reliable ordered `StorageServiceEvent` path before either initial
 DB generation can be published. Verify initial and replacement processing and
 API publications, exact-`Arc` retirements, suppression of repeated retirement,
