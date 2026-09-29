@@ -893,6 +893,16 @@ and AwaitingReplacement states. A racing Rebuild reset wins by entering
 `ClosedForRebuild`; no ordinary completion can reopen reads, and only
 activation of the rebuilt candidate installs its privately captured generation.
 
+Cover initial API database acquisition separately. ApiService starts in
+`AwaitingInitial`, owns exactly one `wait_until_api_usable()` task, and returns
+`503` for public database-backed requests until that task installs
+`Available(G1)`. An ordinary initialized startup followed by `reset(Resync)`
+preserves `G1`; neither initial installation nor reset changes a graph
+publication. For an Empty database, allow initial `Available(G1)` and typed
+anchor misses, then verify the distinct Rebuild reset enters
+`ClosedForRebuild`. Also race that reset ahead of initial-wait completion and
+prove the late completion cannot reopen public reads.
+
 Verify [Reset and recovery-time availability](api.md#reset-and-recovery-time-availability--settled)
 with ordinary Resync and Rebuild integration scenarios. Verify the fresh
 `GraphUpdateReceiver` and exact recovery mode; global preemption from

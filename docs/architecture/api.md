@@ -1280,6 +1280,7 @@ requests:
 
 ```rust
 enum ApiDbReadState {
+    AwaitingInitial,
     Available(Arc<ValidatedApiDbClient>),
     AwaitingReplacement {
         lost: Arc<ValidatedApiDbClient>,
@@ -1294,15 +1295,24 @@ and private publication construction do not acquire their database capability
 through this state. Construction captures its own exact
 `ValidatedApiDbClient` for one attempt.
 
+ApiService initializes `public_db_reads` to `AwaitingInitial` and owns exactly
+one internal startup task that calls
+`StorageService::wait_until_api_usable()`. A successful wait installs
+`Available(initial)` only while the state remains `AwaitingInitial`. It changes
+no graph publication ID, state, revision, history, or SSE cursor. Supervisor
+does not acquire or pass this handle, and neither the first `reset` nor the
+first public request initiates the wait. A terminal `StorageWaitError` ends the
+task without spinning and leaves the state `AwaitingInitial` until shutdown.
+
 A public database-backed request briefly reads `public_db_reads`. From
 `Available(client)`, it clones that `Arc`, releases the ApiService state lock,
 and performs its complete database phase against that exact generation. It
 never holds the state lock across database work, switches generations, or
-retries transparently against a replacement. `AwaitingReplacement` and
-`ClosedForRebuild` reject the database phase with `503 Service Unavailable`
-and a short `Retry-After`. A complete projection detached before a concurrent
-state change may still finish delivery under the storage-owned replacement
-gate.
+retries transparently against a replacement. `AwaitingInitial`,
+`AwaitingReplacement`, and `ClosedForRebuild` reject the database phase with
+`503 Service Unavailable` and a short `Retry-After`. A complete projection
+detached before a concurrent state change may still finish delivery under the
+storage-owned replacement gate.
 
 When a public operation through the currently installed client returns
 `GenerationLost`, that request returns `503` and ApiService atomically changes
@@ -1382,13 +1392,24 @@ receiver. Channel closure is not an ApiService lifecycle signal and does not
 replace, invalidate, or reconstruct a publication. ApiService retains its
 current state until the next `reset` call or another defined state transition.
 
-An ordinary Resync `reset` preserves `public_db_reads`, including an in-progress
-ordinary replacement wait. A Rebuild `reset` changes it to
-`ClosedForRebuild` and makes any ordinary replacement attempt obsolete. During
-Rebuild, public database-backed requests in `PreSeal`, `Constructing`, and
-`Aligning` fail cleanly with `503 Service Unavailable` and a short
-`Retry-After`. ApiService's private construction reads remain allowed when
-StorageService publishes a usable API DB generation.
+An ordinary Resync `reset` preserves `public_db_reads`, including
+`AwaitingInitial` or an in-progress ordinary replacement wait. A Rebuild
+`reset` changes any of `AwaitingInitial`, `Available`, or
+`AwaitingReplacement` to `ClosedForRebuild` and makes the initial or ordinary
+replacement wait obsolete. During Rebuild, public database-backed requests in
+`PreSeal`, `Constructing`, and `Aligning` fail cleanly with `503 Service
+Unavailable` and a short `Retry-After`. ApiService's private construction reads
+remain allowed when StorageService publishes a usable API DB generation.
+
+On ordinary initialized startup, the initial wait installs the first usable
+generation and the normal Resync reset preserves it. A coherent network-bound
+Empty database may likewise supply that initial generation; its valid anchored
+requests produce ordinary typed anchor-unavailability outcomes. If the initial
+Resync then leads to a distinct Rebuild run under the
+[processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled),
+that run's Rebuild reset closes public database reads as above. If the reset
+wins the race with initial acquisition, the late initial completion cannot
+escape `ClosedForRebuild`.
 
 ApiService never rebinds an in-flight public request to whatever API DB
 generation StorageService most recently published. A Rebuild construction
