@@ -787,18 +787,21 @@ never prunes Fixed graph structure.
 
 For `VspcCommitted`, resolve immutable metadata needed to project the
 transition from the union of Fixed and post-update Head blocks. This lets an
-added chain member above the Fixed extent supply its merge sets, coordinate,
-and DAA score while mutations apply only to blocks and levels retained by
-Fixed. Apply the storage-owned remove-then-add ordering: retained removed
+added chain member above the Fixed extent supply its merge sets while
+mutations apply only to blocks and levels retained by Fixed. Apply the
+storage-owned remove-then-add ordering: retained removed
 members leave VSPC and become Gray; retained added members enter VSPC; every
 resolved added member's blue and red merge sets recolor matching retained Fixed
-blocks; and affected retained levels receive their final DAA score after the
-complete transition.
+blocks. Independently apply every supplied final level snapshot whose level is
+already retained by Fixed.
 
-If metadata required for the complete Fixed projection is absent from both
-views, change Fixed to `Frozen` before applying any part of that value. Do not
-partially mutate it, query storage implicitly, or advance its revision. The
-same terminal transition preserves the last coherent Fixed image.
+If block metadata required for the complete membership or color projection is
+absent from both views, change Fixed to `Frozen` before applying any part of
+that value. A snapshot supplies its affected level state directly and does not
+require the corresponding removed or added block to exist in either view. Do
+not partially mutate the view, query storage implicitly, or advance its
+revision. The same terminal transition preserves the last coherent Fixed
+image.
 
 A `GraphDelta` produced by this Fixed lineage can still be applied to a
 matching Fixed view under the general absolute-map and revision rules.
@@ -927,7 +930,9 @@ order as the storage transaction, projected onto its retained blocks:
 2. each present added block enters VSPC;
 3. for every present added block in order, each present blue merge-set member
    becomes `Blue`, then each present red merge-set member becomes `Red`; and
-4. affected retained levels receive their final current-VSPC DAA score.
+4. every supplied final level snapshot whose level is already retained replaces
+   that level's public `size` and `daa_score`, preserving its derived
+   `usage_count`.
 
 Membership and color are separate mutable fields. The two change maps are
 independent and may contain the same block hash. Each atomic update records the
@@ -935,13 +940,16 @@ field's value before the complete VSPC transition and its final value after all
 steps; it omits a field whose final value equals its original value. Temporary
 states within the transition never enter the delta.
 
-An absent mutation target is ignored without a placeholder, deferred mutation,
-storage lookup, or fault. The normal absent case is a block already in the past
-below the view extent; its merge-set members are also in its past and cannot
-affect the retained graph. A later absolute `Some(GraphBlock)` carries that
-block's complete then-current projection and needs no replay of ignored field
-changes. If all projected field and level effects are absent or no-ops, the
-atomic VSPC update returns no delta and advances no view revision.
+An absent block mutation target is ignored without a placeholder, deferred
+mutation, storage lookup, or fault. The normal absent case is a block already
+in the past below the view extent; its merge-set members are also in its past
+and cannot affect retained blocks. Level snapshots are independent of block
+presence: they update an already retained nominal or external endpoint level,
+and are ignored when their level is absent. A later absolute
+`Some(GraphBlock)` carries that block's complete then-current projection and
+needs no replay of ignored field changes. If all projected field and level
+effects are absent or no-ops, the atomic VSPC update returns no delta and
+advances no view revision.
 
 Gapless composition treats `block_changes`, `is_in_vspc_changes`, and
 `color_changes` as independent collections. Block changes keep their
@@ -959,16 +967,15 @@ cross-collection cleanup or conflict validation is required. A composed
 interval whose mutations cancel completely still advances from its recorded
 `from_revision_id` to `to_revision_id`.
 
-VSPC DAA-score projection uses the existing `level_changes` collection. After
-capturing each affected retained level's original value, process every present
-removed block as a final-score candidate of `None`, then every present added
-block as `Some(block.daa_score)`. Addition therefore supplies the final score
-when both paths affect one level. Emit one `LevelChange` per level only after
-the complete transition. Both sides remain `Some(Level)` with identical
-`size`; only `daa_score` changes. Omit the entry when the final score equals the
-original score. Existing `LevelChange` composition then combines block-level
-creation or size changes with the VSPC result and removes composed no-ops. A
-retained level-score change alone is sufficient to produce a graph revision.
+VSPC DAA-score projection uses the existing `level_changes` collection. For
+each supplied snapshot whose level is retained, capture the original public
+value and install the snapshot's complete final `size` and `daa_score` while
+preserving the derived `usage_count`. Emit one `LevelChange` only when that
+public value changed. Both sides remain `Some(Level)` because a VSPC update
+does not create or remove levels. Existing `LevelChange` composition then
+combines block-level creation or size changes with the VSPC result and removes
+composed no-ops. A retained level-score change alone is sufficient to produce
+a graph revision.
 
 An edge belongs to an extent `[low_level, high_level]` when its level span
 intersects that extent:
@@ -1391,9 +1398,9 @@ current VSPC DAA resolves the current VSPC level. If `q` is at or above the
 DAA of the current head view's lowest cached VSPC level, that view can resolve it; otherwise use the
 storage lookup. Level resolution and its window must come from **one immutable
 graph view** or one consistent DB transaction, never different revisions.
-ApiService derives cached levels' final scores from `VspcCommitted` and its
-cached block metadata; storage sends no level-score delta. Historical
-DAA/window responses are not cached in v2.
+ApiService obtains cached levels' authoritative final scores from the complete
+level snapshots carried by `VspcCommitted`. Historical DAA/window responses
+are not cached in v2.
 
 ## Status observation — settled
 

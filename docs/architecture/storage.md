@@ -992,11 +992,16 @@ Processing owns delivery of the returned graph-update payload, any resulting
 ## Atomic VSPC transaction — settled
 
 ```rust
+struct VspcCommitOutcome {
+    destination: VspcPoint,
+    level_snapshots: Arc<[LevelCommitted]>,
+}
+
 impl ValidatedDbClient {
     async fn apply_vspc_change(
         &self,
         change: ReadyVspcChange,
-    ) -> Result<VspcPoint, StorageError>;
+    ) -> Result<VspcCommitOutcome, StorageError>;
 }
 
 struct VspcPathConflict {
@@ -1059,9 +1064,18 @@ Applying red after blue resolves any merge-set overlap deterministically. A
 remove/add sequence may temporarily alter and then restore a level score; only
 the final value is persisted.
 
+The outcome's `level_snapshots` is non-repeating by level and contains one
+complete post-commit `LevelCommitted` for every distinct level whose final DAA
+score the transaction evaluates in step 4. It contains final snapshots rather
+than a change list: the consumer decides whether a supplied value changes its
+projection. Construct the snapshots inside the same transaction and return
+them only after definite commit. `None` represents storage's no-VSPC DAA
+sentinel; `size` is the level's unchanged committed size.
+
 The owned change is consumed so definite commit can return its destination
-`VspcPoint` without cloning it. Storage does not return a separate list of
-level-score changes.
+`VspcPoint` without cloning it. The result carries both the committed
+destination and the authoritative final state of every affected level; no
+post-commit projection read is allowed.
 
 ## Reconciliation snapshot — settled
 

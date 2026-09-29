@@ -366,7 +366,10 @@ lifecycle mapping of that defensive error, typed pre-mutation
 `VspcSourceDiscontinuity`, and structured
 `VspcPathDiscontinuity(VspcPathConflict)` evidence, atomic membership and
 coloring changes, merge-set members represented only by boundary identity, and
-final level-score publication.
+final level-score publication. Its definite outcome contains one complete
+post-commit snapshot for every distinct affected level, including a level whose
+remove/add sequence restores its original score, and requires no post-commit
+projection read.
 
 Verify [transaction retries](storage.md#transaction-retries) with PostgreSQL
 integration fixtures. Only SQLSTATE `40001` and `40P01` retry the complete
@@ -713,7 +716,11 @@ overriding an absolute block addition, a final absolute removal, and an empty
 composed mutation that still advances its revision interval. Level cases cover
 removed-only VSPC-empty state, remove/add replacement at one level, restored
 original score, block-created level followed by VSPC scoring, and a level-only
-graph revision.
+graph revision. In particular, retain an external endpoint level below the
+nominal extent, omit every removed and added block at that level from the view,
+and verify that its supplied final snapshot still updates its DAA score and
+produces the corresponding level-only delta. A snapshot for a level absent
+from the view is ignored.
 
 Verify [DAA navigation and graph windows](api.md#daa-navigation-and-graph-windows--settled)
 for floor selection and tie break, the sentinel result, a reorg-created

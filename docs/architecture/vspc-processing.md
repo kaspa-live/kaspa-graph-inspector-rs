@@ -277,7 +277,7 @@ source, or reports that probe error unchanged. The
 solely owns their retirement, retry-budget, and recovery-strength consequences.
 Definite readiness commits through
 `ValidatedDbClient::apply_vspc_change(ready)` and adopts the returned
-destination as the new committed sink.
+outcome's destination as the new committed sink.
 
 ## Catchup filtering, crossing, and overlap — settled
 
@@ -356,16 +356,19 @@ struct VspcCommitted {
     destination: BlockHash,
     removed: Arc<[BlockHash]>,
     added: Arc<[BlockHash]>,
+    level_snapshots: Arc<[LevelCommitted]>,
 }
 ```
 
 For each ready transition, VspcProcessor invokes storage's atomic VSPC
 transaction. Only definite commit advances its local committed sink and
-history. Storage returns the destination `VspcPoint`; no caller-side
-destination reconstruction or clone is required.
+history. Storage returns the destination `VspcPoint` and the complete final
+snapshots of its affected levels; no caller-side destination or level-score
+reconstruction is required.
 
 After definite commit, VspcProcessor offers the corresponding
-`VspcCommitted` update to the run's ordered graph-update producer. The
+`VspcCommitted` update, including the storage-returned level snapshots, to the
+run's ordered graph-update producer. The
 [BlockProcessor delivery contract](block-processing.md#committed-block-delivery)
 offers each newly materialized block's graph update before the `PersistedBlock`
 that can make a VSPC transition ready. Therefore VspcProcessor cannot publish
