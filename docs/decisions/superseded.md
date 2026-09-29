@@ -16,8 +16,8 @@ explain why older handoffs or implementation notes may use different terms.
 | Use an `Auto` recovery mode that falls through from Resync to Rebuild. | Explicit Resync and Rebuild obligations. | [Processing lifecycle](../architecture/processing-lifecycle.md) |
 | Defer the API outside KGI v2. | In-process API and Web-facing graph contract in v2. | [API](../architecture/api.md) |
 | Identify API continuity with `GraphEpoch` stored on every graph image. | `GraphPublication.publication_id`, with views carrying only their own revision. | [API](../architecture/api.md) |
-| Carry `HeadGraphCoverage` in every delta. | Explicit graph mutations plus the delta lineage `high_level`. | [API](../architecture/api.md) |
-| Recheck VSPC source/sink continuity inside ApiService. | Trust the ordered, continuity-certified `VspcProcessor` output. | [API](../architecture/api.md) |
+| Carry `HeadGraphCoverage` in every delta. | Explicit graph mutations plus the delta lineage `high_level`. | [API graph model](../architecture/api-graph.md) |
+| Recheck VSPC source/sink continuity inside ApiService. | Trust the ordered, continuity-certified `VspcProcessor` output. | [API graph model](../architecture/api-graph.md) |
 | Use a cross-session observer stream, global invalid flag, and `InvalidateSession` control. | Fresh per-session graph-update ingress and `ApiService::reset`-owned supersession. | [API ingress](../architecture/api-ingress.md), [API](../architecture/api.md) |
 | Publish a database seed before locating its graph-update boundary and keep a private detector active. | Explicit construction and alignment before activation. | [API](../architecture/api.md) |
 | Treat graph-update channel closure as an ApiService session event. | `ApiService::reset` is the sole ApiService session-supersession mechanism. | [API ingress](../architecture/api-ingress.md), [API](../architecture/api.md) |

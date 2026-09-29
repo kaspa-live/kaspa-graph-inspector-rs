@@ -645,7 +645,7 @@ with:
 ## API and Web
 
 Verify the [graph-update feed](api-ingress.md#in-process-graph-update-feed--settled)
-and [graph publication contract](api.md#graph-views-publication-revision-and-history--settled)
+and [graph model](api-graph.md#graph-values-views-revisions-and-history--settled)
 for causal order, one fresh ingress per processing session, no cross-session
 message tagging, the mutex-protected `PreSeal -> Open` producer gate,
 nonblocking ordinary delivery, a reliable coalescing gap generation even when
@@ -678,13 +678,13 @@ content. An update for a level with no retained crossing-edge endpoint produces
 no visible revision, and unreferenced external endpoint metadata can be
 discarded.
 
-Verify the settled [head block mutation](api.md#head-block-mutation--settled)
+Verify the settled [head block mutation](api-graph.md#head-block-mutation--settled)
 below and at full depth, at the existing high level, at a new high level, and
 with a below-range commit. Cases cover block and child-owned edge pruning,
 existing and new endpoint counters, multiple edges sharing a parent level,
 counter-only maintenance, and removal or survival of an external level.
 
-Verify [Fixed updates through Head](api.md#fixed-updates-through-the-head-cache--settled)
+Verify [Fixed updates through Head](api-graph.md#fixed-updates-through-the-head-cache--settled)
 with both crossing orders at the overlap boundary, an original update that
 produces no Head delta but changes Fixed, block metadata split between the two
 views, an above-Fixed added member that recolors a retained merge-set block,
@@ -709,7 +709,7 @@ points return `GraphViewUpdateError::Frozen`; delta application returns
 changing contents or revision. Keep this distinct from a no-effect update
 accepted by `Head` or `Fixed`.
 
-Verify [frozen subview extraction](api.md#frozen-subview-extraction--settled)
+Verify [frozen subview extraction](api-graph.md#frozen-subview-extraction--settled)
 from `Head`, `Fixed`, and `Frozen` sources, including nested extraction. Cover
 invalid and outside extents; inherited revision and calculated nominal depth;
 complete in-range blocks; crossing edges with zero, one, and two endpoint
@@ -727,7 +727,7 @@ entries, longest-prefix pruning, derived oldest available revision, and
 unchanged current revision. No count or byte pressure may prune history
 earlier.
 
-Verify the [graph-view edge and absolute-map contract](api.md#graph-views-publication-revision-and-history--settled)
+Verify the [graph-view edge and absolute-map contract](api-graph.md#graph-values-views-revisions-and-history--settled)
 with zero, one, and two endpoint blocks retained; Head child addition and
 removal; parent-only removal under Head pruning; Fixed crossing-edge addition;
 outside-extent parent levels under both policies; and PP-boundary sentinel
@@ -737,7 +737,7 @@ identity, and composition without value comparison or a starting view. Keep
 VSPC projection treatment separate.
 
 Verify the settled
-[VSPC projection and composition contract](api.md#vspc-projection-and-delta-composition--settled)
+[VSPC projection and composition contract](api-graph.md#vspc-projection-and-delta-composition--settled)
 with removed and added membership, removal-to-Gray, blue/red overlap, one hash
 changed in both field maps, and mutation targets absent from the receiving
 view. Cover independent field-map composition, net no-op removal, field changes
@@ -810,8 +810,8 @@ the API-owned fresh-view outcome, and leaves the browser's last coherent image
 frozen/stale until explicit refresh.
 
 Verify deltas and client behavior across
-[API publication](api.md#graph-views-publication-revision-and-history--settled) and
-[Web update acquisition](web.md#update-acquisition--partially-open): sequential delta
+[API publication](api.md#head-publication-lifecycle-and-stream-alignment--settled) and
+[Web update acquisition](web.md#update-acquisition--settled): sequential delta
 composition and expiry, response-local hash dictionaries,
 terminal Stale state, replacement publication identity, SSE slow clients,
 fixed-view freeze, DAA focus, and Live arriving during construction or

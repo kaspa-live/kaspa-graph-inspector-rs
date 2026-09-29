@@ -63,8 +63,10 @@ travel directly from NotificationRouter to the processors and never pass
 through ResyncEngine.
 
 ApiService is an in-process, derived read-model service. Its work and freshness
-have lower priority than processing. The [API contract](api.md) owns
-graph-update loss, reconstruction, and publication behavior.
+have lower priority than processing. [API ingress](api-ingress.md) owns
+graph-update loss reporting, the [API graph model](api-graph.md) owns the
+derived graph state, and the [API contract](api.md) owns reconstruction and
+publication behavior.
 
 ## Responsibility boundaries — settled
 
@@ -78,7 +80,7 @@ graph-update loss, reconstruction, and publication behavior.
 | OrphanManager | In-memory orphan topology and dependency demand | [Block processing](block-processing.md) |
 | DependencyResolver | Bounded node retrieval for requested dependencies | [Block processing](block-processing.md) |
 | VspcProcessor | VSPC sequencing, readiness, and coloring coordination | [VSPC processing](vspc-processing.md) |
-| ApiService | Graph publications, views, delta history, and graph API serving | [API](api.md) |
+| ApiService | Graph publications, views, delta history, and graph API serving | [API graph model](api-graph.md), [API](api.md) |
 
 NodeService, StorageService, ResyncEngine, and Supervisor each own their
 respective service, processing, or orchestration state. Published statuses are

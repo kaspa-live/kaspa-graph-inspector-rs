@@ -34,7 +34,7 @@ the delta's `from_revision_id`.
 The Web consumes serialized head, delta, and graph-window responses. It never
 receives an internal `GraphView`, observes `TrackingPolicy`, or applies updates
 to an ApiService subview. Internal subview extraction belongs exclusively to
-the [API contract](api.md#frozen-subview-extraction--settled).
+the [API graph contract](api-graph.md#frozen-subview-extraction--settled).
 Serialized graph-window contents follow the API-owned extraction contract.
 
 ## Fixed views — settled behavior with deferred pacing
