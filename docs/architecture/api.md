@@ -593,8 +593,11 @@ complete history revision. Ordinary graph updates, Live, revision advancement,
 and retained head-window movement keep the same publication ID. Only a later
 session's `reset` call or a gap or failure that prevents the Active projection from
 advancing leads to a replacement publication. API database-generation change
-by itself does not invalidate Active; continuity then comes from the ordered
-session stream rather than the seed generation.
+by itself does not invalidate Active; the
+[`ApiDbReadState`](#public-api-database-generation-adoption--settled)
+transition below controls public database-backed reads independently, while
+graph continuity comes from the ordered session stream rather than the seed
+generation.
 
 ### Universal API reconstruction — settled
 
@@ -1253,9 +1256,62 @@ implementation, and graph wire format remain deferred in the
 
 ## Reset and recovery-time availability — settled
 
+### Public API database generation adoption — settled
+
+ApiService independently maintains this private database-read state for public
+requests:
+
+```rust
+enum ApiDbReadState {
+    Available(Arc<ValidatedApiDbClient>),
+    AwaitingReplacement {
+        lost: Arc<ValidatedApiDbClient>,
+    },
+    ClosedForRebuild,
+}
+```
+
+ApiService stores this state as `public_db_reads`. It governs only public
+database-backed requests. Head views, Head deltas, projected Fixed deltas, SSE,
+and private publication construction do not acquire their database capability
+through this state. Construction captures its own exact
+`ValidatedApiDbClient` for one attempt.
+
+A public database-backed request briefly reads `public_db_reads`. From
+`Available(client)`, it clones that `Arc`, releases the ApiService state lock,
+and performs its complete database phase against that exact generation. It
+never holds the state lock across database work, switches generations, or
+retries transparently against a replacement. `AwaitingReplacement` and
+`ClosedForRebuild` reject the database phase with `503 Service Unavailable`
+and a short `Retry-After`. A complete projection detached before a concurrent
+state change may still finish delivery under the storage-owned replacement
+gate.
+
+When a public operation through the currently installed client returns
+`GenerationLost`, that request returns `503` and ApiService atomically changes
+`Available(lost)` to `AwaitingReplacement { lost }`. Exactly one ApiService
+task then awaits `StorageService::wait_until_api_usable()`. Concurrent or late
+loss reports for the same retired handle create no additional task. A report
+from a handle that is no longer installed cannot change the current state.
+`QueryFailed` is request-local and does not replace or retire the installed
+binding.
+
+When the wait returns a usable replacement, ApiService installs it as
+`Available(replacement)` only if the same replacement attempt still owns
+`AwaitingReplacement`. A late completion cannot overwrite a newer binding,
+`ClosedForRebuild`, or shutdown. The exact internal attempt identity and task
+cancellation primitive remain implementation choices. Successful ordinary
+adoption changes no graph publication ID, state, view revision, history, or
+SSE cursor and does not invoke `reset`, reconstruction, Supervisor, Resync, or
+Rebuild. A terminal `StorageWaitError` ends that wait without spinning and
+leaves public database-backed reads unavailable; StorageService status exposes
+the terminal condition until ApiService shutdown.
+
+### Reset control and recovery effects — settled
+
 `reset` is the sole out-of-band ApiService session-supersession operation
-because it replaces the graph-update input topology. Supervisor owns
-`Arc<ApiService>` and uses this public control surface:
+because it replaces the graph-update input topology.
+Supervisor owns `Arc<ApiService>` and uses this public control surface:
 
 ```rust
 impl ApiService {
@@ -1291,7 +1347,7 @@ globally preempts `PreSeal`, `Constructing`, `Aligning`, or `Active`:
 1. abandon any unpublished candidate and reconstruction state;
 2. mark any current non-Stale publication terminally Stale;
 3. drop the old `GraphUpdateReceiver` and install the fresh one;
-4. establish the recovery-mode-specific historical-read effects below; and
+4. establish the recovery-mode-specific `public_db_reads` effects below; and
 5. enter `PreSeal`.
 
 The call is reliable but has no application-completion barrier. Supervisor may
@@ -1309,19 +1365,21 @@ receiver. Channel closure is not an ApiService lifecycle signal and does not
 replace, invalidate, or reconstruct a publication. ApiService retains its
 current state until the next `reset` call or another defined state transition.
 
-An ordinary Resync `reset` leaves historical DB reads available. During Rebuild,
-public historical-window requests in `PreSeal`, `Constructing`, and `Aligning`
-fail cleanly with `503 Service Unavailable` and a short `Retry-After`.
-ApiService's private construction reads remain allowed when StorageService
-publishes a usable API DB generation.
+An ordinary Resync `reset` preserves `public_db_reads`, including an in-progress
+ordinary replacement wait. A Rebuild `reset` changes it to
+`ClosedForRebuild` and makes any ordinary replacement attempt obsolete. During
+Rebuild, public database-backed requests in `PreSeal`, `Constructing`, and
+`Aligning` fail cleanly with `503 Service Unavailable` and a short
+`Retry-After`. ApiService's private construction reads remain allowed when
+StorageService publishes a usable API DB generation.
 
-ApiService never rebinds public historical requests implicitly to whatever API
-DB generation StorageService most recently published. A Rebuild construction
+ApiService never rebinds an in-flight public request to whatever API DB
+generation StorageService most recently published. A Rebuild construction
 captures its replacement generation privately; only activation installs that
-same generation for public historical requests. If `reset` processing lags
-behind storage replacement, retirement of the previously installed generation
-still makes new database phases fail rather than crossing into the replacement
-generation.
+exact generation as `Available` for later public database-backed requests. If
+`reset` processing lags behind storage replacement, retirement of the
+previously installed generation still makes new database phases fail rather
+than crossing into the replacement generation.
 
 StorageService, rather than `reset`, owns database-replacement exclusion. Its
 [replacement gate](storage.md#api-read-exclusion-during-database-replacement--settled)
@@ -1331,10 +1389,12 @@ coherent response; a request whose database phase the gate denies or cancels
 returns `503`. ApiService neither coordinates replacement nor waits for the
 remaining delivery of detached responses.
 
-After Rebuild, historical reads reopen only when alignment completes and the
-replacement publication becomes Active. Processing does not wait for that
-publication. An ordered Live marker changes the sticky target or the Active
-publication state without another database load or graph revision.
+After Rebuild, public database-backed reads reopen only when alignment
+completes and the replacement publication becomes Active; that activation
+changes `ClosedForRebuild` to `Available` with the candidate's privately
+captured client. Processing does not wait for that publication. An ordered
+Live marker changes the sticky target or the Active publication state without
+another database load or graph revision.
 
 The storage owner defines the `TRUNCATE`/MVCC safety requirement and detailed
 gate boundary. `reset` does not participate in that exclusion mechanism.

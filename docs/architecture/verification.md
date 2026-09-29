@@ -872,20 +872,32 @@ recovery. `PublishPostSeal` is not repeated during same-session reconstruction.
 Changing the API database generation alone must not replace an otherwise
 advancing Active publication.
 
+Verify `ApiDbReadState` independently from graph publication. From an Active
+publication with `Available(G1)`, make a public database operation report
+`GenerationLost`: that request returns `503`, exactly one replacement wait
+starts, and later database-backed requests remain unavailable until `G2` is
+installed for future requests. An in-flight request never switches or retries
+generations; stale `G1` loss reports and stale replacement completions cannot
+displace `G2`. Adoption leaves publication ID, state, view and history
+revisions, and SSE cursor unchanged. Ordinary Resync preserves both Available
+and AwaitingReplacement states. A racing Rebuild reset wins by entering
+`ClosedForRebuild`; no ordinary completion can reopen reads, and only
+activation of the rebuilt candidate installs its privately captured generation.
+
 Verify [Reset and recovery-time availability](api.md#reset-and-recovery-time-availability--settled)
 with ordinary Resync and Rebuild integration scenarios. Verify the fresh
 `GraphUpdateReceiver` and exact recovery mode; global preemption from
 PreSeal, Constructing, Aligning, and Active; and old receiver replacement.
 Supervisor proceeds after `reset` returns without waiting for its application.
-Resync preserves historical reads, and failed reconciliation followed by
+Resync preserves public database-backed reads, and failed reconciliation followed by
 Rebuild calls `reset` again with a fresh ingress. Rebuild relies on
 StorageService rather than `reset` to close API database admission, retire the
 old API generation, and boundedly drain or cancel active database phases.
 Verify a detached old projection may complete delivery while
 an undetached request returns 503, public reads reopen only after the aligned
-replacement becomes Active, public reads never rebind implicitly to a newly
-published storage generation, and no request observes a partial or mixed
-generation, including with PostgreSQL `TRUNCATE`. Verify ordinary sender
+replacement becomes Active, no in-flight request rebinds to a newly published
+storage generation, and no request observes a partial or mixed generation,
+including with PostgreSQL `TRUNCATE`. Verify ordinary sender
 teardown may close the installed receiver, channel closure is not a lifecycle
 signal, and a marker worker with an accepted delivery may outlive
 BlockProcessor Deactivate without retaining an RPC or DB client, then exits

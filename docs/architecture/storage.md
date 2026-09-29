@@ -69,6 +69,11 @@ impl StorageService {
 
 `wait_until_usable()` waits through transient `Connecting`,
 `AwaitingInitialization`, and `Unavailable` states.
+`wait_until_api_usable()` applies the same transient and terminal-state rules
+to the independently published read-only API generation. After an API handle
+has reported `GenerationLost`, StorageService has retired that handle; a later
+wait returns only a currently validated usable API generation and never
+republishes the retired one.
 `AwaitingInitialization` means StorageService has opened, locked, and inspected
 a never-initialized database but cannot yet publish it as usable. The state
 remains pending until initialization is authorized and a validated node
