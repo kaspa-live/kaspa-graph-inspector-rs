@@ -1147,10 +1147,13 @@ fn range_for_extent(
 ) -> FixedDeltaResponseOutcome;
 ```
 
-ApiService first invokes the ordinary Head-history range selection. It then
-projects the selected complete entries to `[low_level, high_level]`. The fixed
-extent must remain inside the Head nominal extent throughout every returned
-entry:
+ApiService first applies the ordinary Head-history publication, availability,
+boundary, and target selection rules to obtain eligible gapless entries. It
+does not apply the canonical Head response-byte budget before projection. It
+projects eligible complete entries in order to `[low_level, high_level]` and
+applies the Fixed response budget to the final projected representation. The
+fixed extent must remain inside the Head nominal extent throughout every
+returned entry:
 
 ```text
 head.low_level <= low_level
@@ -1189,6 +1192,26 @@ accepted presentation approximation. Block, edge, VSPC-membership, and color
 mutations remain exact for the returned interval. A synthesized level never
 affects cursor continuity, containment, or mutation selection, and later
 absolute level changes converge the browser image.
+
+Budget selection treats every stored Head-history entry as an indivisible
+unit. For each eligible entry, ApiService projects the complete entry, adds
+every required endpoint `Level`, composes it with the already accepted
+projected prefix, and measures the resulting complete response. The measured
+representation includes the projected mutations, synthesized endpoint levels,
+response-local hash dictionary, and response envelope. An entry is accepted
+only when that final representation fits the Fixed response budget. Projection
+never splits an aggregated entry, drops an endpoint level, or presents a
+truncated entry as complete.
+
+If all eligible entries fit, return `Complete`. If at least one fits but the
+next complete projected entry does not, return the accepted entries as
+`Prefix`, ending at the last accepted stored-entry boundary. If the first
+complete projected entry does not fit, return
+`FreshViewRequired(FirstStoredDeltaExceedsBudget)`. Existing projection
+failures retain their `Freeze` outcomes. Exact encoded-size measurement and
+whether the accepted interval is transmitted as entries or one composed patch
+remain implementation choices under the wire-format decision, but the emitted
+response must remain within the configured byte limit.
 
 Every projected response uses a self-contained response-local hash dictionary.
 The browser uses the Head `(publication_id, revision)` as its source cursor. A

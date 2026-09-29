@@ -65,9 +65,11 @@ continues until the desired Head cursor is reached.
 If the API reports that the extent left Head, required projection context is
 unavailable, the publication became Stale or changed, or retained Head history
 no longer covers the cursor, keep the last coherent image marked frozen/stale.
-Only explicit refresh establishes another window and possible projected
-lineage. Projected delta responses are `no-store`; the Web retains the updated
-graph image but never caches a response for reuse.
+Do the same when no first complete projected history entry fits the response
+budget: apply no part of that entry and end the projected lineage. Only
+explicit refresh establishes another window and possible projected lineage.
+Projected delta responses are `no-store`; the Web retains the updated graph
+image but never caches a response for reuse.
 
 Fixed-view revision catch-up is distance-adaptive, not a blanket slow path.
 Define:

@@ -764,6 +764,14 @@ required level freezes only the browser fixed image. Head pruning removals
 outside the fixed projection are discarded without affecting Head or the
 browser image.
 
+Exercise the Fixed response budget after projection and endpoint-level
+enrichment. Cover a complete interval that fits, a largest complete-entry
+prefix when the next projected entry exceeds the budget, and a first projected
+entry that exceeds the budget only after an endpoint level and the response
+dictionary are added. Verify the last case applies no partial mutation, returns
+the API-owned fresh-view outcome, and leaves the browser's last coherent image
+frozen/stale until explicit refresh.
+
 Verify deltas and client behavior across
 [API publication](api.md#graph-views-publication-revision-and-history--settled) and
 [Web update acquisition](web.md#update-acquisition--partially-open): sequential delta
