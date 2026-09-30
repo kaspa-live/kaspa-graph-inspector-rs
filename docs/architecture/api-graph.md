@@ -612,10 +612,8 @@ compose(Delta(a,b), Delta(b,c)) = Delta(a,c)
 Composition requires exact equality between the left `to` and right `from`
 revisions. The result uses `a` as `from`, `c` as `to`, and delta `c`'s
 `high_level`. Composition is associative by graph-state effect. A composed
-encoding need not be byte-identical to a directly constructed interval, but it
-must have the same graph-state effect. Every canonical Head delta response uses
-a self-contained response-local hash dictionary. Composition decodes the
-input dictionaries to hashes and constructs a new dictionary for the result.
+delta must have the same graph-state effect as applying its constituent deltas
+in order.
 
 For a range request, the starting revision must be an exact retained entry
 boundary. A start before `oldest_available_revision()` returns `StartPruned`;
@@ -631,19 +629,8 @@ targets. If that available right boundary equals the start, return `UpToDate`.
 An aggregated entry is never split and its discarded internal boundaries are
 not reconstructed.
 
-ApiService rejects a publication mismatch or terminal Stale publication before
-range selection. It then composes selected entries in order under the response
-budget. Return `Complete` when the complete selected range fits. Otherwise
-return the largest nonempty `Prefix` that fits and ends at a stored entry's
-right boundary. If the first stored entry cannot fit, return
-`FreshViewRequired(FirstStoredDeltaExceedsBudget)`. A publication mismatch,
-Stale publication, `StartPruned`, or `StartUnavailable` maps to the matching
-fresh-view reason. `UpToDate` is an ordinary success.
-
-Every canonical range delta is structurally complete and reports its actual
-`to_revision_id`, which may be later than the requested target because an
-aggregate was indivisible, earlier because the response budget selected a
-prefix, or current because the requested target was in the future. Composition
-constructs a new response-local hash dictionary. Exact encoded-size measurement
-and whether a complete interval is transmitted as its entries or one composed
-patch remain implementation choices under the wire-format decision.
+`GraphHistoryRange::Deltas.actual_target` may be later than the requested
+target because an aggregate was indivisible, or equal to the current history
+right boundary because the requested target was in the future. Public outcome
+mapping, response budgeting, dictionaries, encoding, and delivery belong to
+the [canonical Head-delta protocol](api-protocol.md#canonical-head-delta-responses--settled).

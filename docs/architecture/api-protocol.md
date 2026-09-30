@@ -158,6 +158,46 @@ owning `publication_id`. A published view response pairs it with the view's
 current revision and publication state; a delta response pairs it with the
 history interval actually returned.
 
+## Canonical Head delta responses — settled
+
+ApiService rejects a publication mismatch or terminal Stale publication before
+consulting history. For an eligible publication it calls the graph-owned
+[`GraphHistory::range`](api-graph.md#revision-and-history-advancement--settled)
+operation, which owns retained-boundary selection, target extension across an
+indivisible aggregate, and gapless entry composition.
+
+Public outcomes map as follows:
+
+- publication mismatch returns
+  `FreshViewRequired(PublicationMismatch)`;
+- terminal Stale publication returns
+  `FreshViewRequired(PublicationStale)`;
+- `GraphHistoryRangeError::StartPruned` returns
+  `FreshViewRequired(StartPruned)`;
+- `GraphHistoryRangeError::StartUnavailable` returns
+  `FreshViewRequired(StartUnavailable)`; and
+- `GraphHistoryRange::UpToDate` returns `DeltaResponseOutcome::UpToDate`.
+
+For `GraphHistoryRange::Deltas`, ApiService considers complete stored entries
+in order under the configured response-byte budget. The measured public
+representation includes the response envelope and its self-contained,
+response-local hash dictionary. If all selected entries fit, compose them and
+return `Complete`. If only a nonempty complete-entry prefix fits, compose that
+prefix and return `Prefix`. If the first complete stored entry does not fit,
+return `FreshViewRequired(FirstStoredDeltaExceedsBudget)`. An aggregated stored
+entry is indivisible and is never truncated or split to satisfy the budget.
+
+Every returned delta is structurally complete and reports its actual
+`to_revision_id`. It may be later than the requested target because the graph
+range extended through an indivisible aggregate, earlier because budgeting
+selected a prefix, or current because the requested target was in the future.
+Composition operates on graph hashes through the graph-owned operation; public
+encoding then constructs a new response-local hash dictionary for the result.
+Exact encoded-size measurement and whether a complete interval is transmitted
+as its entries or one composed patch remain implementation choices under the
+wire-format decision, but the emitted response must remain within the configured
+byte limit.
+
 ## Head-bounded Fixed delta projection — settled
 
 A public anchored window extracted from the active Head publication can follow
