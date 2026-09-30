@@ -688,10 +688,13 @@ ApiService::reset(graph_updates, recovery_mode)
     -> GraphUpdate::Live
 ```
 
-ApiService owns the complete `reset` effects, gap handling, marker consumption,
-reconstruction, and publication effects in
-[api-service.md](api-service.md#reset-and-recovery-time-availability--settled). This document
-owns Supervisor's `reset` call point and processor command ordering;
+ApiService's complete `reset` effects belong to the
+[ApiService reset contract](api-service.md#reset-and-recovery-time-availability--settled).
+The [API publication lifecycle](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled)
+owns lifecycle-marker consumption and publication effects, while its
+[reconstruction contract](api-publication.md#universal-api-reconstruction--settled)
+owns the reaction to a reported gap. This document owns Supervisor's `reset`
+call point and processor command ordering;
 [BlockProcessor](block-processing.md#graph-lifecycle-marker-delivery--settled)
 owns marker-command enqueue points. `reset` returns after reliable acceptance,
 and processing never waits for its application or publication completion. A
