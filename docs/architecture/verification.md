@@ -863,7 +863,12 @@ lane, and never influence lifecycle decisions. Node status begins without a
 validated observation, replaces it before each Ready publication, and
 preserves it with explicit last-successfully-validated meaning through every
 non-Ready state, including Stopped. No status path reads or writes PostgreSQL
-or gives ApiService a NodeService dependency.
+or gives ApiService a NodeService dependency. The public `SystemStatus` reports
+the running KGI package version and exactly the Supervisor, NodeService,
+StorageService, and processing observations. It exposes network, node server,
+and upstream RPC versions only through `node.last_validated`; it contains no
+separate processing version, API version, `representation_version`, or
+ApiService-status field.
 
 Delta cases cover Frozen and revision compatibility as the only application
 checks, direct target-state installation, Head bound recalculation, fixed-bound

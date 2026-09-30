@@ -105,11 +105,36 @@ struct GraphWindowResolution {
     effective_start_level: u64,
     effective_end_level: u64,
 }
+
+struct SystemStatus {
+    kgi_version: String,
+    supervisor: SupervisorStatus,
+    node: NodeServiceStatus,
+    storage: StorageServiceStatus,
+    processing: ProcessingStatus,
+}
 ```
 
 Together `(publication_id, revision)` form the public cursor. If the selected
 wire format cannot represent every `u64` exactly, its encoding must preserve
 the complete integer domain.
+
+`SystemStatus.kgi_version` is the compile-time package version of the running
+KGI executable. Processing is part of that executable, so there is no separate
+processing version. The internal `representation_version` used for graph ETag
+and encoded-cache identity is not a status field, and v2 defines no separate
+public API-version value.
+
+The component observations are exactly Supervisor, NodeService,
+StorageService, and processing. `node.last_validated` is the sole public source
+of network identity, node server version, and upstream RPC API version and
+revision. [NodeService](node-service.md#nodeservice--settled) owns that
+component observation's lifecycle and current-versus-last meaning; the
+[ApiService status-observation contract](api-service.md#status-observation--settled)
+owns its availability in the composite response.
+`SystemStatus` has no ApiService-status field: successful status admission
+already proves that the memory-only status lane is serving, while graph
+publication state is exposed through its own graph responses and SSE wakeups.
 
 ## Window construction and publication lineage — settled
 
@@ -455,8 +480,9 @@ The public graph API has conceptually:
   DAA score; the anchor resolves once to a fixed level;
 - on-demand Head-bounded delta projection for a window extracted from the
   active Head publication; and
-- status/info covering network, processing/API versions, component state, and
-  the current or last successfully validated node server version.
+- status/info returning `SystemStatus`, including the KGI version, the exact
+  component observations, and the current or last successfully validated
+  network and node server information.
 
 Exact endpoint URLs, HTTP methods, the final wire schema, and the graph wire
 format remain deferred in the [decision register](../decisions/deferred.md).

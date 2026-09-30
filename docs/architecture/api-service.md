@@ -232,18 +232,12 @@ session and must not request API reconstruction, Resync, or Rebuild.
 
 ## Status observation — settled
 
-ApiService receives one observation source from each component under the
+ApiService receives the Supervisor, NodeService, StorageService, and processing
+observation sources under the
 [shared status-delivery contract](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
-and constructs:
-
-```rust
-struct SystemStatus {
-    supervisor: SupervisorStatus,
-    node: NodeServiceStatus,
-    storage: StorageServiceStatus,
-    processing: ProcessingStatus,
-}
-```
+and combines their latest values with the running executable's static version
+to construct the protocol-owned
+[`SystemStatus`](api-protocol.md#public-api-values--settled).
 
 The composition root wires these sources without creating a dependency from
 `kgi-api-core` to `kgi-node` or `kgi-processing`. Exact watch primitives remain
@@ -251,13 +245,13 @@ an implementation choice. Reads do not wait for a cross-component barrier, so
 `SystemStatus` is eventually consistent and must never drive synchronization,
 recovery, command admission, or resource selection.
 
-`SystemStatus` is an API projection value in `kgi-api-model`; its component
-values live in `kgi-model` and retain their focused component owners. The node
-observation exposes the sticky `last_validated` value owned by NodeService.
-When NodeService is `Ready`, that value describes the current connection;
-otherwise the response presents it as last successfully validated rather than
-currently usable. ApiService does not call NodeService or persist this
-observation.
+`SystemStatus` lives in `kgi-api-model`; its component values live in
+`kgi-model` and retain their focused component owners. ApiService exposes the
+latest received `NodeServiceStatus` unchanged: `last_validated = None` makes
+network and node-version information unavailable, while `Some(value)` keeps
+that information present regardless of the accompanying node state.
+NodeService owns the value's lifecycle and current-versus-last meaning.
+ApiService does not call NodeService or persist this observation.
 
 ## Resource isolation and saturation — settled
 
