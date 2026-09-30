@@ -40,8 +40,8 @@ cached level is available.
 
 The [graph-view contract](#graph-values-views-revisions-and-history--settled)
 owns edge representation, window inclusion, endpoint retention, and lifetime.
-The [graph-update ingress](api-ingress.md) supplies the committed parent
-information required to apply that contract.
+The [storage-owned `BlockCommitted` payload](storage.md#block-materialization-transaction--settled)
+supplies the committed parent information required to apply that contract.
 
 ## Graph values, views, revisions, and history — settled
 
@@ -409,14 +409,14 @@ revision boundaries within an aggregate.
 `GraphDelta.high_level` is the high level of the revision lineage that owns the
 delta at `to_revision_id`. A canonical Head delta therefore carries the target
 Head high level. A delta from an internal Fixed lineage carries that Fixed
-view's high level. A Head-bounded projected delta still carries the source
-Head high level because its public cursor belongs to the Head publication;
-it does not redefine the serialized fixed extent. This field is retained in
-internal history, included in the API delta payload, provides the semantic key
-for Head-history pruning, and exposes the lineage high level without requiring
-derivation from mutation contents. A delta does not carry `low_level` or a
-separate coverage object; explicit graph mutations drive a Head view's
-lower-bound changes.
+view's high level. The
+[Head-bounded projection contract](api-protocol.md#head-bounded-fixed-delta-projection--settled)
+owns this field's meaning in a derived public projected response. For canonical
+and internal deltas, the field is retained in history, included in the API
+delta payload, provides the semantic key for Head-history pruning, and exposes
+the lineage high level without requiring derivation from mutation contents. A
+delta does not carry `low_level` or a separate coverage object; explicit graph
+mutations drive a Head view's lower-bound changes.
 
 In canonical and internal lineage deltas, `level_changes` contains only levels
 whose `size` or `daa_score` actually changed. There, `None` represents absence,
@@ -425,9 +425,10 @@ without comparing the current value to `before`; `before` exists for
 composition. Gapless composition folds consecutive changes from the first
 `before` to the last `after` and omits a level whose composed change has no net
 effect. Because each change carries its pre-state, this composition does not
-require the starting view. Head-bounded projection has one explicit
-presentation-only use of `before = None` for an absolute endpoint-level upsert,
-owned by that projection contract below.
+require the starting view. Within the graph model, `before = None` means
+absence. The
+[Head-bounded projection contract](api-protocol.md#head-bounded-fixed-delta-projection--settled)
+owns its sole presentation-only exception.
 
 Within the API graph model, `EdgeId` is the canonical immutable identity of a
 child-parent link. `GraphEdge` adds the complete coordinates required for
