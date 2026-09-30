@@ -151,7 +151,6 @@ enum Component {
     ApiService,
 }
 enum ServiceKind { Node, Storage }
-enum NotificationStream { BlockAdded, Vspc, Both }
 enum MalformedVspcNotificationReason {
     RemovedChainWithoutAddedPath,
     DuplicateChainMember,
@@ -205,7 +204,6 @@ enum OwnershipFault {
 }
 enum FaultKind {
     ServiceGenerationLost(ServiceKind),
-    NotificationContinuityLost(NotificationStream),
     SessionContinuityLost,
     NotificationInputInvalid(NotificationInputKind),
     RecoveryInputInvalid(RecoveryInputKind),
@@ -444,6 +442,13 @@ session-channel disposition policy. The exact channel or worker belongs in
 | Internal command path closes while its worker should be live | `Ownership(InternalControlPathLost)` | `Fatal` | `Fatal` | No fault after completed worker shutdown |
 | A permanent worker exits or panics unexpectedly | `Ownership(UnexpectedWorkerTermination)` | `Fatal` | `Fatal` | No fault after completed worker shutdown |
 | Duplicate, invalid-state, or otherwise invalid forward lifecycle command or milestone | `Ownership(InvalidLifecycleControl)` | `Fatal` | `Fatal` | Not applicable |
+
+NotificationRouter destination saturation is the first row of this table. It
+reports `SessionContinuityLost`; the particular notification destination is
+diagnostic context and does not select a different disposition. Disabling both
+notification streams after that loss belongs to the
+[NotificationRouter contract](node-service.md#notificationrouter) and does not
+mean that both streams independently lost a notification.
 
 Every `Retry` or `Require` result performs complete session teardown under the
 rules above. A session endpoint loss proves that the current run topology can

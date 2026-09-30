@@ -227,7 +227,11 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
     order. Exercise the valid empty no-op and each typed nonempty-removed,
     duplicate-member, and removed/added-intersection result; malformed input
     is not enqueued and disables routing without retiring the RPC generation.
-14. Exercise `MAX_DAA_SCORE` and `MAX_BLUE_SCORE` successfully, then exceed
+14. Saturate each NotificationRouter destination independently. The triggering
+    notification is not enqueued, both streams are disabled, and the router
+    reports `SessionContinuityLost`; the particular destination remains
+    diagnostic context and does not create a notification-specific fault.
+15. Exercise `MAX_DAA_SCORE` and `MAX_BLUE_SCORE` successfully, then exceed
     each by one in full-block and header-only responses. Every excessive node
     value reports the corresponding `ScoreOutOfRange` fault, returns no
     normalized value, is Fatal without retiring the RPC generation, and does

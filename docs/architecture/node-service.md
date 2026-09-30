@@ -326,8 +326,11 @@ Disabled | Enabled | Retired
 
 - Disabled drops notifications immediately.
 - Enabled routes with nonblocking bounded sends.
-- A full destination channel means notification loss: disable both streams and
-  report `Require(Resync)`.
+- A full destination channel means notification loss: enqueue nothing, disable
+  both streams, and report `SessionContinuityLost`. The shared
+  [session-channel policy](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
+  owns its disposition; disabling both streams is a router recovery action and
+  does not assert loss on both streams.
 - An Enabled `BlockAdded` is normalized to `ValidatedNodeBlock` before bounded
   delivery. On failure, disable both streams and enqueue no block. A score-range
   failure retains its `ScoreOutOfRange` classification; any other intrinsic
