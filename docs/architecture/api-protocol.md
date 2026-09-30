@@ -187,9 +187,9 @@ history interval actually returned.
 
 ApiService rejects a publication mismatch or terminal Stale publication before
 consulting history. For an eligible publication it calls the graph-owned
-[`GraphHistory::range`](api-graph.md#revision-and-history-advancement--settled)
-operation, which owns retained-boundary selection, target extension across an
-indivisible aggregate, and gapless entry composition.
+[`GraphHistory::range`](api-graph.md#retained-history-range)
+operation, which owns retained-entry selection and target extension across an
+indivisible aggregate and returns the selected gapless `GraphDeltaList`.
 
 Public outcomes map as follows:
 
@@ -207,9 +207,12 @@ Public outcomes map as follows:
 For `GraphHistoryRange::Deltas`, ApiService considers complete stored entries
 in order under the configured response-byte budget. The measured public
 representation includes the response envelope and its self-contained,
-response-local hash dictionary. If all selected entries fit, compose them and
-return `Complete`. If only a nonempty complete-entry prefix fits, compose that
-prefix and return `Prefix`. If the first complete stored entry does not fit,
+response-local hash dictionary. If all selected entries fit, combine them
+through the graph-owned
+[delta composition operation](api-graph.md#graph-delta-composition) and return
+`Complete`. If only a nonempty complete-entry prefix fits, compose that prefix
+through the same operation and return `Prefix`. If the first complete stored
+entry does not fit,
 return `FreshViewRequired(FirstStoredDeltaExceedsBudget)`. An aggregated stored
 entry is indivisible and is never truncated or split to satisfy the budget.
 

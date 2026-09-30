@@ -630,6 +630,8 @@ hypothetical infinite activity stream at one level is not a valid Kaspa
 behavior and cannot justify an additional history cap. A cursor whose required
 deltas left with their level normally requires a fresh view.
 
+### Graph delta composition
+
 Gapless canonical intervals selected from one `GraphHistory` compose
 sequentially:
 
@@ -644,6 +646,8 @@ revisions. The result uses `a` as `from`, `c` as `to`, and delta `c`'s
 `high_level`. Composition is associative by graph-state effect. A composed
 delta must have the same graph-state effect as applying its constituent deltas
 in order.
+
+### Retained history range
 
 For a range request, compare the target with the start before inspecting
 retained history. A target below the start returns `BackwardTarget` and creates
