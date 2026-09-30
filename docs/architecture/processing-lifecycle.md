@@ -49,7 +49,8 @@ bindings. Supervisor never requests publication or reconnection. Each service
 autonomously replaces its retired generation; Supervisor retains published
 replacements for the next processing run and never injects them into an
 existing `ProcessingSession`. Unexpected closure of either reliable event path
-while Supervisor is Running is a Fatal managed-service failure.
+while Supervisor is Running reports
+`Ownership(ManagedComponentUnavailable)` and enters the Fatal lifecycle.
 
 When recovery is desired and the engine is Idle, Supervisor may retain either
 resource while the other is absent. It starts no run until both exact
@@ -195,9 +196,17 @@ enum BoundedProcessingState {
     Orphans,
     VspcPending,
 }
+enum OwnershipFault {
+    SessionDataEndpointLost,
+    ManagedComponentUnavailable,
+    InternalControlPathLost,
+    UnexpectedWorkerTermination,
+    InvalidLifecycleControl,
+}
 enum FaultKind {
     ServiceGenerationLost(ServiceKind),
     NotificationContinuityLost(NotificationStream),
+    SessionContinuityLost,
     NotificationInputInvalid(NotificationInputKind),
     RecoveryInputInvalid(RecoveryInputKind),
     ReconciliationFailed,
@@ -206,7 +215,7 @@ enum FaultKind {
     BoundedStateExhausted(BoundedProcessingState),
     ScoreOutOfRange(ScoreRangeFault),
     Persistence(PersistenceFault),
-    Ownership,
+    Ownership(OwnershipFault),
 }
 struct ComponentFault {
     source: Component,
@@ -416,19 +425,40 @@ ResyncEngine                       -> Supervisor
 ```
 
 Faults and milestones use reliable owner-directed events. Each run retains its
-first causal fault diagnostically. Unexpected permanent-worker exit, panic, closed command
-channel, or invalid forward command is a typed ownership/session or fatal
-fault, not ordinary DAG discontinuity. A dropped barrier acknowledgement
-receiver does not cancel the worker's completed teardown transition.
+first causal fault diagnostically. A dropped barrier acknowledgement receiver
+does not cancel the worker's completed teardown transition.
 
 Internal child-worker command mailboxes are unbounded and prioritized, with
 one logical producer per worker. They do not impose data-channel backpressure.
 Supervisor-facing component methods hide any mailbox or event-loop mechanism.
 Data, notification, and worker-to-worker channels are bounded and
-cancellation-aware. Full means
-`Require(Resync)` when ordered session continuity may have been lost;
-closed/unavailable means a session ownership fault; cancellation during
-expected teardown is not a fault. The graph-update feed is the exception: the
+cancellation-aware. The following table is the exhaustive ownership and
+session-channel disposition policy. The exact channel or worker belongs in
+`diagnostic`; it does not select control flow.
+
+| Condition | Fault kind | Active Resync/Rebuild | Live | Expected teardown or completed shutdown |
+|---|---|---|---|---|
+| Bounded session data channel is full and ordered continuity may be lost | `SessionContinuityLost` | `Require(Resync)`; coalescing never weakens an existing Rebuild obligation | `Require(Resync)` | No fault |
+| Bounded session data endpoint is closed or unavailable | `Ownership(SessionDataEndpointLost)` | `Retry`, retaining the current recovery obligation | `Require(Resync)` | No fault |
+| Supervisor-facing managed component is unavailable, or its reliable event path closes while it should be live | `Ownership(ManagedComponentUnavailable)` | `Fatal` | `Fatal` | No fault after completed component shutdown |
+| Internal command path closes while its worker should be live | `Ownership(InternalControlPathLost)` | `Fatal` | `Fatal` | No fault after completed worker shutdown |
+| A permanent worker exits or panics unexpectedly | `Ownership(UnexpectedWorkerTermination)` | `Fatal` | `Fatal` | No fault after completed worker shutdown |
+| Duplicate, invalid-state, or otherwise invalid forward lifecycle command or milestone | `Ownership(InvalidLifecycleControl)` | `Fatal` | `Fatal` | Not applicable |
+
+Every `Retry` or `Require` result performs complete session teardown under the
+rules above. A session endpoint loss proves that the current run topology can
+no longer make progress, but does not by itself prove persisted-state
+inconsistency: recovery therefore retries its existing obligation, while Live
+requires Resync to establish a new session. A managed-component or permanent
+worker/control failure has no architecture-defined local restart and is
+therefore Fatal. Cancellation or closure caused by the expected teardown path
+produces no `ComponentFault`.
+
+The Fatal ownership rows apply whenever Supervisor is Running, including while
+it is Idle or attempting to start a session; the Active-recovery and Live
+columns do not limit them to an installed processing run.
+
+The graph-update feed is the exception: the
 [API ingress contract](api-ingress.md#in-process-graph-update-feed--settled)
 reports a continuity gap without blocking processing, and the
 [API publication reconstruction contract](api-publication.md#universal-api-reconstruction--settled)
@@ -437,15 +467,17 @@ Detailed Tokio fairness and drain mechanics remain deferred in the
 [decision register](../decisions/deferred.md).
 
 `ResyncEngine::start` and the processor `Begin`, `Catchup`, and `Live` commands
-are exact-once and state-specific. Duplicate or invalid-state delivery is
-Fatal. Successful `start` means the operation was accepted; later milestones
+are exact-once and state-specific. Duplicate or invalid-state delivery reports
+`Ownership(InvalidLifecycleControl)`. Successful `start` means the operation
+was accepted; later milestones
 or faults report the run's outcome. The two processor `Live` sends need not be
 simultaneous; enqueue is not completion. `ResyncEngine::deactivate` completes
 only at Idle and is idempotent there. `ResyncEngine::shutdown` is terminal,
 idempotent from every state, supersedes an in-progress `deactivate`, and
 completes only after full shutdown. Processor Deactivate and Shutdown commands
 retain their corresponding completed-barrier acknowledgements. Unexpected
-internal command-channel closure is Fatal while its worker is meant to live.
+internal command-channel closure while its worker is meant to live reports
+`Ownership(InternalControlPathLost)`.
 
 `Rebuild` intent must not outlive successful PP-boundary sealing.
 `PpBoundarySealed` is an exact-once upward milestone event, never a command to
@@ -456,7 +488,8 @@ to Supervisor. BlockProcessor has already enqueued `PublishPostSeal` to its
 lifecycle-marker worker under its
 [marker-delivery contract](block-processing.md#graph-lifecycle-marker-delivery--settled).
 Supervisor only downgrades both desired and active recovery to `Resync`.
-Duplicate or invalid-state milestone delivery is Fatal. Entering Live satisfies
+Duplicate or invalid-state milestone delivery reports
+`Ownership(InvalidLifecycleControl)`. Entering Live satisfies
 and clears the remaining recovery requirement.
 
 ## ResyncEngine — settled

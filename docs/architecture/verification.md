@@ -558,10 +558,17 @@ with injected clocks and deterministic jitter:
   through complete session teardown; and
 - typed fault kinds, never diagnostics, drive policy and counters.
 
+Exercise every row of the lifecycle-owned
+[ownership and session-channel disposition table](processing-lifecycle.md#supervisor-and-recovery-intent--settled),
+including distinct full and closed bounded-channel faults during active
+recovery, Live, and expected teardown; unavailable ApiService control;
+internal command-path closure; unexpected worker termination; and invalid
+lifecycle control. Assert that typed fault fields, rather than diagnostics,
+select every disposition.
+
 Verify [teardown](processing-lifecycle.md#teardown-and-delivery-semantics--settled)
 by asserting that both processors' session-scoped RPC and DB clones are
-released before `Deactivated`, cancellation races finish, and full versus
-closed bounded channels retain their distinct dispositions.
+released before `Deactivated` and cancellation races finish.
 
 ## Block processing and dependency resolution
 

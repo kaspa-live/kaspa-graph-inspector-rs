@@ -116,8 +116,9 @@ idempotent binding transition is complete. Successful `reset` means the
 operation was reliably accepted for ordered processing; it does not wait for
 application. Successful `shutdown` means ApiService completed the shutdown
 barrier. An unavailable component returns `ApiServiceError` under the
-parent-to-child failure semantics owned by the
-[processing lifecycle](processing-lifecycle.md#teardown-and-delivery-semantics--settled).
+`Ownership(ManagedComponentUnavailable)` parent-to-child failure semantics
+owned by the
+[processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
 
 `reset` installs the fresh session receiver supplied under the
 [graph-update ingress contract](api-ingress.md). `RecoveryMode` is the

@@ -251,10 +251,12 @@ reports the gap under the
 [API ingress contract](api-ingress.md#in-process-graph-update-feed--settled).
 
 `PersistedBlock` delivery is asynchronous but cannot be silently lost after a
-successful commit. A full bounded destination loses session continuity and
-requires Resync; a closed or unavailable receiver is a session ownership
-fault. Cancellation during expected teardown is not a fault. A later session
-rederives authoritative state from the database.
+successful commit. A full bounded destination reports
+`SessionContinuityLost`; a closed or unavailable receiver reports
+`Ownership(SessionDataEndpointLost)`. Their phase-dependent dispositions and
+the expected-teardown exception belong to the shared
+[session-channel policy](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
+A later session rederives authoritative state from the database.
 
 ## OrphanManager — settled
 
@@ -332,9 +334,11 @@ because retained database contents can no longer be trusted against node
 state. RPC or connection failure does not prove unavailability and follows
 the validated-client/session fault path.
 
-For OrphanManager-to-Resolver bounded work sends, full requires Resync,
-closed or unavailable is a session fault, and cancellation during teardown is
-expected. Deactivation cancels and joins tasks and releases descendant
+For OrphanManager-to-Resolver bounded work sends, full reports
+`SessionContinuityLost`, while closed or unavailable reports
+`Ownership(SessionDataEndpointLost)`. Their dispositions belong to the shared
+[session-channel policy](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
+Deactivation cancels and joins tasks and releases descendant
 session-resource clones before acknowledging. BlockProcessor continues
 draining and discarding child results while joining descendants so a full
 result channel cannot deadlock the barrier.
