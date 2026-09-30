@@ -123,10 +123,12 @@ autonomous reconnection and validation, without a request from Supervisor,
 ResyncEngine, or ApiService. Events report transitions; they do not initiate
 them. Supervisor event handling and API forwarding belong to the
 [processing lifecycle](processing-lifecycle.md#processing-session-and-resource-acquisition--settled).
-StorageService also owns database-replacement exclusion; the
-[API lifecycle](api-service.md#reset-and-recovery-time-availability--settled) owns only
-its local generation binding, public request availability, and graph
-publication state.
+StorageService also owns database-replacement exclusion. The
+[ApiService binding contract](api-service.md#api-database-generation-binding--settled)
+owns local generation binding and database-backed read admission, the
+[API publication contract](api-publication.md#publication-state-and-revision--settled)
+owns graph publication state, and the [API protocol](api-protocol.md) owns the
+corresponding public responses.
 
 Callers receive semantic read operations and complete domain transactions.
 Storage exposes no connection pool, database connection, transaction object,
