@@ -428,9 +428,11 @@ Data, notification, and worker-to-worker channels are bounded and
 cancellation-aware. Full means
 `Require(Resync)` when ordered session continuity may have been lost;
 closed/unavailable means a session ownership fault; cancellation during
-expected teardown is not a fault. The graph-update feed is the exception:
-the [API-owned graph-update gap contract](api-ingress.md#in-process-graph-update-feed--settled)
-reconstructs the derived image without requesting processing recovery.
+expected teardown is not a fault. The graph-update feed is the exception: the
+[API ingress contract](api-ingress.md#in-process-graph-update-feed--settled)
+reports a continuity gap without blocking processing, and the
+[API publication reconstruction contract](api-publication.md#universal-api-reconstruction--settled)
+rebuilds the derived image without requesting processing recovery.
 Detailed Tokio fairness and drain mechanics remain deferred in the
 [decision register](../decisions/deferred.md).
 
@@ -1018,6 +1020,8 @@ draining duties remain in their focused documents. Exact shutdown timeouts and
 escalation policy remain deferred in the
 [decision register](../decisions/deferred.md).
 
-The graph-update path is deliberately separate: a reported stream gap rebuilds
-the API image without interrupting processing. Its behavior is defined in
-[api-ingress.md](api-ingress.md#in-process-graph-update-feed--settled).
+The graph-update path is deliberately separate. The
+[API ingress contract](api-ingress.md#in-process-graph-update-feed--settled)
+owns gap reporting, and the
+[API publication reconstruction contract](api-publication.md#universal-api-reconstruction--settled)
+owns rebuilding the API image without interrupting processing.
