@@ -751,7 +751,7 @@ and verify that its supplied final snapshot still updates its DAA score and
 produces the corresponding level-only delta. A snapshot for a level absent
 from the view is ignored.
 
-Verify [DAA navigation and graph windows](api.md#daa-navigation-and-graph-windows--settled)
+Verify [DAA navigation and graph windows](api-protocol.md#daa-navigation-and-graph-windows--settled)
 for floor selection and tie break, the sentinel result, a reorg-created
 VSPC-empty level, atomic level-score publication, and navigation plus window
 consistency from one image. Accept zero and `MAX_DAA_SCORE` as query bounds and
@@ -775,7 +775,7 @@ and malformed hash input produce `400` without a storage call. A DAA score
 beyond the current VSPC score remains a successful current-VSPC resolution.
 
 Verify the settled
-[Head-bounded Fixed projection](api.md#head-bounded-fixed-delta-projection--settled)
+[Head-bounded Fixed projection](api-protocol.md#head-bounded-fixed-delta-projection--settled)
 from a Head-extracted anchored window. Cover a fully contained extent, an empty
 projected mutation that still advances the Head cursor, blocks inside the
 extent, crossing edges with neither endpoint block present, nominal and

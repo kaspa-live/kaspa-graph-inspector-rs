@@ -14,7 +14,7 @@ explain why older handoffs or implementation notes may use different terms.
 | Gate global Live on a fixed body-tip snapshot, materiality batch, and bounded extra GetBlocks pages. | Overlap-based Live admission without a body-DAG completeness claim. | [Processing lifecycle](../architecture/processing-lifecycle.md) |
 | Pass raw `SharedNodeBlock` values between components and derive a separate `BlockMaterialization`. | One flattened `ValidatedNodeBlock` crosses the NodeService boundary. | [Domain model](../architecture/domain-model.md), [NodeService](../architecture/node-service.md) |
 | Use an `Auto` recovery mode that falls through from Resync to Rebuild. | Explicit Resync and Rebuild obligations. | [Processing lifecycle](../architecture/processing-lifecycle.md) |
-| Defer the API outside KGI v2. | In-process API and Web-facing graph contract in v2. | [API](../architecture/api.md) |
+| Defer the API outside KGI v2. | In-process API and Web-facing graph contract in v2. | [ApiService](../architecture/api-service.md), [API protocol](../architecture/api-protocol.md) |
 | Identify API continuity with `GraphEpoch` stored on every graph image. | `GraphPublication.publication_id`, with views carrying only their own revision. | [API graph publication](../architecture/api-publication.md), [API graph model](../architecture/api-graph.md) |
 | Carry `HeadGraphCoverage` in every delta. | Explicit graph mutations plus the delta lineage `high_level`. | [API graph model](../architecture/api-graph.md) |
 | Recheck VSPC source/sink continuity inside ApiService. | Trust the ordered, continuity-certified `VspcProcessor` output. | [API graph model](../architecture/api-graph.md) |

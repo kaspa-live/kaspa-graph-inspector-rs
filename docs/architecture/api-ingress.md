@@ -5,7 +5,7 @@
 This document owns the per-session graph-update channel, its producer and
 receiver capabilities, the pre-seal delivery gate, lifecycle-marker delivery,
 and gap reporting. The producer documents own when committed values and marker
-commands are offered. [API publication](api.md) owns how ApiService consumes
+commands are offered. [API publication](api-publication.md) owns how ApiService consumes
 the ordered stream and reconstructs its derived graph projection.
 
 ## In-process graph-update feed — settled

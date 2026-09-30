@@ -7,8 +7,7 @@ database seed construction, graph-update alignment, activation, reconstruction,
 and replacement. The [API graph model](api-graph.md) owns the contained view,
 delta, and history semantics. [ApiService control](api-service.md) owns reset
 and API database-generation binding. Public HTTP, SSE, window, cursor, and
-cache behavior remains in the [API contract](api.md) until its protocol
-extraction.
+cache behavior belongs to the [API protocol](api-protocol.md).
 
 ## Publication and seed values — settled
 

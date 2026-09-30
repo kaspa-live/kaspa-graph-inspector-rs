@@ -3,7 +3,7 @@
 ## Scope and ownership
 
 This document owns browser-side graph state, update behavior, view focus, and
-public block identity. [The API architecture](api.md) owns the graph wire
+public block identity. [The API protocol](api-protocol.md) owns the graph wire
 contract, snapshots, deltas, SSE cursor delivery, and response-local hash
 dictionaries.
 

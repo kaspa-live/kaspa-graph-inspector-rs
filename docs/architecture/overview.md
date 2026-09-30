@@ -80,7 +80,7 @@ reconstruction and publication behavior.
 | OrphanManager | In-memory orphan topology and dependency demand | [Block processing](block-processing.md) |
 | DependencyResolver | Bounded node retrieval for requested dependencies | [Block processing](block-processing.md) |
 | VspcProcessor | VSPC sequencing, readiness, and coloring coordination | [VSPC processing](vspc-processing.md) |
-| ApiService | Graph publications, views, delta history, control, and graph API serving | [API graph model](api-graph.md), [API graph publication](api-publication.md), [ApiService](api-service.md), [API](api.md) |
+| ApiService | Graph publications, views, delta history, control, and graph API serving | [API graph model](api-graph.md), [API graph publication](api-publication.md), [ApiService](api-service.md), [API protocol](api-protocol.md) |
 
 NodeService, StorageService, ResyncEngine, and Supervisor each own their
 respective service, processing, or orchestration state. Published statuses are

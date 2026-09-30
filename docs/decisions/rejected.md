@@ -30,12 +30,12 @@ These proposals were considered and not accepted.
 | Add `ProcessingResources`. | It adds no semantics to the prepared session inputs. | [Processing lifecycle](../architecture/processing-lifecycle.md) |
 | Add a redundant `PendingVspcChange` wrapper. | It adds no semantics to `VspcChange`. | [VSPC processing](../architecture/vspc-processing.md) |
 | Infer parent-row foreign-key validity merely from identity existence. | Identity does not prove materiality. | [Storage](../architecture/storage.md) |
-| Expose CompactId publicly. | It is database-local identity. | [API](../architecture/api.md) |
-| Add a v1-style `/blockHashesByIds` public endpoint. | Every graph response carries the complete response-local hash dictionary needed to decode it. | [API](../architecture/api.md) |
-| Assume coordinates are stable across instances. | Coordinates belong to one database allocation. | [Domain model](../architecture/domain-model.md), [API](../architecture/api.md) |
+| Expose CompactId publicly. | It is database-local identity. | [API protocol](../architecture/api-protocol.md) |
+| Add a v1-style `/blockHashesByIds` public endpoint. | Every graph response carries the complete response-local hash dictionary needed to decode it. | [API protocol](../architecture/api-protocol.md) |
+| Assume coordinates are stable across instances. | Coordinates belong to one database allocation. | [Domain model](../architecture/domain-model.md), [API protocol](../architecture/api-protocol.md) |
 | Permit partially populated retained head-view levels. | It breaks the view-completeness invariant. | [API graph model](../architecture/api-graph.md) |
 | Add a revision-count or byte-size cap to `GraphHistory`. | History is level-scoped, and Kaspa cannot produce unbounded revisions while remaining indefinitely at one fixed level. | [API graph model](../architecture/api-graph.md) |
-| Apply a standalone Head-generated `GraphDelta` to a `Fixed` view. | Internal Fixed updates use the original event plus Head context; browser fixed views use the API's extent-projected, context-enriched response. | [API graph model](../architecture/api-graph.md), [API](../architecture/api.md) |
+| Apply a standalone Head-generated `GraphDelta` to a `Fixed` view. | Internal Fixed updates use the original event plus Head context; browser fixed views use the API's extent-projected, context-enriched response. | [API graph model](../architecture/api-graph.md), [API protocol](../architecture/api-protocol.md) |
 | Escalate API graph-update loss directly into processing recovery. | API projection availability is outside processing correctness. | [API ingress](../architecture/api-ingress.md) |
 | Serve API reads from a partially rebuilt database. | It can expose mixed database generations. | [Storage](../architecture/storage.md), [ApiService](../architecture/api-service.md) |
 | Move pruning-point or reconciliation preparation into Supervisor. | It violates recovery-component ownership. | [Processing lifecycle](../architecture/processing-lifecycle.md) |

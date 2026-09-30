@@ -6,7 +6,7 @@ This document owns the ApiService Supervisor-facing control surface, API
 database-generation binding, reset and shutdown behavior, status aggregation,
 resource admission, bulkheads, saturation, and operational measurements.
 [API graph publication](api-publication.md) owns publication construction and
-reconstruction. [The public API contract](api.md) owns HTTP, SSE, windows,
+reconstruction. [The API protocol](api-protocol.md) owns HTTP, SSE, windows,
 cursors, public errors, and cache semantics.
 
 ## Service shape — settled
@@ -56,7 +56,7 @@ A public database-backed request is admitted only when
 exact `Arc`, releases the ApiService state lock, and performs its complete
 database phase without holding the lock, switching generations, or retrying
 transparently. A disabled gate or absent client rejects database-backed request
-admission; the [public API](api.md#daa-navigation-and-graph-windows--settled)
+admission; the [API protocol](api-protocol.md#daa-navigation-and-graph-windows--settled)
 owns its HTTP response. A complete projection detached before a concurrent
 state change may still finish delivery under the storage-owned replacement
 gate.
@@ -314,7 +314,7 @@ the cache memory allowance, first drop an optional stale image when useful.
 Otherwise mark head temporarily unavailable and retry a complete reload. Never
 publish partial levels. Slow SSE clients follow the bounded coalescing and
 disconnect contract in the
-[public API](api.md#public-projection-and-delivery-failures--settled).
+[API protocol](api-protocol.md#public-projection-and-delivery-failures--settled).
 
 V2 exposes these operational measurements:
 
