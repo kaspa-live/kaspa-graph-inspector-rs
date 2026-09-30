@@ -5,10 +5,10 @@
 This document owns `GraphPublication`, publication identity and lifecycle state,
 database seed construction, graph-update alignment, activation, reconstruction,
 and replacement. The [API graph model](api-graph.md) owns the contained view,
-delta, and history semantics. [ApiService control](api.md) owns reset and API
-database-generation binding until its service extraction. Public HTTP, SSE,
-window, cursor, and cache behavior remains in the [API contract](api.md) until
-its protocol extraction.
+delta, and history semantics. [ApiService control](api-service.md) owns reset
+and API database-generation binding. Public HTTP, SSE, window, cursor, and
+cache behavior remains in the [API contract](api.md) until its protocol
+extraction.
 
 ## Publication and seed values — settled
 
@@ -128,7 +128,7 @@ AwaitReset -- reset() --> PreSeal
 
 `reset` may preempt every installed-session state. Its complete topology and
 state effects are owned by the
-[reset contract](api.md#reset-and-recovery-time-availability--settled).
+[reset contract](api-service.md#reset-and-recovery-time-availability--settled).
 
 In `PreSeal`, ApiService waits for the mandatory `PublishPostSeal` marker; the
 producer gate prevents ordinary committed updates from entering the channel.
@@ -200,7 +200,7 @@ and retained head-window movement keep the same publication ID. Only a later
 session's `reset` call or a gap or failure that prevents the Active projection from
 advancing leads to a replacement publication. API database-generation change
 by itself does not invalidate Active; the
-[API database binding](api.md#api-database-generation-binding--settled)
+[API database binding](api-service.md#api-database-generation-binding--settled)
 controls public database-backed reads independently, while
 graph continuity comes from the ordered session stream rather than the seed
 generation.

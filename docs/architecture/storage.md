@@ -83,7 +83,7 @@ Service state outlives individual validated DB generations.
 StorageService is `Stopped` and has released its owned pools, database lock,
 clients, and caches.
 `StorageServiceStatus` is the component observation consumed by the
-[API status contract](api.md#status-observation--settled). It contains no
+[API status contract](api-service.md#status-observation--settled). It contains no
 validated database capability and never authorizes a database operation or
 lifecycle transition.
 
@@ -93,7 +93,7 @@ exact client generation; StorageService never rebinds the client underneath
 the run. A replacement generation starts with fresh caches.
 
 `ValidatedApiDbClient` is the storage handle for the read-only pool required by
-the [API resource contract](api.md#resource-isolation-and-saturation--settled).
+the [API resource contract](api-service.md#resource-isolation-and-saturation--settled).
 It exposes no processing mutation or processing cache.
 Network binding, schema, and generation validation precede publication of
 either handle. StorageService autonomously opens, reconnects, validates,
@@ -124,7 +124,7 @@ ResyncEngine, or ApiService. Events report transitions; they do not initiate
 them. Supervisor event handling and API forwarding belong to the
 [processing lifecycle](processing-lifecycle.md#processing-session-and-resource-acquisition--settled).
 StorageService also owns database-replacement exclusion; the
-[API lifecycle](api.md#reset-and-recovery-time-availability--settled) owns only
+[API lifecycle](api-service.md#reset-and-recovery-time-availability--settled) owns only
 its local generation binding, public request availability, and graph
 publication state.
 
@@ -181,8 +181,9 @@ phases that still hold shared permits. Retirement emits the ordered
 `StorageServiceEvent::ApiDbRetired` and starts autonomous replacement of the API
 pool. StorageService then acquires the exclusive replacement permit. A request
 that detached its projection before closure may finish returning that old
-coherent image. Every other affected request fails cleanly through the API as
-`503 Service Unavailable`; an API read cannot delay replacement without bound.
+coherent image. Every other affected request reports database-backed read
+unavailability; the [public API](api.md#daa-navigation-and-graph-windows--settled)
+owns its HTTP mapping. An API read cannot delay replacement without bound.
 
 The exclusive permit remains held through the atomic replacement outcome and
 cache publication or generation retirement. StorageService publishes no
@@ -195,7 +196,8 @@ public historical-request availability.
 If replacement uses PostgreSQL `TRUNCATE`, transactional rollback does **not**
 make it generally MVCC-safe for pre-existing snapshots. The gate must ensure a
 request returns one detached old image, one coherent replacement-generation
-image, or `503`, never mixed or partially rebuilt tables. See PostgreSQL's
+image, or an unavailable read outcome, never mixed or partially rebuilt
+tables. See PostgreSQL's
 [`TRUNCATE`](https://www.postgresql.org/docs/current/sql-truncate.html) and
 [MVCC caveat](https://www.postgresql.org/docs/current/mvcc-caveats.html)
 documentation. Concrete permit, cancellation, and transaction primitives are

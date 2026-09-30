@@ -37,5 +37,5 @@ These proposals were considered and not accepted.
 | Add a revision-count or byte-size cap to `GraphHistory`. | History is level-scoped, and Kaspa cannot produce unbounded revisions while remaining indefinitely at one fixed level. | [API graph model](../architecture/api-graph.md) |
 | Apply a standalone Head-generated `GraphDelta` to a `Fixed` view. | Internal Fixed updates use the original event plus Head context; browser fixed views use the API's extent-projected, context-enriched response. | [API graph model](../architecture/api-graph.md), [API](../architecture/api.md) |
 | Escalate API graph-update loss directly into processing recovery. | API projection availability is outside processing correctness. | [API ingress](../architecture/api-ingress.md) |
-| Serve API reads from a partially rebuilt database. | It can expose mixed database generations. | [API](../architecture/api.md) |
+| Serve API reads from a partially rebuilt database. | It can expose mixed database generations. | [Storage](../architecture/storage.md), [ApiService](../architecture/api-service.md) |
 | Move pruning-point or reconciliation preparation into Supervisor. | It violates recovery-component ownership. | [Processing lifecycle](../architecture/processing-lifecycle.md) |

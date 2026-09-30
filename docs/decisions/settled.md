@@ -13,7 +13,7 @@ mechanics.
 | VSPC processing | Ordered readiness-gated VSPC processing and publication. | [VSPC processing](../architecture/vspc-processing.md) |
 | Recovery lifecycle | Explicit Resync/Rebuild coordination and overlap-based Live admission. | [Processing lifecycle](../architecture/processing-lifecycle.md) |
 | API publication | Database-seeded publication-identified graph views, composable revision deltas, and historical reads. | [API graph model](../architecture/api-graph.md), [API graph publication](../architecture/api-publication.md), [API](../architecture/api.md), [storage](../architecture/storage.md) |
-| Resource isolation | Processing-priority resource isolation and bounded API load. | [Overview](../architecture/overview.md), [API](../architecture/api.md) |
+| Resource isolation | Processing-priority resource isolation and bounded API load. | [Overview](../architecture/overview.md), [ApiService](../architecture/api-service.md) |
 | Web behavior | Publication-aware, hash-identified live and fixed graph views. | [Web](../architecture/web.md) |
 | Verification | Accepted pinned upstream review and executable KGI verification. | [Verification](../architecture/verification.md#current-puar-result) |
 | Core crate structure | A top composition crate over acyclic model, node, API model, API ingress, storage, processing, and API core crates. | [Overview](../architecture/overview.md#core-crate-structure--settled) |

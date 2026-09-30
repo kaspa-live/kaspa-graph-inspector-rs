@@ -834,7 +834,7 @@ and [Supervisor control](processing-lifecycle.md#supervisor-and-recovery-intent-
 boundaries: the top `kgi` crate owns the four component `Arc` values and uses
 their public async methods without a Supervisor-facing command handle or
 command enum. In particular, verify the
-[ApiService control boundary](api.md#reset-and-recovery-time-availability--settled):
+[ApiService control boundary](api-service.md#reset-and-recovery-time-availability--settled):
 Supervisor can call `reset` and await the `shutdown` barrier while
 `kgi-processing` remains independent of `kgi-api-core`; `reset` returns after
 reliable acceptance without waiting for application. Verify status observations are
@@ -967,7 +967,7 @@ still enables the gate, and database-backed requests remain `503` until a later
 neither generation turnover nor an absent current client invalidates an
 otherwise advancing Active graph publication.
 
-Verify [Reset and recovery-time availability](api.md#reset-and-recovery-time-availability--settled)
+Verify [Reset and recovery-time availability](api-service.md#reset-and-recovery-time-availability--settled)
 with ordinary Resync and Rebuild integration scenarios. Verify the fresh
 `GraphUpdateReceiver` and exact recovery mode; global preemption from
 PreSeal, Constructing, Aligning, and Active; and old receiver replacement.
@@ -989,7 +989,7 @@ signal, and a marker worker with an accepted delivery may outlive
 BlockProcessor Deactivate without retaining an RPC or DB client, then exits
 after delivery or receiver replacement.
 
-Verify the [ApiService shutdown barrier](api.md#apiservice-shutdown--settled)
+Verify the [ApiService shutdown barrier](api-service.md#apiservice-shutdown--settled)
 from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`, and `Active`, including
 races with `reset`, marker delivery, gap reconstruction, database projection,
 serialization, detached response delivery, SSE wakeups, and API-generation
@@ -1030,7 +1030,7 @@ delta catch-up or explicit-refresh fallback after Head retention expires.
 
 API load tests verify the
 [system isolation contract](overview.md#resource-isolation-and-scalability--settled)
-and [API bulkheads](api.md#resource-isolation-and-saturation--settled).
+and [API bulkheads](api-service.md#resource-isolation-and-saturation--settled).
 Exercise status, head, and historical admission lanes independently, including
 configured rejection limits, while measuring both processors' commit latency.
 Also cover bounded slow-SSE behavior, cache-memory exhaustion with complete

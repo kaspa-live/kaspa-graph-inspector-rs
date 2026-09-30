@@ -88,7 +88,7 @@ they do not initiate reconnection.
 NodeService is `Stopped` and has released its owned connection resources.
 
 `NodeServiceStatus` is the component observation consumed by the
-[API status contract](api.md#status-observation--settled). It never carries
+[API status contract](api-service.md#status-observation--settled). It never carries
 `ValidatedRpcClient`. Initially `last_validated` is `None`. Every
 successful validation replaces it before publishing `Ready`; leaving `Ready`
 preserves it through `Connecting`, `Unavailable`, `Rejected`, and `Stopped`.

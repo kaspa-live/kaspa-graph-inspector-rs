@@ -11,8 +11,9 @@ subscription, and normalization rules belong to
 [node-service.md](node-service.md); persistence and transaction mechanics to
 [storage.md](storage.md); processor-local admission and overlap rules to
 [block-processing.md](block-processing.md) and
-[vspc-processing.md](vspc-processing.md); and API publication effects to
-[api.md](api.md). Shared value types belong to
+[vspc-processing.md](vspc-processing.md); API publication effects to
+[api-publication.md](api-publication.md); and ApiService control effects to
+[api-service.md](api-service.md). Shared value types belong to
 [domain-model.md](domain-model.md).
 
 ## Processing session and resource acquisition — settled
@@ -246,7 +247,7 @@ struct ProcessingStatus {
 `deactivation_requested` is internal and absent from public status.
 Supervisor and ResyncEngine publish their respective status values under the
 shared delivery contract below. The
-[API status-observation contract](api.md#status-observation--settled) owns only
+[API status-observation contract](api-service.md#status-observation--settled) owns only
 their composite public projection.
 
 All component status publication is latest-value and lossy: each publication
@@ -689,7 +690,7 @@ ApiService::reset(graph_updates, recovery_mode)
 
 ApiService owns the complete `reset` effects, gap handling, marker consumption,
 reconstruction, and publication effects in
-[api.md](api.md#reset-and-recovery-time-availability--settled). This document
+[api-service.md](api-service.md#reset-and-recovery-time-availability--settled). This document
 owns Supervisor's `reset` call point and processor command ordering;
 [BlockProcessor](block-processing.md#graph-lifecycle-marker-delivery--settled)
 owns marker-command enqueue points. `reset` returns after reliable acceptance,
@@ -1009,7 +1010,7 @@ Dropping the graph-update receiver during this coordinated barrier unblocks a
 marker worker awaiting lossless delivery. Resulting producer closure is
 expected teardown cancellation rather than a processing fault. ApiService owns
 the local effects and completion semantics of its
-[shutdown barrier](api.md#apiservice-shutdown--settled); processor-specific
+[shutdown barrier](api-service.md#apiservice-shutdown--settled); processor-specific
 draining duties remain in their focused documents. Exact shutdown timeouts and
 escalation policy remain deferred in the
 [decision register](../decisions/deferred.md).

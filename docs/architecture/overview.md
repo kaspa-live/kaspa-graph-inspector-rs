@@ -80,7 +80,7 @@ reconstruction and publication behavior.
 | OrphanManager | In-memory orphan topology and dependency demand | [Block processing](block-processing.md) |
 | DependencyResolver | Bounded node retrieval for requested dependencies | [Block processing](block-processing.md) |
 | VspcProcessor | VSPC sequencing, readiness, and coloring coordination | [VSPC processing](vspc-processing.md) |
-| ApiService | Graph publications, views, delta history, and graph API serving | [API graph model](api-graph.md), [API graph publication](api-publication.md), [API](api.md) |
+| ApiService | Graph publications, views, delta history, control, and graph API serving | [API graph model](api-graph.md), [API graph publication](api-publication.md), [ApiService](api-service.md), [API](api.md) |
 
 NodeService, StorageService, ResyncEngine, and Supervisor each own their
 respective service, processing, or orchestration state. Published statuses are
@@ -185,7 +185,7 @@ priority over every read-only API workload. API projection failure never
 becomes processing recovery. The
 [API feed contract](api-ingress.md#in-process-graph-update-feed--settled) owns
 graph-update gap signaling. The
-[API resource contract](api.md#resource-isolation-and-saturation--settled) owns
+[API resource contract](api-service.md#resource-isolation-and-saturation--settled) owns
 the concrete pools, admission lanes, limits, and saturation behavior.
 
 KGI v2 starts with one in-process ApiService and one processing stack. This
