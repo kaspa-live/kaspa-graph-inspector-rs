@@ -67,6 +67,13 @@ enum GraphDeltaApplyError {
     },
 }
 
+enum GraphDeltaCreationError {
+    NonForwardRevision {
+        from_revision_id: u64,
+        to_revision_id: u64,
+    },
+}
+
 enum GraphHistoryAppendError {
     RevisionMismatch {
         history_revision: u64,
@@ -75,6 +82,10 @@ enum GraphHistoryAppendError {
 }
 
 enum GraphHistoryRangeError {
+    BackwardTarget {
+        from_revision_id: u64,
+        target_revision_id: u64,
+    },
     StartPruned {
         requested: u64,
         oldest_available: u64,
@@ -167,6 +178,22 @@ struct GraphDelta {
 struct GraphHistory {
     current_revision_id: u64,
     deltas: OrderedDeltaList,
+}
+
+impl GraphDelta {
+    pub fn new(
+        from_revision_id: u64,
+        to_revision_id: u64,
+        high_level: u64,
+        block_changes: HashMap<BlockHash, Option<GraphBlock>>,
+        edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
+        level_changes: Vec<LevelChange>,
+        is_in_vspc_changes: HashMap<BlockHash, FieldChange<bool>>,
+        color_changes: HashMap<BlockHash, FieldChange<BlockColor>>,
+    ) -> Result<Self, GraphDeltaCreationError>;
+
+    pub fn from_revision_id(&self) -> u64;
+    pub fn to_revision_id(&self) -> u64;
 }
 ```
 
@@ -358,10 +385,13 @@ The intermediate state is valid. A view or subview request may therefore
 observe revision `n+1` while a delta-history request can reach only revision
 `n`. There is no equality invariant between the two current revision fields.
 
-Every `GraphDelta` is created with
-`to_revision_id > from_revision_id`. Direct view mutation produces one-step
-deltas; composition preserves a forward interval. Delta application and
-history append trust this construction invariant and do not check it again.
+`GraphDelta::new` is the only constructor. Its revision fields are private,
+have no setters, and are exposed only through their read-only accessors. The
+constructor rejects `to_revision_id <= from_revision_id` with
+`NonForwardRevision`. Direct view mutation produces one-step deltas;
+composition and public projection construct their results through the same
+checked constructor. Delta application and history append trust this
+construction invariant and do not check it again.
 
 ```rust
 impl GraphView {
@@ -615,11 +645,14 @@ revisions. The result uses `a` as `from`, `c` as `to`, and delta `c`'s
 delta must have the same graph-state effect as applying its constituent deltas
 in order.
 
-For a range request, the starting revision must be an exact retained entry
-boundary. A start before `oldest_available_revision()` returns `StartPruned`;
-a start inside an aggregate, after current history, or otherwise absent returns
-`StartUnavailable`. When the requested target equals the start, return
-`UpToDate`. Otherwise, select gapless entries beginning exactly at the start.
+For a range request, compare the target with the start before inspecting
+retained history. A target below the start returns `BackwardTarget` and creates
+no delta. When the target equals the start, return `UpToDate`. Otherwise, the
+starting revision must be an exact retained entry boundary. A start before
+`oldest_available_revision()` returns `StartPruned`; a start inside an
+aggregate, after current history, or otherwise absent returns
+`StartUnavailable`. A valid forward request selects gapless entries beginning
+exactly at the start.
 
 The target need not be a retained boundary. If it lies inside an aggregated
 entry, include that complete entry and set `actual_target` to its right

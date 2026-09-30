@@ -711,7 +711,16 @@ revision `n`. A retained mutation advances the view to `n+1` and returns
 return `n+1` while a history request exposes only `n`; appending the delta then
 advances history to `n+1`. A no-effect update returns no delta and advances
 neither revision. History rejects a nongapless append and accepts a gapless
-aggregated interval without requiring internal one-step boundaries.
+aggregated interval without requiring internal one-step boundaries. Construct
+direct, composed, and projected deltas only through `GraphDelta::new`; verify it
+rejects equal and backward revision endpoints, exposes the accepted endpoints
+through read-only accessors, and offers no revision mutation path.
+
+Verify `GraphHistory::range` checks target ordering before retained-boundary
+selection: a target below the start returns `BackwardTarget` and constructs no
+delta, while equality remains `UpToDate`. Both canonical Head and Head-bounded
+Fixed requests map the backward case to `400 Bad Request` without changing the
+publication, history, view, or browser lineage.
 
 Verify every subview extract inherits its source revision with
 `TrackingPolicy::Frozen`. `BlockCommitted` and `VspcCommitted` mutation entry

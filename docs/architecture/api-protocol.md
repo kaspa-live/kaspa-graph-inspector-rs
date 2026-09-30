@@ -168,6 +168,7 @@ indivisible aggregate, and gapless entry composition.
 
 Public outcomes map as follows:
 
+- `GraphHistoryRangeError::BackwardTarget` returns `400 Bad Request`;
 - publication mismatch returns
   `FreshViewRequired(PublicationMismatch)`;
 - terminal Stale publication returns
@@ -221,8 +222,10 @@ fn range_for_extent(
 ```
 
 ApiService first applies the ordinary Head-history publication, availability,
-boundary, and target selection rules to obtain eligible gapless entries. It
-does not apply the canonical Head response-byte budget before projection. It
+boundary, and target selection rules to obtain eligible gapless entries. That
+validation rejects a backward target before projection under the canonical
+Head-delta protocol. ApiService does not apply the canonical Head response-byte
+budget before projection. It
 projects eligible complete entries in order to `[low_level, high_level]` and
 applies the Fixed response budget to the final projected representation. The
 fixed extent must remain inside the Head nominal extent throughout every
