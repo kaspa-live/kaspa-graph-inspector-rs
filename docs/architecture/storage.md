@@ -1179,11 +1179,12 @@ enrich and validate the stored sink before constructing the anchor.
 
 ## API graph projection reads — settled
 
-The API-owned [database seed contract](api.md#database-seed-extent-and-projection--settled)
-defines `GraphViewSeedRequest`, `GraphViewSeedOutcome`, `GraphViewSeed`, the
-typed anchor-unavailability values, its effective extent, and the contents of
-the returned projection. Storage exposes that semantic read only through the
-separate read-only API handle. Under the
+The API-owned [database seed contract](api-publication.md#database-seed-extent-and-projection--settled)
+defines `GraphViewSeedRequest`, `GraphViewSeedOutcome`, `GraphViewSeed`, and the
+contents of the returned projection. The [public API values](api.md#public-api-values--settled)
+define its anchors, resolution, and typed normal anchor-unavailability values.
+Storage exposes that semantic read only through the separate read-only API
+handle. Under the
 [core crate structure](overview.md#core-crate-structure--settled),
 these shared values come from `kgi-api-model`; `kgi-storage` does not depend on
 `kgi-api-core`:
@@ -1240,7 +1241,7 @@ reports `GenerationLost` to the operation without retiring the independent
 processing handle. Publication of the validated replacement emits
 `StorageServiceEvent::ApiDbPublished`. A structurally incomplete or internally
 incoherent result reports `InconsistentProjection`; it never returns a partial
-seed. The [ApiService construction contract](api.md#head-publication-lifecycle-and-stream-alignment--settled)
+seed. The [ApiService construction contract](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled)
 owns those errors during Head construction; the
 [API contract](api.md#daa-navigation-and-graph-windows--settled) owns public
 anchored-window dispositions.

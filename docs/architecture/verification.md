@@ -810,7 +810,7 @@ the API-owned fresh-view outcome, and leaves the browser's last coherent image
 frozen/stale until explicit refresh.
 
 Verify deltas and client behavior across
-[API publication](api.md#head-publication-lifecycle-and-stream-alignment--settled) and
+[API publication](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled) and
 [Web update acquisition](web.md#update-acquisition--settled): sequential delta
 composition and expiry, response-local hash dictionaries,
 terminal Stale state, replacement publication identity, SSE slow clients,
@@ -818,7 +818,7 @@ fixed-view freeze, DAA focus, and Live arriving during construction or
 alignment. The latter must publish the completed image directly as Live.
 
 Verify the settled
-[publication-state contract](api.md#publication-state-and-revision--settled):
+[publication-state contract](api-publication.md#publication-state-and-revision--settled):
 initial Synchronizing, direct initial Live, visible `Synchronizing -> Live`,
 and terminal Stale transitions leave graph view and history revisions
 unchanged. Cover reliable `reset` processing without an application-completion barrier,
@@ -876,8 +876,8 @@ Repeated identical requests therefore execute independent on-demand
 projection. Cache pressure must not delay or fault processing.
 
 Verify the settled
-[database-seed projection](api.md#database-seed-extent-and-projection--settled),
-[head-publication lifecycle](api.md#head-publication-lifecycle-and-stream-alignment--settled), and
+[database-seed projection](api-publication.md#database-seed-extent-and-projection--settled),
+[head-publication lifecycle](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled), and
 [storage read operation](storage.md#api-graph-projection-reads--settled).
 Cover a `MAX_CACHE_DEPTH` head seed; odd and even anchored depths; shifting at
 level 1 and the database head; level, block-hash, and DAA anchors; and a retained

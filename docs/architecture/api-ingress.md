@@ -113,7 +113,7 @@ state mutex, and then uses lossless delivery, awaiting channel capacity instead
 of reporting an ordinary-update gap. Its command FIFO preserves
 `PublishPostSeal` before `Live`; unrelated ordinary graph updates may
 interleave before `Live`. ApiService's reaction to a reported gap belongs to
-the [publication reconstruction contract](api.md#universal-api-reconstruction--settled).
+the [publication reconstruction contract](api-publication.md#universal-api-reconstruction--settled).
 
 The [BlockProcessor marker contract](block-processing.md#graph-lifecycle-marker-delivery--settled)
 owns its worker and marker-command enqueue points. The

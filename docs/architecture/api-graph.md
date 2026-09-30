@@ -5,7 +5,7 @@
 This document owns `GraphView`, `GraphDelta`, `GraphHistory`, their graph value
 shapes, view tracking policies, update and extraction behavior, revision and
 history advancement, delta application and composition, edge and level
-retention, and history pruning. [API publication](api.md) owns publication
+retention, and history pruning. [API publication](api-publication.md) owns publication
 identity, lifecycle, construction, alignment, and replacement. Public HTTP and
 SSE representation remains in the [API contract](api.md) until its protocol
 extraction.
