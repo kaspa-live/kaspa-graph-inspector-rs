@@ -871,6 +871,17 @@ and upstream RPC versions only through `node.last_validated`; it contains no
 separate processing version, API version, `representation_version`, or
 ApiService-status field.
 
+Verify the API's common HTTP conventions independently of endpoint DTOs. Every
+public route is rooted at `/api/v1`, uses its canonical lowercase noun path
+without a trailing slash, and accepts only the settled `GET` operation without
+a request body. Query names are case-sensitive snake_case and have no
+abbreviated aliases. Cover unsigned decimal integers, canonical hexadecimal
+block hashes, exact lowercase booleans, and lowercase kebab-case enums. Reject
+malformed or negative numeric values, duplicate scalar parameters, unknown
+parameters, mutually exclusive selections, and missing required parameters
+with `400 Bad Request`. No rejected request reaches graph construction,
+history selection, or storage.
+
 Delta cases cover Frozen and revision compatibility as the only application
 checks, direct target-state installation, Head bound recalculation, fixed-bound
 retention, and equality between sequential application and a directly or

@@ -17,6 +17,45 @@ owns lifecycle-marker production. [Storage](storage.md) owns database
 transactions, query implementation, and database-replacement exclusion. Web
 client behavior belongs to the [Web architecture](web.md).
 
+## Common HTTP conventions — settled
+
+The public HTTP contract is rooted at `/api/v1`. This `v1` identifies the
+first public HTTP contract; it is independent of the KGI executable version,
+the KGI v2 product generation, `representation_version`, publication IDs, and
+graph revisions. It does not create a separate API-version field in
+`SystemStatus`.
+
+Canonical resource paths use lowercase nouns. Multiword path segments use
+lowercase kebab-case. Graph resources are below `/api/v1/graph/`, while the
+service-status resource is below `/api/v1/status`. Canonical paths have no
+trailing slash. RPC-style action names such as `getHead` are not used.
+
+The current public API is read-only. Snapshots, deltas, windows, SSE, and
+status use `GET`; a GET request has no request body. `POST`, `PUT`, `PATCH`,
+and `DELETE` are outside the current public API. `HEAD` is not part of the v1
+contract unless accepted later.
+
+Query parameters select cursors, revisions, depths, level extents, anchors,
+and other request-specific projections. Cursors and block hashes do not become
+path segments. Parameter names are case-sensitive lowercase snake_case and use
+the architecture's semantic names, including `publication_id`,
+`from_revision_id`, `to_revision_id`, `max_depth`, `block_hash`, `daa_score`,
+and `client_id`; abbreviated aliases are not accepted.
+
+Unsigned integer parameters use unsigned decimal text, block hashes use their
+canonical hexadecimal representation, boolean parameters use exactly `true`
+or `false`, and enum parameters use stable lowercase kebab-case values.
+Request parsing is strict. A malformed value, negative unsigned value,
+duplicate scalar parameter, unknown query parameter, mutually exclusive
+combination, or missing required parameter returns `400 Bad Request`.
+Endpoint-specific rules still determine whether a well-formed value is capped,
+unavailable, or outside its semantic range.
+
+This common contract fixes route and request syntax. Each endpoint section
+owns its exact resource path, parameters, logical outcomes, and cache behavior.
+The final response DTOs, error-body schema, graph encoding, and HTTP
+compression policy remain deferred.
+
 ## Public graph limits and identity — settled
 
 Define `MAX_WINDOW_DEPTH` and `MAX_CACHE_LEVEL_DISTANCE` under this strict
@@ -29,7 +68,7 @@ MAX_CACHE_LEVEL_DISTANCE + MAX_WINDOW_DEPTH < MAX_CACHE_DEPTH
 Their exact values remain deferred in the
 [decision register](../decisions/deferred.md). Every windowed endpoint caps
 requested depth to `MAX_WINDOW_DEPTH` and reports the effective range. An
-oversized `/graph/head` request cannot fall back to DB; it is capped. The
+oversized Head snapshot request cannot fall back to DB; it is capped. The
 [graph model](api-graph.md) owns `MAX_CACHE_DEPTH` and complete-level retention.
 
 The domain-owned `CompactId` crosses into ApiService only as the private
@@ -715,8 +754,10 @@ The public graph API has conceptually:
   component observations, and the current or last successfully validated
   network and node server information.
 
-Exact endpoint URLs, HTTP methods, the final wire schema, and the graph wire
-format remain deferred in the [decision register](../decisions/deferred.md).
+Endpoint-specific resource paths and parameter sets, the final wire schema,
+and the graph wire format remain deferred in the
+[decision register](../decisions/deferred.md). HTTP methods and common route
+and request syntax follow the settled conventions above.
 
 Every graph response carries its hash dictionary. A window extracted from a
 `GraphPublication` carries the lineage metadata required by the
