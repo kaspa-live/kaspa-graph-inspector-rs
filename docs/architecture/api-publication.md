@@ -80,10 +80,12 @@ exactly `MAX_CACHE_DEPTH`, and its low level is:
 max(1, high_level - MAX_CACHE_DEPTH + 1)
 ```
 
-An `AnchoredWindow` accepts `max_depth` only in
-`1..=MAX_WINDOW_DEPTH`. Storage resolves its level, block-hash, or DAA anchor
-inside the same consistent read as the projection. For a requested depth `d`,
-the nominal extent initially allocates:
+The [public anchored-window protocol](api-protocol.md#anchored-graph-windows--settled)
+owns request validation and caps a positive requested depth before selecting a
+projection source. An internal `AnchoredWindow` therefore receives an
+effective `max_depth` only in `1..=MAX_WINDOW_DEPTH`. Storage resolves its
+level, block-hash, or DAA anchor inside the same consistent read as the
+projection. For an effective depth `d`, the nominal extent initially allocates:
 
 ```text
 levels_above = (d - 1) / 2

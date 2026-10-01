@@ -771,7 +771,7 @@ and verify that its supplied final snapshot still updates its DAA score and
 produces the corresponding level-only delta. A snapshot for a level absent
 from the view is ignored.
 
-Verify [DAA navigation and graph windows](api-protocol.md#daa-navigation-and-graph-windows--settled)
+Verify [anchored graph windows](api-protocol.md#anchored-graph-windows--settled)
 for floor selection and tie break, the sentinel result, a reorg-created
 VSPC-empty level, atomic level-score publication, and navigation plus window
 consistency from one image. Accept zero and `MAX_DAA_SCORE` as query bounds and
@@ -785,14 +785,25 @@ keep the returned level fixed across eligible projected deltas, and re-resolve
 only when explicit refresh resubmits that anchor. A database-backed window has
 no public delta lineage and remains frozen until that refresh.
 
+Exercise each settled `GET /api/v1/graph/window` request form. Require
+`max_depth` and exactly one anchor; reject zero or multiple anchors and every
+additional parameter before storage access. Accept every positive depth, cap
+values above `MAX_WINDOW_DEPTH`, and report the effective extent. Cover a
+complete Head extraction and database fallback for an anchor or extent outside
+the retained Head image. Each response must use only one immutable source. The
+Head result carries its complete publication lineage and source Head level;
+the database result carries none and is discarded after serialization. Neither
+path may insert a response into `GraphCache`.
+
 For database-backed anchor misses, verify exact-level absence returns
 `LevelNotRetained`, an unknown or identity-only block hash returns
 `BlockNotMaterialized`, and a DAA score before every retained VSPC score returns
 `NoRetainedDaaMatch`. Each is an ordinary `AnchorUnavailable` result from the
 same stable transaction, produces `404`, and changes no API DB generation,
-publication, or processing state. Level zero, out-of-range DAA, invalid depth,
-and malformed hash input produce `400` without a storage call. A DAA score
-beyond the current VSPC score remains a successful current-VSPC resolution.
+publication, or processing state. Level zero, out-of-range DAA, zero or
+malformed depth, and malformed hash input produce `400` without a storage
+call. A DAA score beyond the current VSPC score remains a successful
+current-VSPC resolution.
 
 Verify the settled
 [Head-bounded Fixed projection](api-protocol.md#head-bounded-fixed-delta-projection--settled)

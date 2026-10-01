@@ -184,7 +184,7 @@ phases that still hold shared permits. Retirement emits the ordered
 pool. StorageService then acquires the exclusive replacement permit. A request
 that detached its projection before closure may finish returning that old
 coherent image. Every other affected request reports database-backed read
-unavailability; the [API protocol](api-protocol.md#daa-navigation-and-graph-windows--settled)
+unavailability; the [API protocol](api-protocol.md#anchored-graph-windows--settled)
 owns its HTTP mapping. An API read cannot delay replacement without bound.
 
 The exclusive permit remains held through the atomic replacement outcome and
@@ -1247,7 +1247,7 @@ processing handle. Publication of the validated replacement emits
 incoherent result reports `InconsistentProjection`; it never returns a partial
 seed. The [ApiService construction contract](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled)
 owns those errors during Head construction; the
-[API protocol](api-protocol.md#daa-navigation-and-graph-windows--settled) owns public
+[API protocol](api-protocol.md#anchored-graph-windows--settled) owns public
 anchored-window dispositions.
 
 ## Historical read contracts — settled

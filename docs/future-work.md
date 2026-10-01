@@ -24,7 +24,7 @@ are accepted; do not introduce them implicitly during implementation.
   cannot be transactional must likewise be an explicit offline administrative
   operation;
 - historical graph-window response caching, if usage measurements justify it;
-  the [API protocol](architecture/api-protocol.md#daa-navigation-and-graph-windows--settled)
+  the [API protocol](architecture/api-protocol.md#anchored-graph-windows--settled)
   owns current behavior, and any future cache must account for VSPC reorgs and
   graph changes within one API publication epoch;
 - other improvements must be recorded explicitly rather than silently entering

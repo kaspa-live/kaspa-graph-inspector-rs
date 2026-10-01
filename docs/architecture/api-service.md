@@ -56,7 +56,7 @@ A public database-backed request is admitted only when
 exact `Arc`, releases the ApiService state lock, and performs its complete
 database phase without holding the lock, switching generations, or retrying
 transparently. A disabled gate or absent client rejects database-backed request
-admission; the [API protocol](api-protocol.md#daa-navigation-and-graph-windows--settled)
+admission; the [API protocol](api-protocol.md#anchored-graph-windows--settled)
 owns its HTTP response. A complete projection detached before a concurrent
 state change may still finish delivery under the storage-owned replacement
 gate.

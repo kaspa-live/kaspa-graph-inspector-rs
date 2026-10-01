@@ -766,7 +766,48 @@ cache single-flight. Cache work cannot affect graph correctness or processing.
 Concrete cache collections and the estimator weights remain deferred in the
 [decision register](../decisions/deferred.md).
 
-## DAA navigation and graph windows — settled
+## Anchored graph windows — settled
+
+The canonical anchored-window operation is one resource with three mutually
+exclusive request forms:
+
+```http
+GET /api/v1/graph/window?max_depth=N&level=L
+GET /api/v1/graph/window?max_depth=N&block_hash=H
+GET /api/v1/graph/window?max_depth=N&daa_score=Q
+```
+
+`max_depth` and exactly one of `level`, `block_hash`, or `daa_score` are
+required. Zero or multiple anchor parameters, `level = 0`, an undecodable
+block hash, and a DAA score outside `0..=MAX_DAA_SCORE` return `400 Bad
+Request` before storage access. A positive `max_depth` is capped to
+`MAX_WINDOW_DEPTH`; zero is invalid. Other malformed, duplicate, or additional
+parameters follow the [common request rules](#common-http-conventions--settled).
+The endpoint accepts no publication cursor, revision, `client_id`, or source
+selection parameter.
+
+After ordinary graph-endpoint admission establishes a coherent current Head
+publication, ApiService first attempts to resolve the anchor and extract the
+complete effective window from one immutable image of it. If either the anchor
+or any required part of the effective extent is unavailable there, it uses one
+consistent database transaction for both resolution and projection. It never
+combines the two sources. Crossing the retained Head view's lower bound
+requires the database path; the Head view's configured depth alone does not.
+
+Every successful response carries the graph projection,
+`GraphWindowResolution`, its effective level extent, and a response-local hash
+dictionary. A Head-extracted response additionally carries the source Head
+`publication_id`, revision, captured `GraphPublicationState`, and source Head
+`high_level`; this is the lineage consumed by the
+[Head-bounded Fixed projection](#head-bounded-fixed-delta-projection--settled).
+A database-backed response carries no publication ID, publication state, or
+public delta lineage. Its request-local revision-zero `Fixed` view is serialized
+once and discarded.
+
+Neither source enters the publication-owned `GraphCache`. Historical
+database-backed responses retain their settled no-ETag behavior. Remaining
+anchored-window HTTP cache headers are part of the deferred common HTTP outcome
+work in the [decision register](../decisions/deferred.md).
 
 Every successful anchored window response carries `GraphWindowResolution`,
 independently of whether its one anchor is a level, block hash, or DAA score.
@@ -826,10 +867,7 @@ errors change no publication ID or state, view or history revision, SSE cursor,
 or processing recovery obligation; they neither stale nor reconstruct the
 installed Head.
 
-Reject invalid anchor input before storage access with `400 Bad Request`. This
-includes level zero, a DAA score outside the shared range, an invalid
-`max_depth`, and a block hash that cannot be decoded into `BlockHash`. These
-input errors are distinct from a valid typed anchor that has no retained
+These input errors are distinct from a valid typed anchor that has no retained
 match.
 
 ## Public API surface — settled
@@ -845,8 +883,9 @@ The public graph API has conceptually:
   component observations, and the current or last successfully validated
   network and node server information.
 
-Remaining endpoint-specific resource paths and parameter sets, the final wire
-schema, and the graph wire format remain deferred in the
+Remaining endpoint-specific resource paths and parameter sets beyond the
+settled operations above, the final wire schema, and the graph wire format
+remain deferred in the
 [decision register](../decisions/deferred.md). HTTP methods and common route
 and request syntax follow the settled conventions above.
 
@@ -859,6 +898,3 @@ lineage. A view constructed directly from a database starts at revision zero
 and has no publication ID unless it is placed in a `GraphPublication`; its
 chosen tracking policy determines whether it accepts updates. Database-backed
 windows remain capped by `MAX_WINDOW_DEPTH` and have no public delta lineage.
-Requests crossing the current head view's lower bound take the consistent DB
-path; head depth itself never forces this
-fallback.
