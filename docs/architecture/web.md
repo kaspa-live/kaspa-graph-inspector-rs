@@ -32,9 +32,18 @@ or the API requires a snapshot. It never assumes one response reaches the
 original target. It applies a delta only when the view's current revision equals
 the delta's `from_revision_id`.
 
-For canonical Head catch-up, the Web consumes `KGI-More-Available`. After
-applying a response marked `true`, it immediately requests again from the
-returned `to_revision_id`; after `false`, it waits for the next SSE wakeup.
+For canonical Head catch-up, the Web supplies its current opaque SSE
+`client_id` and consumes the response's `DeltaContinuation`. After
+`ContinueImmediately`, it requests again from the returned `to_revision_id`;
+after `ReachedHead` or `WaitForWakeup`, it waits for the next SSE wakeup. A
+no-delta wait response leaves the graph cursor unchanged. The Web adopts each
+dedicated `ClientRegistration` message before processing the following
+`PublicationWakeup`; this replaces its opaque identifier on initial connection,
+reconnection, and publication replacement without embedding registration state
+in the wakeup. Every HTTP request continues to supply the Web's actual
+`from_revision_id` as its authoritative graph cursor.
+`ClientRegistrationRequired` reconnects SSE and retries from that unchanged
+cursor.
 Under the API-owned
 [cached Head-delta wire contract](api-protocol.md#canonical-head-delta-responses--settled),
 the Web advances its local bounds from `GraphDelta.high_level` and its window

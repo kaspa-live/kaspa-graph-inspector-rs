@@ -889,34 +889,59 @@ For every appended history entry, verify `estimated_raw_bytes` and the absolute
 `cumulative_estimated_bytes` boundary at `delta.to_revision_id`. Cover range
 cost subtraction before and after prefix pruning, the first retained left
 boundary derivation, and an aggregated entry exposing only its final cost
-boundary. Exercise delta-to-Head target selection in order: Head when its soft
-estimate fits, otherwise the youngest reachable cached source revision, and
-otherwise the youngest ordinary stored boundary. Force the actual encoded
-result over its hard limit and verify fallback to an earlier complete boundary,
-then the first-entry fresh-view outcome.
+boundary. Exercise the delta-to-Head regions at the exact half-distance and 80%
+boundaries. In the heat region, cover no heated boundary, competing destination
+counts, the outgoing-cache/job and youngest-revision tie breaks, and exclusion
+when a boundary leaves retained history or the moving heat region. Confirm
+request-from counts and continuation kinds do not change heat. In the
+CPU-oriented region, cover an exact cache hit, the shortest bridge to the
+nearest reachable completed cached source, exclusion of a running job as a
+bridge destination, and fallback to the youngest affordable ordinary boundary.
+Force the actual encoded result over its hard limit and verify fallback to an
+earlier complete boundary, then the first-entry fresh-view outcome.
 
 For encoded head-response reuse, issue concurrent identical snapshot requests
 at one cursor and effective window and verify that they share one construction,
 serialization, and compression result. For canonical Head deltas, verify one
 publication-owned job per source revision: concurrent requests join it after
 its target is captured, success publishes one `CachedDelta`, and failure gives
-all waiters the same request-local error before removing the job. A cache hit
-reuses the immutable encoded body while `KGI-More-Available` is assembled from
-the then-observed publication Head. Cover the request-local envelope changing
-from `Complete` to `Prefix` and the header's one-way `false -> true` change as
-an Active Head advances, immediate client continuation for `true`, SSE waiting
-for `false`, and `Complete` plus `false` at a Stale publication's final Head.
-For an exact historical target, also cover `Complete` plus `true` when that
-target is satisfied while the publication Head is newer.
+all waiters the same request-local error before removing the job. Count every
+successfully delivered waiter independently toward the destination heat. A
+cache hit reuses the immutable encoded body and is never promoted or replaced
+because Head advanced; request-local `Complete`/`Prefix` and
+`DeltaContinuation` remain outside those bytes. Verify one immutable outgoing
+entry per source revision and convergence of distinct sources on a heated
+destination. Exact-target canonical requests bypass the source-keyed cache and
+its jobs while their successful actual destinations still contribute heat.
+
+For a Live publication and interval four, cover no-delta waiting at Head
+distances one through three; target eligibility beginning at `F + 4`; no-heat
+fallback; `ReachedHead`, `ContinueImmediately`, and `WaitForWakeup`; one wakeup
+at the armed boundary; suppression of further graph wakeups until rearming;
+and state or replacement wakeups bypassing the schedule. The opaque client ID
+selects only wake state, while a retried HTTP `from_revision_id` remains the
+authoritative graph cursor. Cover disconnect cleanup, reconnect with a new ID,
+and `ClientRegistrationRequired` for missing, expired, and wrong-publication
+registrations before cache or history work. On initial connection and
+reconnection, require a dedicated ID-only `ClientRegistration` before the
+initial `PublicationWakeup`. Replace a publication without reconnecting its SSE
+transport and verify the old ID is invalidated, a new ID-only registration is
+delivered, and only then is the replacement wakeup observed. A state-only
+transition must not replace the ID. Cover saturation rather than wrap at the
+maximum revision. Synchronizing never parks for the interval. Entering Stale
+wakes armed clients once and permits an
+interval shorter than four through the final stalled Head without rearming.
+Force both an estimated and a final-encoded budget to select a shorter prefix;
+that prefix remains valid and cacheable and derives continuation from its
+remaining Head distance. Also cover a CPU-oriented bridge shorter than four.
 
 Verify Stale preserves cache entries, permits existing and new jobs to finish
 against the stalled Head, and replacement or destruction cancels unfinished
 jobs and releases the cache. Evict an entry when its source revision leaves
-history and when its target level exceeds `MAX_CACHE_LEVEL_DISTANCE`; either
-miss reconstructs an equivalent response. At the 80% distance gate require a
-fresh window before starting a job. Historical DB windows bypass this cache.
-Exact-target canonical requests likewise bypass the source-keyed cache and its
-single-flight jobs.
+history and when its target level falls more than `MAX_CACHE_LEVEL_DISTANCE`
+behind Head; either miss reconstructs an equivalent response. At the 80%
+distance gate require a fresh window before starting a job. Historical DB
+windows bypass this cache.
 Projected Fixed delta requests also bypass cache lookup, insertion, and cache
 single-flight, return `Cache-Control: no-store`, and produce no ETag. Repeated
 identical requests therefore execute independent on-demand projection. Cache

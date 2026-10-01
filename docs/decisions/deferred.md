@@ -12,13 +12,15 @@ become durable project constraints.
 3. Exact capacities for processor channels, the per-session graph-update
    channel and ApiService staging buffer, orphan and VSPC pending memory,
    DependencyResolver and RPC concurrency, and HTTP
-   work, plus concrete cache collections and raw-byte estimator weights. Local RPC
+   work, plus concrete cache, destination-heat, and client-wake registry
+   collections and raw-byte estimator weights. Local RPC
    scheduling and batching remain implementation choices only where the
    focused architecture does not fix request boundaries or batch semantics.
    Moka is the current cache-library candidate.
 4. Orphan occupancy threshold within the settled range of approximately one
    quarter through one third.
 5. Detailed Tokio fairness, drain, graph-update gap counter/wakeup primitives,
+   per-client revision-wakeup scheduling primitives,
    component-status watch primitives, BlockProcessor marker-worker primitives,
    ApiService task structure, and concrete storage synchronization mechanics.
    A shared mutation lock plus per-lane mutexes is one valid storage shape;

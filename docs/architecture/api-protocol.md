@@ -67,9 +67,19 @@ enum FreshViewReason {
 
 enum DeltaResponseOutcome {
     UpToDate,
+    ClientRegistrationRequired,
+    WaitForWakeup {
+        wake_at_revision_id: u64,
+    },
     Complete(GraphDelta),
     Prefix(GraphDelta),
     FreshViewRequired(FreshViewReason),
+}
+
+enum DeltaContinuation {
+    ReachedHead,
+    ContinueImmediately,
+    WaitForWakeup,
 }
 
 enum FixedProjectionEndReason {
@@ -182,6 +192,50 @@ emits another wakeup with the same cursor and the new state. Reconnection emits
 the latest cursor and current state. Graph data still comes exclusively from
 HTTP snapshot or delta responses.
 
+Each new or re-established SSE connection receives a dedicated
+`ClientRegistration` message containing only a fresh unguessable opaque
+`client_id`. The server emits that message before the connection's initial
+`PublicationWakeup`; ordered SSE delivery makes the identifier current before
+the client observes the graph cursor. The identifier's concrete token encoding
+remains part of the deferred wire schema.
+
+Publication replacement preserves the live SSE transport. After the
+[publication lifecycle](api-publication.md#publication-state-and-revision--settled)
+releases the old publication's identifier, the server registers the connection
+in the replacement publication, emits a new `ClientRegistration`, and only then
+emits the replacement `PublicationWakeup`. The registration message still
+contains only the new identifier; publication identity, revision, and state
+remain exclusive to the following wakeup. A state-only transition within one
+publication does not allocate another identifier.
+
+A delta-to-current HTTP request carries the current identifier so ApiService
+can update the matching
+publication-local wake schedule after choosing the response. The identifier is
+transport coordination only: it encodes no publication, revision, network, or
+client identity. The request's `from_revision_id` is always the authoritative
+graph cursor, including after retry or reconnect.
+
+The publication-local scheduling value is conceptually:
+
+```rust
+struct DeltaClientWakeState {
+    wake_at_revision_id: u64,
+    wake_sent: bool,
+}
+```
+
+`DeltaClientRegistry` is the publication-local mapping from each live opaque
+identifier to exactly one such scheduling value; its concrete collection and
+token representation remain implementation choices.
+
+No current or highest graph revision is stored in this value. Registration
+initializes the boundary from the client-supplied cursor and marks the initial
+connection wakeup sent. Disconnect removes the registration. Reconnection and
+publication replacement each create a new opaque identifier. A missing,
+expired, or wrong-publication identifier returns
+`ClientRegistrationRequired`; the client first establishes a current SSE
+registration. Exact-target requests do not use this coordination identity.
+
 Head snapshots carry the current `GraphPublicationState`; their ETags vary with
 it. Immutable delta payloads contain graph changes only and do not vary when
 the publication state later changes.
@@ -193,10 +247,12 @@ history interval actually returned.
 
 ## Canonical Head delta responses — settled
 
-ApiService rejects a publication mismatch before consulting history. An Active,
-Synchronizing, or terminal Stale publication is otherwise eligible: Stale
-history no longer advances, but clients may catch up through its final stalled
-Head. For an eligible publication ApiService calls the graph-owned
+ApiService rejects a publication mismatch before consulting history. A
+delta-to-current request then validates its publication-local `client_id`.
+A publication in `Synchronizing`, `Live`, or terminal `Stale` state is
+otherwise eligible. Stale history no longer advances, but clients may catch up
+through its final stalled Head. For an eligible request ApiService calls the
+graph-owned
 [`GraphHistory::range`](api-graph.md#retained-history-range)
 operation, which owns retained-entry selection and target extension across an
 indivisible aggregate and returns the selected gapless
@@ -207,6 +263,9 @@ Public outcomes map as follows:
 - `GraphHistoryRangeError::BackwardTarget` returns `400 Bad Request`;
 - publication mismatch returns
   `FreshViewRequired(PublicationMismatch)`;
+- a delta-to-current request without its current publication's live SSE
+  registration returns `ClientRegistrationRequired` before cache or history
+  work;
 - `GraphHistoryRangeError::StartPruned` returns
   `FreshViewRequired(StartPruned)`;
 - `GraphHistoryRangeError::StartUnavailable` returns
@@ -219,16 +278,61 @@ entry's `delta.high_level` as the deliberately approximate source-level
 boundary. If its distance behind the publication Head reaches or exceeds 80%
 of `MAX_CACHE_LEVEL_DISTANCE`, return
 `FreshViewRequired(DeltaDistanceExceeded)`. Do not reconstruct an exact source
-level. A client beyond this gate reloads a complete applicable window.
+level. A client beyond this gate reloads a complete applicable window. Define:
+
+```text
+HOT_DESTINATION_LEVEL_DISTANCE = MAX_CACHE_LEVEL_DISTANCE / 2
+DELTA_CONVERGENCE_REVISION_INTERVAL = 4
+```
+
+Wake-boundary addition saturates at `u64::MAX`; revision arithmetic never
+wraps.
+
+The required initial v2 value is four. It is measured in graph revisions rather
+than time. A later accepted tuning change may replace the value without
+changing the convergence model. At the expected average of roughly twenty
+graph revisions per second on a 10-BPS network, four revisions provide about
+200 milliseconds for grouping clients without imposing a long live-view lag.
+In the rules below, `I` denotes
+`DELTA_CONVERGENCE_REVISION_INTERVAL`.
+
+After the distance gate and before cache lookup, a Live delta-to-current
+request with source `F` and Head `H` returns
+`WaitForWakeup { wake_at_revision_id: F.saturating_add(I) }` when
+`0 < H - F < I`.
+It constructs and delivers no delta, replaces the client's wake boundary with
+that value, and clears `wake_sent`. This rule also suppresses a previously
+cached short entry. Synchronizing and Stale do not defer at this gate.
 
 For an eligible `GraphHistoryRange::Deltas`, ApiService uses the entries'
-cumulative estimated costs to choose a complete target boundary under the soft
-estimated response budget:
+cumulative estimated costs to find the youngest complete boundary `Y` under
+the soft estimated response budget. If no complete boundary fits that estimate,
+the first complete stored entry remains the candidate for the mandatory hard
+encoded-size check. A completed cache entry keyed by the
+request's source revision is immutable and is served directly. On a cache miss,
+delta-to-current target selection uses the approximate source-level distance:
 
-1. choose the requested available right boundary when its estimate fits;
-2. otherwise choose the youngest reachable hot point, where a hot point is the
-   source revision of an existing `CachedDelta`;
-3. otherwise choose the youngest ordinary stored-entry boundary that fits.
+1. At or inside `HOT_DESTINATION_LEVEL_DISTANCE`, use heat-oriented selection.
+   When `Y >= F.saturating_add(I)`, choose the hottest retained complete
+   boundary `T` in `[F.saturating_add(I), Y]`; if none has heat, choose `Y`.
+   When `Y < F.saturating_add(I)`, choose `Y` as the necessary size-limited
+   short target. Synchronizing chooses from the currently affordable range
+   without imposing the minimum interval.
+2. Beyond `HOT_DESTINATION_LEVEL_DISTANCE` but before the 80% fresh-view gate,
+   minimize new CPU work. Choose the nearest younger boundary `R` that is the
+   source of a completed `CachedDelta` and is reachable under the response
+   budget, then construct the shortest bridge `F -> R`. A running job is not a
+   completed bridge destination. If no such source exists, choose `Y`.
+
+Heat for a revision is the number of canonical Head delta responses
+successfully delivered with that actual `to_revision_id`, including every
+waiter completed by a single-flight job. Destination heat is the primary
+choice in the first region; ties prefer a destination with an outgoing
+completed cache entry or running job and then the youngest revision. Requests
+received from a revision are measured for observability, but that count never
+contributes to heat. Do not separately count continuation states. A heat entry
+becomes ineligible when its revision leaves retained history or its boundary
+leaves the moving heat region.
 
 When appending a canonical Head delta, ApiService supplies its cheap
 `estimated_raw_bytes` from mutation counts and approximate field sizes for the
@@ -242,8 +346,8 @@ with Head while that job is running. Compose the chosen entries through the
 graph-owned [delta composition operation](api-graph.md#graph-delta-composition),
 construct the response-local hash dictionary, encode once, and check the hard
 response-byte limit. If the encoded result exceeds that limit, retry at an
-earlier complete boundary, preferring another hot point. If even the first
-complete stored entry cannot fit, return
+earlier complete boundary, preferring another eligible heated destination in
+the heat region. If even the first complete stored entry cannot fit, return
 `FreshViewRequired(FirstStoredDeltaExceedsBudget)`. An aggregated stored entry
 is indivisible and is never truncated or split.
 
@@ -263,15 +367,41 @@ These are request-specific envelope outcomes rather than fields of the encoded
 delta body. A later request may therefore wrap the same cached body differently
 as Head advances.
 
-Every delta response carries `KGI-More-Available`. For `Complete` or `Prefix`,
-ApiService compares the returned `to_revision_id` with the publication history Head observed while
-assembling that response. Equality yields `false`; an earlier target yields
-`true`. A client receiving `true` immediately requests again from the returned
-target. A client receiving `false` waits for an SSE wakeup. For a Stale
-publication the comparison uses its final stalled Head. A `false` observation
-can become obsolete immediately after response assembly; ordinary SSE delivery
-covers that race. For `UpToDate`, make the same comparison against the request's
-starting revision.
+The delta-to-current response envelope carries `DeltaContinuation`; it is not
+part of the immutable encoded delta body. For a Live publication, after a
+response ending at `T` against the then-observed Head `H`:
+
+```text
+T == H        => ReachedHead
+H - T >= I    => ContinueImmediately
+0 < H - T < I => WaitForWakeup
+```
+
+`ReachedHead` and `WaitForWakeup` replace the client's schedule with
+`T.saturating_add(I)` and clear `wake_sent`. Once Head reaches that boundary,
+ApiService emits one SSE wakeup and marks it sent; further history revisions
+emit no additional graph wakeup for that registration until another delta
+response rearms it.
+`ContinueImmediately` replaces the boundary in the same way but marks it sent:
+the HTTP response itself supplies the immediate continuation and no duplicate
+SSE wakeup is needed for the already-satisfied boundary. `UpToDate` uses the
+same rule with the request's starting revision. A state-only transition and
+publication replacement always emit their required
+wakeup independently of this graph-revision schedule.
+
+Synchronizing never parks a client for the four-revision interval: an
+intermediate response uses `ContinueImmediately`, and ordinary graph wakeups
+remain available. Stale cannot wait for future graph progress; entering Stale
+wakes every armed client once, intermediate responses use
+`ContinueImmediately`, and reaching the final stalled Head uses `ReachedHead`
+without arming another graph-revision wakeup. The final Stale interval may be
+shorter than four revisions.
+
+The soft estimate and hard encoded-size limit take precedence over ordinary
+four-revision spacing. An encoded-size fallback may therefore produce and
+cache a shorter complete prefix. Its continuation depends only on the
+remaining distance to the then-observed Head. CPU-oriented bridges may also be
+shorter because their purpose is to join an existing cached lane.
 
 The serialized cached Head-delta body omits block and edge removals. Under the
 strict [public graph-limit bound](#public-graph-limits-and-identity--settled),
@@ -435,9 +565,11 @@ Resync or Rebuild.
 SSE is only an ordered `PublicationWakeup`, not the graph data channel.
 Reconnection is not exactly-once. Each client has a bounded wakeup buffer. On
 connection the server emits the latest history cursor and publication state;
-subsequent history advancement, state change, or replacement publication emits
-an updated wakeup. Slow clients receive coalesced wakeups and, if persistently
-behind, are disconnected and recover through HTTP delta or view requests.
+Live history advancement follows the registered four-revision wake schedule;
+state change and replacement wakeups bypass it. Synchronizing continues to
+emit ordinary coalesced history wakeups, and entering Stale wakes armed clients
+once. Slow clients receive coalesced wakeups and, if persistently behind, are
+disconnected and recover through HTTP delta or view requests.
 
 `representation_version` is the settled term for the graph payload schema.
 KGI v2 selects exactly one graph wire format after the deferred format
@@ -455,7 +587,10 @@ selection and remains part of the deferred encoding work.
 For the publication-owned `GraphCache`, defined by the
 [publication value](api-publication.md#publication-and-seed-values--settled),
 internal identities omit `publication_id` because the containing publication
-already supplies it. The canonical cached delta value is:
+already supplies it. `GraphCache` contains the source-keyed completed entries,
+source-keyed single-flight jobs, and destination-response heat counters. Heat
+and request-source counters saturate rather than wrap. Concrete collections
+remain deferred. The canonical cached delta value is:
 
 ```rust
 struct CachedDelta {
@@ -467,13 +602,10 @@ struct CachedDelta {
 ```
 
 `encoded_body` is the immutable encoded graph-delta body. It does not contain
-the request-specific `Complete`/`Prefix` discriminator or progress state.
-ApiService creates a lightweight response around those bytes and supplies the
-outcome plus `KGI-More-Available` as defined by the canonical Head-delta
-contract. For one cached edge, a delta-to-current outcome can move only from
-`Complete` to `Prefix`, and the header only from `false` to `true`, as an Active
-Head advances beyond `to_revision_id`; neither moves back within the
-publication. Whether the lightweight HTTP wrapper is also retained is an
+the request-specific `Complete`/`Prefix` discriminator or
+`DeltaContinuation`. ApiService creates a lightweight response around those
+bytes and derives both values from the request target, then-current publication
+state, and Head. Whether the lightweight HTTP wrapper is also retained is an
 implementation detail.
 
 The delta cache and its single-flight job map serve delta-to-current requests
@@ -482,13 +614,15 @@ both. At most one logical job runs for a source revision. Concurrent requests
 attach to that job even if Head advances after its target was captured. Success
 publishes one `CachedDelta` at the source key and completes every waiter.
 Failure returns the same request-local error to every waiter, removes the job,
-and permits a later request to start another job. The soft-cost
-target-selection policy defines cached source revisions as hot points for later
-jobs.
+and permits a later request to start another job. Each successfully delivered
+waiter increments the actual destination's heat independently. A completed
+entry is never promoted as Head advances; later requests from its exact source
+reuse it until structural eviction.
 
 The [publication lifecycle](api-publication.md#publication-state-and-revision--settled)
 owns preservation, cancellation, and release of the cache and its jobs across
-Stale and replacement. While Active or Stale, evict a `CachedDelta` when its
+Stale and replacement. While the publication remains installed or is retained
+as Stale, evict a `CachedDelta` when its
 source revision is no longer retained or its target `high_level` is more than
 `MAX_CACHE_LEVEL_DISTANCE` behind that publication's Head. These structural
 bounds replace an independent encoded-byte cache cap.
@@ -559,8 +693,8 @@ No error returns a partial graph or transparently retries the failed request.
 The [ApiService binding contract](api-service.md#api-database-generation-binding--settled)
 owns the exact `ApiDbState` transition for each named binding path. Public read
 errors change no publication ID or state, view or history revision, SSE cursor,
-or processing recovery obligation; they neither stale nor reconstruct an
-Active Head.
+or processing recovery obligation; they neither stale nor reconstruct the
+installed Head.
 
 Reject invalid anchor input before storage access with `400 Bad Request`. This
 includes level zero, a DAA score outside the shared range, an invalid

@@ -319,6 +319,9 @@ V2 exposes these operational measurements:
 - active and rejected SSE clients;
 - encoded-response cache hits, misses, evictions, and coalesced identical
   requests;
+- destination concentration, request-source counts, cached segment length,
+  per-client revision wakeups, requests per catch-up, and size-limited
+  short-prefix frequency;
 - database permit and query time;
 - delta-journal resets and slow-client disconnects; and
 - BlockProcessor and VspcProcessor commit latency.

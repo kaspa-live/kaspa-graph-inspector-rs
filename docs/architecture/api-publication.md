@@ -30,6 +30,7 @@ struct GraphPublication {
     view: GraphView,
     history: GraphHistory,
     cache: GraphCache,
+    clients: DeltaClientRegistry,
 }
 
 enum GraphViewSeedRequest {
@@ -57,9 +58,12 @@ enum GraphViewSeedOutcome {
 ```
 
 Only `GraphPublication` has a `publication_id`. Each publication receives a
-fresh random nonzero `u64`. `GraphCache` is private runtime state;
+fresh random nonzero `u64`. `GraphCache` and `DeltaClientRegistry` are private
+runtime state;
 [API protocol](api-protocol.md#publication-scoped-head-response-cache--settled)
-owns its entry identities, public response semantics, and delta-cache policy.
+owns cache entry identities and delta-cache policy, while the
+[publication wire contract](api-protocol.md#publication-wire-observation--settled)
+owns client registration and wake scheduling.
 
 ## Database seed extent and projection — settled
 
@@ -277,7 +281,10 @@ no additional state effect.
 Becoming Stale does not destroy the publication's response cache or cancel its
 response-construction jobs. The coherent view and history stop advancing.
 Replacement or destruction of the publication cancels and joins its unfinished
-cache jobs and releases all cache entries. Public access while Stale and
+cache jobs and releases all cache entries and that publication's client
+identifiers. The protocol owner defines how live SSE transports receive their
+replacement identifiers. Stale transition and client-registration behavior
+follow the protocol owner. Public access while Stale and
 ordinary entry eviction belong to the
 [API protocol](api-protocol.md#publication-scoped-head-response-cache--settled).
 
