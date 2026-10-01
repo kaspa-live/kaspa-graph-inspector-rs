@@ -23,8 +23,7 @@ contract. The complete reading order and precedence rules are defined in
 | `architecture/` | Current focused system contracts and ownership index | Normative according to `AGENTS.md` |
 | `decisions/` | Settled, open, deferred, rejected, and superseded decision registers plus any standalone ADRs | Accepted ADRs and rejected/superseded status constrain work; current behavior remains in the focused owner |
 | `future-work.md` | Work explicitly outside KGI v2 | Non-normative |
-| `implementation/sequence.md` | Planned implementation order | Non-normative |
-| `implementation/status.md` | Current implementation state | Non-normative |
+| `implementation/` | Planned implementation order, current status, and implementation analyses | Non-normative |
 | `reviews/` | Review evidence and findings | Non-normative |
 | `history/audits/` | Historical reconciliation evidence | Non-normative |
 | `history/handoffs/` | Superseded architecture handoffs retained for provenance | Non-normative |
