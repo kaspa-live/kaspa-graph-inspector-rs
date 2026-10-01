@@ -882,6 +882,22 @@ parameters, mutually exclusive selections, and missing required parameters
 with `400 Bad Request`. No rejected request reaches graph construction,
 history selection, or storage.
 
+Verify `GET /api/v1/graph/head` requires `max_depth`, rejects zero, accepts the
+inclusive `1..=MAX_WINDOW_DEPTH` range, and caps larger well-formed values.
+Every successful response comes only from one coherent in-memory Head extent,
+reports its effective capped depth and actual bounds, carries a complete local
+hash dictionary plus the captured publication ID, revision, and state, and
+never accesses PostgreSQL. Cover `Synchronizing`, `Live`, terminal `Stale`, and
+no coherent publication. Advance or replace the publication during response
+serialization and verify the captured response remains internally coherent.
+The endpoint neither accepts nor returns `client_id`.
+
+Exercise `If-None-Match` across an unchanged response, graph revision advance,
+effective-extent change, state-only transition, and publication replacement.
+Only the unchanged complete identity returns `304 Not Modified`; every other
+case returns the complete snapshot. Verify `Cache-Control: no-cache`, including
+a state-only ETag change at an unchanged revision.
+
 Delta cases cover Frozen and revision compatibility as the only application
 checks, direct target-state installation, Head bound recalculation, fixed-bound
 retention, and equality between sequential application and a directly or

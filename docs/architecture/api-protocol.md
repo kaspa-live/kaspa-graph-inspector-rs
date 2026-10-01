@@ -275,16 +275,58 @@ expired, or wrong-publication identifier returns
 `ClientRegistrationRequired`; the client first establishes a current SSE
 registration. Exact-target requests do not use this coordination identity.
 
-Head snapshots carry the current `GraphPublicationState`; their ETags vary with
-it. Immutable delta payloads contain graph changes only and do not vary when
-the publication state later changes.
-
 The API response envelope, rather than `GraphView` or `GraphDelta`, carries the
 owning `publication_id`. A published view response pairs it with the view's
 current revision and publication state; a delta response pairs it with the
 history interval actually returned.
 
+## Head snapshot endpoint — settled
+
+The canonical Head snapshot operation is:
+
+```http
+GET /api/v1/graph/head?max_depth=N
+```
+
+`max_depth` is required. Values in `1..=MAX_WINDOW_DEPTH` are accepted as
+requested; a larger well-formed value is capped to `MAX_WINDOW_DEPTH`; zero is
+an invalid semantic value. Missing or malformed input follows the
+[common request rules](#common-http-conventions--settled).
+
+The endpoint extracts one coherent extent exclusively from the current
+in-memory Head publication. It never reads PostgreSQL and never falls back to a
+database-backed window. A successful logical response contains the owning
+`publication_id`, captured revision, captured `GraphPublicationState`, the
+effective capped depth and actual low/high extent, the complete graph
+projection, and its response-local hash dictionary. Concrete DTO organization
+remains part of the deferred wire schema; internal `TrackingPolicy` is not a
+public value.
+
+The captured `(publication_id, revision)` is the cursor for subsequent
+depth-independent canonical Head deltas. Snapshot acquisition neither accepts
+nor returns an SSE `client_id`; that identifier coordinates an established SSE
+registration with delta-to-current requests.
+
+`Synchronizing`, `Live`, and terminal `Stale` publications can each serve a
+coherent snapshot with their exact state. Without a coherent publication, the
+endpoint returns the graph-unavailable outcome. Head advancement or publication
+replacement during serialization does not restart the request: the completed
+response remains valid for its captured publication, revision, state, and
+effective extent.
+
+The endpoint accepts `If-None-Match`. Its ETag identity contains the
+publication ID, revision, effective capped depth and actual level extent,
+`representation_version`, and publication state. An exact match returns
+`304 Not Modified`; otherwise the endpoint returns the complete captured
+snapshot. A state-only transition therefore changes the ETag even when the
+graph revision is unchanged, because the self-contained snapshot carries that
+state. Responses use
+`Cache-Control: no-cache`, requiring revalidation before reuse.
+
 ## Canonical Head delta responses — settled
+
+Immutable delta payloads contain graph changes only and do not vary when the
+publication state later changes.
 
 ApiService rejects a publication mismatch before consulting history. A
 delta-to-current request then validates its publication-local `client_id`.
@@ -612,10 +654,10 @@ disconnected and recover through HTTP delta or view requests.
 
 `representation_version` is the settled term for the graph payload schema.
 KGI v2 selects exactly one graph wire format after the deferred format
-evaluation; clients do not negotiate among graph encodings. An ETag for a head
-view distinguishes publication ID, revision, effective window,
-`representation_version`, and publication state; `Cache-Control: no-cache`
-allows cheap revalidation/304. A delta-to-current query must revalidate.
+evaluation; clients do not negotiate among graph encodings. Head snapshot
+conditional caching follows the
+[endpoint contract](#head-snapshot-endpoint--settled). A delta-to-current query
+must revalidate.
 Historical database windows, projected Fixed deltas, and SSE have no ETag;
 projected Fixed deltas additionally require `Cache-Control: no-store` under
 their owning contract. HTTP compression is separate from graph-format
@@ -754,8 +796,8 @@ The public graph API has conceptually:
   component observations, and the current or last successfully validated
   network and node server information.
 
-Endpoint-specific resource paths and parameter sets, the final wire schema,
-and the graph wire format remain deferred in the
+Remaining endpoint-specific resource paths and parameter sets, the final wire
+schema, and the graph wire format remain deferred in the
 [decision register](../decisions/deferred.md). HTTP methods and common route
 and request syntax follow the settled conventions above.
 
