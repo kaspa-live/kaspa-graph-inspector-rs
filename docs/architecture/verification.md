@@ -938,18 +938,23 @@ cache hit reuses the immutable encoded body and is never promoted or replaced
 because Head advanced; request-local `Complete`/`Prefix` and
 `DeltaContinuation` remain outside those bytes. Verify one immutable outgoing
 entry per source revision and convergence of distinct sources on a heated
-destination. Exact-target canonical requests bypass the source-keyed cache and
-its jobs while their successful actual destinations still contribute heat.
+destination. Exercise an SSE-coordinated and an HTTP-only request from the same
+source and verify both reuse the same cache entry or join the same job.
 
 For a Live publication and interval four, cover no-delta waiting at Head
 distances one through three; target eligibility beginning at `F + 4`; no-heat
 fallback; `ReachedHead`, `ContinueImmediately`, and `WaitForWakeup`; one wakeup
 at the armed boundary; suppression of further graph wakeups until rearming;
-and state or replacement wakeups bypassing the schedule. The opaque client ID
-selects only wake state, while a retried HTTP `from_revision_id` remains the
-authoritative graph cursor. Cover disconnect cleanup, reconnect with a new ID,
-and `ClientRegistrationRequired` for missing, expired, and wrong-publication
-registrations before cache or history work. On initial connection and
+and state or replacement wakeups bypassing the schedule. Verify the canonical
+`GET /api/v1/graph/deltas` endpoint requires `publication_id` and
+`from_revision_id`, accepts an optional `client_id`, rejects a public
+`to_revision_id`, exposes the captured publication state, and emits the exact
+`KGI-Delta-Continuation` values required by the protocol. The opaque client ID
+selects only wake state, while every HTTP
+`from_revision_id` remains the authoritative graph cursor. Its omission must
+select HTTP-only polling without `ClientRegistrationRequired`; cover that
+outcome for an expired and wrong-publication supplied identifier before cache
+or history work. On initial connection and
 reconnection, require a dedicated ID-only `ClientRegistration` before the
 initial `PublicationWakeup`. Replace a publication without reconnecting its SSE
 transport and verify the old ID is invalidated, a new ID-only registration is
@@ -958,6 +963,13 @@ transition must not replace the ID. Cover saturation rather than wrap at the
 maximum revision. Synchronizing never parks for the interval. Entering Stale
 wakes armed clients once and permits an
 interval shorter than four through the final stalled Head without rearming.
+For HTTP-only `head` and `wakeup`, verify the protocol-owned calculated
+`KGI-Delta-Retry-After-Ms` values at lags zero through three and its absence
+from `continue` and SSE-coordinated responses. At a Stale final Head require
+1000 milliseconds, repeated same-endpoint polling while that publication
+remains current, and a publication-mismatch outcome followed by a replacement
+Head snapshot after replacement. The SSE-coordinated Web must wait for the
+replacement wakeup instead.
 Force both an estimated and a final-encoded budget to select a shorter prefix;
 that prefix remains valid and cacheable and derives continuation from its
 remaining Head distance. Also cover a CPU-oriented bridge shorter than four.

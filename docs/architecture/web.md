@@ -37,7 +37,10 @@ For canonical Head catch-up, the Web supplies its current opaque SSE
 `ContinueImmediately`, it requests again from the returned `to_revision_id`;
 after `ReachedHead` or `WaitForWakeup`, it waits for the next SSE wakeup. A
 no-delta wait response leaves the graph cursor unchanged. The Web adopts each
-dedicated `ClientRegistration` message before processing the following
+delta response's captured publication state. At a Stale publication's final
+Head it waits for the replacement wakeup instead of polling that terminal
+cursor. The Web adopts each dedicated `ClientRegistration` message before
+processing the following
 `PublicationWakeup`; this replaces its opaque identifier on initial connection,
 reconnection, and publication replacement without embedding registration state
 in the wakeup. Every HTTP request continues to supply the Web's actual

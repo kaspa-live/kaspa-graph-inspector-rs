@@ -247,12 +247,12 @@ contains only the new identifier; publication identity, revision, and state
 remain exclusive to the following wakeup. A state-only transition within one
 publication does not allocate another identifier.
 
-A delta-to-current HTTP request carries the current identifier so ApiService
-can update the matching
-publication-local wake schedule after choosing the response. The identifier is
-transport coordination only: it encodes no publication, revision, network, or
-client identity. The request's `from_revision_id` is always the authoritative
-graph cursor, including after retry or reconnect.
+A delta-to-current HTTP request may carry the current identifier so ApiService
+can update the matching publication-local wake schedule after choosing the
+response. Supplying no identifier selects HTTP-only polling and is valid. A
+supplied identifier is transport coordination only: it encodes no publication,
+revision, network, or client identity. The request's `from_revision_id` is
+always the authoritative graph cursor, including after retry or reconnect.
 
 The publication-local scheduling value is conceptually:
 
@@ -270,15 +270,16 @@ token representation remain implementation choices.
 No current or highest graph revision is stored in this value. Registration
 initializes the boundary from the client-supplied cursor and marks the initial
 connection wakeup sent. Disconnect removes the registration. Reconnection and
-publication replacement each create a new opaque identifier. A missing,
-expired, or wrong-publication identifier returns
-`ClientRegistrationRequired`; the client first establishes a current SSE
-registration. Exact-target requests do not use this coordination identity.
+publication replacement each create a new opaque identifier. A supplied
+expired or wrong-publication identifier returns `ClientRegistrationRequired`;
+the client first establishes a current SSE registration. An omitted identifier
+creates no registry entry and never returns that outcome.
 
 The API response envelope, rather than `GraphView` or `GraphDelta`, carries the
 owning `publication_id`. A published view response pairs it with the view's
-current revision and publication state; a delta response pairs it with the
-history interval actually returned.
+current revision and publication state; every successful delta response pairs
+it with the history interval actually returned and the captured publication
+state.
 
 ## Head snapshot endpoint — settled
 
@@ -328,8 +329,22 @@ state. Responses use
 Immutable delta payloads contain graph changes only and do not vary when the
 publication state later changes.
 
+The canonical Head delta operation is:
+
+```http
+GET /api/v1/graph/deltas?publication_id=P&from_revision_id=F[&client_id=C]
+```
+
+`publication_id` and `from_revision_id` are required. `client_id` is optional:
+its presence selects SSE-coordinated delivery and its absence selects HTTP-only
+polling. The public operation always targets the current Head captured for the
+request and does not accept `to_revision_id`; exact-target range selection
+remains internal to ApiService. Missing, malformed, duplicate, or additional
+parameters follow the [common request rules](#common-http-conventions--settled).
+
 ApiService rejects a publication mismatch before consulting history. A
-delta-to-current request then validates its publication-local `client_id`.
+delta-to-current request then validates a supplied publication-local
+`client_id`.
 A publication in `Synchronizing`, `Live`, or terminal `Stale` state is
 otherwise eligible. Stale history no longer advances, but clients may catch up
 through its final stalled Head. For an eligible request ApiService calls the
@@ -341,12 +356,10 @@ indivisible aggregate and returns the selected gapless
 
 Public outcomes map as follows:
 
-- `GraphHistoryRangeError::BackwardTarget` returns `400 Bad Request`;
 - publication mismatch returns
   `FreshViewRequired(PublicationMismatch)`;
-- a delta-to-current request without its current publication's live SSE
-  registration returns `ClientRegistrationRequired` before cache or history
-  work;
+- a request carrying an expired or wrong-publication `client_id` returns
+  `ClientRegistrationRequired` before cache or history work;
 - `GraphHistoryRangeError::StartPruned` returns
   `FreshViewRequired(StartPruned)`;
 - `GraphHistoryRangeError::StartUnavailable` returns
@@ -381,9 +394,11 @@ After the distance gate and before cache lookup, a Live delta-to-current
 request with source `F` and Head `H` returns
 `WaitForWakeup { wake_at_revision_id: F.saturating_add(I) }` when
 `0 < H - F < I`.
-It constructs and delivers no delta, replaces the client's wake boundary with
-that value, and clears `wake_sent`. This rule also suppresses a previously
-cached short entry. Synchronizing and Stale do not defer at this gate.
+It constructs and delivers no delta. For an SSE-coordinated request it also
+replaces the client's wake boundary with that value and clears `wake_sent`;
+an HTTP-only request has no registry state to update. This rule suppresses a
+previously cached short entry in both modes. Synchronizing and Stale do not
+defer at this gate.
 
 For an eligible `GraphHistoryRange::Deltas`, ApiService uses the entries'
 cumulative estimated costs to find the youngest complete boundary `Y` under
@@ -433,24 +448,34 @@ the heat region. If even the first complete stored entry cannot fit, return
 is indivisible and is never truncated or split.
 
 Every returned delta is complete under the public Head-window contract and
-reports its actual `to_revision_id`. It may be later than the requested target because the graph
-range extended through an indivisible aggregate, earlier because budgeting
-selected a prefix, or current because the requested target was in the future.
+reports its actual `to_revision_id`. It may be later than the selected target
+because the graph range extended through an indivisible aggregate or earlier
+because budgeting selected a prefix.
 Composition operates on graph hashes through the graph-owned operation; public
 encoding then constructs a new response-local hash dictionary for the result.
 The emitted response is one composed patch and must remain within the
 configured byte limit.
 
 Return `Complete` when the actual returned right boundary reaches or extends
-through the request's explicit or captured target. Return `Prefix` when target
-selection or encoded-size fallback stops at an earlier complete boundary.
+through the captured target. Return `Prefix` when target selection or
+encoded-size fallback stops at an earlier complete boundary.
 These are request-specific envelope outcomes rather than fields of the encoded
 delta body. A later request may therefore wrap the same cached body differently
 as Head advances.
 
-The delta-to-current response envelope carries `DeltaContinuation`; it is not
-part of the immutable encoded delta body. For a Live publication, after a
-response ending at `T` against the then-observed Head `H`:
+Every successful delta-to-current response carries its captured
+`GraphPublicationState` and exposes `DeltaContinuation` through exactly one of
+these response headers:
+
+```http
+KGI-Delta-Continuation: head
+KGI-Delta-Continuation: continue
+KGI-Delta-Continuation: wakeup
+```
+
+The continuation is request-specific response metadata and is not part of the
+immutable encoded delta body. For a Live publication, after a response ending
+at cursor `T` against the then-observed Head `H`:
 
 ```text
 T == H        => ReachedHead
@@ -458,17 +483,36 @@ H - T >= I    => ContinueImmediately
 0 < H - T < I => WaitForWakeup
 ```
 
-`ReachedHead` and `WaitForWakeup` replace the client's schedule with
-`T.saturating_add(I)` and clear `wake_sent`. Once Head reaches that boundary,
-ApiService emits one SSE wakeup and marks it sent; further history revisions
-emit no additional graph wakeup for that registration until another delta
-response rearms it.
-`ContinueImmediately` replaces the boundary in the same way but marks it sent:
-the HTTP response itself supplies the immediate continuation and no duplicate
-SSE wakeup is needed for the already-satisfied boundary. `UpToDate` uses the
-same rule with the request's starting revision. A state-only transition and
-publication replacement always emit their required
-wakeup independently of this graph-revision schedule.
+For a no-delta outcome, `T` is the unchanged request cursor. On an
+SSE-coordinated request, `ReachedHead` and `WaitForWakeup` replace the client's
+schedule with `T.saturating_add(I)` and clear `wake_sent`. Once Head reaches
+that boundary, ApiService emits one SSE wakeup and marks it sent; further
+history revisions emit no additional graph wakeup for that registration until
+another delta response rearms it. `ContinueImmediately` replaces the boundary
+in the same way but marks it sent: the HTTP response itself supplies the
+immediate continuation and no duplicate SSE wakeup is needed for the
+already-satisfied boundary. `UpToDate` uses the same rule with the request's
+starting revision. A state-only transition and publication replacement always
+emit their required wakeup independently of this graph-revision schedule.
+
+An HTTP-only request has no wake schedule. `continue` instructs it to request
+again immediately from `T`. A Live or Synchronizing response carrying `head`
+or `wakeup` also carries a calculated polling delay:
+
+```http
+KGI-Delta-Retry-After-Ms: N
+```
+
+For that response, define `lag = H - T` and calculate in checked integer
+arithmetic:
+
+```text
+N = 50 * max(1, DELTA_CONVERGENCE_REVISION_INTERVAL + 1 - lag)
+```
+
+The HTTP-only client waits at least `N` milliseconds before requesting again.
+The retry header is absent from `continue` responses and from all
+SSE-coordinated responses.
 
 Synchronizing never parks a client for the four-revision interval: an
 intermediate response uses `ContinueImmediately`, and ordinary graph wakeups
@@ -476,7 +520,12 @@ remain available. Stale cannot wait for future graph progress; entering Stale
 wakes every armed client once, intermediate responses use
 `ContinueImmediately`, and reaching the final stalled Head uses `ReachedHead`
 without arming another graph-revision wakeup. The final Stale interval may be
-shorter than four revisions.
+shorter than four revisions. At that final Head an HTTP-only response carries
+`KGI-Delta-Retry-After-Ms: 1000`; the client polls this same delta endpoint
+until publication replacement produces `FreshViewRequired(PublicationMismatch)`,
+then obtains the replacement Head snapshot. The SSE-coordinated response omits
+the retry header and does not rearm graph-revision delivery; publication
+replacement remains observable through the existing SSE transport.
 
 The soft estimate and hard encoded-size limit take precedence over ordinary
 four-revision spacing. An encoded-size fallback may therefore produce and
@@ -689,11 +738,11 @@ bytes and derives both values from the request target, then-current publication
 state, and Head. Whether the lightweight HTTP wrapper is also retained is an
 implementation detail.
 
-The delta cache and its single-flight job map serve delta-to-current requests
-and are keyed by source revision. Other exact-target canonical requests bypass
-both. At most one logical job runs for a source revision. Concurrent requests
-attach to that job even if Head advances after its target was captured. Success
-publishes one `CachedDelta` at the source key and completes every waiter.
+The delta cache and its single-flight job map serve both SSE-coordinated and
+HTTP-only delta-to-current requests and are keyed by source revision. At most
+one logical job runs for a source revision. Concurrent requests attach to that
+job even if Head advances after its target was captured. Success publishes one
+`CachedDelta` at the source key and completes every waiter.
 Failure returns the same request-local error to every waiter, removes the job,
 and permits a later request to start another job. Each successfully delivered
 waiter increments the actual destination's heat independently. A completed
