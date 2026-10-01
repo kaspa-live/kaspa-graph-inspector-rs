@@ -35,12 +35,12 @@ the delta's `from_revision_id`.
 For canonical Head catch-up, the Web consumes `KGI-More-Available`. After
 applying a response marked `true`, it immediately requests again from the
 returned `to_revision_id`; after `false`, it waits for the next SSE wakeup.
-Because public cached Head deltas omit publication-tail block and edge
-removals, the Web advances its local bounds from `GraphDelta.high_level` and
-its window depth, removes blocks below the resulting `low_level`, and removes
-an edge when its child leaves the window. The API protocol owns the strict
-depth-and-distance bound that makes those omitted removals irrelevant to every
-eligible client window.
+Under the API-owned
+[cached Head-delta wire contract](api-protocol.md#canonical-head-delta-responses--settled),
+the Web advances its local bounds from `GraphDelta.high_level` and its window
+depth, removes blocks below the resulting `low_level`, and removes an edge when
+its child leaves the window. This is the browser side of that contract rather
+than an independent removal rule.
 
 The Web consumes serialized head, delta, and graph-window responses. It never
 receives an internal `GraphView`, observes `TrackingPolicy`, or applies updates

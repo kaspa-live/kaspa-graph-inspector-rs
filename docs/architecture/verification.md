@@ -924,10 +924,13 @@ work must not delay or fault processing.
 
 Under the strict
 `MAX_CACHE_LEVEL_DISTANCE + MAX_WINDOW_DEPTH < MAX_CACHE_DEPTH` bound, verify
-cached public Head deltas omit block and edge removals. Advance a maximum-depth
-eligible browser window and prove its local `high_level`/depth pruning produces
-the same retained blocks and child-owned edges as the complete canonical
-history. Retain every VSPC membership, color, and required level mutation.
+the composed in-memory Head delta still contains every canonical block and edge
+removal immediately before serialization, while its cached wire body omits
+those removal entries and their now-unused dictionary hashes. Advance a
+maximum-depth eligible browser window and prove its local `high_level`/depth
+pruning produces the same retained blocks and child-owned edges as the complete
+canonical history. Retain every VSPC membership, color, and required level
+mutation.
 
 Verify the settled
 [database-seed projection](api-publication.md#database-seed-extent-and-projection--settled),

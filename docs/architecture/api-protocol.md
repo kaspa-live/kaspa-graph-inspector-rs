@@ -232,10 +232,10 @@ estimated response budget:
 
 When appending a canonical Head delta, ApiService supplies its cheap
 `estimated_raw_bytes` from mutation counts and approximate field sizes for the
-cacheable public representation. The estimate excludes block and edge
-removals, is additive across entries, and performs no graph encoding or
-compression. Exact weights remain deferred; the estimate selects a candidate
-and never authorizes an oversized response.
+cacheable wire representation. The estimate discounts the block and edge
+removals that the serializer will omit, is additive across entries, and
+performs no graph encoding or compression. Exact weights remain deferred; the
+estimate selects a candidate and never authorizes an oversized response.
 
 The target is captured when the single-flight job starts and does not advance
 with Head while that job is running. Compose the chosen entries through the
@@ -273,21 +273,23 @@ can become obsolete immediately after response assembly; ordinary SSE delivery
 covers that race. For `UpToDate`, make the same comparison against the request's
 starting revision.
 
-Public cached Head deltas omit block and edge removals. Under the strict
-[public graph-limit bound](#public-graph-limits-and-identity--settled), the
-publication removal frontier cannot reach any
+The serialized cached Head-delta body omits block and edge removals. Under the
+strict [public graph-limit bound](#public-graph-limits-and-identity--settled),
+the publication removal frontier cannot reach any
 block or child-owned edge retained by an eligible client window. The client
 uses `GraphDelta.high_level` and its own window depth to advance `low_level`,
 remove blocks below that boundary, and remove edges when their child leaves the
 window. VSPC membership and color changes remain ordinary field mutations and
 are never discarded by this rule. Required level changes remain present.
 
-Apply this omission only after composing the complete canonical history
-interval, then construct the derived public `GraphDelta` through the checked
-graph-owned constructor. The derived response is not a `GraphHistoryEntry`, is
-never appended to server history, and is never applied to ApiService's complete
-Head `GraphView`. Its completeness is relative to the bounded public client
-window established above.
+Every in-memory `GraphDelta` retains the complete canonical contract through
+history selection, composition, target capture, and delivery to the serializer.
+The serializer is the sole omission point: while producing the cacheable wire
+body, it skips removal-valued entries in `block_changes` and `edge_changes` and
+omits their unused hashes from the response-local dictionary. It does not
+construct a filtered `GraphDelta`. `CachedDelta` retains only the resulting
+encoded bytes. No canonical delta in history, composition, or ApiService's Head
+view loses those removals.
 
 ## Head-bounded Fixed delta projection — settled
 
