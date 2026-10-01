@@ -11,8 +11,8 @@ become durable project constraints.
 2. PostgreSQL Rust client, migration framework, and concrete SQL types.
 3. Exact capacities for processor channels, the per-session graph-update
    channel and ApiService staging buffer, orphan and VSPC pending memory,
-   caches, DependencyResolver and RPC concurrency, and HTTP
-   work, plus cache eviction policies and concrete implementations. Local RPC
+   DependencyResolver and RPC concurrency, and HTTP
+   work, plus concrete cache collections and raw-byte estimator weights. Local RPC
    scheduling and batching remain implementation choices only where the
    focused architecture does not fix request boundaries or batch semantics.
    Moka is the current cache-library candidate.
@@ -23,13 +23,16 @@ become durable project constraints.
    ApiService task structure, and concrete storage synchronization mechanics.
    A shared mutation lock plus per-lane mutexes is one valid storage shape;
    exact lock types remain an implementation choice.
-6. API endpoint URLs, HTTP methods, and final wire schema. The exact graph
-   response format is intentionally not chosen yet. Benchmark JSON against
-   appropriate binary formats such as CBOR, MessagePack, and Protobuf across
-   server construction and serialization, compression, transfer, browser
-   decoding, and graph-model construction.
-7. Exact `MAX_WINDOW_DEPTH` within the settled 1000-level cache bound, HTTP and
-   SSE budgets, and adaptive fixed-view delay curve and cap. Treat
+6. API endpoint URLs, HTTP methods, and final wire schema. Select exactly one
+   graph response format for v2; clients will not negotiate among graph
+   encodings. Benchmark JSON against appropriate binary formats such as CBOR,
+   MessagePack, and Protobuf across server construction and serialization,
+   compression, transfer, browser decoding, and graph-model construction.
+   Select the HTTP compression policy separately.
+7. Exact `MAX_WINDOW_DEPTH` and `MAX_CACHE_LEVEL_DISTANCE` under the settled
+   strict sum bound beneath `MAX_CACHE_DEPTH = 1000`; the soft estimated and
+   hard encoded response budgets; HTTP and SSE budgets; and the adaptive
+   fixed-view delay curve and cap. Treat
    traffic-share estimates and the numeric SSE-client
    limit as load-test inputs rather than fixed architecture constants.
 8. Detailed shared/exclusive permit, historical-read cancellation, and

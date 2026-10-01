@@ -104,7 +104,7 @@ enum GraphHistoryRange {
         from: u64,
         requested_target: u64,
         actual_target: u64,
-        entries: GraphDeltaList,
+        entries: GraphHistoryEntryList,
     },
 }
 
@@ -175,9 +175,16 @@ struct GraphDelta {
     color_changes: HashMap<BlockHash, FieldChange<BlockColor>>,
 }
 
+struct GraphHistoryEntry {
+    delta: GraphDelta,
+    estimated_raw_bytes: u64,
+    cumulative_estimated_bytes: u64,
+}
+
 struct GraphHistory {
     current_revision_id: u64,
-    deltas: OrderedDeltaList,
+    current_cumulative_estimated_bytes: u64,
+    entries: OrderedGraphHistoryEntryList,
 }
 
 impl GraphDelta {
@@ -405,6 +412,7 @@ impl GraphHistory {
     fn append(
         &mut self,
         delta: GraphDelta,
+        estimated_raw_bytes: u64,
     ) -> Result<(), GraphHistoryAppendError>;
 }
 ```
@@ -429,12 +437,23 @@ for Fixed; only a delta from the same Fixed lineage has the required context.
 
 `append` requires only
 `history.current_revision_id == delta.from_revision_id`. On success, it takes
-ownership of the delta, appends it to the ordered list, and sets
-`current_revision_id = delta.to_revision_id` atomically. On mismatch, both
-remain unchanged. A stored entry may be either a direct one-step delta or an
-already aggregated delta. Consecutive stored entries remain gapless by their
-outer interval boundaries; history neither requires nor reconstructs internal
-revision boundaries within an aggregate.
+ownership of the delta and its protocol-supplied `estimated_raw_bytes`, adds
+that estimate to `current_cumulative_estimated_bytes`, appends the resulting
+`GraphHistoryEntry`, and sets both current fields to the entry's target values
+atomically. On mismatch, all values remain unchanged. A new revision-zero
+history starts with cumulative value zero. A stored entry may hold
+either a direct one-step delta or an already aggregated delta. For an aggregate,
+`estimated_raw_bytes` is the sum of its constituents and
+`cumulative_estimated_bytes` is the final constituent's cumulative value.
+Consecutive stored entries remain gapless by their outer interval boundaries;
+history neither requires nor reconstructs internal revision boundaries within
+an aggregate.
+
+The exact raw-byte estimator belongs to the
+[canonical Head-delta protocol](api-protocol.md#canonical-head-delta-responses--settled).
+The estimate is planning metadata rather than graph state or a wire field.
+Composition cancellations, response-local hash deduplication, and compression
+may make it differ from the final encoded size.
 
 `GraphDelta.high_level` is the high level of the revision lineage that owns the
 delta at `to_revision_id`. A canonical Head delta therefore carries the target
@@ -614,9 +633,27 @@ It never removes a middle entry. An aggregated stored delta is indivisible and
 uses the `high_level` of its final constituent: retain the whole aggregate
 until that level leaves the Head extent, then remove the whole aggregate. This
 may retain older constituent history longer than necessary and is safe.
-Pruning never changes `current_revision_id`. If entries remain,
+Pruning changes neither current field. If entries remain,
 `oldest_available_revision()` is the first entry's `from_revision_id`;
 otherwise it is `current_revision_id`.
+
+Pruning preserves absolute `cumulative_estimated_bytes` values rather than
+rebasing retained entries. Each cost boundary is the corresponding
+`entry.delta.to_revision_id`. For two retained boundaries `from < to`:
+
+```text
+estimated_cost(from, to) = cumulative(to) - cumulative(from)
+```
+
+When `from` is the first retained entry's left boundary, derive its cumulative
+value as:
+
+```text
+first.cumulative_estimated_bytes - first.estimated_raw_bytes
+```
+
+Only stored entry boundaries are cost boundaries. An aggregate therefore
+offers one selectable right boundary, not reconstructed internal ones.
 
 After append, ApiService may prune against the current complete Head
 `low_level` before publishing the new complete history value. A history reader

@@ -263,8 +263,8 @@ priority:
 - bounded HTTP concurrency, query duration, response bytes and serialization
   CPU;
 - bounded SSE clients and per-client buffers;
-- level-scoped delta history, bounded cache memory, and bounded historical-read
-  work;
+- level-scoped delta history, publication-scoped structurally bounded response
+  reuse, and bounded historical-read work;
 - a separate memory-only status/info admission lane, so graph saturation
   cannot hide service state; and
 - distinct budgets for head delivery and historical database reads.
@@ -304,11 +304,13 @@ request's participation in StorageService's replacement gate. Response
 construction cannot issue follow-up database reads. `reset` need not wait for or
 cancel the remaining serialization and delivery work.
 
-If the complete cache depth required by the [graph model](api-graph.md) exceeds
-the cache memory allowance, first drop an optional stale image when useful.
-Otherwise mark head temporarily unavailable and retry a complete reload. Never
-publish partial levels. Slow SSE clients follow the bounded coalescing and
-disconnect contract in the
+If the complete Head depth required by the [graph model](api-graph.md) exceeds
+the graph-view memory allowance, first drop an optional older coherent image
+when useful. Otherwise mark Head temporarily unavailable and retry a complete
+reload. Never publish partial levels. Encoded delta reuse has no independent
+ApiService-owned resource rule beyond the structural bounds owned by the
+[API protocol](api-protocol.md#publication-scoped-head-response-cache--settled).
+Slow SSE clients follow the bounded coalescing and disconnect contract in the
 [API protocol](api-protocol.md#public-projection-and-delivery-failures--settled).
 
 V2 exposes these operational measurements:

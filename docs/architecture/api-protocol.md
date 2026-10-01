@@ -19,9 +19,16 @@ client behavior belongs to the [Web architecture](web.md).
 
 ## Public graph limits and identity — settled
 
-Define `MAX_WINDOW_DEPTH <= MAX_CACHE_DEPTH`; its exact value remains deferred
-in the [decision register](../decisions/deferred.md). Every windowed endpoint
-caps requested depth to `MAX_WINDOW_DEPTH` and reports the effective range. An
+Define `MAX_WINDOW_DEPTH` and `MAX_CACHE_LEVEL_DISTANCE` under this strict
+bound:
+
+```text
+MAX_CACHE_LEVEL_DISTANCE + MAX_WINDOW_DEPTH < MAX_CACHE_DEPTH
+```
+
+Their exact values remain deferred in the
+[decision register](../decisions/deferred.md). Every windowed endpoint caps
+requested depth to `MAX_WINDOW_DEPTH` and reports the effective range. An
 oversized `/graph/head` request cannot fall back to DB; it is capped. The
 [graph model](api-graph.md) owns `MAX_CACHE_DEPTH` and complete-level retention.
 
@@ -54,6 +61,7 @@ enum FreshViewReason {
     PublicationStale,
     StartPruned,
     StartUnavailable,
+    DeltaDistanceExceeded,
     FirstStoredDeltaExceedsBudget,
 }
 
@@ -185,47 +193,101 @@ history interval actually returned.
 
 ## Canonical Head delta responses — settled
 
-ApiService rejects a publication mismatch or terminal Stale publication before
-consulting history. For an eligible publication it calls the graph-owned
+ApiService rejects a publication mismatch before consulting history. An Active,
+Synchronizing, or terminal Stale publication is otherwise eligible: Stale
+history no longer advances, but clients may catch up through its final stalled
+Head. For an eligible publication ApiService calls the graph-owned
 [`GraphHistory::range`](api-graph.md#retained-history-range)
 operation, which owns retained-entry selection and target extension across an
-indivisible aggregate and returns the selected gapless `GraphDeltaList`.
+indivisible aggregate and returns the selected gapless
+`GraphHistoryEntryList`.
 
 Public outcomes map as follows:
 
 - `GraphHistoryRangeError::BackwardTarget` returns `400 Bad Request`;
 - publication mismatch returns
   `FreshViewRequired(PublicationMismatch)`;
-- terminal Stale publication returns
-  `FreshViewRequired(PublicationStale)`;
 - `GraphHistoryRangeError::StartPruned` returns
   `FreshViewRequired(StartPruned)`;
 - `GraphHistoryRangeError::StartUnavailable` returns
   `FreshViewRequired(StartUnavailable)`; and
 - `GraphHistoryRange::UpToDate` returns `DeltaResponseOutcome::UpToDate`.
 
-For `GraphHistoryRange::Deltas`, ApiService considers complete stored entries
-in order under the configured response-byte budget. The measured public
-representation includes the response envelope and its self-contained,
-response-local hash dictionary. If all selected entries fit, combine them
-through the graph-owned
-[delta composition operation](api-graph.md#graph-delta-composition) and return
-`Complete`. If only a nonempty complete-entry prefix fits, compose that prefix
-through the same operation and return `Prefix`. If the first complete stored
-entry does not fit,
-return `FreshViewRequired(FirstStoredDeltaExceedsBudget)`. An aggregated stored
-entry is indivisible and is never truncated or split to satisfy the budget.
+Before cache lookup, joining a job, or constructing a delta-to-Head response,
+use the first selected stored
+entry's `delta.high_level` as the deliberately approximate source-level
+boundary. If its distance behind the publication Head reaches or exceeds 80%
+of `MAX_CACHE_LEVEL_DISTANCE`, return
+`FreshViewRequired(DeltaDistanceExceeded)`. Do not reconstruct an exact source
+level. A client beyond this gate reloads a complete applicable window.
 
-Every returned delta is structurally complete and reports its actual
-`to_revision_id`. It may be later than the requested target because the graph
+For an eligible `GraphHistoryRange::Deltas`, ApiService uses the entries'
+cumulative estimated costs to choose a complete target boundary under the soft
+estimated response budget:
+
+1. choose the requested available right boundary when its estimate fits;
+2. otherwise choose the youngest reachable hot point, where a hot point is the
+   source revision of an existing `CachedDelta`;
+3. otherwise choose the youngest ordinary stored-entry boundary that fits.
+
+When appending a canonical Head delta, ApiService supplies its cheap
+`estimated_raw_bytes` from mutation counts and approximate field sizes for the
+cacheable public representation. The estimate excludes block and edge
+removals, is additive across entries, and performs no graph encoding or
+compression. Exact weights remain deferred; the estimate selects a candidate
+and never authorizes an oversized response.
+
+The target is captured when the single-flight job starts and does not advance
+with Head while that job is running. Compose the chosen entries through the
+graph-owned [delta composition operation](api-graph.md#graph-delta-composition),
+construct the response-local hash dictionary, encode once, and check the hard
+response-byte limit. If the encoded result exceeds that limit, retry at an
+earlier complete boundary, preferring another hot point. If even the first
+complete stored entry cannot fit, return
+`FreshViewRequired(FirstStoredDeltaExceedsBudget)`. An aggregated stored entry
+is indivisible and is never truncated or split.
+
+Every returned delta is complete under the public Head-window contract and
+reports its actual `to_revision_id`. It may be later than the requested target because the graph
 range extended through an indivisible aggregate, earlier because budgeting
 selected a prefix, or current because the requested target was in the future.
 Composition operates on graph hashes through the graph-owned operation; public
 encoding then constructs a new response-local hash dictionary for the result.
-Exact encoded-size measurement and whether a complete interval is transmitted
-as its entries or one composed patch remain implementation choices under the
-wire-format decision, but the emitted response must remain within the configured
-byte limit.
+The emitted response is one composed patch and must remain within the
+configured byte limit.
+
+Return `Complete` when the actual returned right boundary reaches or extends
+through the request's explicit or captured target. Return `Prefix` when target
+selection or encoded-size fallback stops at an earlier complete boundary.
+These are request-specific envelope outcomes rather than fields of the encoded
+delta body. A later request may therefore wrap the same cached body differently
+as Head advances.
+
+Every delta response carries `KGI-More-Available`. For `Complete` or `Prefix`,
+ApiService compares the returned `to_revision_id` with the publication history Head observed while
+assembling that response. Equality yields `false`; an earlier target yields
+`true`. A client receiving `true` immediately requests again from the returned
+target. A client receiving `false` waits for an SSE wakeup. For a Stale
+publication the comparison uses its final stalled Head. A `false` observation
+can become obsolete immediately after response assembly; ordinary SSE delivery
+covers that race. For `UpToDate`, make the same comparison against the request's
+starting revision.
+
+Public cached Head deltas omit block and edge removals. Under the strict
+[public graph-limit bound](#public-graph-limits-and-identity--settled), the
+publication removal frontier cannot reach any
+block or child-owned edge retained by an eligible client window. The client
+uses `GraphDelta.high_level` and its own window depth to advance `low_level`,
+remove blocks below that boundary, and remove edges when their child leaves the
+window. VSPC membership and color changes remain ordinary field mutations and
+are never discarded by this rule. Required level changes remain present.
+
+Apply this omission only after composing the complete canonical history
+interval, then construct the derived public `GraphDelta` through the checked
+graph-owned constructor. The derived response is not a `GraphHistoryEntry`, is
+never appended to server history, and is never applied to ApiService's complete
+Head `GraphView`. Its completeness is relative to the bounded public client
+window established above.
 
 ## Head-bounded Fixed delta projection — settled
 
@@ -376,36 +438,66 @@ an updated wakeup. Slow clients receive coalesced wakeups and, if persistently
 behind, are disconnected and recover through HTTP delta or view requests.
 
 `representation_version` is the settled term for the graph payload schema.
-An ETag for a head view distinguishes publication ID, revision, effective
-window, negotiated response format, `representation_version`, and publication
-state; `Cache-Control: no-cache` allows cheap revalidation/304. A "to current"
-Head-delta query must revalidate. Historical database windows, projected Fixed
-deltas, and SSE have no ETag; projected Fixed deltas additionally require
-`Cache-Control: no-store` under their owning contract.
+KGI v2 selects exactly one graph wire format after the deferred format
+evaluation; clients do not negotiate among graph encodings. An ETag for a head
+view distinguishes publication ID, revision, effective window,
+`representation_version`, and publication state; `Cache-Control: no-cache`
+allows cheap revalidation/304. A delta-to-current query must revalidate.
+Historical database windows, projected Fixed deltas, and SSE have no ETag;
+projected Fixed deltas additionally require `Cache-Control: no-store` under
+their owning contract. HTTP compression is separate from graph-format
+selection and remains part of the deferred encoding work.
 
-ApiService maintains bounded server-side reuse of encoded head responses. It
-caches immutable encoded bodies for a head view at one exact revision and
-effective window, and for a delta over one exact
-`(publication_id,from,to)` interval. Concurrent requests for the same absent
-variant are single-flight. A view variant is identified by publication ID,
-revision, publication state, effective window, negotiated response format,
-`representation_version`, and content encoding. A canonical Head-delta variant
-is identified by publication ID, its exact `from` and `to` revisions,
-negotiated response format, `representation_version`, and content encoding;
-publication state is not part of the immutable graph interval. A "to current"
-request captures an exact target before it can join shared construction or use
-an encoded entry; a bounded complete-prefix response is keyed by its actual
-returned interval.
-Projected Fixed delta requests bypass this cache and its single-flight path.
+## Publication-scoped Head response cache — settled
+
+For the publication-owned `GraphCache`, defined by the
+[publication value](api-publication.md#publication-and-seed-values--settled),
+internal identities omit `publication_id` because the containing publication
+already supplies it. The canonical cached delta value is:
+
+```rust
+struct CachedDelta {
+    from_revision_id: u64,
+    to_revision_id: u64,
+    high_level: u64,
+    encoded_body: Bytes,
+}
+```
+
+`encoded_body` is the immutable encoded graph-delta body. It does not contain
+the request-specific `Complete`/`Prefix` discriminator or progress state.
+ApiService creates a lightweight response around those bytes and supplies the
+outcome plus `KGI-More-Available` as defined by the canonical Head-delta
+contract. For one cached edge, a delta-to-current outcome can move only from
+`Complete` to `Prefix`, and the header only from `false` to `true`, as an Active
+Head advances beyond `to_revision_id`; neither moves back within the
+publication. Whether the lightweight HTTP wrapper is also retained is an
+implementation detail.
+
+The delta cache and its single-flight job map serve delta-to-current requests
+and are keyed by source revision. Other exact-target canonical requests bypass
+both. At most one logical job runs for a source revision. Concurrent requests
+attach to that job even if Head advances after its target was captured. Success
+publishes one `CachedDelta` at the source key and completes every waiter.
+Failure returns the same request-local error to every waiter, removes the job,
+and permits a later request to start another job. The soft-cost
+target-selection policy defines cached source revisions as hot points for later
+jobs.
+
+The [publication lifecycle](api-publication.md#publication-state-and-revision--settled)
+owns preservation, cancellation, and release of the cache and its jobs across
+Stale and replacement. While Active or Stale, evict a `CachedDelta` when its
+source revision is no longer retained or its target `high_level` is more than
+`MAX_CACHE_LEVEL_DISTANCE` behind that publication's Head. These structural
+bounds replace an independent encoded-byte cache cap.
 
 An encoded-cache miss or eviction affects performance only: reconstruct the
-response from the current `GraphView` or retained `GraphHistory`. Historical
-database-backed windows remain uncached in v2, and SSE remains an uncached
-cursor notification stream. Failure to retain a new encoded entry does not
-reject an otherwise serviceable response, and cached bytes are never reused
-across distinct variants. Cache pressure cannot affect graph correctness or
-processing. Exact cache capacity, eviction policy,
-implementation, and graph wire format remain deferred in the
+response from the current `GraphView` or retained `GraphHistory`. Optional
+exact-revision Head-view response reuse belongs to the same publication and may
+be dropped at any time. Historical database-backed windows, projected Fixed
+deltas, and SSE remain uncached in v2; projected Fixed requests also bypass
+cache single-flight. Cache work cannot affect graph correctness or processing.
+Concrete cache collections and the estimator weights remain deferred in the
 [decision register](../decisions/deferred.md).
 
 ## DAA navigation and graph windows — settled

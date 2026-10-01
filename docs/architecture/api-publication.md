@@ -4,10 +4,12 @@
 
 This document owns `GraphPublication`, publication identity and lifecycle state,
 database seed construction, graph-update alignment, activation, reconstruction,
-and replacement. The [API graph model](api-graph.md) owns the contained view,
-delta, and history semantics. [ApiService control](api-service.md) owns reset
-and API database-generation binding. Public HTTP, SSE, window, cursor, and
-cache behavior belongs to the [API protocol](api-protocol.md).
+replacement, and the lifetime of publication-scoped response reuse. The
+[API graph model](api-graph.md) owns the contained view, delta, and history
+semantics. [ApiService control](api-service.md) owns reset and API
+database-generation binding. Public HTTP, SSE, window, cursor, cache-entry,
+selection, and delivery behavior belongs to the
+[API protocol](api-protocol.md).
 
 ## Publication and seed values — settled
 
@@ -27,6 +29,7 @@ struct GraphPublication {
     state: GraphPublicationState,
     view: GraphView,
     history: GraphHistory,
+    cache: GraphCache,
 }
 
 enum GraphViewSeedRequest {
@@ -54,7 +57,9 @@ enum GraphViewSeedOutcome {
 ```
 
 Only `GraphPublication` has a `publication_id`. Each publication receives a
-fresh random nonzero `u64`.
+fresh random nonzero `u64`. `GraphCache` is private runtime state;
+[API protocol](api-protocol.md#publication-scoped-head-response-cache--settled)
+owns its entry identities, public response semantics, and delta-cache policy.
 
 ## Database seed extent and projection — settled
 
@@ -268,6 +273,13 @@ Once a publication is visible, lifecycle events admit only
 state transitions do not modify `GraphView`, create `GraphDelta`, or advance
 either view or history revision. Repeating a terminal Stale transition creates
 no additional state effect.
+
+Becoming Stale does not destroy the publication's response cache or cancel its
+response-construction jobs. The coherent view and history stop advancing.
+Replacement or destruction of the publication cancels and joins its unfinished
+cache jobs and releases all cache entries. Public access while Stale and
+ordinary entry eviction belong to the
+[API protocol](api-protocol.md#publication-scoped-head-response-cache--settled).
 
 `GraphPublication` owns lifecycle state; the contained graph values retain the
 semantics owned by the [graph model](api-graph.md).

@@ -20,9 +20,10 @@ automatically reloads.
 
 A state-only wakeup can repeat the current graph cursor. The Web adopts its
 publication state without requesting or applying a graph delta. On a Stale
-state, it keeps the coherent image visibly marked stale. A head-following view
-reloads when a replacement publication ID appears; until then it does not
-pretend that the old image remains Live.
+state, it keeps the coherent image visibly marked stale. If its cursor is
+behind the Stale wakeup, a head-following view may first catch up through that
+publication's final stalled Head. It reloads when a replacement publication ID
+appears; until then it does not pretend that the old image remains Live.
 
 A delta response may end at an intermediate revision below the Web's desired
 cursor. The single catch-up loop applies that complete interval, adopts its
@@ -30,6 +31,16 @@ cursor. The single catch-up loop applies that complete interval, adopts its
 or the API requires a snapshot. It never assumes one response reaches the
 original target. It applies a delta only when the view's current revision equals
 the delta's `from_revision_id`.
+
+For canonical Head catch-up, the Web consumes `KGI-More-Available`. After
+applying a response marked `true`, it immediately requests again from the
+returned `to_revision_id`; after `false`, it waits for the next SSE wakeup.
+Because public cached Head deltas omit publication-tail block and edge
+removals, the Web advances its local bounds from `GraphDelta.high_level` and
+its window depth, removes blocks below the resulting `low_level`, and removes
+an edge when its child leaves the window. The API protocol owns the strict
+depth-and-distance bound that makes those omitted removals irrelevant to every
+eligible client window.
 
 The Web consumes serialized head, delta, and graph-window responses. It never
 receives an internal `GraphView`, observes `TrackingPolicy`, or applies updates

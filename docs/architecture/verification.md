@@ -843,8 +843,9 @@ initial Synchronizing, direct initial Live, visible `Synchronizing -> Live`,
 and terminal Stale transitions leave graph view and history revisions
 unchanged. Cover reliable `reset` processing without an application-completion barrier,
 cancellation of unpublished construction, no additional effect for an already
-Stale publication, delta rejection for Stale, head-snapshot state and ETag
-changes, and immutable delta bytes across later state changes. SSE cases cover
+Stale publication, canonical delta catch-up through the Stale publication's
+final Head, head-snapshot state and ETag changes, and immutable delta bytes
+across later state changes. SSE cases cover
 state-only wakeups repeating one graph cursor, reconnect reporting current
 state, Web adoption without a delta request, and a fresh publication ID for a
 replacement image.
@@ -884,21 +885,49 @@ stored boundary. A starting cursor inside an aggregate is unavailable. A first
 stored entry that cannot fit requires a fresh snapshot rather than a partial
 delta.
 
+For every appended history entry, verify `estimated_raw_bytes` and the absolute
+`cumulative_estimated_bytes` boundary at `delta.to_revision_id`. Cover range
+cost subtraction before and after prefix pruning, the first retained left
+boundary derivation, and an aggregated entry exposing only its final cost
+boundary. Exercise delta-to-Head target selection in order: Head when its soft
+estimate fits, otherwise the youngest reachable cached source revision, and
+otherwise the youngest ordinary stored boundary. Force the actual encoded
+result over its hard limit and verify fallback to an earlier complete boundary,
+then the first-entry fresh-view outcome.
+
 For encoded head-response reuse, issue concurrent identical snapshot requests
 at one cursor and effective window and verify that they share one construction,
-serialization, and compression result. Do the same for an exact delta
-interval. Requests differing in publication ID, revision, interval,
-effective window, response format, `representation_version`, or content
-encoding must not share encoded bytes. Head-view requests differing in
-publication state must not share encoded bytes; one immutable delta interval
-may reuse its bytes across later state changes. A "to current" request must capture an
-exact target before reuse; a bounded complete-prefix response is cached by its
-actual returned interval. Eviction must reconstruct an equivalent response
-from the current graph view or retained deltas. Historical DB windows bypass
-this cache. Projected Fixed delta requests also bypass cache lookup, insertion,
-and cache single-flight, return `Cache-Control: no-store`, and produce no ETag.
-Repeated identical requests therefore execute independent on-demand
-projection. Cache pressure must not delay or fault processing.
+serialization, and compression result. For canonical Head deltas, verify one
+publication-owned job per source revision: concurrent requests join it after
+its target is captured, success publishes one `CachedDelta`, and failure gives
+all waiters the same request-local error before removing the job. A cache hit
+reuses the immutable encoded body while `KGI-More-Available` is assembled from
+the then-observed publication Head. Cover the request-local envelope changing
+from `Complete` to `Prefix` and the header's one-way `false -> true` change as
+an Active Head advances, immediate client continuation for `true`, SSE waiting
+for `false`, and `Complete` plus `false` at a Stale publication's final Head.
+For an exact historical target, also cover `Complete` plus `true` when that
+target is satisfied while the publication Head is newer.
+
+Verify Stale preserves cache entries, permits existing and new jobs to finish
+against the stalled Head, and replacement or destruction cancels unfinished
+jobs and releases the cache. Evict an entry when its source revision leaves
+history and when its target level exceeds `MAX_CACHE_LEVEL_DISTANCE`; either
+miss reconstructs an equivalent response. At the 80% distance gate require a
+fresh window before starting a job. Historical DB windows bypass this cache.
+Exact-target canonical requests likewise bypass the source-keyed cache and its
+single-flight jobs.
+Projected Fixed delta requests also bypass cache lookup, insertion, and cache
+single-flight, return `Cache-Control: no-store`, and produce no ETag. Repeated
+identical requests therefore execute independent on-demand projection. Cache
+work must not delay or fault processing.
+
+Under the strict
+`MAX_CACHE_LEVEL_DISTANCE + MAX_WINDOW_DEPTH < MAX_CACHE_DEPTH` bound, verify
+cached public Head deltas omit block and edge removals. Advance a maximum-depth
+eligible browser window and prove its local `high_level`/depth pruning produces
+the same retained blocks and child-owned edges as the complete canonical
+history. Retain every VSPC membership, color, and required level mutation.
 
 Verify the settled
 [database-seed projection](api-publication.md#database-seed-extent-and-projection--settled),
@@ -1058,8 +1087,8 @@ API load tests verify the
 and [API bulkheads](api-service.md#resource-isolation-and-saturation--settled).
 Exercise status, head, and historical admission lanes independently, including
 configured rejection limits, while measuring both processors' commit latency.
-Also cover bounded slow-SSE behavior, cache-memory exhaustion with complete
-levels, explicit rejection or temporary unavailability, and the required
+Also cover bounded slow-SSE behavior, Head graph-memory exhaustion with
+complete levels, explicit rejection or temporary unavailability, and the required
 operational measurements. Saturated API work must not materially delay
 processing or produce a partial graph image.
 

@@ -30,7 +30,9 @@ Supervisor
 │   │   ├── DependencyResolver
 │   │   └── lifecycle-marker worker
 │   └── Arc<VspcProcessor>
-└── Arc<ApiService> ────────────► HeadGraphCache
+└── Arc<ApiService> ────────────► GraphPublication
+                                  ├── Head GraphView / GraphHistory
+                                  └── publication-scoped GraphCache
 
 NotificationRouter (implements Notify)
 ├── BlockAdded ────────────────► BlockProcessor notification input
