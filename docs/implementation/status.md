@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 22 September 2026.
+Updated 2 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -11,6 +11,11 @@ No production Rust implementation, tests, or migrations have started. The
 commit containing the architecture authority cutover is the stable baseline
 for implementation. Open architecture requirements continue to block only
 their dependent work.
+
+The Cargo repository layout, storage-owned migration placement, retained KGI
+v1 React source with a Vite build, Web test tooling, atomic release bundle,
+runtime Web configuration, Docker and conventional installation layouts, and
+file-log directory model are settled but not yet implemented.
 
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.

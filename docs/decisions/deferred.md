@@ -4,10 +4,8 @@ These choices are deliberately left to implementation work. Implementations
 must stay within the linked settled architecture and record choices where they
 become durable project constraints.
 
-1. Cargo workspace and module layout outside the settled
-   [core crate structure](../architecture/overview.md#core-crate-structure--settled),
-   including migrations, Web assets, and internal module boundaries. The top
-   binary/composition crate is the settled `kgi` crate.
+1. Internal Rust module boundaries within the settled
+   [crate and repository structure](../architecture/overview.md#repository-web-build-and-release-structure--settled).
 2. PostgreSQL Rust client, migration framework, and concrete SQL types.
 3. Exact capacities for processor channels, the per-session graph-update
    channel and ApiService staging buffer, orphan and VSPC pending memory,
@@ -43,9 +41,10 @@ become durable project constraints.
    transaction mechanism for StorageService's database-replacement gate. Safe
    transaction locking is one candidate; another mechanism is acceptable when
    it preserves the storage-owned exclusion contract.
-9. Exact metrics export and labels, tracing, operational endpoints, and
-   deployment layout. Required v2 observability and processing-latency
-   acceptance remain settled.
+9. Exact metrics export and labels, tracing, operational endpoints, file-log
+   rotation size and retained archive count, service hardening directives, and
+   concrete container base images. Required v2 observability,
+   processing-latency acceptance, and the deployment layout remain settled.
 10. Exhaustive parity matrix and additional fixtures beyond the required
     [verification baseline](../architecture/verification.md).
 11. Shutdown timeouts and escalation policy.

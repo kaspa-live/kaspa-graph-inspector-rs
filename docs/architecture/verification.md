@@ -1278,6 +1278,33 @@ visible and at distances through 10, then verify that distance 11 enters the
 configured increasing-delay policy without breaking contiguous canonical
 delta catch-up or explicit-refresh fallback after Head retention expires.
 
+Web unit tests use Vitest beside the owning source under `web/src/`. Browser
+flows use Playwright under `web/tests/browser/`, with test-only support under
+`web/tests/support/` and shared recorded inputs under `fixtures/web/`. The
+frequent browser suite runs Chromium. Firefox and WebKit are release smoke
+coverage rather than multiplying every routine run.
+
+The normal browser suite starts Vite and a deterministic test-only HTTP/SSE
+fixture server that replays recorded public payloads without reimplementing
+graph behavior. The same Playwright scenarios can target an externally started
+complete KGI stack. Pure graph mutation, delta, decoding, and browser state
+machines stay at the Vitest level; Playwright covers actual HTTP, SSE,
+publication replacement, canvas startup, navigation, and interaction. Keep
+visual snapshots few and run them in one pinned Chromium and operating-system
+environment; semantic graph correctness does not depend on pixel comparison.
+`npm run test:browser` selects the deterministic fixture server;
+`npm run test:browser:full` selects the externally started complete stack.
+
+Verify the
+[repository and release contract](overview.md#repository-web-build-and-release-structure--settled):
+the bundle exposes no partial final directory, contains one matching binary
+and complete Web build, derives the standard Web root, rejects a missing root,
+and serves the deployment-neutral application with its runtime configuration.
+Exercise absent and valid external-explorer templates without delaying or
+changing graph rendering. Packaging checks also cover console plus rotating
+file logging, explicit file-log disablement, invalid simultaneous log options,
+and writable log-volume replacement without local correctness state.
+
 ## Resource isolation and performance
 
 API load tests verify the

@@ -7,6 +7,20 @@ public block identity. [The API protocol](api-protocol.md) owns the graph wire
 contract, snapshots, deltas, SSE cursor delivery, and response-local hash
 dictionaries.
 
+## Delivery and runtime configuration — settled
+
+The browser uses the same origin as KGI and calls the fixed relative
+`/api/v1` surface. It derives the current site from `window.location.origin`
+and has no compiled API-address or site-address setting.
+
+The top crate's
+[runtime Web configuration](overview.md#http-composition-and-runtime-web-configuration--settled)
+may supply an external block-explorer URL template. The Web fetches that
+configuration alongside its initial status and graph work without delaying
+graph rendering. Until a valid optional template is available, or when its
+value is absent, the external explorer action is hidden; graph behavior is
+unchanged.
+
 ## Update acquisition — settled
 
 The v1 Web's fast repeated polling is replaced by SSE cursor wakeups and HTTP

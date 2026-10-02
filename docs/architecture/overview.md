@@ -2,9 +2,10 @@
 
 ## Scope and ownership
 
-This document owns the system boundary, component ownership, core crate
-structure, direction of control and data flow, and system-wide resource
-isolation. Shared identities and graph terminology belong to
+This document owns the system boundary, component ownership, core crate and
+repository structure, direction of control and data flow, release and
+deployment layout, logging, and system-wide resource isolation. Shared
+identities and graph terminology belong to
 the [domain model](domain-model.md). Component behavior belongs to the linked
 focused document.
 
@@ -145,9 +146,227 @@ state.
 graph-update producer, and does not depend on `kgi-api-core`.
 
 The top `kgi` crate owns Supervisor, process composition, CLI entry points, and
-global shutdown. Migrations, Web assets, and internal module boundaries remain
-deferred in the
+global shutdown. Internal module boundaries remain deferred in the
 [decision register](../decisions/deferred.md).
+
+## Repository, Web build, and release structure — settled
+
+The repository is one virtual Cargo workspace. Product crates live below
+`crates/`; build orchestration lives outside the production dependency graph;
+the browser application is a sibling frontend project under `web/`:
+
+```text
+kaspa-graph-inspector-rs/
+├── .cargo/config.toml
+├── Cargo.toml
+├── Cargo.lock
+├── rust-toolchain.toml
+├── README.md
+├── LICENSE
+├── AGENTS.md
+├── crates/
+│   ├── kgi/
+│   ├── kgi-model/
+│   ├── kgi-api-model/
+│   ├── kgi-api-ingress/
+│   ├── kgi-node/
+│   ├── kgi-storage/
+│   │   └── migrations/
+│   ├── kgi-processing/
+│   └── kgi-api-core/
+├── tools/xtask/
+├── web/
+│   ├── package.json
+│   ├── package-lock.json
+│   ├── vite.config.ts
+│   ├── vitest.config.ts
+│   ├── playwright.config.ts
+│   ├── public/
+│   ├── src/
+│   └── tests/
+├── fixtures/
+│   ├── node/
+│   ├── storage/
+│   ├── graph/
+│   └── web/
+├── deploy/
+│   ├── docker/
+│   │   ├── Dockerfile
+│   │   ├── compose.example.yaml
+│   │   └── compose.dev.yaml
+│   └── systemd/
+│       ├── kgi.service
+│       └── kgi.env.example
+├── scripts/
+└── docs/
+```
+
+`crates/kgi-storage/migrations/` is the sole migration-file location because
+StorageService owns schema and migration execution. Shared stable fixtures
+live below the repository-level `fixtures/`; test logic remains with the
+component that owns the behavior. The [verification contract](verification.md)
+owns the exact Web test runners and placement.
+
+The KGI v2 browser application retains the KGI v1 React, TypeScript, MUI,
+Emotion, PixiJS, React Spring, UI, and visualization code wherever compatible.
+During import, Vite replaces the deprecated Create React App build layer as an
+isolated tooling change. Adapting the imported application to the v2 HTTP,
+SSE, publication, and graph contracts is separate work. Generated
+`target/`, root `dist/`, `web/dist/`, `web/node_modules/`, coverage, and browser
+test-report directories are untracked.
+
+The repository supplies a Cargo alias for the tooling command:
+
+```text
+cargo xtask bundle
+cargo xtask bundle --target <rust-target>
+cargo xtask bundle --profile <cargo-profile>
+```
+
+`tools/xtask` is a workspace tooling crate, not a production dependency. The
+default bundle profile is `release`. The bundle command uses `npm ci`, the
+committed npm lockfile, `cargo build --locked`, and the committed Cargo
+lockfile. It builds the Web assets and `kgi` binary before
+constructing a temporary release directory, copies the complete matching
+outputs, adds the license and minimal release provenance, and exposes the
+final versioned directory only through an atomic same-filesystem rename. A
+failure leaves no final partial bundle. The command packages only; it does not
+deploy, upload, publish, or alter a running installation.
+
+The portable bundle layout is:
+
+```text
+dist/kgi-<version>-<target>/
+├── bin/kgi
+├── share/kgi/web/
+├── LICENSE
+└── release.json
+```
+
+`release.json` records the KGI package version, full source commit, and target.
+The workspace package version is authoritative; the private Web package has no
+independent release version. The binary resolves the standard Web root at
+`../share/kgi/web` relative to its real executable location and also accepts
+an explicit `--web-root` override. When Web serving is enabled, an invalid or
+missing root fails startup rather than exposing an apparently healthy server
+without its UI.
+
+## HTTP composition and runtime Web configuration — settled
+
+`kgi-api-core` exposes the Axum router for the
+[protocol-owned `/api/v1` surface](api-protocol.md#common-http-conventions--settled).
+The top `kgi` crate composes that router with the runtime Web configuration and
+static application delivery:
+
+```text
+/api/v1/...       kgi-api-core HTTP and SSE
+/kgi-config.json  top-crate Web runtime configuration
+/assets/...       immutable Vite assets
+/*                browser application fallback
+```
+
+The production browser and API share one origin. Browser code uses the fixed
+relative `/api/v1` contract and obtains its own site identity from
+`window.location.origin`; neither value is deployment-specific Vite input.
+The build is deployment-neutral and is never rebuilt for a node, network, or
+installation.
+
+The only current runtime Web value is:
+
+```rust
+struct WebRuntimeConfig {
+    block_explorer_url_template: Option<String>,
+}
+```
+
+`GET /kgi-config.json` always returns the complete public representation. A
+configured template is a valid HTTP or HTTPS URL containing exactly one
+`{hash}` placeholder; invalid configuration fails process startup. It is
+public presentation configuration and may never contain credentials or expose
+environment variables generically. It is owned and served by the top `kgi`
+crate and does not belong to `kgi-api-core`, `kgi-api-model`, or
+`SystemStatus`.
+
+The operator supplies this value through
+`--block-explorer-url-template <template>` or the equivalent
+`KGI_BLOCK_EXPLORER_URL_TEMPLATE` environment configuration. Vite never reads
+that deployment setting.
+
+Hashed Vite assets use long-lived immutable caching. `index.html` and the
+runtime configuration require revalidation; the latter has a configuration
+ETag. The [Web contract](web.md#delivery-and-runtime-configuration--settled)
+owns browser behavior when consuming the optional value.
+
+## Deployment and logging — settled
+
+Docker and conventional installation use the portable bundle without
+embedding Web assets in the executable. The Docker image installs it under
+`/opt/kgi`, runs one unprivileged KGI process, exposes one HTTP listener, sends
+console logs to stdout/stderr, and receives termination directly through its
+exec-form entry point. PostgreSQL and the rusty-kaspa node remain external.
+The release tree is read-only.
+
+KGI also writes bounded rotating files by default, following the rusty-kaspa
+operational shape: `kgi.log` is the complete log and `kgi_err.log` contains
+warning/error records, both with compressed size-based archives. The CLI
+exposes `--log-dir`, `--no-log-files`, and
+`--log-level`, with equivalent `KGI_LOG_DIR`, `KGI_NO_LOG_FILES`, and
+`KGI_LOG_LEVEL` configuration. Supplying a log directory while disabling file
+logging is invalid. Exact rotation size and archive count remain deferred.
+
+The standard mutable log path is `/var/log/kgi`; conventional packages create
+it for the `kgi` service user and containers mount it as a writable log volume.
+Multiple instances use distinct configured log directories. Console logging
+continues while file logging is active. KGI needs no local volume for
+correctness state because authoritative graph state is in PostgreSQL, but the
+log volume preserves operational history across replacement.
+
+The conventional layout is:
+
+```text
+/opt/kgi/releases/<version-target>/
+├── bin/kgi
+├── share/kgi/web/
+├── LICENSE
+└── release.json
+
+/opt/kgi/current -> releases/<version-target>
+/etc/kgi/
+/var/log/kgi/
+```
+
+The supplied systemd unit runs as the `kgi` user, reads
+`/etc/kgi/kgi.env`, starts `/opt/kgi/current/bin/kgi`, restarts on failure, and
+delivers `SIGTERM` for graceful shutdown. Exact hardening directives and
+shutdown escalation remain deferred.
+
+An upgrade extracts a new immutable release, stops KGI and awaits graceful
+shutdown, atomically replaces `current`, and starts the new release. Stopping
+before the switch prevents the old binary from serving new assets. Resolving
+the executable's real path keeps a running process bound to its own matching
+asset directory. Binary-and-Web rollback is separate from database migration
+compatibility and never promises schema rollback.
+
+The Docker image uses the equivalent `/opt/kgi/bin/kgi` and
+`/opt/kgi/share/kgi/web` layout and exposes port `8080`. It stores no
+credentials, operator configuration, initialization authorization,
+reinitialization token, or consensus override in the image. Read-only
+configuration and secrets are supplied at runtime. A persistent
+reinitialization token retains the
+[storage-owned idempotence semantics](storage.md#administrative-reinitialization--settled)
+across container replacement.
+
+The development Compose file may provide PostgreSQL and other local
+dependencies. The production image has no requirement that PostgreSQL or the
+node share its container, Compose project, or host.
+
+The database ownership lock permits only one active KGI writer. Container and
+service upgrades therefore stop the old process before starting the new one;
+an overlapping rolling or blue-green replacement is invalid. External reverse
+proxy TLS preserves the same-origin contract and is the initial production
+shape; direct KGI TLS is not required. Exact liveness/readiness endpoints stay
+deferred, and `/api/v1/status` proves HTTP reachability rather than processing
+readiness.
 
 ## Interaction rules — settled
 
@@ -197,5 +416,5 @@ clients may make that separation useful. Database replication is not required
 for v2. The design does not authorize multiple independent processors writing
 the same database.
 
-Exact tracing, operational endpoints, and deployment layout remain
-deferred in the [decision register](../decisions/deferred.md).
+Exact tracing and operational endpoints remain deferred in the
+[decision register](../decisions/deferred.md).
