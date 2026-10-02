@@ -1020,6 +1020,25 @@ settled recovery dispositions when violated.
 
 ## Teardown and delivery semantics — settled
 
+### Termination-triggered global shutdown — settled
+
+Supervisor implements the
+[`Shutdown`](overview.md#process-termination-signal-adapter--settled) target
+contract and owns the single `Signals<Supervisor>` registration. Signal
+installation completes before Supervisor permits managed components to enter
+their running state; `SignalInstallError` is a fatal process-startup failure.
+The synchronous `Shutdown::shutdown` entry point performs no teardown work in
+the signal callback. It submits the existing idempotent terminal-shutdown
+trigger and returns. Supervisor consumes that trigger through its ordinary
+lifecycle processing and enters terminal shutdown exactly once, even if
+another cause has already requested it. Supervisor never forwards the signal
+registration to a service, processor, or worker.
+
+The first signal therefore invokes the global shutdown sequence below rather
+than defining another teardown path. Further signals follow the
+[adapter-owned policy](overview.md#process-termination-signal-adapter--settled).
+If the shutdown barriers complete, the process returns normally.
+
 On Deactivate, ResyncEngine performs this barrier in order:
 
 1. close local routing gates and disable notifications;

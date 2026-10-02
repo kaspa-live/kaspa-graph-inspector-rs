@@ -40,7 +40,7 @@ become durable project constraints.
    processing-latency acceptance, and the deployment layout remain settled.
 10. Exhaustive parity matrix and additional fixtures beyond the required
     [verification baseline](../architecture/verification.md).
-11. Shutdown timeouts and escalation policy.
+11. Automatic shutdown timeouts and timeout-triggered escalation policy.
 Unlisted code-level choices remain implementation details only while they
 preserve every settled contract and do not resolve an item in
 [open.md](open.md) implicitly.

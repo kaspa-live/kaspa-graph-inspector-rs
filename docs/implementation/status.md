@@ -15,7 +15,9 @@ their dependent work.
 The Cargo repository layout, storage-owned migration placement, retained KGI
 v1 React source with a Vite build, Web test tooling, atomic release bundle,
 runtime Web configuration, Docker and conventional installation layouts, and
-file-log directory model are settled but not yet implemented.
+file-log directory model are settled but not yet implemented. The
+Supervisor-owned `kgi-core::signals` termination adapter is also settled but
+not yet implemented.
 
 The public [graph wire format](../architecture/api-protocol.md#common-transport-dto-rules--settled)
 and [mandatory gzip delivery path](../architecture/api-protocol.md#graph-http-compression--settled)

@@ -99,15 +99,22 @@ The core crate structure fixes these acyclic boundaries. An arrow points from
 a crate to one of its dependencies:
 
 ```text
+kgi-core
+kgi-model
 kgi-api-model   ──► kgi-model
 kgi-api-ingress ──► kgi-model
 kgi-node        ──► kgi-model
 kgi-storage     ──► kgi-model + kgi-api-model
 kgi-processing  ──► kgi-model + kgi-api-ingress + kgi-node + kgi-storage
 kgi-api-core    ──► kgi-model + kgi-api-model + kgi-api-ingress + kgi-storage
-kgi             ──► kgi-model + kgi-api-ingress + kgi-node + kgi-storage
+kgi             ──► kgi-core + kgi-model + kgi-api-ingress + kgi-node + kgi-storage
                   + kgi-processing + kgi-api-core
 ```
+
+`kgi-core` has no dependency on another KGI crate. It contains reusable
+process-level infrastructure that is outside the domain model and component
+services. Its initial `signals` module contains the platform termination
+adapter described below.
 
 `kgi-model` contains shared domain values and cross-component message values,
 including `RecoveryMode`, `ParentCommitted`, `LevelCommitted`,
@@ -146,8 +153,52 @@ state.
 graph-update producer, and does not depend on `kgi-api-core`.
 
 The top `kgi` crate owns Supervisor, process composition, CLI entry points, and
-global shutdown. Internal module boundaries remain deferred in the
+global shutdown and is the sole crate that depends on `kgi-core`. Internal
+module boundaries remain deferred in the
 [decision register](../decisions/deferred.md).
+
+## Process termination signal adapter — settled
+
+`kgi-core::signals` adapts operating-system termination to a weakly held
+shutdown target. Its public contract follows the rusty-kaspa core signal
+pattern with KGI-specific installation and repeated-signal behavior:
+
+```rust
+pub trait Shutdown {
+    fn shutdown(self: &Arc<Self>);
+}
+
+pub struct Signals<T: Shutdown + Send + Sync + 'static> {
+    target: Weak<T>,
+    iterations: AtomicU64,
+}
+
+impl<T: Shutdown + Send + Sync> Signals<T> {
+    pub fn new(target: &Arc<T>) -> Self;
+    pub fn init(self: &Arc<Self>) -> Result<(), SignalInstallError>;
+}
+```
+
+On Unix, the handler recognizes `SIGINT` and `SIGTERM`. On Windows, it
+recognizes Ctrl+C. Signal installation reports a typed `SignalInstallError`;
+the processing lifecycle owns its startup disposition.
+
+The adapter retains only `Weak<T>` and therefore cannot extend its target's
+lifetime. Its callback upgrades that weak reference and invokes
+`Shutdown::shutdown`. The concrete target, registration ownership, and target
+reaction belong to the
+[processing lifecycle](processing-lifecycle.md#termination-triggered-global-shutdown--settled).
+
+The first recognized signal invokes the target once. A second recognized
+termination signal before process exit logs forced termination and immediately
+exits with failure status. Unlike the rusty-kaspa reference implementation,
+which exits on its third callback, KGI deliberately applies forced exit to the
+second signal. This is an explicit operator escalation and does not select the
+still-deferred automatic shutdown timeouts or timeout-escalation policy. The
+registered handler remains alive after the first signal so it can observe that
+second signal. It owns no component resource and is process-lifetime
+infrastructure rather than a member of the component shutdown order; normal
+process termination ends it.
 
 ## Repository, Web build, and release structure — settled
 
@@ -166,6 +217,7 @@ kaspa-graph-inspector-rs/
 ├── AGENTS.md
 ├── crates/
 │   ├── kgi/
+│   ├── kgi-core/
 │   ├── kgi-model/
 │   ├── kgi-api-model/
 │   ├── kgi-api-ingress/
@@ -302,8 +354,10 @@ owns browser behavior when consuming the optional value.
 Docker and conventional installation use the portable bundle without
 embedding Web assets in the executable. The Docker image installs it under
 `/opt/kgi`, runs one unprivileged KGI process, exposes one HTTP listener, sends
-console logs to stdout/stderr, and receives termination directly through its
-exec-form entry point. PostgreSQL and the rusty-kaspa node remain external.
+console logs to stdout/stderr, and delivers termination directly to the
+[process signal adapter](#process-termination-signal-adapter--settled)
+through its exec-form entry point. PostgreSQL and the rusty-kaspa node remain
+external.
 The release tree is read-only.
 
 KGI also writes bounded rotating files by default, following the rusty-kaspa
@@ -337,8 +391,10 @@ The conventional layout is:
 
 The supplied systemd unit runs as the `kgi` user, reads
 `/etc/kgi/kgi.env`, starts `/opt/kgi/current/bin/kgi`, restarts on failure, and
-delivers `SIGTERM` for graceful shutdown. Exact hardening directives and
-shutdown escalation remain deferred.
+delivers `SIGTERM` for graceful shutdown through the process-termination
+[adapter](#process-termination-signal-adapter--settled) and
+[Supervisor lifecycle](processing-lifecycle.md#termination-triggered-global-shutdown--settled).
+Exact hardening directives and automatic shutdown escalation remain deferred.
 
 An upgrade extracts a new immutable release, stops KGI and awaits graceful
 shutdown, atomically replaces `current`, and starts the new release. Stopping

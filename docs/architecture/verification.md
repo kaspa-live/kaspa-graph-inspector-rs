@@ -896,6 +896,20 @@ and upstream RPC versions only through `node.last_validated`; it contains no
 separate processing version, API version, `representation_version`, or
 ApiService-status field.
 
+Verify the
+[process signal adapter](overview.md#process-termination-signal-adapter--settled)
+and [Supervisor trigger](processing-lifecycle.md#termination-triggered-global-shutdown--settled)
+without bypassing Supervisor. Verify that the registration holds only a weak
+target reference. A first supported platform signal invokes the Supervisor
+shutdown target, does no teardown work in the signal callback, and causes
+exactly one entry into Supervisor's terminal-shutdown transition. No managed
+component receives or polls the registration. A handler-installation failure
+prevents managed components from entering their running state. In a subprocess
+test, a second signal during graceful shutdown exits immediately with failure
+status; one signal followed by completed Supervisor barriers exits normally.
+Keep this explicit operator action independent of tests for any later
+automatic timeout policy.
+
 Exercise `GET /api/v1/status` without parameters or a request body. Require a
 complete JSON `SystemStatusDto`, `200 OK`, `Content-Type: application/json`,
 `Cache-Control: no-store`, and no ETag or conditional-request behavior. Require
