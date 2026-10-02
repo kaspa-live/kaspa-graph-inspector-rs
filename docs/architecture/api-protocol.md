@@ -53,9 +53,8 @@ unavailable, or outside its semantic range.
 
 This common contract fixes route and request syntax. Each endpoint section
 owns its exact resource path, parameters, logical outcomes, and cache behavior.
-The remaining endpoint-specific response DTOs, error-body schema, graph
-encoding, and HTTP compression policy remain deferred under the common DTO
-rules below.
+Graph encoding and HTTP compression policy remain deferred under the common
+DTO rules below.
 
 ## Common transport DTO rules — settled
 
@@ -468,6 +467,81 @@ application/json`, `Cache-Control: no-store`, and no ETag. It contains no
 ApiService status, graph publication state or cursor, validated capability or
 generation identity, component rejection or unavailability reason, recovery
 fault, diagnostic, or `representation_version`.
+
+## Error response DTO — settled
+
+Every `4xx` or `5xx` response uses one direct JSON object:
+
+```rust
+struct ApiErrorDto {
+    category: ApiErrorCategory,
+    code: ApiErrorCode,
+    message: String,
+    details: Option<ApiErrorDetailsDto>,
+}
+
+enum ApiErrorDetailsDto {
+    WindowAnchorUnavailable(WindowAnchorUnavailableDetailsDto),
+    HeadLevelUnavailable {
+        requested_level: u64,
+    },
+    FreshViewRequired {
+        reason: FreshViewReason,
+    },
+}
+
+enum WindowAnchorUnavailableDetailsDto {
+    LevelNotRetained {
+        requested_level: u64,
+    },
+    BlockNotMaterialized {
+        requested_hash: BlockHash,
+    },
+    NoRetainedDaaMatch {
+        requested_score: u64,
+    },
+}
+```
+
+Every field is present and `details` is explicit JSON `null` when the selected
+code has no structured context. The code discriminates the details shape, so
+the details object has no redundant outer type field. Window-anchor details
+carry the exact `reason` string `level-not-retained`,
+`block-not-materialized`, or `no-retained-daa-match`. `FreshViewRequired`
+carries the exact reason string `publication-mismatch`, `start-pruned`,
+`start-unavailable`, `delta-distance-exceeded`, or
+`first-stored-delta-exceeds-budget`.
+
+Categories and codes use these exact lowercase kebab-case values:
+
+| HTTP | Category | Code | Details |
+|---|---|---|---|
+| `400` | `invalid-request` | `invalid-request` | `null` |
+| `405` | `invalid-request` | `method-not-allowed` | `null` |
+| `404` unknown route | `not-found` | `route-not-found` | `null` |
+| `404` window anchor | `not-found` | `window-anchor-unavailable` | matching anchor details |
+| `404` Head level | `not-found` | `head-level-unavailable` | `requested_level` |
+| `409` registration | `conflict` | `client-registration-required` | `null` |
+| `409` lineage | `conflict` | `fresh-view-required` | `reason` |
+| `429` | `busy` | `capacity-exhausted` | `null` |
+| `503` | `unavailable` | `service-unavailable` | `null` |
+| `500` | `internal` | `internal-error` | `null` |
+
+The direct error object has no universal `data` wrapper. `message` is a concise
+safe English explanation for humans; clients use `category`, `code`, and typed
+`details` for control and must not depend on message text. Public `u64` detail
+values are unsigned decimal JSON strings, and block hashes use canonical
+hexadecimal text.
+
+Every error response carries `Content-Type: application/json` and
+`Cache-Control: no-store`. The common outcome contract additionally requires
+`Allow: GET` for `405` and `Retry-After: 1` for `429` and `503`.
+
+The body never exposes internal error variants, database or RPC generations,
+diagnostics, stack traces, SQL errors, filesystem paths, or serialization
+library messages. In particular, `ApiReadError` values map to the generic
+public `service-unavailable` or `internal-error` codes selected by their
+settled HTTP dispositions.
 
 ## Public API values — settled
 
@@ -1157,11 +1231,8 @@ The delta operation targets the current Head, so the same URL must revalidate
 rather than serve an older response blindly. Anchored windows have no v2 ETag
 and the same anchor may resolve differently after graph changes.
 
-The eventual error DTO distinguishes the semantic categories
-`invalid-request`, `not-found`, `conflict`, `busy`, `unavailable`, and
-`internal`. Endpoint-specific typed reasons remain subordinate to that
-category. Exact DTO fields and encoding remain part of the deferred wire and
-error-body schema.
+The [common error DTO](#error-response-dto--settled) owns the exact category,
+code, typed details, and JSON representation for each failure above.
 
 ## Public delivery failures — settled
 
@@ -1402,8 +1473,7 @@ The public API has conceptually:
   component observations, and the current or last successfully validated
   network and node server information.
 
-The remaining endpoint response and error-body schemas, graph wire format, and
-HTTP compression policy remain deferred in the
+The graph wire format and HTTP compression policy remain deferred in the
 [decision register](../decisions/deferred.md). HTTP methods and common route
 and request syntax follow the settled conventions above.
 

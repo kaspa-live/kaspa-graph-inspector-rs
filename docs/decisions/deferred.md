@@ -25,11 +25,10 @@ become durable project constraints.
    ApiService task structure, and concrete storage synchronization mechanics.
    A shared mutation lock plus per-lane mutexes is one valid storage shape;
    exact lock types remain an implementation choice.
-6. The remaining endpoint-specific public transport DTOs, wire and error-body
-   schemas, and the exact representation of the settled operations under the
-   common DTO rules in the
-   [API protocol](../architecture/api-protocol.md). Select exactly one graph
-   response format for v2; clients will not negotiate among graph encodings.
+6. The graph response format and HTTP compression policy under the common DTO
+   rules in the [API protocol](../architecture/api-protocol.md). Select exactly
+   one graph response format for v2; clients will not negotiate among graph
+   encodings.
    Benchmark JSON against appropriate binary formats such as CBOR, MessagePack,
    and Protobuf across server construction and serialization, compression,
    transfer, browser decoding, and graph-model construction. Select the HTTP

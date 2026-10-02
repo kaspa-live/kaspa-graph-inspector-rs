@@ -947,7 +947,7 @@ Genesis selected-parent-index absence. A cached delta must not intern a hash
 used only by a serializer-omitted block or edge removal. Serialization adds no
 immutable-value comparison or conflict-validation path.
 
-Verify the common HTTP outcome map independently of the final error DTO.
+Verify the common HTTP outcome map and exact `ApiErrorDto` together.
 Complete and prefix graph results, delta `UpToDate` and `WaitForWakeup`,
 anchored windows, Head-level lookup, and status use `200`; only an exact Head
 ETag match uses `304`. Unknown routes use `404`; known resources reject
@@ -963,9 +963,14 @@ Require `Cache-Control: no-cache` on successful Head snapshots and canonical
 deltas. Require `Cache-Control: no-store` on anchored windows, Head-level
 lookup, SSE, status, and every `4xx` or `5xx`. No successful graph response may
 be truncated; a delta prefix is complete through its reported target. Cover
-the semantic error categories `invalid-request`, `not-found`, `conflict`,
-`busy`, `unavailable`, and `internal`, while leaving their final DTO encoding
-to the wire-schema work.
+every exact category/code mapping and require one direct JSON error object with
+all fields present. Exercise each typed window-anchor detail, Head-level detail,
+and fresh-view reason; encode absent details as explicit `null`, public `u64`
+values as unsigned decimal strings, and block hashes as canonical hexadecimal
+text. Require `Content-Type: application/json`, `Cache-Control: no-store`, the
+settled `Allow` and `Retry-After` headers, and client control independent of the
+human message. No response exposes internal variants, generations, diagnostics,
+stack traces, SQL or filesystem information, or serialization-library text.
 
 Verify `GET /api/v1/graph/head` requires `max_depth`, rejects zero, accepts the
 inclusive `1..=MAX_WINDOW_DEPTH` range, and caps larger well-formed values.
