@@ -533,22 +533,23 @@ empty stream.
 A successful operation returns `200 OK` with `Content-Type:
 text/event-stream` and `Cache-Control: no-store`. It has no ETag, graph body,
 response-local hash dictionary, database access, `GraphCache` participation,
-or delta construction. Detailed event-field encoding remains part of the
-deferred wire schema.
+or delta construction. SSE control payloads use the fixed compact JSON
+representation below independently of the graph response format selected
+later.
 
-SSE uses three ordered logical messages:
+SSE uses three ordered message payloads:
 
 ```rust
-struct ClientRegistration {
-    client_id: OpaqueClientId,
+struct ClientRegistrationDto {
+    client_id: String,
 }
 
-struct PublicationWakeup {
+struct PublicationWakeupDto {
     publication_id: u64,
     revision: u64,
 }
 
-struct PublicationState {
+struct PublicationStateDto {
     publication_id: u64,
     revision: u64,
     state: GraphPublicationState,
@@ -556,20 +557,49 @@ struct PublicationState {
 ```
 
 Their SSE event names are respectively `client-registration`,
-`publication-wakeup`, and `publication-state`. `PublicationWakeup` means that
-the graph cursor has advanced far enough for the registered client to attempt
-HTTP catch-up. `PublicationState` establishes or changes publication state;
-its revision is the publication cursor at that state observation. In
-particular, a `Stale` message carries the final stalled Head revision so a
-lagging client can catch up to it. Neither message carries graph data, which
-still comes exclusively from HTTP snapshot or delta responses.
+`publication-wakeup`, and `publication-state`. The event name is the message
+discriminator; its JSON object contains no redundant type field. Public `u64`
+fields are unsigned decimal JSON strings so browsers preserve their complete
+range. `GraphPublicationState` uses the exact lowercase strings
+`synchronizing`, `live`, and `stale`. JSON property order has no meaning.
+
+The complete frames have these shapes:
+
+```text
+event: client-registration
+data: {"client_id":"K7m..."}
+
+event: publication-wakeup
+data: {"publication_id":"42","revision":"123456"}
+
+event: publication-state
+data: {"publication_id":"42","revision":"123456","state":"live"}
+```
+
+Each semantic message occupies one complete SSE event terminated by a blank
+line. KGI emits no SSE `id:` field. `PublicationWakeupDto` means that the graph
+cursor has advanced far enough for the registered client to attempt HTTP
+catch-up. `PublicationStateDto` establishes or changes publication state; its
+revision is the publication cursor at that state observation. In particular,
+a `stale` message carries the final stalled Head revision so a lagging client
+can catch up to it. Neither message carries graph data, which still comes
+exclusively from HTTP snapshot or delta responses.
+
+The server creates `client_id` from a uniformly random `u64`, serializes its
+eight big-endian bytes as canonical unpadded base64url, and therefore emits
+exactly eleven characters. Before registration it checks the current
+publication registry and regenerates a colliding value. The token is transport
+coordination rather than authentication and encodes no publication, revision,
+network, or client identity. A delta request reuses this exact token. Invalid
+length, alphabet, padding, or noncanonical encoding is malformed request input;
+a well-formed token absent from the addressed publication produces the settled
+`ClientRegistrationRequired` outcome.
 
 Each new or re-established SSE connection receives a dedicated
-`ClientRegistration` message containing only a fresh unguessable opaque
-`client_id`, then the current `PublicationState`, then the current
-`PublicationWakeup`. Ordered SSE delivery makes the identifier and state
-current before the client observes the graph cursor. The identifier's concrete
-token encoding remains part of the deferred wire schema. The initial wakeup is
+`ClientRegistrationDto` message containing only a fresh opaque `client_id`,
+then the current `PublicationStateDto`, then the current
+`PublicationWakeupDto`. Ordered SSE delivery makes the identifier and state
+current before the client observes the graph cursor. The initial wakeup is
 always emitted; ApiService does not assume that the request cursor remains
 current while the stream is established.
 
@@ -577,12 +607,12 @@ Publication replacement preserves the live SSE transport. After the
 [publication lifecycle](api-publication.md#publication-state-and-revision--settled)
 releases the old publication's identifier, the server registers the connection
 in the replacement publication and emits, in order, a new
-`ClientRegistration`, the replacement `PublicationState`, and the replacement
-`PublicationWakeup`. The registration message still contains only the new
-identifier. A state transition within one publication emits only
-`PublicationState` and does not allocate another identifier or pretend that a
-graph revision occurred. State delivery and the replacement sequence bypass
-the ordinary graph-revision wake schedule.
+`ClientRegistrationDto`, the replacement `PublicationStateDto`, and the
+replacement `PublicationWakeupDto`. The registration message still contains
+only the new identifier. A state transition within one publication emits only
+`PublicationStateDto` and does not allocate another identifier or pretend that
+a graph revision occurred. State delivery and the replacement sequence
+bypass the ordinary graph-revision wake schedule.
 
 A delta-to-current HTTP request may carry the current identifier so ApiService
 can update the matching publication-local wake schedule after choosing the
@@ -601,8 +631,8 @@ struct DeltaClientWakeState {
 ```
 
 `DeltaClientRegistry` is the publication-local mapping from each live opaque
-identifier to exactly one such scheduling value; its concrete collection and
-token representation remain implementation choices.
+identifier to exactly one such scheduling value; its concrete collection
+remains an implementation choice.
 
 No current or highest graph revision is stored in this value. Registration
 initializes the boundary from the client-supplied cursor and marks the

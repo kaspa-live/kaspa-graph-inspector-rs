@@ -1063,10 +1063,20 @@ delta construction. A stale but well-formed request cursor must still receive
 the current publication.
 
 On initial connection and reconnection, require an ID-only
-`ClientRegistration`, then `PublicationState`, then `PublicationWakeup` in
-order. Replace a publication without reconnecting its SSE transport and verify
-the old ID is invalidated before the same three-message sequence reports the
-replacement. A state transition emits only `PublicationState`, does not
+`ClientRegistrationDto`, then `PublicationStateDto`, then
+`PublicationWakeupDto` in order. Encode each as one complete compact-JSON SSE
+event under its exact event name, without a redundant type property or SSE
+`id:` field. Round-trip zero and maximum `u64` publication and revision values
+as unsigned decimal JSON strings, reject other state spellings, and ignore JSON
+property order. Generate the client token from random `u64` big-endian bytes;
+require its eleven-character canonical unpadded-base64url representation and
+regenerate a forced active-registry collision. Reject malformed token syntax,
+while a canonical unknown or wrong-publication token produces
+`ClientRegistrationRequired`.
+
+Replace a publication without reconnecting its SSE transport and verify the
+old ID is invalidated before the same three-message sequence reports the
+replacement. A state transition emits only `PublicationStateDto`, does not
 replace the ID, and bypasses the graph-wakeup schedule. Entering Stale carries
 the final stalled Head revision. Verify `Last-Event-ID` has no graph-cursor,
 publication, registration, or replay meaning. Cover saturation rather than
