@@ -837,10 +837,12 @@ Exercise
 Require one valid publication ID and at least one positive level, treat
 repeated level parameters and values as a set, and reject malformed or
 additional parameters. Capture one immutable `Synchronizing`, `Live`, or
-`Stale` Head image and return every requested absolute value with its
-publication ID, revision, and state. Cover a value newer than the delta being
-enriched. A missing level returns one all-or-nothing `LevelUnavailable`
-outcome; an unaddressable publication returns
+`Stale` Head image and decode one `HeadLevelLookupResponseDto` containing
+exactly one complete unordered `LevelDto` per distinct requested level plus
+the capture's publication ID, revision, and state. Require no hash dictionary,
+ETag, or partial capture. Cover a value newer than the delta being enriched. A
+missing level returns one all-or-nothing `LevelUnavailable` outcome; an
+unaddressable publication returns
 `FreshViewRequired(PublicationMismatch)`. Neither outcome returns partial
 levels.
 

@@ -358,6 +358,29 @@ body.from_revision_id < body.to_revision_id
 Its resulting cursor is `(KGI-Publication-Id, body.to_revision_id)`. An
 `up-to-date` or `wait-for-wakeup` response leaves the request cursor unchanged.
 
+## Head-level lookup response DTO — settled
+
+The successful retained Head-level lookup response is:
+
+```rust
+struct HeadLevelLookupResponseDto {
+    publication_id: u64,
+    revision: u64,
+    state: GraphPublicationState,
+    levels: Vec<LevelDto>,
+}
+```
+
+`levels` is unordered and contains exactly one complete `LevelDto` for every
+distinct requested level. All entries and the publication fields come from one
+immutable Head capture. The response carries no hash dictionary because no
+value references a block hash.
+
+Success returns this DTO with `200 OK`, `Cache-Control: no-store`, and no ETag.
+An unavailable requested level remains the typed all-or-nothing `404` outcome;
+a publication mismatch remains a typed `409` fresh-view outcome. Their bodies
+belong to the common error schema rather than this success DTO.
+
 ## Public API values — settled
 
 The following conceptual shapes are shared across public response and window
@@ -904,9 +927,11 @@ looks up every requested level in that image. `Synchronizing`, `Live`, and
 terminal `Stale` publications are all eligible while addressable. Success
 returns `HeadLevelLookupOutcome::Complete` with the captured publication ID,
 revision, state, and one complete absolute `Level` value per distinct
-requested level. A value can be newer than the canonical delta being enriched;
-it is presentation context and does not change cursor continuity, containment,
-or mutation selection.
+requested level, serialized as the
+[`HeadLevelLookupResponseDto`](#head-level-lookup-response-dto--settled). A
+value can be newer than the canonical delta being enriched; it is presentation
+context and does not change cursor continuity, containment, or mutation
+selection.
 
 The lookup is all-or-nothing. If any requested level is absent from the
 captured Head image, return `LevelUnavailable` naming one unavailable level
