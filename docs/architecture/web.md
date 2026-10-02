@@ -81,7 +81,7 @@ to an ApiService subview. Internal subview extraction belongs exclusively to
 the [API graph contract](api-graph.md#frozen-subview-extraction--settled).
 Serialized graph-window contents follow the API-owned extraction contract.
 
-## Fixed views — settled behavior with deferred pacing
+## Fixed views — settled
 
 A browser fixed view is presentation state built from serialized API responses;
 it is not an internal `GraphView` and has no API `TrackingPolicy`. A
@@ -106,6 +106,12 @@ cursor, the source Head `high_level`, and the exact effective level extent. It
 uses the same optional SSE `client_id`, continuation headers, cache-backed
 delta lane, and catch-up sequencing as any canonical Head-delta consumer. An
 SSE wakeup updates only the desired cursor and publication state.
+
+A Head-backed fixed view adds no distance-based delay or separate pacing
+policy. It follows the same continuation and SSE-wakeup flow as any canonical
+Head-delta consumer. The shared convergence interval and cached delta lane
+already group work, while another scheduler would deliberately increase cursor
+lag and exposure to Head-history expiry.
 
 Before filtering a response, derive its target Head lower bound from the
 canonical `GraphDelta.high_level` and `MAX_CACHE_DEPTH`. If the target Head
@@ -151,19 +157,6 @@ freeze the last coherent image. A terminal `Stale` publication remains
 addressable: the Web may catch up through its final stalled Head and obtain
 missing levels from it. Publication replacement freezes the old fixed image.
 Only explicit refresh establishes another window and possible Head lineage.
-
-Fixed-view revision catch-up is distance-adaptive, not a blanket slow path.
-Define:
-
-```text
-distance = max(0, head_level - visible_window_end_level)
-```
-
-If the head is visible or at most ten levels ahead, update without added
-throttling. Beyond that, delay increasingly as distance grows, while
-preserving contiguous canonical catch-up and explicit-refresh fallback if Head
-history retention expires. The exact delay curve and cap remain deferred in the
-[decision register](../decisions/deferred.md).
 
 ## Block identity and Genesis — settled
 

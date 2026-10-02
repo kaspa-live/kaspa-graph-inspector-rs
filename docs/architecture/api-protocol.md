@@ -1115,7 +1115,7 @@ the publication removal frontier cannot reach any
 block or child-owned edge retained by an eligible client window. The client
 uses `GraphDelta.high_level` according to its view policy. A Head-following
 client advances its lower bound and removes objects that leave it; the
-[Web contract](web.md#fixed-views--settled-behavior-with-deferred-pacing) owns
+[Web contract](web.md#fixed-views--settled) owns
 the fixed-window reaction. VSPC membership and color changes remain ordinary
 field mutations and are never discarded by this rule. Required level changes
 remain present.
@@ -1139,7 +1139,7 @@ extent projection. The response remains the canonical Head delta selected,
 constructed, cached, and encoded under that endpoint's ordinary contract.
 
 The initial window supplies the fixed effective extent and source Head cursor.
-The [Web owner](web.md#fixed-views--settled-behavior-with-deferred-pacing) owns
+The [Web owner](web.md#fixed-views--settled) owns
 containment, extent filtering, missing-level detection, atomic application,
 and its terminal freeze behavior. ApiService retains no registration for the
 fixed extent and reconstructs no extent-specific intermediate prefix.

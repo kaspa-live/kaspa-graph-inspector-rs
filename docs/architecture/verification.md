@@ -1300,10 +1300,10 @@ expose or consult persisted `NodeMetadata.genesis_hash`.
 Browser graph tests cover the [Web contract](web.md): update acquisition,
 fixed-view freeze and follow-live behavior, stable block identity, direct
 parent rendering, and Genesis recognition from zero actual direct parents.
-For distance-adaptive fixed views, verify no added throttling while the head is
-visible and at distances through 10, then verify that distance 11 enters the
-configured increasing-delay policy without breaking contiguous canonical
-delta catch-up or explicit-refresh fallback after Head retention expires.
+Verify a Head-backed fixed view introduces no distance-based timer and follows
+the ordinary canonical-delta continuation and SSE-wakeup flow while its extent
+remains eligible. Retention expiry still freezes the last coherent image for
+explicit refresh.
 
 Web unit tests use Vitest beside the owning source under `web/src/`. Browser
 flows use Playwright under `web/tests/browser/`, with test-only support under

@@ -370,7 +370,7 @@ Applying a Head-generated delta directly to this internal Fixed view is
 prohibited by the [rejected-design register](../decisions/rejected.md): it
 lacks the original committed event and does not guarantee all projection
 context. Browser-side filtering of the public canonical representation belongs
-to the [Web contract](web.md#fixed-views--settled-behavior-with-deferred-pacing)
+to the [Web contract](web.md#fixed-views--settled)
 and does not invoke this mutation path.
 
 Fixed-view coherence failure is local. Disjoint extents, unavailable required
