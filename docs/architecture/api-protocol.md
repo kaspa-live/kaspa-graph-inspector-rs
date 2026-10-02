@@ -76,8 +76,9 @@ Every public `u64`, including revisions, levels, scores, timestamps, and
 publication IDs, preserves its complete value. The selected graph encoding
 determines the exact native or lossless alternative representation. Ordered
 semantic collections, including direct parents and blue and red merge sets,
-preserve their order. Sets and maps use the deterministic serialization order
-defined by their endpoint-specific DTO contract.
+preserve their order. Sets, maps, and their serialized collection forms remain
+unordered unless an endpoint-specific contract states otherwise; clients must
+not derive meaning from their traversal order.
 
 Internal implementation state does not enter the public schema. This includes
 `TrackingPolicy`, retained-level usage counters, `CompactId`, history byte
@@ -85,10 +86,10 @@ estimates and cumulative costs, cache heat, client wake state, and database or
 RPC generation identifiers.
 
 `representation_version` remains internal and is not a response or
-`SystemStatus` field. It changes when graph payload field meaning, canonical
-ordering, hash-reference representation, or graph encoding changes in a way
-that invalidates cached graph bytes or ETags. Public errors use their own
-common schema and never reuse a graph success DTO.
+`SystemStatus` field. It changes when graph payload field meaning,
+hash-reference representation, or graph encoding changes in a way that
+invalidates cached graph bytes or ETags. Public errors use their own common
+schema and never reuse a graph success DTO.
 
 ## Public graph limits and identity — settled
 
@@ -107,11 +108,10 @@ oversized Head snapshot request cannot fall back to DB; it is capped. The
 
 The domain-owned `CompactId` crosses into ApiService only as the private
 alignment cut and `BlockCommitted.id`; it is never a public block identity or
-wire value. Each HTTP graph response has its own small numeric references and
-an included local ID-to-hash dictionary covering **all** hashes it references,
-including off-window parent endpoints and merge-set members. These local IDs
-are not persistent across responses or instances; coordinates may diverge
-across independently allocated DBs.
+wire value. Each HTTP graph response uses the response-local
+[hash dictionary and graph value DTOs](#serialized-graph-values-and-hash-dictionary--settled)
+defined below. Its local references are not persistent across responses or
+instances; coordinates may diverge across independently allocated DBs.
 
 The public block projection preserves its **actual direct-parent list** even
 when some parents are outside the response or PP boundary and have no
@@ -119,6 +119,85 @@ drawable edge. A materialized Genesis is recognized from its empty actual
 direct-parent list. The public projection and Web client do not need to expose
 or consult the persisted `NodeMetadata.genesis_hash`, and no dedicated
 Genesis-hash API endpoint is required.
+
+## Serialized graph values and hash dictionary — settled
+
+The serialization-only hash reference is a plain alias rather than a newtype:
+
+```rust
+type HashRef = u32;
+```
+
+Every serialized graph body that references hashes carries this response-local
+dictionary:
+
+```rust
+hashes: Vec<BlockHash>
+```
+
+`HashRef` is the zero-based index of its hash in that vector. The reference is
+valid only inside the response that carries the dictionary. The dictionary
+covers every serialized block identity, direct parent, blue or red merge-set
+member, edge endpoint, VSPC-membership target, and color-change target,
+including references whose blocks are outside the nominal window.
+
+Dictionary construction traverses graph values in the serializer's actual
+order and interns each hash on first encounter. Conceptually it uses a
+`Vec<BlockHash>` plus a `HashMap<BlockHash, u32>` so a repeated hash reuses its
+already assigned reference. Dictionary order and numeric references need not
+repeat across independent serializations of the same graph meaning. A cached
+delta's settled serializer-only removal omission happens before interning those
+omitted entries, so a hash used only by an omitted block or edge removal does
+not enter the dictionary. The selected graph encoding determines whether each
+dictionary hash uses raw bytes or canonical hexadecimal text.
+
+The serialized graph subvalues are:
+
+```rust
+struct LevelDto {
+    level: u64,
+    size: u64,
+    daa_score: Option<u64>,
+}
+
+struct GraphBlockDto {
+    hash: HashRef,
+    coordinate: BlockCoordinate,
+    timestamp: u64,
+    daa_score: u64,
+    selected_parent_index: Option<u32>,
+    direct_parents: Vec<HashRef>,
+    blue_merge_set: Vec<HashRef>,
+    red_merge_set: Vec<HashRef>,
+    color: BlockColor,
+    is_in_vspc: bool,
+}
+
+struct EdgeIdDto {
+    parent: HashRef,
+    child: HashRef,
+}
+
+struct GraphEdgeDto {
+    id: EdgeIdDto,
+    parent_coordinate: BlockCoordinate,
+    child_coordinate: BlockCoordinate,
+}
+```
+
+`selected_parent_index` indexes the same block's `direct_parents` vector; it
+is unrelated to `HashRef` and is absent for Genesis. Direct parents and the
+blue and red merge sets preserve their graph-owned semantic order. Canonical
+and serialized graph values retain the full `u64` level, slot, level-size,
+timestamp, and score domains.
+
+Levels, blocks, edges, and all change collections are unordered on the wire.
+Only their contents are significant; a client builds any indexes required for
+display or mutation. The serializer converts directly from the captured
+`GraphView` or composed `GraphDelta`; it does not replace either canonical
+value earlier, compare repeated immutable values, or introduce a
+content-conflict validation step. Internal graph and service fields excluded
+by the common DTO rules never enter these values.
 
 ## Public API values — settled
 
@@ -397,13 +476,15 @@ replacement during serialization does not restart the request: the completed
 response remains valid for its captured publication, revision, state, and
 effective extent.
 
-The endpoint accepts `If-None-Match`. Its ETag identity contains the
-publication ID, revision, effective capped depth and actual level extent,
-`representation_version`, and publication state. An exact match returns
-`304 Not Modified`; otherwise the endpoint returns the complete captured
-snapshot. A state-only transition therefore changes the ETag even when the
-graph revision is unchanged, because the self-contained snapshot carries that
-state. Responses use
+The endpoint accepts `If-None-Match` and emits a weak ETag. Its semantic
+identity contains the publication ID, revision, effective capped depth and
+actual level extent, `representation_version`, and publication state. The weak
+validator permits independently serialized equivalent snapshots to order
+unordered collections and assign response-local hash references differently.
+An exact semantic match returns `304 Not Modified`; otherwise the endpoint
+returns the complete captured snapshot. A state-only transition therefore
+changes the ETag even when the graph revision is unchanged, because the
+self-contained snapshot carries that state. Responses use
 `Cache-Control: no-cache`, requiring revalidation before reuse.
 
 ## Canonical Head delta responses — settled
@@ -1027,8 +1108,8 @@ The public API has conceptually:
   component observations, and the current or last successfully validated
   network and node server information.
 
-The final wire and error-body schemas, graph wire format, and HTTP compression
-policy remain deferred in the
+The remaining endpoint response and error-body schemas, graph wire format, and
+HTTP compression policy remain deferred in the
 [decision register](../decisions/deferred.md). HTTP methods and common route
 and request syntax follow the settled conventions above.
 

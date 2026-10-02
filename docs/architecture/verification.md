@@ -914,10 +914,23 @@ Keep canonical `GraphView` and `GraphDelta` values intact until that boundary,
 exercise explicit response-variant discrimination and absence independently
 from zero or empty values, and round-trip the full public `u64` domain through
 the selected encoding. Check ordered graph collections retain their semantic
-order, every set or map follows its DTO-owned deterministic order, and no
-internal-only field enters a public payload. A representation-significant
-schema or encoding change must alter the internal representation version used
-by graph cache identity and Head ETags.
+order, unordered collections remain semantically equivalent across different
+traversal orders, and no internal-only field enters a public payload. A
+representation-significant schema or encoding change must alter the internal
+representation version used by graph cache identity and Head ETags.
+
+Verify graph-value serialization uses zero-based response-local `u32` hash
+references and a first-encounter dictionary built from the serializer's actual
+traversal. Repeat hashes across block identity, ordered parent and merge-set
+vectors, edge endpoints, and VSPC field targets and require one dictionary
+entry per response with consistent local references. Randomize internal
+hash-map iteration and require decoded graph equivalence without requiring
+identical encoded order, dictionary order, or reference numbers. Round-trip
+the complete `u64` domains retained by levels, coordinates, level sizes,
+timestamps, and scores; preserve ordered parent and merge-set vectors and the
+Genesis selected-parent-index absence. A cached delta must not intern a hash
+used only by a serializer-omitted block or edge removal. Serialization adds no
+immutable-value comparison or conflict-validation path.
 
 Verify the common HTTP outcome map independently of the final error DTO.
 Complete and prefix graph results, delta `UpToDate` and `WaitForWakeup`,
@@ -951,9 +964,11 @@ The endpoint neither accepts nor returns `client_id`.
 
 Exercise `If-None-Match` across an unchanged response, graph revision advance,
 effective-extent change, state-only transition, and publication replacement.
-Only the unchanged complete identity returns `304 Not Modified`; every other
-case returns the complete snapshot. Verify `Cache-Control: no-cache`, including
-a state-only ETag change at an unchanged revision.
+Require a weak Head ETag. Independently serialize the same semantic snapshot
+with different unordered collection and dictionary orders and require the same
+weak identity and `304 Not Modified`. Every semantic identity change returns
+the complete snapshot. Verify `Cache-Control: no-cache`, including a state-only
+ETag change at an unchanged revision.
 
 Delta cases cover Frozen and revision compatibility as the only application
 checks, direct target-state installation, Head bound recalculation, fixed-bound
