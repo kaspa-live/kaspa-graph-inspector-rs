@@ -121,6 +121,19 @@ an accepted ADR, or the applicable decision-status register as appropriate.
 Version control tracks the complete `docs/history/audits/` directory for
 historical provenance. Tracking an audit does not give it normative authority.
 
+## Frozen design archives
+
+`docs/history/archives/` contains rejected or replaced design material frozen
+at the point it left the current architecture. Version control tracks the
+complete directory for provenance. Its files are non-normative and do not
+participate in architecture, implementation, or review precedence.
+
+After its initial commit, an archive file must never be edited, reformatted,
+relinked, renamed, or deleted. Later corrections, commentary, or related
+discarded material require a new archive file. All collaboration roles ignore
+the directory unless the user explicitly asks them to inspect a specific
+archive.
+
 ## Chat archives
 
 `docs/chats/` contains local chat transcript archives used only as provenance

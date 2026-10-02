@@ -26,6 +26,7 @@ contract. The complete reading order and precedence rules are defined in
 | `implementation/` | Planned implementation order, current status, and implementation analyses | Non-normative |
 | `reviews/` | Review evidence and findings | Non-normative |
 | `history/audits/` | Historical reconciliation evidence | Non-normative |
+| `history/archives/` | Frozen rejected or replaced design snapshots | Non-normative; governed by the [`AGENTS.md` archive policy](../AGENTS.md#frozen-design-archives) |
 | `history/handoffs/` | Superseded architecture handoffs retained for provenance | Non-normative |
 | `rk-issues/` | Tracked rusty-kaspa issue records | Non-normative and outside normal role scope |
 | `chats/` | Untracked local chat provenance | Non-normative |

@@ -702,8 +702,8 @@ views, an above-Fixed added member that recolors a retained merge-set block,
 and a retained endpoint-level DAA change. Cover independent revisions, missing
 required metadata, and the first post-update disjoint extent. The latter two
 must preserve the last coherent image and make every later mutation fail under
-the Frozen rule. No case may apply a Head-generated delta to Fixed or perform a
-storage read.
+the Frozen rule. No case may apply a Head-generated delta directly to the
+internal Fixed `GraphView` or perform a storage read.
 
 Verify the settled graph-model core with a view and history initially at
 revision `n`. A retained mutation advances the view to `n+1` and returns
@@ -712,15 +712,14 @@ return `n+1` while a history request exposes only `n`; appending the delta then
 advances history to `n+1`. A no-effect update returns no delta and advances
 neither revision. History rejects a nongapless append and accepts a gapless
 aggregated interval without requiring internal one-step boundaries. Construct
-direct, composed, and projected deltas only through `GraphDelta::new`; verify it
+direct and composed deltas only through `GraphDelta::new`; verify it
 rejects equal and backward revision endpoints, exposes the accepted endpoints
 through read-only accessors, and offers no revision mutation path.
 
 Verify `GraphHistory::range` checks target ordering before retained-boundary
 selection: a target below the start returns `BackwardTarget` and constructs no
-delta, while equality remains `UpToDate`. Both canonical Head and Head-bounded
-Fixed requests map the backward case to `400 Bad Request` without changing the
-publication, history, view, or browser lineage.
+delta, while equality remains `UpToDate`. Public delta-to-current operations
+cannot express a backward target.
 
 Verify every subview extract inherits its source revision with
 `TrackingPolicy::Frozen`. `BlockCommitted` and `VspcCommitted` mutation entry
@@ -781,7 +780,7 @@ Verify successful level, block-hash, and DAA anchors return a
 `GraphWindowResolution` whose resolved level lies in its effective capped
 range and whose resolution and graph contents come from the same immutable
 graph view or database transaction. Browser cases retain the original anchor,
-keep the returned level fixed across eligible projected deltas, and re-resolve
+keep the returned level fixed across eligible canonical Head deltas, and re-resolve
 only when explicit refresh resubmits that anchor. A database-backed window has
 no public delta lineage and remains frozen until that refresh.
 
@@ -806,39 +805,45 @@ call. A DAA score beyond the current VSPC score remains a successful
 current-VSPC resolution.
 
 Verify the settled
-[Head-bounded Fixed projection](api-protocol.md#head-bounded-fixed-delta-projection--settled)
-from a Head-extracted anchored window. Cover a fully contained extent, an empty
-projected mutation that still advances the Head cursor, blocks inside the
-extent, crossing edges with neither endpoint block present, nominal and
-external endpoint levels, and retained VSPC-membership and color changes. A raw
-Head delta must never be delivered as the projected response. Verify the
-initial extracted response supplies the source Head high level, every projected
-`GraphDelta.high_level` is the source Head high level at its returned `to`
-revision, the browser adopts it for pacing, and neither value changes the fixed
-effective bounds. An SSE wakeup alone must not change the browser's known Head
-level.
+[fixed-window reuse of canonical Head deltas](api-protocol.md#fixed-window-reuse-of-canonical-head-deltas--settled)
+from a Head-extracted anchored window. Deliver the same canonical encoded body
+through a Head consumer and a fixed-window consumer. The Web must filter it to
+blocks inside the fixed extent, intersecting edges, nominal and retained
+endpoint levels, and membership or color changes for retained blocks. Cover
+crossing edges with neither endpoint block present and mutations entirely
+outside the extent. A filtered candidate with no visible mutation must still
+advance the browser cursor and adopt the canonical delta's Head high level
+without changing either fixed bound.
 
-Advance Head until the fixed lower bound leaves its nominal extent. Verify an
-indivisible crossing history entry is not projected, any earlier complete
-prefix is returned and applied, and the browser then freezes. Also cover no
-valid prefix, publication replacement, Stale publication, and expired history.
-When a retained edge needs an unchanged endpoint level, fetch it from the
-current Head view; accept that this level can be newer than the returned
-cursor, but never use it for coverage or cursor decisions. Encode the
-synthesized absolute upsert as `before = None` and `after = Some(level)`, apply
-it successfully whether the browser previously lacked or retained that level,
-and do not interpret its `before` as an absence assertion. Verify enrichment
-occurs after canonical projected composition. Absence of that required level
-freezes only the browser fixed image. Head pruning removals outside the fixed
-projection are discarded without affecting Head or the browser image.
+While the target Head still contains the complete fixed extent, verify omitted
+canonical block and edge removals do not remove fixed objects. Then compose an
+add-then-remove transition whose target Head has crossed the fixed lower bound.
+The Web must detect the target bound from `GraphDelta.high_level`, apply none
+of that response, preserve its previous coherent revision and image, and
+freeze without reconstructing an intermediate prefix. Also cover publication
+replacement and expired history. A terminal Stale publication remains
+addressable: canonical catch-up and missing-level lookup continue through its
+final stalled Head.
 
-Exercise the Fixed response budget after projection and endpoint-level
-enrichment. Cover a complete interval that fits, a largest complete-entry
-prefix when the next projected entry exceeds the budget, and a first projected
-entry that exceeds the budget only after an endpoint level and the response
-dictionary are added. Verify the last case applies no partial mutation, returns
-the API-owned fresh-view outcome, and leaves the browser's last coherent image
-frozen/stale until explicit refresh.
+Exercise
+`GET /api/v1/graph/levels?publication_id=P&level=L1[&level=L2...]`.
+Require one valid publication ID and at least one positive level, treat
+repeated level parameters and values as a set, and reject malformed or
+additional parameters. Capture one immutable `Synchronizing`, `Live`, or
+`Stale` Head image and return every requested absolute value with its
+publication ID, revision, and state. Cover a value newer than the delta being
+enriched. A missing level returns one all-or-nothing `LevelUnavailable`
+outcome; an unaddressable publication returns
+`FreshViewRequired(PublicationMismatch)`. Neither outcome returns partial
+levels.
+
+When a retained edge needs an unchanged endpoint level, stage the lookup result
+with the locally filtered delta and apply both atomically. Preserve the local
+derived edge-usage counter while replacing the level's public size and DAA
+score. Lookup failure must apply no candidate mutation and freeze only the
+browser fixed image. The lookup never reads PostgreSQL, enters `GraphCache`,
+joins cache single-flight work, carries a hash dictionary or ETag, or omits
+`Cache-Control: no-store`.
 
 Verify deltas and client behavior across
 [API publication](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled) and
@@ -992,9 +997,9 @@ history and when its target level falls more than `MAX_CACHE_LEVEL_DISTANCE`
 behind Head; either miss reconstructs an equivalent response. At the 80%
 distance gate require a fresh window before starting a job. Historical DB
 windows bypass this cache.
-Projected Fixed delta requests also bypass cache lookup, insertion, and cache
-single-flight, return `Cache-Control: no-store`, and produce no ETag. Repeated
-identical requests therefore execute independent on-demand projection. Cache
+Head-level lookups also bypass cache lookup, insertion, and cache single-flight,
+return `Cache-Control: no-store`, and produce no ETag. Fixed-window consumers
+must receive the same cached canonical Head response as other consumers. Cache
 work must not delay or fault processing.
 
 Under the strict
@@ -1155,7 +1160,7 @@ fixed-view freeze and follow-live behavior, stable block identity, direct
 parent rendering, and Genesis recognition from zero actual direct parents.
 For distance-adaptive fixed views, verify no added throttling while the head is
 visible and at distances through 10, then verify that distance 11 enters the
-configured increasing-delay policy without breaking contiguous projected
+configured increasing-delay policy without breaking contiguous canonical
 delta catch-up or explicit-refresh fallback after Head retention expires.
 
 ## Resource isolation and performance

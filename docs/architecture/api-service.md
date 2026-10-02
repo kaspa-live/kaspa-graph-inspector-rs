@@ -311,7 +311,7 @@ reload. Never publish partial levels. Encoded delta reuse has no independent
 ApiService-owned resource rule beyond the structural bounds owned by the
 [API protocol](api-protocol.md#publication-scoped-head-response-cache--settled).
 Slow SSE clients follow the bounded coalescing and disconnect contract in the
-[API protocol](api-protocol.md#public-projection-and-delivery-failures--settled).
+[API protocol](api-protocol.md#public-delivery-failures--settled).
 
 V2 exposes these operational measurements:
 

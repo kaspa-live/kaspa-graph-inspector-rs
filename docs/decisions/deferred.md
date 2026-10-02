@@ -26,9 +26,10 @@ become durable project constraints.
    A shared mutation lock plus per-lane mutexes is one valid storage shape;
    exact lock types remain an implementation choice.
 6. Remaining endpoint-specific API resource paths and parameter sets beyond
-   the settled Head snapshot, canonical Head delta, and anchored-window
-   operations in the [API protocol](../architecture/api-protocol.md), plus the
-   remaining endpoint cache headers and final wire and error-body schemas.
+   the settled Head snapshot, canonical Head delta, anchored-window, and
+   Head-level lookup operations in the
+   [API protocol](../architecture/api-protocol.md), plus the remaining endpoint
+   cache headers and final wire and error-body schemas.
    Select exactly one graph
    response format for v2; clients will not negotiate among graph encodings.
    Benchmark JSON against appropriate binary formats such as CBOR, MessagePack,

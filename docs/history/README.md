@@ -8,6 +8,9 @@ implementation, or review precedence.
   focused-document authority cutover.
 - [`audits/`](audits/) contains historical reconciliation evidence and working
   reports.
+- [`archives/`](archives/) contains frozen rejected or replaced design
+  snapshots governed by the repository's
+  [archive policy](../../AGENTS.md#frozen-design-archives).
 
 Current architecture and document authority are defined by
 [`docs/architecture/README.md`](../architecture/README.md) and

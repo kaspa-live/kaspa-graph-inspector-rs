@@ -366,9 +366,12 @@ revision unchanged.
 
 A `GraphDelta` produced by this Fixed lineage can still be applied to a
 matching Fixed view under the general absolute-map and revision rules.
-Applying a standalone Head-generated delta to Fixed is prohibited by the
-[rejected-design register](../decisions/rejected.md): it lacks the original
-committed event and does not guarantee all projection context.
+Applying a Head-generated delta directly to this internal Fixed view is
+prohibited by the [rejected-design register](../decisions/rejected.md): it
+lacks the original committed event and does not guarantee all projection
+context. Browser-side filtering of the public canonical representation belongs
+to the [Web contract](web.md#fixed-views--settled-behavior-with-deferred-pacing)
+and does not invoke this mutation path.
 
 Fixed-view coherence failure is local. Disjoint extents, unavailable required
 Head-cache metadata, a same-lineage delta revision mismatch, or another failure
@@ -395,10 +398,10 @@ observe revision `n+1` while a delta-history request can reach only revision
 `GraphDelta::new` is the only constructor. Its revision fields are private,
 have no setters, and are exposed only through their read-only accessors. The
 constructor rejects `to_revision_id <= from_revision_id` with
-`NonForwardRevision`. Direct view mutation produces one-step deltas;
-composition and public projection construct their results through the same
-checked constructor. Delta application and history append trust this
-construction invariant and do not check it again.
+`NonForwardRevision`. Direct view mutation produces one-step deltas, and
+composition constructs its results through the same checked constructor.
+Delta application and history append trust this construction invariant and do
+not check it again.
 
 ```rust
 impl GraphView {
@@ -432,8 +435,9 @@ low_level  = max(1, high_level - max_depth + 1)
 
 A Fixed view retains both nominal bounds. Every accepted view sets
 `current_revision_id = delta.to_revision_id`. An error leaves the complete view
-and revision unchanged. A standalone Head-generated delta remains prohibited
-for Fixed; only a delta from the same Fixed lineage has the required context.
+and revision unchanged. Direct application of a Head-generated delta remains
+prohibited for internal Fixed; only a delta from the same Fixed lineage has the
+required context.
 
 `append` requires only
 `history.current_revision_id == delta.from_revision_id`. On success, it takes
@@ -458,13 +462,10 @@ may make it differ from the final encoded size.
 `GraphDelta.high_level` is the high level of the revision lineage that owns the
 delta at `to_revision_id`. A canonical Head delta therefore carries the target
 Head high level. A delta from an internal Fixed lineage carries that Fixed
-view's high level. The
-[Head-bounded projection contract](api-protocol.md#head-bounded-fixed-delta-projection--settled)
-owns this field's meaning in a derived public projected response. For canonical
-and internal deltas, the field is retained in history, included in the API
-delta payload, provides the semantic key for Head-history pruning, and exposes
-the lineage high level without requiring derivation from mutation contents. A
-delta does not carry `low_level` or a separate coverage object; explicit graph
+view's high level. The field is retained in history, included in the API delta
+payload, provides the semantic key for Head-history pruning, and exposes the
+lineage high level without requiring derivation from mutation contents. A delta
+does not carry `low_level` or a separate coverage object; explicit graph
 mutations drive a Head view's lower-bound changes.
 
 In canonical and internal lineage deltas, `level_changes` contains only levels
@@ -475,9 +476,7 @@ composition. Gapless composition folds consecutive changes from the first
 `before` to the last `after` and omits a level whose composed change has no net
 effect. Because each change carries its pre-state, this composition does not
 require the starting view. Within the graph model, `before = None` means
-absence. The
-[Head-bounded projection contract](api-protocol.md#head-bounded-fixed-delta-projection--settled)
-owns its sole presentation-only exception.
+absence.
 
 Within the API graph model, `EdgeId` is the canonical immutable identity of a
 child-parent link. `GraphEdge` adds the complete coordinates required for
