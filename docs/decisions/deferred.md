@@ -23,12 +23,12 @@ become durable project constraints.
    ApiService task structure, and concrete storage synchronization mechanics.
    A shared mutation lock plus per-lane mutexes is one valid storage shape;
    exact lock types remain an implementation choice.
-6. The HTTP compression policy for the settled JSON graph responses under the
-   common DTO rules in the [API protocol](../architecture/api-protocol.md).
+6. Exact gzip compression quality for the settled graph delivery contract in
+   the [API protocol](../architecture/api-protocol.md#graph-http-compression--settled).
 7. Exact `MAX_WINDOW_DEPTH` and `MAX_CACHE_LEVEL_DISTANCE` under the settled
    strict sum bound beneath `MAX_CACHE_DEPTH = 1000`; the soft estimated and
-   hard encoded response budgets; HTTP and SSE budgets; and the adaptive
-   fixed-view delay curve and cap. Treat
+   hard uncompressed JSON response budget; HTTP and SSE budgets; and the
+   adaptive fixed-view delay curve and cap. Treat
    traffic-share estimates and the numeric SSE-client
    limit as load-test inputs rather than fixed architecture constants.
 8. Detailed shared/exclusive permit, historical-read cancellation, and

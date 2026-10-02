@@ -55,8 +55,8 @@ This common contract fixes route and request syntax. Each endpoint section
 owns its exact resource path, parameters, logical outcomes, and cache behavior.
 All successful graph response bodies use JSON. They carry
 `Content-Type: application/json`. Clients do not negotiate among graph
-encodings. HTTP compression remains a separate deferred implementation choice
-under the common DTO rules below.
+encodings. Successful graph delivery uses the single
+[gzip path](#graph-http-compression--settled) below.
 
 ## Common transport DTO rules — settled
 
@@ -98,6 +98,42 @@ RPC generation identifiers.
 hash-reference representation, or graph encoding changes in a way that
 invalidates cached graph bytes or ETags. Public errors use their own common
 schema and never reuse a graph success DTO.
+
+## Graph HTTP compression — settled
+
+Every request to a graph endpoint must accept the `gzip` content coding under
+standard HTTP `Accept-Encoding` semantics. Route, method, and request-syntax
+validation retain their ordinary precedence. After those checks and before
+graph lookup, cache access, history work, database access, or serialization, a
+request that does not accept gzip returns the typed `406 Not Acceptable`
+`gzip-required` error.
+
+Every body-bearing successful graph response carries:
+
+```http
+Content-Type: application/json
+Content-Encoding: gzip
+Vary: Accept-Encoding
+```
+
+Bodyless delta outcomes and `304 Not Modified` still require a request that
+accepts gzip, carry `Vary: Accept-Encoding`, and carry no `Content-Encoding`.
+Every response from a graph endpoint carries `Vary: Accept-Encoding`. Error
+bodies, including `gzip-required`, use the ordinary uncompressed common JSON
+error representation. The gzip requirement does not apply to status, SSE,
+`/kgi-config.json`, or static Web assets; their owning contracts remain
+independent.
+
+The hard graph-response byte limit measures the complete uncompressed JSON
+body. Compression ratio never authorizes a larger logical response. Gzip runs
+only after JSON serialization and that size check succeed. A compression
+failure retains the common request-local failure policy and publishes no cache
+entry.
+
+Compression does not alter graph semantics. Gzip quality does not change
+`representation_version`, graph revision, cache identity, or the weak Head
+ETag. The exact gzip quality is an implementation tuning choice. Successful
+graph responses support no identity body and no second compressed variant.
 
 ## Public graph limits and identity — settled
 
@@ -526,6 +562,7 @@ Categories and codes use these exact lowercase kebab-case values:
 |---|---|---|---|
 | `400` | `invalid-request` | `invalid-request` | `null` |
 | `405` | `invalid-request` | `method-not-allowed` | `null` |
+| `406` | `not-acceptable` | `gzip-required` | `null` |
 | `404` unknown route | `not-found` | `route-not-found` | `null` |
 | `404` window anchor | `not-found` | `window-anchor-unavailable` | matching anchor details |
 | `404` Head level | `not-found` | `head-level-unavailable` | `requested_level` |
@@ -543,7 +580,8 @@ hexadecimal text.
 
 Every error response carries `Content-Type: application/json` and
 `Cache-Control: no-store`. The common outcome contract additionally requires
-`Allow: GET` for `405` and `Retry-After: 1` for `429` and `503`.
+`Allow: GET` for `405` and `Retry-After: 1` for `429` and `503`. A graph
+endpoint's error response is uncompressed and carries `Vary: Accept-Encoding`.
 
 The body never exposes internal error variants, database or RPC generations,
 diagnostics, stack traces, SQL errors, filesystem paths, or serialization
@@ -947,7 +985,7 @@ For an eligible `GraphHistoryRange::Deltas`, ApiService uses the entries'
 cumulative estimated costs to find the youngest complete boundary `Y` under
 the soft estimated response budget. If no complete boundary fits that estimate,
 the first complete stored entry remains the candidate for the mandatory hard
-encoded-size check. A completed cache entry keyed by the
+uncompressed-JSON-size check. A completed cache entry keyed by the
 request's source revision is immutable and is served directly. On a cache miss,
 delta-to-current target selection uses the approximate source-level distance:
 
@@ -983,10 +1021,11 @@ estimate selects a candidate and never authorizes an oversized response.
 The target is captured when the single-flight job starts and does not advance
 with Head while that job is running. Compose the chosen entries through the
 graph-owned [delta composition operation](api-graph.md#graph-delta-composition),
-construct the response-local hash dictionary, encode once, and check the hard
-response-byte limit. If the encoded result exceeds that limit, retry at an
-earlier complete boundary, preferring another eligible heated destination in
-the heat region. If even the first complete stored entry cannot fit, return
+construct the response-local hash dictionary, serialize the JSON once, and
+check its uncompressed byte length against the hard response limit. If the
+uncompressed JSON exceeds that limit, retry at an earlier complete boundary,
+preferring another eligible heated destination in the heat region. If even the
+first complete stored entry cannot fit, return
 `FreshViewRequired(FirstStoredDeltaExceedsBudget)`. An aggregated stored entry
 is indivisible and is never truncated or split.
 
@@ -996,12 +1035,13 @@ because the graph range extended through an indivisible aggregate or earlier
 because budgeting selected a prefix.
 Composition operates on graph hashes through the graph-owned operation; public
 encoding then constructs a new response-local hash dictionary for the result.
-The emitted response is one composed patch and must remain within the
-configured byte limit.
+The emitted response is one composed patch whose uncompressed JSON must remain
+within the configured byte limit. Gzip compression and cache insertion occur
+only after that check succeeds.
 
 Return `Complete` when the actual returned right boundary reaches or extends
 through the captured target. Return `Prefix` when target selection or
-encoded-size fallback stops at an earlier complete boundary.
+uncompressed-JSON-size fallback stops at an earlier complete boundary.
 These are request-specific envelope outcomes rather than fields of the encoded
 delta body. A later request may therefore wrap the same cached body differently
 as Head advances.
@@ -1063,11 +1103,11 @@ snapshot. The SSE-coordinated response omits the retry header and does not
 rearm graph-revision delivery; publication replacement remains observable
 through the existing SSE transport.
 
-The soft estimate and hard encoded-size limit take precedence over ordinary
-four-revision spacing. An encoded-size fallback may therefore produce and
-cache a shorter complete prefix. Its continuation depends only on the
-remaining distance to the then-observed Head. CPU-oriented bridges may also be
-shorter because their purpose is to join an existing cached lane.
+The soft estimate and hard uncompressed-JSON-size limit take precedence over
+ordinary four-revision spacing. A size fallback may therefore produce and
+cache a shorter complete prefix. Its continuation depends only on the remaining
+distance to the then-observed Head. CPU-oriented bridges may also be shorter
+because their purpose is to join an existing cached lane.
 
 The serialized cached Head-delta body omits block and edge removals. Under the
 strict [public graph-limit bound](#public-graph-limits-and-identity--settled),
@@ -1086,8 +1126,8 @@ The serializer is the sole omission point: while producing the cacheable wire
 body, it skips removal-valued entries in `block_changes` and `edge_changes` and
 omits their unused hashes from the response-local dictionary. It does not
 construct a filtered `GraphDelta`. `CachedDelta` retains only the resulting
-encoded bytes. No canonical delta in history, composition, or ApiService's Head
-view loses those removals.
+gzip body and its uncompressed JSON byte count. No canonical delta in history,
+composition, or ApiService's Head view loses those removals.
 
 ## Fixed-window reuse of canonical Head deltas — settled
 
@@ -1158,6 +1198,11 @@ Strict request parsing and endpoint-specific invalid semantic values return
 `400 Bad Request`. An unknown route returns `404 Not Found`. A known v1
 resource requested with an unsupported method returns `405 Method Not Allowed`
 with `Allow: GET`.
+
+After those request checks, a graph request that does not accept gzip returns
+`406 Not Acceptable` with category `not-acceptable`, code `gzip-required`, and
+`details: null`. This capability check precedes every graph, cache, history,
+database, serialization, and compression operation.
 
 Normal graph-object lookup misses return `404 Not Found`. These are the three
 `GraphWindowAnchorUnavailable` variants and
@@ -1266,7 +1311,8 @@ Head snapshot conditional caching follows the
 must revalidate.
 Historical database windows, Head-level lookup, and SSE have no ETag. Head-level
 lookup and SSE require `Cache-Control: no-store` under their owning contracts.
-HTTP compression remains a separate deferred implementation choice.
+The [graph gzip contract](#graph-http-compression--settled) owns transfer
+compression and leaves only exact gzip quality to implementation tuning.
 
 ## Publication-scoped Head response cache — settled
 
@@ -1283,17 +1329,20 @@ struct CachedDelta {
     from_revision_id: u64,
     to_revision_id: u64,
     high_level: u64,
-    encoded_body: Bytes,
+    uncompressed_json_bytes: u64,
+    gzip_body: Bytes,
 }
 ```
 
-`encoded_body` is exactly the JSON encoding of
-[`GraphDeltaBodyDto`](#canonical-delta-response-dtos--settled). It contains no
-publication ID, publication state, response-outcome discriminator,
-continuation, wake boundary, or retry delay. ApiService reuses those exact
-bytes and adds the request-specific HTTP headers from the captured request
-target, publication state, and Head. Whether that lightweight HTTP wrapper is
-also retained is an implementation detail.
+`gzip_body` is the final compressed JSON encoding of
+[`GraphDeltaBodyDto`](#canonical-delta-response-dtos--settled).
+`uncompressed_json_bytes` is the byte length checked against the hard response
+limit before compression; `gzip_body.len()` is the transferred body size. The
+cached value contains no publication ID, publication state, response-outcome
+discriminator, continuation, wake boundary, or retry delay. ApiService reuses
+those exact compressed bytes and adds the request-specific HTTP headers from
+the captured request target, publication state, and Head. Whether that
+lightweight HTTP wrapper is also retained is an implementation detail.
 
 The delta cache and its single-flight job map serve both SSE-coordinated and
 HTTP-only delta-to-current requests and are keyed by source revision. At most
@@ -1316,9 +1365,11 @@ bounds replace an independent encoded-byte cache cap.
 
 An encoded-cache miss or eviction affects performance only: reconstruct the
 response from the current `GraphView` or retained `GraphHistory`. Optional
-exact-revision Head-view response reuse belongs to the same publication and may
-be dropped at any time. Historical database-backed windows, Head-level lookup,
-and SSE remain uncached in v2; the lookup also bypasses cache single-flight.
+exact-revision Head-view response reuse belongs to the same publication, stores
+only its final gzip body and uncompressed JSON byte length, and may be dropped
+at any time. Historical database-backed windows and Head-level lookup are
+serialized, size-checked, compressed once, delivered, and discarded. They and
+SSE remain uncached in v2; the lookup also bypasses cache single-flight.
 Cache work cannot affect graph correctness or processing.
 Concrete cache collections and the estimator weights remain deferred in the
 [decision register](../decisions/deferred.md).
@@ -1477,8 +1528,8 @@ The public API has conceptually:
   component observations, and the current or last successfully validated
   network and node server information.
 
-The graph wire format is the settled JSON representation defined above. HTTP
-compression remains deferred in the
+The graph wire format and mandatory gzip delivery are the settled
+representations defined above. Only exact gzip quality remains deferred in the
 [decision register](../decisions/deferred.md). HTTP methods and common route
 and request syntax follow the settled conventions above.
 

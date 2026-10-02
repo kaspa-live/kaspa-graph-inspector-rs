@@ -936,6 +936,20 @@ traversal orders, and no internal-only field enters a public payload. A
 representation-significant schema or encoding change must alter the internal
 representation version used by graph cache identity and Head ETags.
 
+Verify the protocol-owned
+[graph gzip contract](api-protocol.md#graph-http-compression--settled) across
+every graph endpoint. A syntactically valid graph request that does not accept
+gzip returns the typed `406` `gzip-required` response before graph, cache,
+history, database, serialization, or compression work. Invalid routes,
+methods, and request syntax retain their earlier `404`, `405`, or `400`
+precedence. Every graph-endpoint response carries
+`Vary: Accept-Encoding`; every successful graph body additionally carries
+`Content-Encoding: gzip`, while `304` and bodyless delta success carry no
+`Content-Encoding`. Error bodies remain uncompressed common JSON. Status, SSE,
+runtime configuration, and static assets do not inherit this graph-only rule.
+Force compression failure after successful serialization and size checking;
+require the existing request-local `500` outcome and no cache insertion.
+
 Verify graph-value serialization uses zero-based response-local `u32` hash
 references and a first-encounter dictionary built from the serializer's actual
 traversal. Repeat hashes across block identity, ordered parent and merge-set
@@ -954,7 +968,9 @@ Complete and prefix graph results, delta `UpToDate` and `WaitForWakeup`,
 anchored windows, Head-level lookup, and status use `200`; only an exact Head
 ETag match uses `304`. Unknown routes use `404`; known resources reject
 unsupported methods with `405` and `Allow: GET`. Anchor and Head-level lookup
-misses use typed `404` outcomes. Registration and every fresh-view reason use
+misses use typed `404` outcomes. A valid graph request that does not accept
+gzip uses typed `406` category `not-acceptable`, code `gzip-required`, and
+explicit `null` details. Registration and every fresh-view reason use
 typed `409` outcomes. Admission-lane saturation before commitment uses `429`,
 while unavailable graph or database capabilities use `503`; both carry
 `Retry-After: 1`. Unexpected request-local failure before commitment uses
@@ -1028,8 +1044,10 @@ request-from counts and continuation kinds do not change heat. In the
 CPU-oriented region, cover an exact cache hit, the shortest bridge to the
 nearest reachable completed cached source, exclusion of a running job as a
 bridge destination, and fallback to the youngest affordable ordinary boundary.
-Force the actual encoded result over its hard limit and verify fallback to an
-earlier complete boundary, then the first-entry fresh-view outcome.
+Force the actual uncompressed JSON result over its hard limit and verify
+fallback to an earlier complete boundary, then the first-entry fresh-view
+outcome. A compressed body that fits the transport efficiently does not permit
+an over-limit uncompressed representation.
 
 For encoded head-response reuse, issue concurrent identical snapshot requests
 at one cursor and effective window and verify that they share one construction,
@@ -1038,11 +1056,13 @@ publication-owned job per source revision: concurrent requests join it after
 its target is captured, success publishes one `CachedDelta`, and failure gives
 all waiters the same request-local error before removing the job. Count every
 successfully delivered waiter independently toward the destination heat. A
-cache hit reuses the exact encoded `GraphDeltaBodyDto` bytes and is never
+cache hit reuses the exact gzip bytes and is never
 promoted or replaced because Head advanced; publication ID and state, outcome,
 continuation, wake boundary, and retry delay remain outside those bytes. Wrap
 one cached body with different valid request-specific headers without
-re-encoding it. Verify one immutable outgoing entry per source revision and
+serializing, compressing, or decompressing it. Verify that `CachedDelta`
+retains the checked uncompressed JSON byte count and final gzip body. Verify
+one immutable outgoing entry per source revision and
 convergence of distinct sources on a heated destination. Exercise an
 SSE-coordinated and an HTTP-only request from the same source and verify both
 reuse the same cache entry or join the same job.
@@ -1103,9 +1123,10 @@ from `continue` and SSE-coordinated responses. At a Stale final Head require
 remains current, and a publication-mismatch outcome followed by a replacement
 Head snapshot after replacement. The SSE-coordinated Web must wait for the
 replacement wakeup instead.
-Force both an estimated and a final-encoded budget to select a shorter prefix;
-that prefix remains valid and cacheable and derives continuation from its
-remaining Head distance. Also cover a CPU-oriented bridge shorter than four.
+Force both an estimated and a final uncompressed JSON budget to select a
+shorter prefix; that prefix remains valid and cacheable and derives
+continuation from its remaining Head distance. Also cover a CPU-oriented
+bridge shorter than four.
 
 Verify Stale preserves cache entries, permits existing and new jobs to finish
 against the stalled Head, and replacement or destruction cancels unfinished
@@ -1118,6 +1139,10 @@ Head-level lookups also bypass cache lookup, insertion, and cache single-flight,
 return `Cache-Control: no-store`, and produce no ETag. Fixed-window consumers
 must receive the same cached canonical Head response as other consumers. Cache
 work must not delay or fault processing.
+Verify optional exact-revision Head reuse stores its post-compression gzip body
+and uncompressed JSON byte count. Historical database-backed windows and
+Head-level lookups serialize, check their uncompressed JSON size, compress,
+deliver, and discard without entering `GraphCache`.
 
 Under the strict
 `MAX_CACHE_LEVEL_DISTANCE + MAX_WINDOW_DEPTH < MAX_CACHE_DEPTH` bound, verify

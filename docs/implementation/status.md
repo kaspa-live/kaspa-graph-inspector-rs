@@ -18,7 +18,8 @@ runtime Web configuration, Docker and conventional installation layouts, and
 file-log directory model are settled but not yet implemented.
 
 The public [graph wire format](../architecture/api-protocol.md#common-transport-dto-rules--settled)
-is settled. HTTP compression remains deferred; optional later binary-format
+and [mandatory gzip delivery path](../architecture/api-protocol.md#graph-http-compression--settled)
+are settled. Exact gzip quality remains deferred; optional later binary-format
 benchmarking does not block implementation.
 
 The non-normative [implementation sequence](sequence.md) records

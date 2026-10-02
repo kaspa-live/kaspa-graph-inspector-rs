@@ -18,6 +18,6 @@ mechanics.
 | Verification | Accepted pinned upstream review and executable KGI verification. | [Verification](../architecture/verification.md#current-puar-result) |
 | Core crate structure | A top composition crate over acyclic model, node, API model, API ingress, storage, processing, and API core crates. | [Overview](../architecture/overview.md#core-crate-structure--settled) |
 | Repository and deployment | One Cargo workspace with the retained React Web migrated to Vite, reproducible atomic binary-and-asset bundles, runtime Web configuration, conventional and Docker layouts, and persistent rotating logs. | [Repository and release](../architecture/overview.md#repository-web-build-and-release-structure--settled), [HTTP composition](../architecture/overview.md#http-composition-and-runtime-web-configuration--settled), [deployment](../architecture/overview.md#deployment-and-logging--settled) |
-| Graph wire format | One JSON representation with lossless decimal-string `u64` values and no format negotiation. | [API protocol](../architecture/api-protocol.md#common-transport-dto-rules--settled) |
+| Graph wire format | One JSON representation with lossless decimal-string `u64` values, delivered through one mandatory gzip path. | [API representation](../architecture/api-protocol.md#common-transport-dto-rules--settled), [gzip delivery](../architecture/api-protocol.md#graph-http-compression--settled) |
 
 Later standalone accepted ADRs may be added to this directory and indexed here.
