@@ -215,36 +215,79 @@ Unavailable`, while the separate status/info lane remains available.
 
 ## Publication wire observation — settled
 
-SSE carries the current state beside the graph cursor:
+The public SSE operation is:
+
+```http
+GET /api/v1/graph/wakeups?publication_id=P&from_revision_id=F
+```
+
+`publication_id` and `from_revision_id` are required and describe the
+client's actual graph cursor when it opens the stream. The endpoint accepts no
+`client_id`, target revision, window depth or extent, anchor, or request body.
+Malformed, duplicate, missing, or additional parameters follow the
+[common request rules](#common-http-conventions--settled).
+
+The supplied cursor initializes transport scheduling only. It does not
+constrain the initial messages to that publication or revision. If a coherent
+current publication exists, ApiService accepts a well-formed stale cursor,
+registers the connection in the current publication, and reports that
+publication below. Without a coherent graph publication, return the ordinary
+graph-unavailable `503 Service Unavailable` outcome instead of opening an
+empty stream.
+
+A successful operation returns `200 OK` with `Content-Type:
+text/event-stream` and `Cache-Control: no-store`. It has no ETag, graph body,
+response-local hash dictionary, database access, `GraphCache` participation,
+or delta construction. Detailed event-field encoding remains part of the
+deferred wire schema.
+
+SSE uses three ordered logical messages:
 
 ```rust
+struct ClientRegistration {
+    client_id: OpaqueClientId,
+}
+
 struct PublicationWakeup {
+    publication_id: u64,
+    revision: u64,
+}
+
+struct PublicationState {
     publication_id: u64,
     revision: u64,
     state: GraphPublicationState,
 }
 ```
 
-The graph cursor remains `(publication_id, revision)`. A state-only transition
-emits another wakeup with the same cursor and the new state. Reconnection emits
-the latest cursor and current state. Graph data still comes exclusively from
-HTTP snapshot or delta responses.
+Their SSE event names are respectively `client-registration`,
+`publication-wakeup`, and `publication-state`. `PublicationWakeup` means that
+the graph cursor has advanced far enough for the registered client to attempt
+HTTP catch-up. `PublicationState` establishes or changes publication state;
+its revision is the publication cursor at that state observation. In
+particular, a `Stale` message carries the final stalled Head revision so a
+lagging client can catch up to it. Neither message carries graph data, which
+still comes exclusively from HTTP snapshot or delta responses.
 
 Each new or re-established SSE connection receives a dedicated
 `ClientRegistration` message containing only a fresh unguessable opaque
-`client_id`. The server emits that message before the connection's initial
-`PublicationWakeup`; ordered SSE delivery makes the identifier current before
-the client observes the graph cursor. The identifier's concrete token encoding
-remains part of the deferred wire schema.
+`client_id`, then the current `PublicationState`, then the current
+`PublicationWakeup`. Ordered SSE delivery makes the identifier and state
+current before the client observes the graph cursor. The identifier's concrete
+token encoding remains part of the deferred wire schema. The initial wakeup is
+always emitted; ApiService does not assume that the request cursor remains
+current while the stream is established.
 
 Publication replacement preserves the live SSE transport. After the
 [publication lifecycle](api-publication.md#publication-state-and-revision--settled)
 releases the old publication's identifier, the server registers the connection
-in the replacement publication, emits a new `ClientRegistration`, and only then
-emits the replacement `PublicationWakeup`. The registration message still
-contains only the new identifier; publication identity, revision, and state
-remain exclusive to the following wakeup. A state-only transition within one
-publication does not allocate another identifier.
+in the replacement publication and emits, in order, a new
+`ClientRegistration`, the replacement `PublicationState`, and the replacement
+`PublicationWakeup`. The registration message still contains only the new
+identifier. A state transition within one publication emits only
+`PublicationState` and does not allocate another identifier or pretend that a
+graph revision occurred. State delivery and the replacement sequence bypass
+the ordinary graph-revision wake schedule.
 
 A delta-to-current HTTP request may carry the current identifier so ApiService
 can update the matching publication-local wake schedule after choosing the
@@ -267,12 +310,18 @@ identifier to exactly one such scheduling value; its concrete collection and
 token representation remain implementation choices.
 
 No current or highest graph revision is stored in this value. Registration
-initializes the boundary from the client-supplied cursor and marks the initial
-connection wakeup sent. Disconnect removes the registration. Reconnection and
-publication replacement each create a new opaque identifier. A supplied
-expired or wrong-publication identifier returns `ClientRegistrationRequired`;
-the client first establishes a current SSE registration. An omitted identifier
-creates no registry entry and never returns that outcome.
+initializes the boundary from the client-supplied cursor and marks the
+connection's mandatory initial graph wakeup sent. Disconnect removes the
+registration. Reconnection and publication replacement each create a new
+opaque identifier. A supplied expired or wrong-publication identifier returns
+`ClientRegistrationRequired`; the client first establishes a current SSE
+registration. An omitted identifier creates no registry entry and never
+returns that outcome.
+
+SSE delivery is not exactly once and provides no event replay. KGI does not
+use SSE `Last-Event-ID` as a graph revision, publication ID, or `client_id`.
+Reconnection instead creates a new registration and delivers the current
+state and graph cursor through the ordered initial sequence above.
 
 The API response envelope, rather than `GraphView` or `GraphDelta`, carries the
 owning `publication_id`. A published view response pairs it with the view's
@@ -491,8 +540,8 @@ another delta response rearms it. `ContinueImmediately` replaces the boundary
 in the same way but marks it sent: the HTTP response itself supplies the
 immediate continuation and no duplicate SSE wakeup is needed for the
 already-satisfied boundary. `UpToDate` uses the same rule with the request's
-starting revision. A state-only transition and publication replacement always
-emit their required wakeup independently of this graph-revision schedule.
+starting revision. `PublicationState` and the ordered publication-replacement
+sequence are delivered independently of this graph-revision schedule.
 
 An HTTP-only request has no wake schedule. `continue` instructs it to request
 again immediately from `T`. A Live or Synchronizing response carrying `head`
@@ -516,15 +565,16 @@ SSE-coordinated responses.
 Synchronizing never parks a client for the four-revision interval: an
 intermediate response uses `ContinueImmediately`, and ordinary graph wakeups
 remain available. Stale cannot wait for future graph progress; entering Stale
-wakes every armed client once, intermediate responses use
-`ContinueImmediately`, and reaching the final stalled Head uses `ReachedHead`
-without arming another graph-revision wakeup. The final Stale interval may be
-shorter than four revisions. At that final Head an HTTP-only response carries
-`KGI-Delta-Retry-After-Ms: 1000`; the client polls this same delta endpoint
-until publication replacement produces `FreshViewRequired(PublicationMismatch)`,
-then obtains the replacement Head snapshot. The SSE-coordinated response omits
-the retry header and does not rearm graph-revision delivery; publication
-replacement remains observable through the existing SSE transport.
+emits `PublicationState` regardless of the graph wake schedule, intermediate
+responses use `ContinueImmediately`, and reaching the final stalled Head uses
+`ReachedHead` without arming another graph-revision wakeup. The final Stale
+interval may be shorter than four revisions. At that final Head an HTTP-only
+response carries `KGI-Delta-Retry-After-Ms: 1000`; the client polls this same
+delta endpoint until publication replacement produces
+`FreshViewRequired(PublicationMismatch)`, then obtains the replacement Head
+snapshot. The SSE-coordinated response omits the retry header and does not
+rearm graph-revision delivery; publication replacement remains observable
+through the existing SSE transport.
 
 The soft estimate and hard encoded-size limit take precedence over ordinary
 four-revision spacing. An encoded-size fallback may therefore produce and
@@ -612,14 +662,15 @@ failure likewise remain request-local under the
 These request-local cursor and response failures never request processing
 Resync or Rebuild.
 
-SSE is only an ordered `PublicationWakeup`, not the graph data channel.
-Reconnection is not exactly-once. Each client has a bounded wakeup buffer. On
-connection the server emits the latest history cursor and publication state;
-Live history advancement follows the registered four-revision wake schedule;
-state change and replacement wakeups bypass it. Synchronizing continues to
-emit ordinary coalesced history wakeups, and entering Stale wakes armed clients
-once. Slow clients receive coalesced wakeups and, if persistently behind, are
-disconnected and recover through HTTP delta or view requests.
+SSE carries ordered registration, publication-state, and graph-wakeup messages;
+it is not the graph data channel. Each client has a bounded delivery buffer.
+Live history advancement follows the registered four-revision graph-wakeup
+schedule, while `PublicationState` and the replacement sequence bypass it.
+Synchronizing continues to emit ordinary coalesced graph wakeups. Pending
+graph wakeups may coalesce to the latest cursor; registration and state
+messages retain the ordering required by their owning contract. A persistently
+slow client is disconnected and recovers by reconnecting SSE and using HTTP
+delta or view requests.
 
 `representation_version` is the settled term for the graph payload schema.
 KGI v2 selects exactly one graph wire format after the deferred format
@@ -627,9 +678,9 @@ evaluation; clients do not negotiate among graph encodings. Head snapshot
 conditional caching follows the
 [endpoint contract](#head-snapshot-endpoint--settled). A delta-to-current query
 must revalidate.
-Historical database windows, Head-level lookup, and SSE have no ETag. The
-Head-level lookup additionally requires `Cache-Control: no-store` under its
-owning contract. HTTP compression is separate from graph-format selection and
+Historical database windows, Head-level lookup, and SSE have no ETag. Head-level
+lookup and SSE require `Cache-Control: no-store` under their owning contracts.
+HTTP compression is separate from graph-format selection and
 remains part of the deferred encoding work.
 
 ## Publication-scoped Head response cache — settled
@@ -794,7 +845,8 @@ match.
 
 The public graph API has conceptually:
 
-- head snapshot, depth-independent delta, and SSE cursor wakeup;
+- head snapshot, depth-independent delta, and the SSE registration, state, and
+  graph-wakeup stream;
 - one capped window operation with exactly one anchor: level, block hash, or
   DAA score; the anchor resolves once to a fixed level;
 - canonical Head-delta reuse for a fixed window extracted from a Head

@@ -861,10 +861,10 @@ unchanged. Cover reliable `reset` processing without an application-completion b
 cancellation of unpublished construction, no additional effect for an already
 Stale publication, canonical delta catch-up through the Stale publication's
 final Head, head-snapshot state and ETag changes, and immutable delta bytes
-across later state changes. SSE cases cover
-state-only wakeups repeating one graph cursor, reconnect reporting current
-state, Web adoption without a delta request, and a fresh publication ID for a
-replacement image.
+across later state changes. SSE cases cover dedicated `PublicationState`
+delivery without a graph revision, reconnect reporting current state, Web
+adoption without a delta request, and a fresh publication ID for a replacement
+image.
 
 Verify the settled [core composition](overview.md#core-crate-structure--settled)
 and [Supervisor control](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
@@ -961,7 +961,8 @@ For a Live publication and interval four, cover no-delta waiting at Head
 distances one through three; target eligibility beginning at `F + 4`; no-heat
 fallback; `ReachedHead`, `ContinueImmediately`, and `WaitForWakeup`; one wakeup
 at the armed boundary; suppression of further graph wakeups until rearming;
-and state or replacement wakeups bypassing the schedule. Verify the canonical
+and `PublicationState` or the replacement sequence bypassing the schedule.
+Verify the canonical
 `GET /api/v1/graph/deltas` endpoint requires `publication_id` and
 `from_revision_id`, accepts an optional `client_id`, rejects a public
 `to_revision_id`, exposes the captured publication state, and emits the exact
@@ -970,15 +971,26 @@ selects only wake state, while every HTTP
 `from_revision_id` remains the authoritative graph cursor. Its omission must
 select HTTP-only polling without `ClientRegistrationRequired`; cover that
 outcome for an expired and wrong-publication supplied identifier before cache
-or history work. On initial connection and
-reconnection, require a dedicated ID-only `ClientRegistration` before the
-initial `PublicationWakeup`. Replace a publication without reconnecting its SSE
-transport and verify the old ID is invalidated, a new ID-only registration is
-delivered, and only then is the replacement wakeup observed. A state-only
-transition must not replace the ID. Cover saturation rather than wrap at the
-maximum revision. Synchronizing never parks for the interval. Entering Stale
-wakes armed clients once and permits an
-interval shorter than four through the final stalled Head without rearming.
+or history work. Exercise
+`GET /api/v1/graph/wakeups?publication_id=P&from_revision_id=F`: require both
+cursor parameters, reject unsupported parameters, and return graph unavailable
+without opening a stream when no coherent publication exists. A successful
+stream has the settled event-stream content type, `Cache-Control: no-store`,
+and no ETag, graph body, hash dictionary, database access, graph-cache work, or
+delta construction. A stale but well-formed request cursor must still receive
+the current publication.
+
+On initial connection and reconnection, require an ID-only
+`ClientRegistration`, then `PublicationState`, then `PublicationWakeup` in
+order. Replace a publication without reconnecting its SSE transport and verify
+the old ID is invalidated before the same three-message sequence reports the
+replacement. A state transition emits only `PublicationState`, does not
+replace the ID, and bypasses the graph-wakeup schedule. Entering Stale carries
+the final stalled Head revision. Verify `Last-Event-ID` has no graph-cursor,
+publication, registration, or replay meaning. Cover saturation rather than
+wrap at the maximum revision. Synchronizing never parks for the interval.
+Entering Stale reports state independently of graph-wakeup arming and permits
+an interval shorter than four through the final stalled Head without rearming.
 For HTTP-only `head` and `wakeup`, verify the protocol-owned calculated
 `KGI-Delta-Retry-After-Ms` values at lags zero through three and its absence
 from `continue` and SSE-coordinated responses. At a Stale final Head require

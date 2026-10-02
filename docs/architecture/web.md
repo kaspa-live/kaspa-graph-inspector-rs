@@ -18,13 +18,13 @@ state comes from HTTP delta or snapshot responses.
 Head-following stays prompt. On publication change, a head-following view
 automatically reloads.
 
-A state-only wakeup can repeat the current graph cursor. The Web adopts its
-publication state without requesting or applying a graph delta. On a Stale
-state, it keeps the coherent image visibly marked stale. If its cursor is
-behind the Stale wakeup, a Head-following or eligible fixed view may first
-catch up through that publication's final stalled Head. It reloads or freezes,
-according to its view policy, when a replacement publication ID appears;
-until then it does not pretend that the old image remains Live.
+The Web adopts each API-owned `PublicationState` without requesting or
+applying a graph delta merely because state changed. On `Stale`, it keeps the
+coherent image visibly marked stale. If its cursor is behind the state
+message's final Head revision, a Head-following or eligible fixed view may
+first catch up through that publication's final stalled Head. It reloads or
+freezes, according to its view policy, when a replacement publication ID
+appears; until then it does not pretend that the old image remains Live.
 
 A delta response may end at an intermediate revision below the Web's desired
 cursor. The single catch-up loop applies that complete interval, adopts its
@@ -40,11 +40,11 @@ after `ReachedHead` or `WaitForWakeup`, it waits for the next SSE wakeup. A
 no-delta wait response leaves the graph cursor unchanged. The Web adopts each
 delta response's captured publication state. At a Stale publication's final
 Head it waits for the replacement wakeup instead of polling that terminal
-cursor. The Web adopts each dedicated `ClientRegistration` message before
-processing the following
-`PublicationWakeup`; this replaces its opaque identifier on initial connection,
-reconnection, and publication replacement without embedding registration state
-in the wakeup. Every HTTP request continues to supply the Web's actual
+cursor. The Web adopts each dedicated `ClientRegistration`, then the API-owned
+`PublicationState`, before processing the following `PublicationWakeup`. This
+replaces its opaque identifier on initial connection, reconnection, and
+publication replacement without embedding registration or publication state
+in the graph wakeup. Every HTTP request continues to supply the Web's actual
 `from_revision_id` as its authoritative graph cursor.
 `ClientRegistrationRequired` reconnects SSE and retries from that unchanged
 cursor.
