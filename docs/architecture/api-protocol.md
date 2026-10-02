@@ -53,8 +53,10 @@ unavailable, or outside its semantic range.
 
 This common contract fixes route and request syntax. Each endpoint section
 owns its exact resource path, parameters, logical outcomes, and cache behavior.
-Graph encoding and HTTP compression policy remain deferred under the common
-DTO rules below.
+All successful graph response bodies use JSON. They carry
+`Content-Type: application/json`. Clients do not negotiate among graph
+encodings. HTTP compression remains a separate deferred implementation choice
+under the common DTO rules below.
 
 ## Common transport DTO rules — settled
 
@@ -72,12 +74,19 @@ variant from the incidental presence or absence of optional fields. Absence is
 distinct from zero, `false`, an empty collection, and every sentinel value.
 
 Every public `u64`, including revisions, levels, scores, timestamps, and
-publication IDs, preserves its complete value. The selected graph encoding
-determines the exact native or lossless alternative representation. Ordered
-semantic collections, including direct parents and blue and red merge sets,
-preserve their order. Sets, maps, and their serialized collection forms remain
-unordered unless an endpoint-specific contract states otherwise; clients must
-not derive meaning from their traversal order.
+publication IDs, is an unsigned decimal JSON string so browsers preserve its
+complete value. Ordered semantic collections, including direct parents and
+blue and red merge sets, preserve their order. Sets, maps, and their serialized
+collection forms remain unordered unless an endpoint-specific contract states
+otherwise; clients must not derive meaning from their traversal order.
+
+JSON is the initial v2 graph format because it requires no browser codec,
+schema generator, or second wire toolchain and lets implementation begin from
+the settled DTOs. Benchmarking MessagePack and optionally CBOR against the
+implemented JSON path is a later optimization rather than an implementation
+prerequisite. Replacing JSON requires an accepted architecture change and a
+new `representation_version`; changing an already released `/api/v1` graph
+representation is a public compatibility change.
 
 Internal implementation state does not enter the public schema. This includes
 `TrackingPolicy`, retained-level usage counters, `CompactId`, history byte
@@ -147,8 +156,8 @@ already assigned reference. Dictionary order and numeric references need not
 repeat across independent serializations of the same graph meaning. A cached
 delta's settled serializer-only removal omission happens before interning those
 omitted entries, so a hash used only by an omitted block or edge removal does
-not enter the dictionary. The selected graph encoding determines whether each
-dictionary hash uses raw bytes or canonical hexadecimal text.
+not enter the dictionary. Each dictionary hash uses canonical hexadecimal
+JSON text.
 
 The serialized graph subvalues are:
 
@@ -382,8 +391,7 @@ belong to the common error schema rather than this success DTO.
 
 ## Status response DTO — settled
 
-Status uses a dedicated JSON response independently of the graph response
-format:
+Status uses its dedicated JSON response:
 
 ```rust
 struct SystemStatusDto {
@@ -628,9 +636,8 @@ struct SystemStatus {
 }
 ```
 
-Together `(publication_id, revision)` form the public cursor. If the selected
-wire format cannot represent every `u64` exactly, its encoding must preserve
-the complete integer domain.
+Together `(publication_id, revision)` form the public cursor. Their wire values
+follow the [common decimal-string `u64` mapping](#common-transport-dto-rules--settled).
 
 `SystemStatus.kgi_version` is the compile-time package version of the running
 KGI executable. Processing is part of that executable, so there is no separate
@@ -696,8 +703,7 @@ A successful operation returns `200 OK` with `Content-Type:
 text/event-stream` and `Cache-Control: no-store`. It has no ETag, graph body,
 response-local hash dictionary, database access, `GraphCache` participation,
 or delta construction. SSE control payloads use the fixed compact JSON
-representation below independently of the graph response format selected
-later.
+representation below.
 
 SSE uses three ordered message payloads:
 
@@ -1254,15 +1260,13 @@ slow client is disconnected and recovers by reconnecting SSE and using HTTP
 delta or view requests.
 
 `representation_version` is the settled term for the graph payload schema.
-KGI v2 selects exactly one graph wire format after the deferred format
-evaluation; clients do not negotiate among graph encodings. Head snapshot
-conditional caching follows the
+The single JSON graph format follows the common transport DTO rules above.
+Head snapshot conditional caching follows the
 [endpoint contract](#head-snapshot-endpoint--settled). A delta-to-current query
 must revalidate.
 Historical database windows, Head-level lookup, and SSE have no ETag. Head-level
 lookup and SSE require `Cache-Control: no-store` under their owning contracts.
-HTTP compression is separate from graph-format selection and
-remains part of the deferred encoding work.
+HTTP compression remains a separate deferred implementation choice.
 
 ## Publication-scoped Head response cache — settled
 
@@ -1283,7 +1287,7 @@ struct CachedDelta {
 }
 ```
 
-`encoded_body` is exactly the selected-format encoding of
+`encoded_body` is exactly the JSON encoding of
 [`GraphDeltaBodyDto`](#canonical-delta-response-dtos--settled). It contains no
 publication ID, publication state, response-outcome discriminator,
 continuation, wake boundary, or retry delay. ApiService reuses those exact
@@ -1473,7 +1477,8 @@ The public API has conceptually:
   component observations, and the current or last successfully validated
   network and node server information.
 
-The graph wire format and HTTP compression policy remain deferred in the
+The graph wire format is the settled JSON representation defined above. HTTP
+compression remains deferred in the
 [decision register](../decisions/deferred.md). HTTP methods and common route
 and request syntax follow the settled conventions above.
 

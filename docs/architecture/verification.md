@@ -928,7 +928,9 @@ Verify the common transport DTO rules at the final serialization boundary.
 Keep canonical `GraphView` and `GraphDelta` values intact until that boundary,
 exercise explicit response-variant discrimination and absence independently
 from zero or empty values, and round-trip the full public `u64` domain through
-the selected encoding. Check ordered graph collections retain their semantic
+its unsigned decimal JSON-string representation and the Web's `bigint`
+conversion boundary. Require `Content-Type: application/json` for every
+successful graph body. Check ordered graph collections retain their semantic
 order, unordered collections remain semantically equivalent across different
 traversal orders, and no internal-only field enters a public payload. A
 representation-significant schema or encoding change must alter the internal

@@ -21,6 +21,11 @@ graph rendering. Until a valid optional template is available, or when its
 value is absent, the external explorer action is hidden; graph behavior is
 unchanged.
 
+For the protocol-owned JSON representation, the Web converts public `u64`
+decimal strings to `bigint` at its DTO boundary before constructing typed
+client values. Graph logic never routes those values through JavaScript
+`number`.
+
 ## Update acquisition — settled
 
 The v1 Web's fast repeated polling is replaced by SSE cursor wakeups and HTTP
