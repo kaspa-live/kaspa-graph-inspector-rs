@@ -264,19 +264,21 @@ expose a partially bound `Empty` database. A structurally valid initialized
 schema and binding with incoherent processing data is `Inconsistent`, while a
 partial schema or binding is `Rejected`.
 
-`--initialize-db` initializes only `Uninitialized`. It is idempotent for every
-compatible existing database: retain `Empty`, `Initialized`, or `Inconsistent`
-state without erasing data or changing its network binding. An `Inconsistent`
-database remains usable only for Rebuild and is not misclassified as `Empty`.
-Without the flag, first initialization requires interactive confirmation;
-noninteractive startup fails with `InitializationConfirmationRequired` and
-identifies `--initialize-db` as the unattended authorization.
+The resolved persistent initialization authorization initializes only
+`Uninitialized`. It is idempotent for every compatible existing database:
+retain `Empty`, `Initialized`, or `Inconsistent` state without erasing data or
+changing its network binding. An `Inconsistent` database remains usable only
+for Rebuild and is not misclassified as `Empty`. Without that authorization,
+first initialization requires interactive confirmation; noninteractive
+startup fails with `InitializationConfirmationRequired` and identifies
+`--initialize-db` as the unattended authorization.
 
 The CLI confirmation identifies the database using safe endpoint information,
 shows the exact network type and suffix plus the RPC-discovered Genesis hash,
 and states that ordinary Rebuild cannot change that binding. It never displays
-database credentials. `--initialize-db` is the explicit unattended equivalent;
-a generic `--yes` does not authorize initialization. `--clear-db` expresses
+database credentials. The persistent initialization authorization is the
+explicit unattended equivalent; a generic `--yes` does not authorize
+initialization. `--clear-db` expresses
 stronger processing-data replacement intent and also authorizes first
 initialization when the database is genuinely Uninitialized, but it never
 authorizes rebinding or claiming an unknown, partial, or unsupported schema.
@@ -418,11 +420,13 @@ claimed.
 Administrative reinitialization is a schema-lifecycle operation, not a
 `RecoveryMode`. It is the only operation allowed to destroy a recognized KGI
 schema, replace its migration history, and change the immutable network
-binding. It has two entry forms:
+binding. It has two entry forms. Their complete configuration sources and
+command selection belong to the
+[process configuration contract](overview.md#process-configuration-and-command-entry--settled):
 
 ```text
-kgi database reinitialize --network-id <network> [--yes]
---reinitialize-db-token=<token>
+kgi database reinitialize [network selection] [--yes]
+kgi [network selection] --reinitialize-db-token=<token>
 ```
 
 The separate `database reinitialize` command is the preferred operator path.
@@ -430,12 +434,12 @@ Without `--yes`, it displays the database identity, existing binding if any,
 the new exact `(network_id, genesis_hash)` binding, and the loss of all KGI
 data and migration history, then requires interactive confirmation. It never
 displays database credentials. A noninteractive invocation without `--yes`
-fails rather than waiting for input. The command runs once and exits. `--yes`
-is accepted only by this one-shot command; normal service startup has no
-schema-reinitialization option.
+fails rather than waiting for input. The top-level
+[command-entry contract](overview.md#command-surface-and-startup-only-actions)
+owns the command's one-shot lifecycle, option availability, and exit behavior.
 
 Both entry forms obtain the target Genesis hash from a validated RPC client.
-The CLI `NetworkId` must match that client's exact network type and suffix.
+The resolved `NetworkId` must match that client's exact network type and suffix.
 Before replacing anything, the operation:
 
 1. acquires the database advisory lock;
@@ -455,8 +459,9 @@ database ownership and configuration remain outside the replaced KGI schema.
 
 Reinitialization is never triggered automatically by Resync, Rebuild,
 inconsistent processing contents, corruption detection, or migration failure.
-After the one-shot command exits, ordinary startup observes `Empty` and
-requires Rebuild from the validated node's pruning point.
+A definitely committed reinitialization leaves `Empty`; a later ordinary
+startup observes that state and requires Rebuild from the validated node's
+pruning point.
 
 The declarative token supports persistent Docker, Compose, systemd, and
 similar configuration without repeating destruction on every restart. Its

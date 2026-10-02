@@ -3,8 +3,9 @@
 ## Scope and ownership
 
 This document owns the system boundary, component ownership, core crate and
-repository structure, direction of control and data flow, release and
-deployment layout, logging, and system-wide resource isolation. Shared
+repository structure, direction of control and data flow, process
+configuration and command entry, release and deployment layout, logging, and
+system-wide resource isolation. Shared
 identities and graph terminology belong to
 the [domain model](domain-model.md). Component behavior belongs to the linked
 focused document.
@@ -113,8 +114,9 @@ kgi             ──► kgi-core + kgi-model + kgi-api-ingress + kgi-node + kg
 
 `kgi-core` has no dependency on another KGI crate. It contains reusable
 process-level infrastructure that is outside the domain model and component
-services. Its initial `signals` module contains the platform termination
-adapter described below.
+services. Its initial `config` module contains the process configuration value
+structs. Its initial `signals` module contains the platform termination adapter
+described below.
 
 `kgi-model` contains shared domain values and cross-component message values,
 including `RecoveryMode`, `ParentCommitted`, `LevelCommitted`,
@@ -152,10 +154,258 @@ state.
 `kgi-processing` owns ResyncEngine and the processing workers, consumes the
 graph-update producer, and does not depend on `kgi-api-core`.
 
-The top `kgi` crate owns Supervisor, process composition, CLI entry points, and
-global shutdown and is the sole crate that depends on `kgi-core`. Internal
+The top `kgi` crate owns Supervisor, process composition, CLI command dispatch,
+and global shutdown and is the sole crate that depends on `kgi-core`. Internal
 module boundaries remain deferred in the
 [decision register](../decisions/deferred.md).
+
+## Process configuration and command entry — settled
+
+`kgi-core::config` owns only the configuration value structs. The top `kgi`
+crate owns CLI argument and subcommand shapes, configuration loading, source
+precedence, resolution, static validation, command dispatch, and process
+startup. It runs any component-owned semantic validator required after static
+resolution and distributes only the resolved values each component requires.
+No component receives the complete process configuration.
+
+The resolved configuration has this semantic shape:
+
+```rust
+struct KgiConfig {
+    network: NetworkConfig,
+    node: NodeConfig,
+    database: DatabaseConfig,
+    http: HttpConfig,
+    logging: LoggingConfig,
+    web: WebConfig,
+}
+```
+
+`KgiConfig` and its section types belong to `kgi-core::config`.
+
+The concrete field types are parsed values suitable for their consumers, such
+as `NetworkId`, socket addresses, URLs, and paths, rather than unvalidated
+strings. `WebConfig` includes the effective Web root and the optional
+block-explorer URL template.
+
+### Sources and precedence
+
+Configuration resolves once with this precedence, from lowest to highest:
+
+```text
+compiled defaults < explicitly selected TOML < environment < explicit CLI
+```
+
+Only a value explicitly present in a higher source replaces a lower value.
+The operator selects a TOML file with `--config-file <path>` or
+`KGI_CONFIG_FILE`; the CLI value wins when both are present. KGI loads no
+implicit configuration file. A selected file that is missing, unreadable,
+invalid UTF-8, or invalid TOML is a configuration error.
+
+Every TOML-backed configuration struct applies the equivalent of:
+
+```rust
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+```
+
+The representation therefore uses kebab-case field names, defaults absent
+fields, and rejects unknown fields at every nesting level. Environment and CLI
+parsing are equally strict; an invalid explicitly supplied value is never
+treated as absent and never falls back to a lower source. The fully resolved
+`KgiConfig` is immutable for the process lifetime. KGI provides no live reload,
+environment interpolation, or generic secret-provider abstraction in v2.
+
+The supported configuration surface is:
+
+| Value | TOML | Environment | CLI |
+|---|---|---|---|
+| Mainnet selector | `network.mainnet` | `KGI_MAINNET` | `--mainnet` |
+| Testnet selector | `network.testnet` | `KGI_TESTNET` | `--testnet` |
+| Devnet selector | `network.devnet` | `KGI_DEVNET` | `--devnet` |
+| Simnet selector | `network.simnet` | `KGI_SIMNET` | `--simnet` |
+| Testnet suffix | `network.netsuffix` | `KGI_NETSUFFIX` | `--netsuffix` |
+| Consensus override file | `network.override-params-file` | `KGI_OVERRIDE_PARAMS_FILE` | `--override-params-file` |
+| Node RPC URL | `node.rpc-url` | `KGI_NODE_RPC_URL` | `--node-rpc-url` |
+| Database URL | `database.url` | `KGI_DATABASE_URL` | `--database-url` |
+| First initialization authorization | `database.initialize` | `KGI_INITIALIZE_DB` | `--initialize-db` |
+| HTTP listen address | `http.listen` | `KGI_HTTP_LISTEN` | `--http-listen` |
+| Log level | `logging.level` | `KGI_LOG_LEVEL` | `--log-level` |
+| Log directory | `logging.directory` | `KGI_LOG_DIR` | `--log-dir` |
+| Disable file logging | `logging.no-files` | `KGI_NO_LOG_FILES` | `--no-log-files` |
+| Web root | `web.root` | `KGI_WEB_ROOT` | `--web-root` |
+| Block-explorer URL template | `web.block-explorer-url-template` | `KGI_BLOCK_EXPLORER_URL_TEMPLATE` | `--block-explorer-url-template` |
+
+A complete TOML file may therefore have this shape; every section and every
+field remains optional except that the final resolved database URL is
+required:
+
+```toml
+[network]
+testnet = true
+netsuffix = 10
+# override-params-file = "/etc/kgi/devnet-params.json"
+
+[node]
+rpc-url = "grpc://127.0.0.1:16210"
+
+[database]
+url = "postgresql://kgi@127.0.0.1/kgi"
+initialize = false
+
+[http]
+listen = "127.0.0.1:8080"
+
+[logging]
+level = "info"
+directory = "./logs"
+no-files = false
+
+[web]
+# root = "/opt/kgi/share/kgi/web"
+# block-explorer-url-template = "https://explorer.example/blocks/{hash}"
+```
+
+The destructive service-start token deliberately has no TOML form. It is
+accepted only as `KGI_REINITIALIZE_DB_TOKEN` or
+`--reinitialize-db-token <token>`. `--clear-db` is CLI-only. `--yes` is
+accepted only by the one-shot administrative command defined below. The
+[storage contract](storage.md#database-bootstrap-and-validation--settled) owns
+the behavior authorized by these values.
+
+### Network selection and defaults
+
+The four network selectors are one precedence group. Within a source, at most
+one may be true. The highest-precedence source containing one true selector
+selects the complete network family; selectors from lower sources do not
+participate. With no selector, KGI uses mainnet. This permits an explicit
+`--mainnet` to replace a lower-source non-mainnet selection.
+
+`netsuffix` follows ordinary field precedence. It is valid only with testnet
+and defaults to `10` when testnet is selected. Any suffix with mainnet,
+devnet, or simnet is invalid. The result is one exact `NetworkId` including
+the testnet suffix.
+
+When `node.rpc-url` is absent, KGI derives the loopback gRPC endpoint from the
+selected network type using rusty-kaspa's default RPC port:
+
+```text
+mainnet     grpc://127.0.0.1:16110
+testnet-*   grpc://127.0.0.1:16210
+simnet      grpc://127.0.0.1:16510
+devnet      grpc://127.0.0.1:16610
+```
+
+An explicit RPC URL replaces that default but does not weaken NodeService's
+exact connected-network validation. The database URL has no default and is
+required. The remaining defaults are:
+
+```text
+http.listen       = 127.0.0.1:8080
+logging.level     = info
+logging.directory = ./logs
+logging.no-files  = false
+web.root          = derived from the executable's release layout
+web.block-explorer-url-template = absent
+```
+
+The Docker configuration explicitly replaces the HTTP address with
+`0.0.0.0:8080` and the log directory with its mounted `/var/log/kgi` path.
+Conventional service packaging likewise selects `/var/log/kgi`; the compiled
+default remains suitable for an interactive local invocation.
+
+### Command surface and startup-only actions
+
+The command surface is:
+
+```text
+kgi [service options]
+kgi database reinitialize [administrative options]
+```
+
+There is no `run` or `serve` subcommand. Global configuration-file selection
+and the network, node, database, logging, and consensus-override inputs needed
+by the administrative operation remain available to
+`database reinitialize`. That command alone accepts `--yes`. It constructs
+only the bounded RPC and database capabilities required by the
+[storage-owned administrative transaction](storage.md#administrative-reinitialization--settled);
+it does not start NodeService, StorageService, ApiService, the HTTP server,
+processors, ResyncEngine, or Supervisor. It executes once and exits: a
+definite successful commit exits successfully, while cancellation, rejection,
+definite failure, and ambiguous commit exit nonzero. A later ordinary service
+invocation observes the resulting network-bound Empty database and follows
+the normal recovery lifecycle.
+
+The persistent initialization authorization is available through every
+ordinary configuration source in the table. `--clear-db` instead expresses
+one service invocation's initial Rebuild intent, remains retained across
+retries in that process, and also authorizes first initialization when
+applicable. The declarative reinitialization token performs its storage-owned
+idempotent check during service startup and, after either performing or
+skipping replacement, continues ordinary startup. Initialization,
+`--clear-db`, and a reinitialization token are mutually exclusive.
+KGI exposes no migration toggle: StorageService automatically applies every
+supported older-v2 migration under its
+[schema lifecycle](storage.md#database-bootstrap-and-validation--settled).
+
+### Validation, startup ordering, and failures
+
+Process entry follows this order:
+
+```text
+parse command shape
+    -> help/version may exit successfully without configuration
+load explicitly selected TOML
+    -> apply environment
+    -> apply explicit CLI
+    -> resolve defaults and derived values
+    -> validate the complete invocation and KgiConfig
+    -> initialize logging
+    -> branch to service startup or the one-shot administrative command
+```
+
+Before complete static validation succeeds, KGI performs no node or database
+connection, HTTP bind, logging-file mutation, signal installation, or
+component startup. Configuration diagnostics produced before logging
+initialization go directly to standard error. Static validation rejects:
+
+- a selected configuration file or explicit value that cannot be parsed;
+- an invalid network-selector group or suffix combination;
+- a missing or syntactically invalid database URL;
+- a syntactically invalid node RPC URL or HTTP listen address;
+- an explicitly configured log directory together with `logging.no-files =
+  true`; the unused compiled default directory does not make `no-files = true`
+  invalid;
+- an invalid combination of startup-only database actions;
+- `--yes` outside `database reinitialize`; and
+- a Web runtime template that violates the
+  [runtime Web configuration contract](#http-composition-and-runtime-web-configuration--settled).
+
+The resolved consensus override setting is additionally subject to the
+[NodeService-owned network, file, and parameter validation](node-service.md#consensus-parameter-resolution)
+before any component starts. The configuration layer does not duplicate those
+domain checks.
+
+During service startup, failure to initialize the selected log destination,
+resolve the effective Web root, or bind the HTTP listener is a startup failure.
+Temporary node and database unavailability belongs to the existing service
+retry lifecycles rather than configuration validation; terminal service
+rejection belongs to Supervisor's Fatal lifecycle. Ordinary service shutdown
+exits successfully, while startup failure, terminal runtime failure, and
+unsuccessful administrative execution exit nonzero. Argument-parser help and
+version output exit successfully; its usage and configuration errors use its
+ordinary nonzero result.
+
+Database URLs and reinitialization tokens are sensitive. KGI supports the
+database URL through all three operator sources, while production deployments
+should prefer `KGI_DATABASE_URL` or a protected mounted TOML file over a
+process-visible CLI argument. The token remains environment-or-CLI only. No
+log, status value, confirmation, error, panic, or unrestricted `Debug` output
+may expose either value. Diagnostics may name the field and source and may
+show a redacted database host, port, and database name, but never credentials,
+username, query parameters, full URL, or token; parsing errors do not echo the
+rejected value. StorageService retains the resolved database connection
+configuration needed for autonomous reconnection. Credential rotation
+requires process restart.
 
 ## Process termination signal adapter — settled
 
@@ -299,11 +549,13 @@ dist/kgi-<version>-<target>/
 
 `release.json` records the KGI package version, full source commit, and target.
 The workspace package version is authoritative; the private Web package has no
-independent release version. The binary resolves the standard Web root at
-`../share/kgi/web` relative to its real executable location and also accepts
-an explicit `--web-root` override. When Web serving is enabled, an invalid or
-missing root fails startup rather than exposing an apparently healthy server
-without its UI.
+independent release version. In the absence of a configured `web.root`, the
+binary derives the standard Web root at `../share/kgi/web` relative to its real
+executable location. The
+[process configuration contract](#process-configuration-and-command-entry--settled)
+owns the override's operator sources. When Web serving is enabled, an invalid
+or missing effective root fails startup rather than exposing an apparently
+healthy server without its UI.
 
 ## HTTP composition and runtime Web configuration — settled
 
@@ -335,16 +587,13 @@ struct WebRuntimeConfig {
 
 `GET /kgi-config.json` always returns the complete public representation. A
 configured template is a valid HTTP or HTTPS URL containing exactly one
-`{hash}` placeholder; invalid configuration fails process startup. It is
-public presentation configuration and may never contain credentials or expose
-environment variables generically. It is owned and served by the top `kgi`
-crate and does not belong to `kgi-api-core`, `kgi-api-model`, or
-`SystemStatus`.
-
-The operator supplies this value through
-`--block-explorer-url-template <template>` or the equivalent
-`KGI_BLOCK_EXPLORER_URL_TEMPLATE` environment configuration. Vite never reads
-that deployment setting.
+`{hash}` placeholder. It is public presentation configuration and may never
+contain credentials or expose environment variables generically. It is owned
+and served by the top `kgi` crate and does not belong to `kgi-api-core`,
+`kgi-api-model`, or `SystemStatus`. The
+[process configuration contract](#process-configuration-and-command-entry--settled)
+owns its operator sources and startup validation. Vite never reads that
+deployment setting.
 
 Hashed Vite assets use long-lived immutable caching. `index.html` and the
 runtime configuration require revalidation; the latter has a configuration
@@ -364,11 +613,10 @@ The release tree is read-only.
 
 KGI also writes bounded rotating files by default, following the rusty-kaspa
 operational shape: `kgi.log` is the complete log and `kgi_err.log` contains
-warning/error records, both with compressed size-based archives. The CLI
-exposes `--log-dir`, `--no-log-files`, and
-`--log-level`, with equivalent `KGI_LOG_DIR`, `KGI_NO_LOG_FILES`, and
-`KGI_LOG_LEVEL` configuration. Supplying a log directory while disabling file
-logging is invalid. Exact rotation size and archive count remain deferred.
+warning/error records, both with compressed size-based archives. Logging
+operator sources and validation belong to the
+[process configuration contract](#process-configuration-and-command-entry--settled).
+Exact rotation size and archive count remain deferred.
 
 The standard mutable log path is `/var/log/kgi`; conventional packages create
 it for the `kgi` service user and containers mount it as a writable log volume.

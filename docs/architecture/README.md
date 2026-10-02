@@ -58,7 +58,7 @@ restating it.
 | Document | Sole concern |
 |---|---|
 | `README.md` | Architecture authority, reading order, ownership boundaries, and navigation. It contains no system behavior. |
-| `overview.md` | System boundary, component ownership, core crate and repository structure, process and data-flow shape, release and deployment layout, logging, and system-wide resource isolation. |
+| `overview.md` | System boundary, component ownership, core crate and repository structure, process and data-flow shape, process configuration and command entry, release and deployment layout, logging, and system-wide resource isolation. |
 | `domain-model.md` | Shared identities and graph vocabulary: hashes, compact IDs, coordinates, consensus order, materiality, PP boundary, and common value types. |
 | `node-service.md` | Node connection lifecycle, validated RPC generations, subscriptions, notification routing, and RPC normalization. |
 | `storage.md` | Database lifecycle, schema and metadata, persistent identities, transactions, caches, and PostgreSQL behavior. |

@@ -155,9 +155,9 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
    including supported testnet and simnet, warns with the exact network,
    parameter source, and all four selected values, then continues. An
    unsupported testnet suffix uses testnet-family defaults. Devnet and simnet
-   without `--override-params-file` use their defaults; with the option they
+   without an override-params file use their defaults; with the setting they
    parse and apply rusty-kaspa `OverrideParams`. An unreadable, malformed, or
-   incompatible explicit file and use of the option with mainnet or any
+   incompatible explicit file and use of the setting with mainnet or any
    testnet suffix fail configuration without fallback. No path represents the
    selected local values as having been compared with the node. Before any
    derived rusty-kaspa call, cover accepted target-time bounds `1` and `1000`,
@@ -272,10 +272,11 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
    materialization creates no boundary identity.
 4. Database startup distinguishes Uninitialized, Empty, Initialized,
    structurally inconsistent processing contents, and rejected schemas.
-   Persistent `--initialize-db` is idempotent for a compatible database and
-   never rebinds its network. Interactive initialization identifies the
-   database and complete network binding without exposing credentials;
-   noninteractive initialization requires explicit authorization. `--clear-db`
+   Persistent initialization authorization is idempotent for a compatible
+   database and never rebinds its network. Interactive initialization
+   identifies the database and complete network binding without exposing
+   credentials; noninteractive initialization requires explicit
+   authorization. `--clear-db`
    may authorize first initialization but never claims or rebinds an existing
    incompatible schema.
 5. One-shot administrative reinitialization requires explicit confirmation,
@@ -1348,6 +1349,30 @@ Exercise absent and valid external-explorer templates without delaying or
 changing graph rendering. Packaging checks also cover console plus rotating
 file logging, explicit file-log disablement, invalid simultaneous log options,
 and writable log-volume replacement without local correctness state.
+
+Verify the
+[process configuration contract](overview.md#process-configuration-and-command-entry--settled)
+in the top `kgi` crate using the `kgi-core::config` value structs. Use
+table-driven resolution across compiled defaults, an explicitly selected
+strict TOML file, environment values, and explicit CLI values. Cover absent
+and unreadable selected files, unknown TOML fields, invalid explicit values,
+field-level precedence, atomic network-selector precedence, conflicting
+selectors, implicit mainnet, testnet's default and explicit suffix, forbidden
+suffix combinations, every network-derived default RPC endpoint, the required
+database URL, the derived and explicitly configured Web roots, and explicit
+overrides of every compiled default. Exercise the Web-root override through
+TOML, environment, and CLI sources.
+
+Cover service entry and `database reinitialize` independently. Assert that
+help and version need no configuration; complete validation precedes logging
+files, signals, connections, HTTP binding, and component startup; the one-shot
+command starts none of the long-lived service graph and exits after its
+definite outcome; and successful token handling continues service startup.
+Exercise the source restrictions and mutual exclusion of initialization,
+clear, token, and confirmation options. Configuration, diagnostic, status,
+confirmation, panic, and debug paths must redact database credentials and the
+token. Temporary endpoint unavailability enters the owning service lifecycle
+rather than static configuration failure.
 
 ## Resource isolation and performance
 

@@ -172,13 +172,13 @@ unsupported testnet suffix
     -> Params::from(NetworkType::Testnet)
     -> warn and continue
 
-devnet or simnet with --override-params-file <path>
+devnet or simnet with a configured override-params file
     -> Params::from(network_id)
     -> parse rusty-kaspa OverrideParams from path
     -> Params::override_params(overrides)
     -> warn that equality with the node cannot be verified
 
-devnet or simnet without --override-params-file
+devnet or simnet without an override-params file
     -> Params::from(network_id)
     -> warn that node overrides cannot be detected
 ```
@@ -188,14 +188,15 @@ unsupported testnet suffix rather than returning an error. The resolver checks
 local support before calling it and uses the testnet-family fallback only for
 an unsupported testnet suffix; panic catching is not control flow.
 
-`--override-params-file` is valid only for configured devnet or simnet. It uses
-the same JSON `OverrideParams` format as rusty-kaspa and is loaded once at
-process startup. It is explicitly unsupported for mainnet and every testnet
-suffix. An explicitly supplied file that is unreadable, malformed, or
-incompatible, or use of the option with an unsupported network, is a
-configuration error and never falls back silently. The file is not persisted
-in node metadata. Genesis remains RPC-discovered and is not taken from the
-file.
+The resolved `override_params_file` setting from the
+[process configuration contract](overview.md#process-configuration-and-command-entry--settled)
+is valid only for configured devnet or simnet. It uses the same JSON
+`OverrideParams` format as rusty-kaspa and is loaded once at process startup.
+It is explicitly unsupported for mainnet and every testnet suffix. An
+explicitly supplied file that is unreadable, malformed, or incompatible, or
+use of the setting with an unsupported network, is a configuration error and
+never falls back silently. The file is not persisted in node metadata.
+Genesis remains RPC-discovered and is not taken from the file.
 
 After applying any override, inspect the resolved raw `BlockrateParams` before
 calling a derived rusty-kaspa method. The parameter set is admissible only
