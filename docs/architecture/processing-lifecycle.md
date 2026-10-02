@@ -1026,13 +1026,14 @@ Supervisor implements the
 [`Shutdown`](overview.md#process-termination-signal-adapter--settled) target
 contract and owns the single `Signals<Supervisor>` registration. Signal
 installation completes before Supervisor permits managed components to enter
-their running state; `SignalInstallError` is a fatal process-startup failure.
+their running state; an installation panic therefore prevents any managed
+component from entering Running.
 The synchronous `Shutdown::shutdown` entry point performs no teardown work in
 the signal callback. It submits the existing idempotent terminal-shutdown
 trigger and returns. Supervisor consumes that trigger through its ordinary
 lifecycle processing and enters terminal shutdown exactly once, even if
-another cause has already requested it. Supervisor never forwards the signal
-registration to a service, processor, or worker.
+another cause or the second signal has already requested it. Supervisor never
+forwards the signal registration to a service, processor, or worker.
 
 The first signal therefore invokes the global shutdown sequence below rather
 than defining another teardown path. Further signals follow the
@@ -1073,9 +1074,12 @@ marker worker awaiting lossless delivery. Resulting producer closure is
 expected teardown cancellation rather than a processing fault. ApiService owns
 the local effects and completion semantics of its
 [shutdown barrier](api-service.md#apiservice-shutdown--settled); processor-specific
-draining duties remain in their focused documents. Exact shutdown timeouts and
-escalation policy remain deferred in the
-[decision register](../decisions/deferred.md).
+draining duties remain in their focused documents.
+
+KGI applies no automatic shutdown timeout and performs no time-triggered
+escalation. Supervisor waits for the shutdown barriers to complete unless the
+process is terminated externally or the signal adapter applies its
+[count-based operator escalation](overview.md#process-termination-signal-adapter--settled).
 
 The graph-update path is deliberately separate. The
 [API ingress contract](api-ingress.md#in-process-graph-update-feed--settled)

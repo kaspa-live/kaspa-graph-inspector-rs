@@ -221,9 +221,10 @@ Successful method completion proves that no API admission, task, graph-update
 receiver, or API database resource remains. A repeated `shutdown` returns
 success for the already completed state. Once shutdown begins, ApiService
 accepts neither `reset` nor `update_api_db_generation`; an update completed
-before shutdown began is subsequently cleared by the shutdown barrier. Exact
-shutdown timeouts and forced escalation remain deferred under the shared
-shutdown policy.
+before shutdown began is subsequently cleared by the shutdown barrier.
+ApiService adds no component-local timeout or escalation to this barrier; the
+Supervisor waiting policy belongs to the
+[processing lifecycle](processing-lifecycle.md#teardown-and-delivery-semantics--settled).
 
 `shutdown` creates no publication, `Stale` transition, graph revision, or SSE
 wakeup because external admission closes first. `ReceiverClosed` caused by

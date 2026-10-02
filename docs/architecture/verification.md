@@ -904,11 +904,14 @@ target reference. A first supported platform signal invokes the Supervisor
 shutdown target, does no teardown work in the signal callback, and causes
 exactly one entry into Supervisor's terminal-shutdown transition. No managed
 component receives or polls the registration. A handler-installation failure
-prevents managed components from entering their running state. In a subprocess
-test, a second signal during graceful shutdown exits immediately with failure
-status; one signal followed by completed Supervisor barriers exits normally.
-Keep this explicit operator action independent of tests for any later
-automatic timeout policy.
+panics with the settled expectation message before managed components enter
+their running state. Verify that a second signal invokes the idempotent target
+again without creating another shutdown transition. In a subprocess test, a
+third signal during graceful shutdown prints the settled halting message and
+immediately exits with status `1`; one or two signals followed by completed
+Supervisor barriers exit normally. Hold a shutdown barrier open after the
+first or second signal and verify that KGI neither times out nor escalates
+without the third signal or external process termination.
 
 Exercise `GET /api/v1/status` without parameters or a request body. Require a
 complete JSON `SystemStatusDto`, `200 OK`, `Content-Type: application/json`,

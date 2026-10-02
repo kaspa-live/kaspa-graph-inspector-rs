@@ -161,7 +161,7 @@ module boundaries remain deferred in the
 
 `kgi-core::signals` adapts operating-system termination to a weakly held
 shutdown target. Its public contract follows the rusty-kaspa core signal
-pattern with KGI-specific installation and repeated-signal behavior:
+pattern:
 
 ```rust
 pub trait Shutdown {
@@ -175,13 +175,14 @@ pub struct Signals<T: Shutdown + Send + Sync + 'static> {
 
 impl<T: Shutdown + Send + Sync> Signals<T> {
     pub fn new(target: &Arc<T>) -> Self;
-    pub fn init(self: &Arc<Self>) -> Result<(), SignalInstallError>;
+    pub fn init(self: &Arc<Self>);
 }
 ```
 
 On Unix, the handler recognizes `SIGINT` and `SIGTERM`. On Windows, it
-recognizes Ctrl+C. Signal installation reports a typed `SignalInstallError`;
-the processing lifecycle owns its startup disposition.
+recognizes Ctrl+C. `init()` installs the handler with `ctrlc::set_handler` and
+calls `.expect("Error setting signal handler")`; installation failure therefore
+panics. The processing lifecycle owns installation timing.
 
 The adapter retains only `Weak<T>` and therefore cannot extend its target's
 lifetime. Its callback upgrades that weak reference and invokes
@@ -189,16 +190,17 @@ lifetime. Its callback upgrades that weak reference and invokes
 reaction belong to the
 [processing lifecycle](processing-lifecycle.md#termination-triggered-global-shutdown--settled).
 
-The first recognized signal invokes the target once. A second recognized
-termination signal before process exit logs forced termination and immediately
-exits with failure status. Unlike the rusty-kaspa reference implementation,
-which exits on its third callback, KGI deliberately applies forced exit to the
-second signal. This is an explicit operator escalation and does not select the
-still-deferred automatic shutdown timeouts or timeout-escalation policy. The
-registered handler remains alive after the first signal so it can observe that
-second signal. It owns no component resource and is process-lifetime
-infrastructure rather than a member of the component shutdown order; normal
-process termination ends it.
+Each callback atomically increments `iterations` with `Ordering::SeqCst`. The
+first and second callbacks print `^SIGTERM - shutting down...`, upgrade the
+weak target, and invoke `Shutdown::shutdown` when that target still exists.
+They have no debounce, delay, grace timer, or elapsed-time threshold. The third
+callback prints `^SIGTERM - halting` and immediately calls
+`std::process::exit(1)` before inspecting the target.
+
+The registered handler remains alive after shutdown is first requested so it
+can observe subsequent signals. It owns no component resource and is
+process-lifetime infrastructure rather than a member of the component shutdown
+order; normal process termination ends it.
 
 ## Repository, Web build, and release structure — settled
 
@@ -394,7 +396,8 @@ The supplied systemd unit runs as the `kgi` user, reads
 delivers `SIGTERM` for graceful shutdown through the process-termination
 [adapter](#process-termination-signal-adapter--settled) and
 [Supervisor lifecycle](processing-lifecycle.md#termination-triggered-global-shutdown--settled).
-Exact hardening directives and automatic shutdown escalation remain deferred.
+Exact hardening directives and any external service-manager stop timeout remain
+deployment choices.
 
 An upgrade extracts a new immutable release, stops KGI and awaits graceful
 shutdown, atomically replaces `current`, and starts the new release. Stopping
