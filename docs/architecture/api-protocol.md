@@ -211,7 +211,7 @@ Database construction alone does not imply `Frozen`; that policy remains
 reserved for subview extraction.
 
 Without a coherent graph publication, graph endpoints return `503 Service
-Unavailable`, while the separate status/info lane remains available.
+Unavailable`, while the separate status lane remains available.
 
 ## Publication wire observation — settled
 
@@ -841,9 +841,47 @@ installed Head.
 These input errors are distinct from a valid typed anchor that has no retained
 match.
 
+## Status endpoint — settled
+
+The public service-status operation is:
+
+```http
+GET /api/v1/status
+```
+
+It accepts no query parameters, publication cursor, graph selection,
+`client_id`, or request body. Malformed or additional input follows the
+[common request rules](#common-http-conventions--settled). V2 exposes no
+separate `/api/v1/info` resource because the existing `SystemStatus` contains
+both the running KGI version and the component observations.
+
+A successful request returns `200 OK` with the complete current
+[`SystemStatus`](#public-api-values--settled) and `Cache-Control: no-store`.
+The endpoint has no ETag or conditional-request behavior. Its detailed
+transport DTO remains part of the deferred wire schema.
+
+Status success is independent of graph publication, node connection,
+processing-session, API database-generation, and historical-read availability.
+Connecting, unavailable, recovering, rejected, fatal, and stopped component
+conditions are values in the successful response rather than endpoint
+failures. Absence of a validated node observation likewise returns success
+with `node.last_validated = None`.
+
+ApiService supplies the value under its
+[status-observation contract](api-service.md#status-observation--settled); the
+protocol adds no cross-component sampling barrier. Every successful response
+contains the complete `SystemStatus` shape rather than a partial component set.
+
+Status admission, isolation, and shutdown follow the
+[ApiService resource contract](api-service.md#resource-isolation-and-saturation--settled).
+Their public consequence is that graph endpoint saturation or unavailability
+does not make an otherwise admitted status request unavailable. The common
+public status-lane saturation outcome remains part of the shared HTTP outcome
+work.
+
 ## Public API surface — settled
 
-The public graph API has conceptually:
+The public API has conceptually:
 
 - head snapshot, depth-independent delta, and the SSE registration, state, and
   graph-wakeup stream;
@@ -851,7 +889,7 @@ The public graph API has conceptually:
   DAA score; the anchor resolves once to a fixed level;
 - canonical Head-delta reuse for a fixed window extracted from a Head
   publication, plus all-or-nothing retained Head-level lookup; and
-- status/info returning `SystemStatus`, including the KGI version, the exact
+- status returning `SystemStatus`, including the KGI version, the exact
   component observations, and the current or last successfully validated
   network and node server information.
 

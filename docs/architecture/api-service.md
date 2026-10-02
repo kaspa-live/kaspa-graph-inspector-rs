@@ -206,7 +206,7 @@ idempotent, valid from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`, and
 alignment, reconstruction, and Active update application. ApiService performs
 the local barrier in order:
 
-1. close public HTTP and status/info admission;
+1. close public graph HTTP and status admission;
 2. close every SSE stream;
 3. drop the installed `GraphUpdateReceiver` and stop gap observation;
 4. cancel publication construction, alignment, reconstruction, staging, and
@@ -265,7 +265,7 @@ priority:
 - bounded SSE clients and per-client buffers;
 - level-scoped delta history, publication-scoped structurally bounded response
   reuse, and bounded historical-read work;
-- a separate memory-only status/info admission lane, so graph saturation
+- a separate memory-only status admission lane, so graph saturation
   cannot hide service state; and
 - distinct budgets for head delivery and historical database reads.
 
