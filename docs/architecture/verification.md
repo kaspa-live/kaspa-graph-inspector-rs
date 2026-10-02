@@ -897,11 +897,17 @@ separate processing version, API version, `representation_version`, or
 ApiService-status field.
 
 Exercise `GET /api/v1/status` without parameters or a request body. Require a
-complete `SystemStatus`, `200 OK`, `Cache-Control: no-store`, and no ETag or
-conditional-request behavior. Verify the endpoint remains successful without a
-graph publication, validated node, processing session, API database generation,
-or enabled historical-read gate, including `node.last_validated = None` and
-component unavailable, recovery, rejection, fatal, and stopped observations.
+complete JSON `SystemStatusDto`, `200 OK`, `Content-Type: application/json`,
+`Cache-Control: no-store`, and no ETag or conditional-request behavior. Require
+every field to be present and every absent optional value to encode as explicit
+JSON `null`. Round-trip every exact lowercase kebab-case component state,
+recovery mode, processing-state name, and network type. Require processing
+mode only for `reconciling`, preserve a custom network suffix, and cover both
+optional upstream RPC version fields. Verify the endpoint remains successful
+without a graph publication, validated node, processing session, API database
+generation, or enabled historical-read gate, including
+`node.last_validated = None` and component unavailable, recovery, rejection,
+fatal, and stopped observations.
 No request may access PostgreSQL, call node RPC, inspect a graph publication or
 `GraphCache`, perform graph serialization, issue recovery control, or wait for
 a cross-component snapshot. Graph-lane saturation must not hide status. Reject

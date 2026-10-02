@@ -381,6 +381,94 @@ An unavailable requested level remains the typed all-or-nothing `404` outcome;
 a publication mismatch remains a typed `409` fresh-view outcome. Their bodies
 belong to the common error schema rather than this success DTO.
 
+## Status response DTO — settled
+
+Status uses a dedicated JSON response independently of the graph response
+format:
+
+```rust
+struct SystemStatusDto {
+    kgi_version: String,
+    supervisor: SupervisorStatusDto,
+    node: NodeServiceStatusDto,
+    storage: StorageServiceStatusDto,
+    processing: ProcessingStatusDto,
+}
+
+struct SupervisorStatusDto {
+    lifecycle: SupervisorLifecycle,
+    desired_recovery: Option<RecoveryMode>,
+    active_recovery: Option<RecoveryMode>,
+}
+
+struct NodeServiceStatusDto {
+    state: NodeServiceStatusState,
+    last_validated: Option<ValidatedNodeStatusDto>,
+}
+
+struct ValidatedNodeStatusDto {
+    network_id: NetworkIdDto,
+    server_version: String,
+    rpc_api_version: Option<u16>,
+    rpc_api_revision: Option<u16>,
+}
+
+struct NetworkIdDto {
+    network_type: NetworkType,
+    suffix: Option<u32>,
+}
+
+struct StorageServiceStatusDto {
+    state: StorageServiceStatusState,
+}
+
+struct ProcessingStatusDto {
+    state: ProcessingStateName,
+    mode: Option<RecoveryMode>,
+}
+```
+
+Every field is present. Each `Option` uses explicit JSON `null`; no optional
+field is omitted. `ProcessingStatusDto.mode` is `resync` or `rebuild` exactly
+when `state` is `reconciling` and is `null` for every other processing state.
+`node.last_validated` directly projects the component-owned optional sticky
+observation; its current-versus-last meaning remains owned by
+[NodeService](node-service.md#nodeservice--settled).
+
+Enum values use these exact lowercase kebab-case strings:
+
+```text
+SupervisorLifecycle:
+running | fatal | shutting-down | stopped
+
+RecoveryMode:
+resync | rebuild
+
+NodeServiceStatusState:
+connecting | ready | unavailable | rejected | stopped
+
+StorageServiceStatusState:
+connecting | awaiting-initialization | ready | unavailable | rejected | stopped
+
+ProcessingStateName:
+idle | reconciling | rebuilding-database | resyncing-dag |
+catching-up | live | deactivating | stopped
+
+NetworkType:
+mainnet | testnet | devnet | simnet
+```
+
+These strings define only the public representation. The focused component
+owners retain the meanings and lifecycle rules of their status values.
+`NetworkIdDto` preserves the validated network type and optional numeric
+suffix structurally instead of depending on a display string.
+
+Success returns one complete `SystemStatusDto` with `200 OK`, `Content-Type:
+application/json`, `Cache-Control: no-store`, and no ETag. It contains no
+ApiService status, graph publication state or cursor, validated capability or
+generation identity, component rejection or unavailability reason, recovery
+fault, diagnostic, or `representation_version`.
+
 ## Public API values — settled
 
 The following conceptual shapes are shared across public response and window
@@ -1275,10 +1363,11 @@ It accepts no query parameters, publication cursor, graph selection,
 separate `/api/v1/info` resource because the existing `SystemStatus` contains
 both the running KGI version and the component observations.
 
-A successful request returns `200 OK` with the complete current
-[`SystemStatus`](#public-api-values--settled) and `Cache-Control: no-store`.
-The endpoint has no ETag or conditional-request behavior. Its detailed
-transport DTO remains part of the deferred wire schema.
+A successful request projects the complete current
+[`SystemStatus`](#public-api-values--settled) into the
+[`SystemStatusDto`](#status-response-dto--settled). The endpoint's exact
+success content type, cache policy, and excluded internal fields are owned by
+that response contract; it has no conditional-request behavior.
 
 Status success is independent of graph publication, node connection,
 processing-session, API database-generation, and historical-read availability.
