@@ -199,6 +199,84 @@ value earlier, compare repeated immutable values, or introduce a
 content-conflict validation step. Internal graph and service fields excluded
 by the common DTO rules never enter these values.
 
+## Complete graph response DTOs — settled
+
+Head snapshots and anchored windows reuse one complete graph body:
+
+```rust
+struct GraphDataDto {
+    hashes: Vec<BlockHash>,
+    levels: Vec<LevelDto>,
+    blocks: Vec<GraphBlockDto>,
+    edges: Vec<GraphEdgeDto>,
+}
+```
+
+`hashes` is the response-local dictionary for every `HashRef` in `blocks` and
+`edges`. The collections are unordered except for the graph-owned ordered
+vectors inside each block. The complete projection and its membership follow
+the [graph-owned extraction and edge rules](api-graph.md#frozen-subview-extraction--settled).
+Consequently, `levels` can validly contain external endpoint levels below or
+above the nominal block extent.
+
+The Head snapshot response is:
+
+```rust
+struct HeadSnapshotResponseDto {
+    publication_id: u64,
+    revision: u64,
+    state: GraphPublicationState,
+    max_depth: u64,
+    low_level: u64,
+    high_level: u64,
+    graph: GraphDataDto,
+}
+```
+
+`max_depth` is the effective capped request depth. `low_level..=high_level` is
+the actual nominal block extent and can be shorter than `max_depth` near the
+pruning-point boundary. `(publication_id, revision)` is the canonical delta
+cursor and `state` is the captured publication state. `TrackingPolicy` and the
+weak ETag remain outside the body.
+
+An anchored window uses an explicit source discriminator:
+
+```rust
+enum GraphWindowSourceDto {
+    Head {
+        publication_id: u64,
+        revision: u64,
+        state: GraphPublicationState,
+        head_high_level: u64,
+    },
+    Database,
+}
+
+struct GraphWindowResponseDto {
+    source: GraphWindowSourceDto,
+    resolution: GraphWindowResolution,
+    graph: GraphDataDto,
+}
+```
+
+The `Head` variant carries the complete lineage needed to consume canonical
+Head deltas. `head_high_level` describes the source Head rather than the fixed
+window's effective end. The `Database` variant contains no publication ID,
+revision, state, or synthetic revision-zero cursor and creates no public delta
+lineage.
+
+`GraphWindowResolution.effective_start_level..=effective_end_level` is the
+nominal fixed block extent; the linked graph-owned projection can additionally
+retain external endpoint levels. The response does not echo the requested
+anchor because `resolved_level` is the retained fixed focus after level,
+block-hash, or DAA resolution.
+
+Each response comes from one immutable capture: one Head image for a Head
+snapshot, one Head extraction for a Head-backed window, or one detached
+consistent database projection for a database-backed window. Advancement or
+replacement during serialization does not alter the captured response. Graph
+data, resolution, and lineage are never mixed across captures.
+
 ## Public API values — settled
 
 The following conceptual shapes are shared across public response and window
@@ -460,9 +538,9 @@ in-memory Head publication. It never reads PostgreSQL and never falls back to a
 database-backed window. A successful logical response contains the owning
 `publication_id`, captured revision, captured `GraphPublicationState`, the
 effective capped depth and actual low/high extent, the complete graph
-projection, and its response-local hash dictionary. Concrete DTO organization
-remains part of the deferred wire schema; internal `TrackingPolicy` is not a
-public value.
+projection, and its response-local hash dictionary through the
+[`HeadSnapshotResponseDto`](#complete-graph-response-dtos--settled). Internal
+`TrackingPolicy` is not a public value.
 
 The captured `(publication_id, revision)` is the cursor for subsequent
 depth-independent canonical Head deltas. Snapshot acquisition neither accepts
@@ -980,15 +1058,12 @@ consistent database transaction for both resolution and projection. It never
 combines the two sources. Crossing the retained Head view's lower bound
 requires the database path; the Head view's configured depth alone does not.
 
-Every successful response carries the graph projection,
-`GraphWindowResolution`, its effective level extent, and a response-local hash
-dictionary. A Head-extracted response additionally carries the source Head
-`publication_id`, revision, captured `GraphPublicationState`, and source Head
-`high_level`; this is the lineage used for
+Every successful response uses the
+[`GraphWindowResponseDto`](#complete-graph-response-dtos--settled). Its
+Head-source variant carries the lineage used for
 [canonical Head-delta reuse](#fixed-window-reuse-of-canonical-head-deltas--settled).
-A database-backed response carries no publication ID, publication state, or
-public delta lineage. Its request-local revision-zero `Fixed` view is serialized
-once and discarded.
+The database-source variant creates no public delta lineage; its request-local
+revision-zero `Fixed` view is serialized once and discarded.
 
 Neither source enters the publication-owned `GraphCache`. Historical
 database-backed responses retain their settled no-ETag behavior. Every

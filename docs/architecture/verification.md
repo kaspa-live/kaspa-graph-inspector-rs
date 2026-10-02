@@ -794,6 +794,13 @@ Head result carries its complete publication lineage and source Head level;
 the database result carries none and is discarded after serialization. Neither
 path may insert a response into `GraphCache`.
 
+Decode both anchored-window source variants. The Head variant carries exactly
+its publication ID, revision, state, and source Head high level; the Database
+variant carries none of those fields and invents no revision-zero cursor. Both
+carry one `GraphWindowResolution` and one complete `GraphDataDto`, do not echo
+the request anchor, and may retain external endpoint levels outside the
+effective nominal bounds.
+
 For database-backed anchor misses, verify exact-level absence returns
 `LevelNotRetained`, an unknown or identity-only block hash returns
 `BlockNotMaterialized`, and a DAA score before every retained VSPC score returns
@@ -957,10 +964,12 @@ inclusive `1..=MAX_WINDOW_DEPTH` range, and caps larger well-formed values.
 Every successful response comes only from one coherent in-memory Head extent,
 reports its effective capped depth and actual bounds, carries a complete local
 hash dictionary plus the captured publication ID, revision, and state, and
-never accesses PostgreSQL. Cover `Synchronizing`, `Live`, terminal `Stale`, and
-no coherent publication. Advance or replace the publication during response
-serialization and verify the captured response remains internally coherent.
-The endpoint neither accepts nor returns `client_id`.
+never accesses PostgreSQL. Decode the exact `HeadSnapshotResponseDto`, including
+one complete `GraphDataDto`, and allow retained external endpoint levels
+outside its nominal low/high bounds. Cover `Synchronizing`, `Live`, terminal
+`Stale`, and no coherent publication. Advance or replace the publication during
+response serialization and verify the captured response remains internally
+coherent. The endpoint neither accepts nor returns `client_id`.
 
 Exercise `If-None-Match` across an unchanged response, graph revision advance,
 effective-extent change, state-only transition, and publication replacement.
