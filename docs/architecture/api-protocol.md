@@ -277,6 +277,87 @@ consistent database projection for a database-backed window. Advancement or
 replacement during serialization does not alter the captured response. Graph
 data, resolution, and lineage are never mixed across captures.
 
+## Canonical delta response DTOs — settled
+
+The canonical delta body contains only the target values required by a client
+to apply the patch:
+
+```rust
+struct LevelMutationDto {
+    level: u64,
+    value: Option<Level>,
+}
+
+struct FieldMutationDto<T> {
+    hash: HashRef,
+    value: T,
+}
+
+struct GraphDeltaBodyDto {
+    from_revision_id: u64,
+    to_revision_id: u64,
+    high_level: u64,
+
+    hashes: Vec<BlockHash>,
+
+    block_upserts: Vec<GraphBlockDto>,
+    edge_upserts: Vec<GraphEdgeDto>,
+    level_mutations: Vec<LevelMutationDto>,
+    is_in_vspc_mutations: Vec<FieldMutationDto<bool>>,
+    color_mutations: Vec<FieldMutationDto<BlockColor>>,
+}
+```
+
+`hashes` is the response-local dictionary for all hash references in the
+body. A level mutation with `Some(value)` installs that complete resulting
+level value; `None` removes the level. Membership and color mutations install
+their complete resulting field values. `block_upserts` and `edge_upserts`
+contain the serialized `Some(value)` results from the canonical change maps.
+The serializer omits block and edge removals under the settled public
+Head-window bound. It also omits each canonical change's composition-only
+`before` value: `before` remains present in the graph-owned delta through
+composition and is unnecessary for client application.
+
+All change collections may be empty while the revision interval and
+`high_level` still advance. Collection ordering follows the
+[common graph-value rules](#serialized-graph-values-and-hash-dictionary--settled).
+
+Every successful canonical delta response carries these exact headers:
+
+```http
+KGI-Publication-Id: P
+KGI-Publication-State: synchronizing | live | stale
+KGI-Delta-Outcome: complete | prefix | up-to-date | wait-for-wakeup
+KGI-Delta-Continuation: head | continue | wakeup
+```
+
+`wait-for-wakeup` additionally carries:
+
+```http
+KGI-Delta-Wake-At-Revision: R
+```
+
+That header is absent for every other outcome. The HTTP-only polling rules may
+also add `KGI-Delta-Retry-After-Ms`. These request-specific headers do not
+enter the cacheable body.
+
+`complete` and `prefix` return one encoded `GraphDeltaBodyDto` as the response
+body. `up-to-date` and `wait-for-wakeup` return an empty body with `200 OK`;
+their headers make them meaningful successful outcomes rather than `204 No
+Content`. `ClientRegistrationRequired` and `FreshViewRequired(reason)` remain
+typed `409 Conflict` error bodies and carry none of the canonical delta-success
+outcome headers.
+
+For a body-bearing response, the request and body satisfy:
+
+```text
+request.from_revision_id == body.from_revision_id
+body.from_revision_id < body.to_revision_id
+```
+
+Its resulting cursor is `(KGI-Publication-Id, body.to_revision_id)`. An
+`up-to-date` or `wait-for-wakeup` response leaves the request cursor unchanged.
+
 ## Public API values — settled
 
 The following conceptual shapes are shared across public response and window
@@ -704,16 +785,8 @@ These are request-specific envelope outcomes rather than fields of the encoded
 delta body. A later request may therefore wrap the same cached body differently
 as Head advances.
 
-Every successful delta-to-current response carries its captured
-`GraphPublicationState` and exposes `DeltaContinuation` through exactly one of
-these response headers:
-
-```http
-KGI-Delta-Continuation: head
-KGI-Delta-Continuation: continue
-KGI-Delta-Continuation: wakeup
-```
-
+Every successful delta-to-current response uses the
+[canonical delta response headers](#canonical-delta-response-dtos--settled).
 The continuation is request-specific response metadata and is not part of the
 immutable encoded delta body. For a Live publication, after a response ending
 at cursor `T` against the then-observed Head `H`:
@@ -853,9 +926,10 @@ describes their transport class without replacing the typed reason.
 
 Successful complete and prefix graph responses, `UpToDate`,
 `WaitForWakeup`, Head-level lookup, anchored windows, and status return `200
-OK`. `UpToDate` and `WaitForWakeup` are successful protocol results rather
-than empty `204` responses because their response still carries publication
-and continuation metadata. A matching Head ETag returns `304 Not Modified`.
+OK`. The exact canonical delta bodies and success headers, including the empty
+`UpToDate` and `WaitForWakeup` bodies, are defined by the
+[delta response DTO contract](#canonical-delta-response-dtos--settled). A
+matching Head ETag returns `304 Not Modified`.
 
 Strict request parsing and endpoint-specific invalid semantic values return
 `400 Bad Request`. An unknown route returns `404 Not Found`. A known v1
@@ -995,12 +1069,13 @@ struct CachedDelta {
 }
 ```
 
-`encoded_body` is the immutable encoded graph-delta body. It does not contain
-the request-specific `Complete`/`Prefix` discriminator or
-`DeltaContinuation`. ApiService creates a lightweight response around those
-bytes and derives both values from the request target, then-current publication
-state, and Head. Whether the lightweight HTTP wrapper is also retained is an
-implementation detail.
+`encoded_body` is exactly the selected-format encoding of
+[`GraphDeltaBodyDto`](#canonical-delta-response-dtos--settled). It contains no
+publication ID, publication state, response-outcome discriminator,
+continuation, wake boundary, or retry delay. ApiService reuses those exact
+bytes and adds the request-specific HTTP headers from the captured request
+target, publication state, and Head. Whether that lightweight HTTP wrapper is
+also retained is an implementation detail.
 
 The delta cache and its single-flight job map serve both SSE-coordinated and
 HTTP-only delta-to-current requests and are keyed by source revision. At most

@@ -993,6 +993,14 @@ stored boundary. A starting cursor inside an aggregate is unavailable. A first
 stored entry that cannot fit requires a fresh snapshot rather than a partial
 delta.
 
+At the serialization boundary, verify that a composed canonical delta retains
+every composition `before` value while `GraphDeltaBodyDto` emits only target
+values. Cover level installation and removal, membership and color target
+values, block and edge upserts, an all-empty mutation body that still advances
+the revision interval, and omission of block and edge removals under the public
+Head-window bound. Require body-bearing responses to start at the requested
+revision and advance to their encoded `to_revision_id`.
+
 For every appended history entry, verify `estimated_raw_bytes` and the absolute
 `cumulative_estimated_bytes` boundary at `delta.to_revision_id`. Cover range
 cost subtraction before and after prefix pruning, the first retained left
@@ -1015,12 +1023,14 @@ publication-owned job per source revision: concurrent requests join it after
 its target is captured, success publishes one `CachedDelta`, and failure gives
 all waiters the same request-local error before removing the job. Count every
 successfully delivered waiter independently toward the destination heat. A
-cache hit reuses the immutable encoded body and is never promoted or replaced
-because Head advanced; request-local `Complete`/`Prefix` and
-`DeltaContinuation` remain outside those bytes. Verify one immutable outgoing
-entry per source revision and convergence of distinct sources on a heated
-destination. Exercise an SSE-coordinated and an HTTP-only request from the same
-source and verify both reuse the same cache entry or join the same job.
+cache hit reuses the exact encoded `GraphDeltaBodyDto` bytes and is never
+promoted or replaced because Head advanced; publication ID and state, outcome,
+continuation, wake boundary, and retry delay remain outside those bytes. Wrap
+one cached body with different valid request-specific headers without
+re-encoding it. Verify one immutable outgoing entry per source revision and
+convergence of distinct sources on a heated destination. Exercise an
+SSE-coordinated and an HTTP-only request from the same source and verify both
+reuse the same cache entry or join the same job.
 
 For a Live publication and interval four, cover no-delta waiting at Head
 distances one through three; target eligibility beginning at `F + 4`; no-heat
@@ -1030,9 +1040,14 @@ and `PublicationState` or the replacement sequence bypassing the schedule.
 Verify the canonical
 `GET /api/v1/graph/deltas` endpoint requires `publication_id` and
 `from_revision_id`, accepts an optional `client_id`, rejects a public
-`to_revision_id`, exposes the captured publication state, and emits the exact
-`KGI-Delta-Continuation` values required by the protocol. The opaque client ID
-selects only wake state, while every HTTP
+`to_revision_id`, and emits the exact publication, publication-state, outcome,
+and continuation headers required by the protocol. Require a body for
+`complete` and `prefix`; require an empty `200 OK` body for `up-to-date` and
+`wait-for-wakeup`. The wake-boundary header appears only for
+`wait-for-wakeup`. Neither typed `409 Conflict` delta error carries the delta
+success headers. Verify body-bearing results advance the cursor to the body
+right boundary while the two empty success outcomes preserve the request
+cursor. The opaque client ID selects only wake state, while every HTTP
 `from_revision_id` remains the authoritative graph cursor. Its omission must
 select HTTP-only polling without `ClientRegistrationRequired`; cover that
 outcome for an expired and wrong-publication supplied identifier before cache
