@@ -270,6 +270,67 @@ priority:
   cannot hide service state; and
 - distinct budgets for head delivery and historical database reads.
 
+The initial v2 limits are:
+
+```text
+MAX_HEAD_HTTP_REQUESTS = 64
+MAX_HISTORICAL_HTTP_REQUESTS = 8
+MAX_STATUS_HTTP_REQUESTS = 16
+
+API_DB_POOL_SIZE = 8
+MAX_PUBLIC_HISTORICAL_DB_READS = 6
+API_DB_QUERY_TIMEOUT = 30 seconds
+
+MAX_GRAPH_ENCODING_JOBS = 4
+MAX_QUEUED_GRAPH_ENCODING_JOBS = 32
+MAX_HISTORICAL_ENCODING_JOBS = 2
+GRAPH_ENCODING_QUEUE_TIMEOUT = 30 seconds
+
+GRAPH_HTTP_DELIVERY_TIMEOUT = 60 seconds
+
+MAX_SSE_CLIENTS = 1024
+SSE_CLIENT_BUFFER_CAPACITY = 8
+```
+
+The Head lane admits Head snapshots, canonical deltas, and Head-level lookups.
+The historical lane admits database-backed anchored windows. The independent
+status lane admits only the memory-only status operation. Admission is
+nonblocking; the [API protocol](api-protocol.md#common-http-outcomes--settled)
+owns the public saturation response.
+
+Public historical reads may occupy at most six of the eight API pool
+connections. The remaining pool capacity is available to publication
+construction, generation validation, and replacement work. ApiService applies
+the query timeout to the complete database phase. Timeout cancels that phase,
+releases its transaction, permit, and connection, and follows the existing
+request-local internal-failure path; it does not by itself retire the API
+database generation.
+
+The four active encoding jobs cover graph JSON serialization and gzip
+compression. Historical work may occupy at most two, preserving capacity for
+publication and Head work. A cache hit that already owns final gzip bytes uses
+no encoding job. A request joining an existing single-flight job consumes no
+additional queue entry or active job.
+
+The encoding queue holds at most 32 reserved or ready jobs in addition to the
+four active jobs. Publication construction and Head work rank ahead of
+historical work. A database-backed request reserves queue capacity before
+starting its database phase. Failure to reserve performs no database work and
+is admission saturation. Once reserved, the detached projection waits for an
+encoder without retaining any database resource. If it cannot begin within
+`GRAPH_ENCODING_QUEUE_TIMEOUT`, remove the job and report temporary service
+unavailability under the API protocol. Cancellation removes a queued job and
+releases its reservation.
+
+The delivery timeout begins only when a complete gzip graph response is ready.
+A client that cannot receive it within the limit loses that response and its
+HTTP admission and response memory are released. SSE streams are exempt from
+this duration and use their bounded delivery behavior instead.
+
+The SSE client buffer capacity counts complete semantic messages. Numeric
+client and buffer limits do not weaken the protocol-owned coalescing, ordered
+registration and state delivery, or slow-client disconnect rules.
+
 API snapshot reload ranks above historical queries and below processing. On
 saturation, reject or degrade API work explicitly. HTTP, database,
 serialization, cache, and client saturation must not block processing,
@@ -282,6 +343,7 @@ response construction in this order:
 
 ```text
 acquire HTTP admission
+    -> reserve bounded encoding-queue capacity
     -> acquire API DB permit and connection
     -> open one consistent read-only transaction
     -> resolve the anchor and materialize the complete bounded projection
@@ -317,19 +379,25 @@ Slow SSE clients follow the bounded coalescing and disconnect contract in the
 V2 exposes these operational measurements:
 
 - request count, latency, and response bytes by endpoint;
-- active and rejected SSE clients;
+- admission occupancy and rejection count for the Head, historical, and status
+  lanes;
+- active and rejected SSE clients, per-client buffer high-water marks, graph
+  wakeup coalescing, and slow-client disconnects;
 - encoded-response cache hits, misses, evictions, and coalesced identical
   requests;
 - destination concentration, request-source counts, cached segment length,
   per-client revision wakeups, requests per catch-up, and size-limited
   short-prefix frequency;
-- database permit and query time;
-- delta-journal resets and slow-client disconnects; and
+- database pool and public-read permit occupancy, query duration, and query
+  timeouts;
+- encoding reservation, queue, and active-job occupancy, queue timeouts, and
+  encoding duration;
+- response delivery duration and delivery timeouts;
+- delta-journal resets; and
 - BlockProcessor and VspcProcessor commit latency.
 
 The metrics export mechanism and labels remain deferred in the
 [decision register](../decisions/deferred.md).
 
-API traffic up to configured rejection limits must not materially increase
-either processor's commit latency. Exact API capacities and resource budgets
-remain deferred in the [decision register](../decisions/deferred.md).
+API traffic up to the settled rejection limits must not materially increase
+either processor's commit latency.

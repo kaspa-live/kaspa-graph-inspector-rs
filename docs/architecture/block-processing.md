@@ -286,11 +286,17 @@ hash in `resolution_pending` until OrphanManager observes `AddOrphan` or
 request gap before BlockProcessor accounts for the result.
 
 Dependency selection uses orphan topology only. Age and DAA score are not
-inputs. When occupancy reaches a configured threshold in the approximate range
-from one quarter through one third of capacity, request frontier hashes to
-maximize release. Exact processor-channel and orphan capacities, resolver
-concurrency, and the orphan threshold remain deferred in the
-[decision register](../decisions/deferred.md).
+inputs. Define:
+
+```text
+MAX_ORPHAN_BLOCKS = 1024
+ORPHAN_RESOLUTION_THRESHOLD = 256
+```
+
+When occupancy reaches the one-quarter threshold, request frontier hashes to
+maximize release while retaining capacity for new arrivals.
+OrphanManager reports orphan occupancy, high-water mark, and threshold
+crossings.
 
 Orphan capacity counts distinct stored block hashes. An orphan hash already in
 the topology consumes no additional slot. If admitting a new orphan would
@@ -318,6 +324,17 @@ OrphanManager. It has:
 - bounded concurrent GetBlock tasks;
 - cancellation for outstanding tasks; and
 - no database transaction held during node RPC.
+
+Define:
+
+```text
+MAX_DEPENDENCY_RPC_CONCURRENCY = 8
+```
+
+Dependency resolution is exceptional repair work rather than an intensive
+steady-state RPC lane. The limit allows parallel release of orphan topology
+without dominating the validated node connection.
+DependencyResolver reports active and permit-waiting RPC operations.
 
 OrphanManager sends Resolve work and `Cancel(hash)` when a block arrives
 naturally. It owns the pending set and prevents duplicate requests. Resolver

@@ -430,9 +430,19 @@ Internal child-worker command mailboxes are unbounded and prioritized, with
 one logical producer per worker. They do not impose data-channel backpressure.
 Supervisor-facing component methods hide any mailbox or event-loop mechanism.
 Data, notification, and worker-to-worker channels are bounded and
-cancellation-aware. The following table is the exhaustive ownership and
+cancellation-aware. Every such processing-session data channel has capacity:
+
+```text
+PROCESSING_DATA_CHANNEL_CAPACITY = 1024
+```
+
+The separately owned graph-update feed is not a processing data channel under
+this constant. The following table is the exhaustive ownership and
 session-channel disposition policy. The exact channel or worker belongs in
 `diagnostic`; it does not select control flow.
+
+Every bounded processing data channel reports current occupancy and high-water
+mark. Capacity faults remain counted by their typed `FaultKind`.
 
 | Condition | Fault kind | Active Resync/Rebuild | Live | Expected teardown or completed shutdown |
 |---|---|---|---|---|

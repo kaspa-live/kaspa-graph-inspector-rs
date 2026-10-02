@@ -124,11 +124,22 @@ error representation. The gzip requirement does not apply to status, SSE,
 `/kgi-config.json`, or static Web assets; their owning contracts remain
 independent.
 
-The hard graph-response byte limit measures the complete uncompressed JSON
-body. Compression ratio never authorizes a larger logical response. Gzip runs
-only after JSON serialization and that size check succeed. A compression
-failure retains the common request-local failure policy and publishes no cache
-entry.
+Define:
+
+```text
+SOFT_DELTA_ESTIMATED_BYTES = 4 MiB
+MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES = 16 MiB
+```
+
+The soft limit guides only canonical-delta target selection. Crossing it moves
+selection to an earlier complete history boundary; it never splits a stored
+entry or authorizes an oversized result.
+
+The hard limit measures the complete uncompressed JSON body of every Head
+snapshot, canonical delta, anchored window, and Head-level lookup response.
+Compression ratio never authorizes a larger logical response. Gzip runs only
+after JSON serialization and that size check succeed. A compression failure
+retains the common request-local failure policy and publishes no cache entry.
 
 Compression does not alter graph semantics. Gzip quality does not change
 `representation_version`, graph revision, cache identity, or the weak Head
@@ -137,17 +148,19 @@ graph responses support no identity body and no second compressed variant.
 
 ## Public graph limits and identity — settled
 
-Define `MAX_WINDOW_DEPTH` and `MAX_CACHE_LEVEL_DISTANCE` under this strict
-bound:
+Define:
 
 ```text
+MAX_WINDOW_DEPTH = 250
+MAX_CACHE_LEVEL_DISTANCE = 500
 MAX_CACHE_LEVEL_DISTANCE + MAX_WINDOW_DEPTH < MAX_CACHE_DEPTH
 ```
 
-Their exact values remain deferred in the
-[decision register](../decisions/deferred.md). Every windowed endpoint caps
-requested depth to `MAX_WINDOW_DEPTH` and reports the effective range. An
-oversized Head snapshot request cannot fall back to DB; it is capped. The
+With the graph-owned `MAX_CACHE_DEPTH = 1000`, the public limits leave 250
+complete levels between the oldest eligible cached-delta source and the oldest
+level of the largest client window. Every windowed endpoint caps requested
+depth to `MAX_WINDOW_DEPTH` and reports the effective range. An oversized Head
+snapshot request cannot fall back to DB; it is capped. The
 [graph model](api-graph.md) owns `MAX_CACHE_DEPTH` and complete-level retention.
 
 The domain-owned `CompactId` crosses into ApiService only as the private
@@ -532,6 +545,10 @@ enum ApiErrorDetailsDto {
     FreshViewRequired {
         reason: FreshViewReason,
     },
+    GraphResponseTooLarge {
+        max_uncompressed_bytes: u64,
+        actual_uncompressed_bytes: u64,
+    },
 }
 
 enum WindowAnchorUnavailableDetailsDto {
@@ -568,8 +585,10 @@ Categories and codes use these exact lowercase kebab-case values:
 | `404` Head level | `not-found` | `head-level-unavailable` | `requested_level` |
 | `409` registration | `conflict` | `client-registration-required` | `null` |
 | `409` lineage | `conflict` | `fresh-view-required` | `reason` |
+| `422` | `unprocessable` | `graph-response-too-large` | `max_uncompressed_bytes`, `actual_uncompressed_bytes` |
 | `429` | `busy` | `capacity-exhausted` | `null` |
 | `503` | `unavailable` | `service-unavailable` | `null` |
+| `503` encoding queue timeout | `unavailable` | `encoding-timeout` | `null` |
 | `500` | `internal` | `internal-error` | `null` |
 
 The direct error object has no universal `data` wrapper. `message` is a concise
@@ -950,15 +969,20 @@ Public outcomes map as follows:
 Before cache lookup, joining a job, or constructing a delta-to-Head response,
 use the first selected stored
 entry's `delta.high_level` as the deliberately approximate source-level
-boundary. If its distance behind the publication Head reaches or exceeds 80%
-of `MAX_CACHE_LEVEL_DISTANCE`, return
-`FreshViewRequired(DeltaDistanceExceeded)`. Do not reconstruct an exact source
-level. A client beyond this gate reloads a complete applicable window. Define:
+boundary. Define:
 
 ```text
-HOT_DESTINATION_LEVEL_DISTANCE = MAX_CACHE_LEVEL_DISTANCE / 2
+DELTA_RELOAD_LEVEL_DISTANCE = 400
+HOT_DESTINATION_LEVEL_DISTANCE = 250
 DELTA_CONVERGENCE_REVISION_INTERVAL = 4
 ```
+
+If the source boundary's distance behind the publication Head reaches or
+exceeds `DELTA_RELOAD_LEVEL_DISTANCE`, return
+`FreshViewRequired(DeltaDistanceExceeded)`. Do not reconstruct an exact source
+level. A client beyond this gate reloads a complete applicable window. The
+reload distance is 80% of `MAX_CACHE_LEVEL_DISTANCE`; the hot-destination
+distance is half of it.
 
 Wake-boundary addition saturates at `u64::MAX`; revision arithmetic never
 wraps.
@@ -983,7 +1007,7 @@ defer at this gate.
 
 For an eligible `GraphHistoryRange::Deltas`, ApiService uses the entries'
 cumulative estimated costs to find the youngest complete boundary `Y` under
-the soft estimated response budget. If no complete boundary fits that estimate,
+`SOFT_DELTA_ESTIMATED_BYTES`. If no complete boundary fits that estimate,
 the first complete stored entry remains the candidate for the mandatory hard
 uncompressed-JSON-size check. A completed cache entry keyed by the
 request's source revision is immutable and is served directly. On a cache miss,
@@ -995,7 +1019,8 @@ delta-to-current target selection uses the approximate source-level distance:
    When `Y < F.saturating_add(I)`, choose `Y` as the necessary size-limited
    short target. Synchronizing chooses from the currently affordable range
    without imposing the minimum interval.
-2. Beyond `HOT_DESTINATION_LEVEL_DISTANCE` but before the 80% fresh-view gate,
+2. Beyond `HOT_DESTINATION_LEVEL_DISTANCE` but before
+   `DELTA_RELOAD_LEVEL_DISTANCE`,
    minimize new CPU work. Choose the nearest younger boundary `R` that is the
    source of a completed `CachedDelta` and is reachable under the response
    budget, then construct the shortest bridge `F -> R`. A running job is not a
@@ -1151,14 +1176,21 @@ unchanged and therefore absent from the canonical delta. The public lookup is:
 GET /api/v1/graph/levels?publication_id=P&level=L1[&level=L2...]
 ```
 
+Define:
+
+```text
+MAX_HEAD_LEVELS_PER_REQUEST = 64
+```
+
 `publication_id` and at least one `level` value are required. `level` is
 an explicitly repeated collection parameter rather than a scalar, so repeated
 occurrences are valid and form a set; repeated values have no additional
 meaning. Every value must be a positive unsigned level. Other malformed,
 unknown, or additional parameters follow the
 [common request rules](#common-http-conventions--settled). The endpoint accepts
-no graph revision, anchor, depth, or `client_id`. Its maximum request
-cardinality is part of the deferred HTTP resource budgets.
+no graph revision, anchor, depth, or `client_id`. Deduplicate repeated values
+before applying `MAX_HEAD_LEVELS_PER_REQUEST`. Exceeding it is invalid request
+input.
 
 ApiService captures one immutable image of the identified Head publication and
 looks up every requested level in that image. `Synchronizing`, `Live`, and
@@ -1222,6 +1254,15 @@ All `FreshViewReason` variants use this one status. They require abandoning or
 repairing the current transport or graph lineage, so v2 does not divide them
 between `409 Conflict` and `410 Gone`.
 
+A complete Head snapshot, anchored window, or Head-level lookup whose
+uncompressed JSON exceeds `MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES` returns
+`422 Unprocessable Content` with code `graph-response-too-large`, identifies
+the hard byte limit and the observed uncompressed JSON size, and returns no
+partial graph. The client may retry with a smaller depth or fewer levels.
+Canonical deltas retain their earlier-boundary
+fallback and `FreshViewRequired(FirstStoredDeltaExceedsBudget)` outcome when
+the first indivisible stored entry cannot fit.
+
 Rejection before response commitment because the applicable bounded public
 HTTP, status, historical-read, serialization, or SSE admission lane is full
 returns:
@@ -1248,7 +1289,9 @@ Cache-Control: no-store
 This includes no coherent graph publication, disabled Rebuild-time API reads,
 no current validated API DB generation, replacement-gate denial or
 cancellation, `ApiReadError::GenerationLost`, and temporary inability to
-publish the complete required in-memory Head. The distinction is that `429`
+publish the complete required in-memory Head. It also includes expiry of an
+already reserved graph-encoding queue wait, with code `encoding-timeout`. The
+distinction is that `429`
 reports full admission capacity while `503` reports an unavailable capability
 or service state. `Retry-After` uses HTTP seconds and is separate from the
 successful delta protocol's millisecond `KGI-Delta-Retry-After-Ms` header.
@@ -1264,7 +1307,8 @@ HTTP outcome.
 KGI never presents a truncated graph as success. A delta `Prefix` remains
 successful because it is a complete patch through its reported
 `to_revision_id`. When a complete response cannot be produced, return the
-applicable typed `409`, temporary `503`, or unexpected `500` outcome.
+applicable typed `409`, size-bound `422`, temporary `503`, or unexpected `500`
+outcome.
 
 Cache behavior is:
 
@@ -1343,6 +1387,11 @@ discriminator, continuation, wake boundary, or retry delay. ApiService reuses
 those exact compressed bytes and adds the request-specific HTTP headers from
 the captured request target, publication state, and Head. Whether that
 lightweight HTTP wrapper is also retained is an implementation detail.
+
+Every `CachedDelta` is individually bounded by
+`MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES`. `GraphCache` has no independent total
+encoded-byte cap; publication lifetime, retained source boundaries, and target
+level distance provide its structural bound.
 
 The delta cache and its single-flight job map serve both SSE-coordinated and
 HTTP-only delta-to-current requests and are keyed by source revision. At most

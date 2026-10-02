@@ -571,6 +571,14 @@ internal command-path closure; unexpected worker termination; and invalid
 lifecycle control. Assert that typed fault fields, rather than diagnostics,
 select every disposition.
 
+For every bounded processing data channel, exercise the exact focused-owner
+capacity, its final successful ordered send, and the next full-channel result.
+Verify current occupancy and high-water measurements without applying that
+capacity to prioritized lifecycle command paths or the separately owned graph
+update feed. Saturate DependencyResolver's local RPC allowance and prove the
+validated client's larger total RPC allowance still admits recovery and VSPC
+work; cancellation must release both allowances.
+
 Verify [teardown](processing-lifecycle.md#teardown-and-delivery-semantics--settled)
 by asserting that both processors' session-scoped RPC and DB clones are
 released before `Deactivated` and cancellation races finish.
@@ -611,6 +619,11 @@ Verify [block admission](block-processing.md#admission-and-materialization),
     reverse-index, or pending-resolution mutation and accepts only lifecycle
     commands until Deactivate. Re-admitting an existing orphan at capacity
     consumes no new slot and does not report exhaustion.
+11. At the focused owner's exact orphan threshold and capacity, verify
+    dependency selection begins at the threshold and admission remains valid
+    through capacity. Hold resolver RPCs open and prove active work never
+    exceeds its focused-owner concurrency bound while cancellation and queued
+    work continue to make progress.
 
 ## VSPC processing
 
@@ -634,6 +647,8 @@ with:
   synthetic or notification candidate reports
   `BoundedStateExhausted(VspcPending)` without partial index mutation, eviction,
   or coalescing and accepts only lifecycle commands until Deactivate;
+- exercise the exact focused-owner pending capacity at its below, equal, and
+  over-capacity boundaries and record its high-water measurement;
 - repeated `PersistedBlock` delivery for one hash reuses the first history
   record without content comparison and leaves both history indexes unchanged;
   a new hash updates both indexes in one local transition;
@@ -675,7 +690,10 @@ without using `EnteredLive` as an API trigger. After the gate opens, a causal
 graph offer must complete before its dependent processing delivery; on `Full`,
 the gap generation must advance first. Cover complete view levels, external
 parent-edge endpoints and level sizes, actual parent presence independent of
-visible edges, and fresh publication identity after each replacement.
+visible edges, and fresh publication identity after each replacement. Fill the
+feed through its focused-owner capacity, verify the final admitted update
+preserves order, then verify the next ordinary offer reports a gap while a
+lossless lifecycle marker waits for capacity.
 
 Cover `BlockCommitted` conversion to `GraphBlock`, including the selected-parent
 index for an ordinary block, the Genesis `None` case, and propagation of the
@@ -837,7 +855,10 @@ Exercise
 `GET /api/v1/graph/levels?publication_id=P&level=L1[&level=L2...]`.
 Require one valid publication ID and at least one positive level, treat
 repeated level parameters and values as a set, and reject malformed or
-additional parameters. Capture one immutable `Synchronizing`, `Live`, or
+additional parameters. Deduplicate repeated values before enforcing the
+focused-owner cardinality; accept exactly the maximum and reject one distinct
+level beyond it before publication lookup. Capture one immutable
+`Synchronizing`, `Live`, or
 `Stale` Head image and decode one `HeadLevelLookupResponseDto` containing
 exactly one complete unordered `LevelDto` per distinct requested level plus
 the capture's publication ID, revision, and state. Require no hash dictionary,
@@ -989,7 +1010,11 @@ unsupported methods with `405` and `Allow: GET`. Anchor and Head-level lookup
 misses use typed `404` outcomes. A valid graph request that does not accept
 gzip uses typed `406` category `not-acceptable`, code `gzip-required`, and
 explicit `null` details. Registration and every fresh-view reason use
-typed `409` outcomes. Admission-lane saturation before commitment uses `429`,
+typed `409` outcomes. Oversized complete non-delta graph responses use the
+typed `422` `graph-response-too-large` result, identify the hard limit, and
+contain no partial graph. Verify the exact structured maximum and observed
+uncompressed byte details.
+Admission-lane saturation before commitment uses `429`,
 while unavailable graph or database capabilities use `503`; both carry
 `Retry-After: 1`. Unexpected request-local failure before commitment uses
 `500`. After commitment, delivery failure closes the response or stream rather
@@ -1150,8 +1175,9 @@ Verify Stale preserves cache entries, permits existing and new jobs to finish
 against the stalled Head, and replacement or destruction cancels unfinished
 jobs and releases the cache. Evict an entry when its source revision leaves
 history and when its target level falls more than `MAX_CACHE_LEVEL_DISTANCE`
-behind Head; either miss reconstructs an equivalent response. At the 80%
-distance gate require a fresh window before starting a job. Historical DB
+behind Head; either miss reconstructs an equivalent response. At
+`DELTA_RELOAD_LEVEL_DISTANCE`, require a fresh window before starting a job.
+Historical DB
 windows bypass this cache.
 Head-level lookups also bypass cache lookup, insertion, and cache single-flight,
 return `Cache-Control: no-store`, and produce no ETag. Fixed-window consumers
@@ -1222,6 +1248,11 @@ application failure, and a gap during each state. None may request processing
 recovery. `PublishPostSeal` is not repeated during same-session reconstruction.
 Changing the API database generation alone must not replace an otherwise
 advancing Active publication.
+
+At the focused-owner staging capacity, verify that only block and VSPC values
+consume entries, Live remains sticky without consuming one, and the next
+ordinary update restarts construction without retaining a partial staged
+suffix. Record occupancy, high-water, overflow, and reconstruction metrics.
 
 Verify `ApiDbState` independently from graph publication. Install the reliable
 StorageService-to-Supervisor event path before initial generation publication.
@@ -1380,11 +1411,27 @@ API load tests verify the
 [system isolation contract](overview.md#resource-isolation-and-scalability--settled)
 and [API bulkheads](api-service.md#resource-isolation-and-saturation--settled).
 Exercise status, head, and historical admission lanes independently, including
-configured rejection limits, while measuring both processors' commit latency.
+their focused-owner rejection limits, while measuring both processors' commit latency.
 Also cover bounded slow-SSE behavior, Head graph-memory exhaustion with
 complete levels, explicit rejection or temporary unavailability, and the required
 operational measurements. Saturated API work must not materially delay
 processing or produce a partial graph image.
+
+At every focused-owner admission boundary, exercise the final accepted request
+and the next rejected request independently for Head, historical, status, and
+SSE work. Fill an SSE delivery buffer with coalescible graph wakeups, then with
+required ordered messages, and verify coalescing or disconnect respectively.
+An HTTP graph delivery exceeding its owner-defined duration closes after
+commitment and releases admission and response memory.
+
+For encoding work, fill the reservation queue before issuing a historical
+request and verify rejection performs no database access. With a reservation
+held, complete and detach a historical projection while every encoder is busy;
+the request must wait without a database resource and then encode when admitted.
+Exercise the queue timeout as temporary service unavailability, cancellation
+as reservation release, single-flight waiters without extra queue entries, and
+the focused-owner active and historical encoding limits. Publication and Head
+work must continue while historical encoders are saturated.
 
 For historical request resource lifetime, stall response delivery after the
 complete database projection has been materialized and verify that no
@@ -1394,6 +1441,10 @@ serialization or compression failure, and an oversized response after database
 release. Query/database-replacement races must retain the storage gate's old
 coherent detached result or clean 503 outcome even when database resources were
 released before response construction completed.
+Saturate public historical reads and prove the pool capacity reserved for
+publication and generation work remains usable. Force the focused-owner query
+timeout and verify transaction, permit, and connection release through the
+request-local internal-failure path without retiring the database generation.
 
 Go KGI parity fixtures, rusty-kaspa RPC and notification fixtures, PostgreSQL
 integration tests, and browser graph tests accompany the applicable groups

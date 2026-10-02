@@ -10,7 +10,14 @@ the ordered stream and reconstructs its derived graph projection.
 
 ## In-process graph-update feed — settled
 
-Every processing session owns one fresh ordered, bounded graph-update channel. The
+Define:
+
+```text
+GRAPH_UPDATE_CHANNEL_CAPACITY = 1024
+```
+
+Every processing session owns one fresh ordered graph-update channel with that
+capacity. The
 channel topology is the session boundary: graph updates carry no session ID,
 or cross-session stale-message filter. Processors offer
 `BlockCommitted`/`VspcCommitted` only after their respective DB commits. The
@@ -119,6 +126,10 @@ The [BlockProcessor marker contract](block-processing.md#graph-lifecycle-marker-
 owns its worker and marker-command enqueue points. The
 [processing lifecycle](processing-lifecycle.md#live-admission) owns the global
 causality before the Live command. ApiService consumes the resulting channel
-order without reconstructing those producer decisions. Exact channel and
-wakeup primitives remain deferred in the
-[decision register](../decisions/deferred.md).
+order without reconstructing those producer decisions. The capacity provides
+about 51 seconds at an expected 20 updates per second and about 10 seconds at
+100 updates per second. Exact channel and wakeup primitives remain deferred in
+the [decision register](../decisions/deferred.md).
+
+Operational measurements include current occupancy, high-water mark, reported
+gap count, and receiver-closure count for each session feed.

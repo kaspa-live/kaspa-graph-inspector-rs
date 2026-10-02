@@ -253,9 +253,23 @@ updates to it. A previously Live target, or `Live` encountered while draining,
 remains sticky, so its replacement is initially Live. API-local reconstruction
 never requests processing Resync or Rebuild.
 
-The staging buffer is bounded by update count. It never drops one staged entry
-in isolation. Reaching its implementation-selected capacity invokes
-`restart_construction()`, making the current receive frontier the newer cut.
+Define:
+
+```text
+API_STAGING_UPDATE_CAPACITY = 4096
+```
+
+The staging buffer counts `BlockCommitted` and `VspcCommitted` updates. `Live`
+is sticky state rather than a staged entry, and `PublishPostSeal` establishes
+the construction cut. The buffer never drops one staged entry in isolation.
+If admitting another update would exceed its capacity, do not insert that
+update and invoke `restart_construction()`, making the current receive frontier
+the newer cut.
+This capacity provides about 205 seconds at an expected 20 updates per second
+and about 41 seconds at 100 updates per second.
+
+Operational measurements include staging occupancy and high-water mark,
+overflow count, and the resulting reconstruction count.
 
 Throughout reconstruction, a previous coherent publication remains readable
 as Stale.

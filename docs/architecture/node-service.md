@@ -412,6 +412,20 @@ payloads use [`VspcChange`](domain-model.md#vspc-value-types--settled).
 
 ### RPC normalization
 
+Each published `ValidatedRpcClient` bounds its normalized runtime requests with:
+
+```text
+MAX_RPC_CONCURRENCY = 32
+```
+
+Every runtime operation waits cancellably for a permit before issuing its RPC.
+Permit waiting is ordinary local backpressure, not notification loss or a
+recovery fault. DependencyResolver independently admits at most its
+BlockProcessor-owned concurrency limit, leaving capacity for recovery and VSPC
+operations. Connection validation precedes publication and remains sequential;
+it does not consume this runtime budget.
+NodeService reports active and permit-waiting runtime RPC operations.
+
 #### Full-block normalization
 
 NodeService is the sole constructor of `ValidatedNodeBlock`. One common

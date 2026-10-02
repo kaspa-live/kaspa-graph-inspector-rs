@@ -120,8 +120,13 @@ update between them.
 These pending structures share one bounded capacity. A single
 `HashMap<BlockHash, Vec<VspcChange>>` cannot represent multi-dependency
 readiness and ordered candidate selection.
-The exact pending capacity remains deferred in the
-[decision register](../decisions/deferred.md).
+Define:
+
+```text
+MAX_PENDING_VSPC_CHANGES = 1024
+```
+
+VspcProcessor reports pending-candidate occupancy and high-water mark.
 
 Capacity counts distinct pending candidates. The notification collision checks
 below precede capacity admission because an existing-destination collision does
