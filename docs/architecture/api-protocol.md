@@ -53,8 +53,42 @@ unavailable, or outside its semantic range.
 
 This common contract fixes route and request syntax. Each endpoint section
 owns its exact resource path, parameters, logical outcomes, and cache behavior.
-The final response DTOs, error-body schema, graph encoding, and HTTP
-compression policy remain deferred.
+The remaining endpoint-specific response DTOs, error-body schema, graph
+encoding, and HTTP compression policy remain deferred under the common DTO
+rules below.
+
+## Common transport DTO rules — settled
+
+The [core crate structure](overview.md#core-crate-structure--settled) owns the
+placement of public semantic values and runtime serialization. At that boundary,
+`GraphView` and `GraphDelta` remain in their canonical graph-owned forms until
+serialization; the serializer performs response-local hash substitution and
+only those omissions authorized by this protocol. No earlier intermediate
+transport graph replaces either canonical value.
+
+Each endpoint has its own success response. V2 has no universal success wrapper
+with generic `data`, `status`, or `metadata` fields. A response with multiple
+semantic variants uses an explicit discriminator; a decoder never infers the
+variant from the incidental presence or absence of optional fields. Absence is
+distinct from zero, `false`, an empty collection, and every sentinel value.
+
+Every public `u64`, including revisions, levels, scores, timestamps, and
+publication IDs, preserves its complete value. The selected graph encoding
+determines the exact native or lossless alternative representation. Ordered
+semantic collections, including direct parents and blue and red merge sets,
+preserve their order. Sets and maps use the deterministic serialization order
+defined by their endpoint-specific DTO contract.
+
+Internal implementation state does not enter the public schema. This includes
+`TrackingPolicy`, retained-level usage counters, `CompactId`, history byte
+estimates and cumulative costs, cache heat, client wake state, and database or
+RPC generation identifiers.
+
+`representation_version` remains internal and is not a response or
+`SystemStatus` field. It changes when graph payload field meaning, canonical
+ordering, hash-reference representation, or graph encoding changes in a way
+that invalidates cached graph bytes or ETags. Public errors use their own
+common schema and never reuse a graph success DTO.
 
 ## Public graph limits and identity — settled
 

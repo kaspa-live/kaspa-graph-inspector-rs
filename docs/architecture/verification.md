@@ -909,6 +909,16 @@ parameters, mutually exclusive selections, and missing required parameters
 with `400 Bad Request`. No rejected request reaches graph construction,
 history selection, or storage.
 
+Verify the common transport DTO rules at the final serialization boundary.
+Keep canonical `GraphView` and `GraphDelta` values intact until that boundary,
+exercise explicit response-variant discrimination and absence independently
+from zero or empty values, and round-trip the full public `u64` domain through
+the selected encoding. Check ordered graph collections retain their semantic
+order, every set or map follows its DTO-owned deterministic order, and no
+internal-only field enters a public payload. A representation-significant
+schema or encoding change must alter the internal representation version used
+by graph cache identity and Head ETags.
+
 Verify the common HTTP outcome map independently of the final error DTO.
 Complete and prefix graph results, delta `UpToDate` and `WaitForWakeup`,
 anchored windows, Head-level lookup, and status use `200`; only an exact Head
