@@ -653,6 +653,106 @@ single-flight work. It has no ETag and carries `Cache-Control: no-store`.
 Because its values contain no hashes, it needs no response-local hash
 dictionary.
 
+## Common HTTP outcomes — settled
+
+Endpoint-specific typed outcomes remain authoritative. The common HTTP status
+describes their transport class without replacing the typed reason.
+
+Successful complete and prefix graph responses, `UpToDate`,
+`WaitForWakeup`, Head-level lookup, anchored windows, and status return `200
+OK`. `UpToDate` and `WaitForWakeup` are successful protocol results rather
+than empty `204` responses because their response still carries publication
+and continuation metadata. A matching Head ETag returns `304 Not Modified`.
+
+Strict request parsing and endpoint-specific invalid semantic values return
+`400 Bad Request`. An unknown route returns `404 Not Found`. A known v1
+resource requested with an unsupported method returns `405 Method Not Allowed`
+with `Allow: GET`.
+
+Normal graph-object lookup misses return `404 Not Found`. These are the three
+`GraphWindowAnchorUnavailable` variants and
+`HeadLevelLookupOutcome::LevelUnavailable`; their typed reason distinguishes
+them from an unknown route.
+
+Cursor and registration recovery returns `409 Conflict` with the applicable
+typed outcome:
+
+```text
+DeltaResponseOutcome::ClientRegistrationRequired
+DeltaResponseOutcome::FreshViewRequired(reason)
+HeadLevelLookupOutcome::FreshViewRequired(reason)
+```
+
+All `FreshViewReason` variants use this one status. They require abandoning or
+repairing the current transport or graph lineage, so v2 does not divide them
+between `409 Conflict` and `410 Gone`.
+
+Rejection before response commitment because the applicable bounded public
+HTTP, status, historical-read, serialization, or SSE admission lane is full
+returns:
+
+```http
+429 Too Many Requests
+Retry-After: 1
+Cache-Control: no-store
+```
+
+This means KGI remains operational but cannot admit that public work now. A
+persistently slow client detected after SSE establishment is disconnected
+under the SSE delivery contract; a second HTTP outcome cannot be sent after
+stream commitment.
+
+Temporary absence of a capability or usable service state returns:
+
+```http
+503 Service Unavailable
+Retry-After: 1
+Cache-Control: no-store
+```
+
+This includes no coherent graph publication, disabled Rebuild-time API reads,
+no current validated API DB generation, replacement-gate denial or
+cancellation, `ApiReadError::GenerationLost`, and temporary inability to
+publish the complete required in-memory Head. The distinction is that `429`
+reports full admission capacity while `503` reports an unavailable capability
+or service state. `Retry-After` uses HTTP seconds and is separate from the
+successful delta protocol's millisecond `KGI-Delta-Retry-After-Ms` header.
+
+Unexpected request-local failures before response commitment return `500
+Internal Server Error` with `Cache-Control: no-store`. This includes
+`ApiReadError::QueryFailed`, `ApiReadError::InconsistentProjection`, and
+serialization or compression failure. Such failures do not stale a graph
+publication or request processing recovery. A failure after HTTP or SSE
+commitment terminates that response or stream rather than attempting a second
+HTTP outcome.
+
+KGI never presents a truncated graph as success. A delta `Prefix` remains
+successful because it is a complete patch through its reported
+`to_revision_id`. When a complete response cannot be produced, return the
+applicable typed `409`, temporary `503`, or unexpected `500` outcome.
+
+Cache behavior is:
+
+| Response | Cache policy |
+|---|---|
+| Head snapshot `200` or `304` | `Cache-Control: no-cache` |
+| Canonical delta success | `Cache-Control: no-cache` |
+| Anchored window | `Cache-Control: no-store` |
+| Head-level lookup | `Cache-Control: no-store` |
+| SSE | `Cache-Control: no-store` |
+| Status | `Cache-Control: no-store` |
+| Any `4xx` or `5xx` | `Cache-Control: no-store` |
+
+The delta operation targets the current Head, so the same URL must revalidate
+rather than serve an older response blindly. Anchored windows have no v2 ETag
+and the same anchor may resolve differently after graph changes.
+
+The eventual error DTO distinguishes the semantic categories
+`invalid-request`, `not-found`, `conflict`, `busy`, `unavailable`, and
+`internal`. Endpoint-specific typed reasons remain subordinate to that
+category. Exact DTO fields and encoding remain part of the deferred wire and
+error-body schema.
+
 ## Public delivery failures — settled
 
 Fresh-view range outcomes affect only their request. Serialization,
@@ -776,9 +876,9 @@ public delta lineage. Its request-local revision-zero `Fixed` view is serialized
 once and discarded.
 
 Neither source enters the publication-owned `GraphCache`. Historical
-database-backed responses retain their settled no-ETag behavior. Remaining
-anchored-window HTTP cache headers are part of the deferred common HTTP outcome
-work in the [decision register](../decisions/deferred.md).
+database-backed responses retain their settled no-ETag behavior. Every
+anchored-window response follows the
+[common `no-store` cache policy](#common-http-outcomes--settled).
 
 Every successful anchored window response carries `GraphWindowResolution`,
 independently of whether its one anchor is a level, block hash, or DAA score.
@@ -821,14 +921,14 @@ exact database condition producing each variant.
 
 A disabled public-read gate, absence of a current API DB client, or denial or
 cancellation by the storage replacement gate returns `503 Service Unavailable`
-with a short `Retry-After`.
+with `Retry-After: 1`.
 
 Public database-backed `ApiReadError` outcomes are exhaustive:
 
 | Error | Public response | Binding path |
 |---|---|---|
 | `QueryFailed` | `500 Internal Server Error` | Non-generation-loss |
-| `GenerationLost` | `503 Service Unavailable` with a short `Retry-After` | Generation-loss |
+| `GenerationLost` | `503 Service Unavailable` with `Retry-After: 1` | Generation-loss |
 | `InconsistentProjection` | `500 Internal Server Error` | Non-generation-loss |
 
 No error returns a partial graph or transparently retries the failed request.
@@ -893,9 +993,8 @@ The public API has conceptually:
   component observations, and the current or last successfully validated
   network and node server information.
 
-Remaining endpoint-specific resource paths and parameter sets beyond the
-settled operations above, the final wire schema, and the graph wire format
-remain deferred in the
+The final wire and error-body schemas, graph wire format, and HTTP compression
+policy remain deferred in the
 [decision register](../decisions/deferred.md). HTTP methods and common route
 and request syntax follow the settled conventions above.
 

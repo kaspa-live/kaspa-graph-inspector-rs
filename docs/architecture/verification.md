@@ -909,6 +909,26 @@ parameters, mutually exclusive selections, and missing required parameters
 with `400 Bad Request`. No rejected request reaches graph construction,
 history selection, or storage.
 
+Verify the common HTTP outcome map independently of the final error DTO.
+Complete and prefix graph results, delta `UpToDate` and `WaitForWakeup`,
+anchored windows, Head-level lookup, and status use `200`; only an exact Head
+ETag match uses `304`. Unknown routes use `404`; known resources reject
+unsupported methods with `405` and `Allow: GET`. Anchor and Head-level lookup
+misses use typed `404` outcomes. Registration and every fresh-view reason use
+typed `409` outcomes. Admission-lane saturation before commitment uses `429`,
+while unavailable graph or database capabilities use `503`; both carry
+`Retry-After: 1`. Unexpected request-local failure before commitment uses
+`500`. After commitment, delivery failure closes the response or stream rather
+than emitting another outcome.
+
+Require `Cache-Control: no-cache` on successful Head snapshots and canonical
+deltas. Require `Cache-Control: no-store` on anchored windows, Head-level
+lookup, SSE, status, and every `4xx` or `5xx`. No successful graph response may
+be truncated; a delta prefix is complete through its reported target. Cover
+the semantic error categories `invalid-request`, `not-found`, `conflict`,
+`busy`, `unavailable`, and `internal`, while leaving their final DTO encoding
+to the wire-schema work.
+
 Verify `GET /api/v1/graph/head` requires `max_depth`, rejects zero, accepts the
 inclusive `1..=MAX_WINDOW_DEPTH` range, and caps larger well-formed values.
 Every successful response comes only from one coherent in-memory Head extent,

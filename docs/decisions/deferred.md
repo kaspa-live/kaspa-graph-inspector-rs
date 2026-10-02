@@ -25,12 +25,9 @@ become durable project constraints.
    ApiService task structure, and concrete storage synchronization mechanics.
    A shared mutation lock plus per-lane mutexes is one valid storage shape;
    exact lock types remain an implementation choice.
-6. Remaining endpoint-specific API resource paths and parameter sets beyond
-   the settled Head snapshot, canonical Head delta, anchored-window,
-   Head-level lookup, SSE wakeup, and status operations in the
-   [API protocol](../architecture/api-protocol.md), plus the remaining endpoint
-   cache headers and final wire and error-body schemas.
-   Select exactly one graph
+6. Final public transport DTOs, wire and error-body schemas, and the exact
+   representation of the settled operations in the
+   [API protocol](../architecture/api-protocol.md). Select exactly one graph
    response format for v2; clients will not negotiate among graph encodings.
    Benchmark JSON against appropriate binary formats such as CBOR, MessagePack,
    and Protobuf across server construction and serialization, compression,
