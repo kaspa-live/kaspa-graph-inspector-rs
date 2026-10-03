@@ -94,7 +94,20 @@ the run. A replacement generation starts with fresh caches.
 
 `ValidatedApiDbClient` is the storage handle for the read-only pool required by
 the [API resource contract](api-service.md#resource-isolation-and-saturation--settled).
-It exposes no processing mutation or processing cache.
+It exposes no processing mutation or processing cache. Each published handle
+owns shared terminal validity state that is observed through every clone:
+
+```rust
+impl ValidatedApiDbClient {
+    fn is_valid(&self) -> bool;
+}
+```
+
+StorageService is the sole authority that changes this state. A newly
+published handle is valid. Retirement changes it atomically to invalid before
+the retirement event is emitted or an operation returns `GenerationLost`, and
+an invalid handle can never become valid or be published again. Callers may
+observe validity but cannot change it.
 Network binding, schema, and generation validation precede publication of
 either handle. StorageService autonomously opens, reconnects, validates,
 retires, and republishes both pool generations. It reports every lifecycle
@@ -1246,11 +1259,12 @@ it never substitutes for an unavailable anchor.
 A query failure that leaves the pool generation usable reports `QueryFailed`.
 Loss of this API pool generation atomically retires that handle, emits the
 ordered `StorageServiceEvent::ApiDbRetired`, starts autonomous reacquisition, and
-reports `GenerationLost` to the operation without retiring the independent
-processing handle. Publication of the validated replacement emits
+reports `GenerationLost` to the operation only after `is_valid()` is false,
+without retiring the independent processing handle. Publication of the
+validated replacement emits
 `StorageServiceEvent::ApiDbPublished`. A structurally incomplete or internally
 incoherent result reports `InconsistentProjection`; it never returns a partial
-seed. The [ApiService construction contract](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled)
+seed. The [publication construction contract](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled)
 owns those errors during Head construction; the
 [API protocol](api-protocol.md#anchored-graph-windows--settled) owns public
 anchored-window dispositions.

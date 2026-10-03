@@ -888,11 +888,11 @@ Verify the settled
 [publication-state contract](api-publication.md#publication-state-and-revision--settled):
 initial Synchronizing, direct initial Live, visible `Synchronizing -> Live`,
 and terminal Stale transitions leave graph view and history revisions
-unchanged. Cover reliable `reset` processing without an application-completion barrier,
-cancellation of unpublished construction, no additional effect for an already
-Stale publication, canonical delta catch-up through the Stale publication's
-final Head, head-snapshot state and ETag changes, and immutable delta bytes
-across later state changes. SSE cases cover dedicated `PublicationState`
+unchanged. Cover the runtime-replacement `reset` barrier without waiting for
+construction or activation, cancellation of unpublished construction, no
+additional effect for an already Stale publication, canonical delta catch-up
+through the Stale publication's final Head, head-snapshot state and ETag
+changes, and immutable delta bytes across later state changes. SSE cases cover dedicated `PublicationState`
 delivery without a graph revision, reconnect reporting current state, Web
 adoption without a delta request, and a fresh publication ID for a replacement
 image.
@@ -905,7 +905,8 @@ command enum. In particular, verify the
 [ApiService control boundary](api-service.md#reset-and-recovery-time-availability--settled):
 Supervisor can call `reset` and await the `shutdown` barrier while
 `kgi-processing` remains independent of `kgi-api-core`; `reset` returns after
-reliable acceptance without waiting for application. Verify status observations are
+the new runtime is installed and its predecessor has shut down, without waiting
+for graph construction or publication activation. Verify status observations are
 latest-value and lossy, remain available through the separate memory-only
 lane, and never influence lifecycle decisions. Node status begins without a
 validated observation, replaces it before each Ready publication, and
@@ -1058,9 +1059,10 @@ checks, direct target-state installation, Head bound recalculation, fixed-bound
 retention, and equality between sequential application and a directly or
 incrementally composed interval;
 associative graph-state effects across three adjacent intervals; later-value,
-insertion-folding, final `high_level`, and response-dictionary composition; and
-rejection of cross-publication or nongapless composition. Under a small response
-budget, verify advancement through complete stored entries. Cover a requested
+insertion-folding, final `high_level`, and response-dictionary composition;
+rejection of nongapless composition; and protocol rejection of a publication
+mismatch before history selection. Under a small response budget, verify
+advancement through complete stored entries. Cover a requested
 target inside an aggregate by extending through its right boundary, a future
 target by returning through current history, and a prefix ending at an earlier
 stored boundary. A starting cursor inside an aggregate is unavailable. A first
@@ -1217,8 +1219,9 @@ block is outside the projected window. Recompute derived level usage from
 edges. Exercise the separate capped API pool and prove its saturation or
 generation loss cannot consume or retire a processing-pool connection.
 
-Lifecycle cases cover `AwaitReset -> PreSeal`, waiting for the first-channel
-PostSeal marker while producer-side suppression remains active,
+Lifecycle cases cover ApiService `AwaitReset`, construction of a fresh private
+runtime in `PreSeal`, waiting for the first-channel PostSeal marker while
+producer-side suppression remains active,
 `Constructing -> Aligning`, and the prohibition on direct
 construction-to-activation. Alignment covers block IDs at and below the
 snapshot cut, a first greater ID with no retained effect, a first greater ID
@@ -1237,12 +1240,13 @@ VSPC commits racing with the marker transition; an offer ordered after the
 transition enters the channel instead. No pre-seal seed or second marker is
 required.
 
-Exercise the universal reconstruction primitive from Constructing, Aligning,
-and Active. The first two abandon their candidate; Active first becomes
-terminally Stale. In every case, drain through the first observed channel
-Empty, discard graph mutations, preserve sticky Live, capture the newest gap
-generation, and start a newer seed. Updates after the empty frontier must be
-staged, while a later gap-generation change restarts reconstruction again.
+Exercise the runtime's universal intra-session reconstruction primitive from
+Constructing, Aligning, and Active. The first two cancel any seed attempt and
+abandon their candidate; Active first becomes terminally Stale. In every case,
+drain through the first observed channel Empty, discard graph mutations,
+preserve sticky Live, capture the newest gap generation, and start a newer
+seed. Updates after the empty frontier must be staged, while a later
+gap-generation change restarts reconstruction again.
 Cover staging overflow, query/generation/projection failure, alignment or
 application failure, and a gap during each state. None may request processing
 recovery. `PublishPostSeal` is not repeated during same-session reconstruction.
@@ -1261,19 +1265,27 @@ database-backed request returns `503`. StorageService publishes `G1`, emits
 `ApiDbPublished(G1)`, and Supervisor maps it to `Published(G1)` for
 `update_api_db_generation`. ApiService adopts it without changing publication
 ID, state, view or history revisions, or SSE cursor. An ordinary Resync
-preserves both local fields.
+preserves both snapshot fields. Verify `public_read_client()` is immediate and
+returns a client only while the gate is open and the current exact client is
+valid. Verify `current().await` ignores that gate, waits through an absent or
+invalid current client, wakes on a valid published replacement, and returns
+`None` only after ApiDbState becomes `Stopped`.
 
 From an Active publication using `G1`, make a public database operation report
 `GenerationLost`. StorageService must atomically retire `G1`, emit exactly one
 ordered `ApiDbRetired(G1)`, start autonomous reacquisition, and later emit
 `ApiDbPublished(G2)` without an ApiService request. Supervisor maps those to
-the corresponding API control events. The failed operation returns
-`503` and clears `G1` locally when it is still current; forwarding the retirement
-is idempotent. A late `Retired(G1)` after `G2` cannot clear `G2`, and an in-flight
-operation never switches or retries generations. Exercise the same loss from a
-construction seed attempt: it invokes reconstruction, waits while no client is
-available, and resumes with the forwarded replacement. Prove ApiService emits
-no reverse generation-loss event and Supervisor creates no acquisition task.
+the corresponding API control events. Before returning the error,
+StorageService makes `G1.is_valid()` false permanently. The failed operation
+returns `503` without directly clearing ApiDbState; the invalid client is
+immediately inadmissible, and forwarding the exact retirement removes it from
+the latest snapshot idempotently. A late `Retired(G1)` after `G2` cannot clear
+`G2`, a retired Arc is never republished, and an in-flight operation never
+switches or retries generations. Exercise the same loss from a construction
+seed attempt: the runtime invokes reconstruction, waits in `current()` while no
+valid client is available, and resumes with the forwarded replacement. Prove
+ApiService emits no reverse generation-loss event and Supervisor creates no
+acquisition task.
 
 For both a public database-backed anchored window and a Head seed attempt,
 exercise `QueryFailed` and `InconsistentProjection`. A public request returns
@@ -1297,9 +1309,16 @@ otherwise advancing Active graph publication.
 
 Verify [Reset and recovery-time availability](api-service.md#reset-and-recovery-time-availability--settled)
 with ordinary Resync and Rebuild integration scenarios. Verify the fresh
-`GraphUpdateReceiver` and exact recovery mode; global preemption from
-PreSeal, Constructing, Aligning, and Active; and old receiver replacement.
-Supervisor proceeds after `reset` returns without waiting for its application.
+`GraphUpdateReceiver` and exact recovery mode. From PreSeal, Constructing,
+Aligning, and Active, start the fresh runtime before exchanging it into the
+private lifecycle slot, then await the old runtime's uniform shutdown before
+`reset` returns. Verify the new receiver can drain during the bounded runtime
+overlap and that reset completion waits for neither construction nor
+publication activation. Serialize concurrent reset and shutdown calls through
+the runtime mutex; reset after `Stopped` is rejected and repeated shutdown is
+successful. Permit either overlapping runtime to install a coherent
+publication without sender identity or a revocable installation capability;
+the most recently completed installation is current.
 Resync preserves public database-backed reads, and failed reconciliation followed by
 Rebuild calls `reset` again with a fresh ingress. Rebuild relies on
 StorageService rather than `reset` to close API database admission, retire the
@@ -1311,11 +1330,12 @@ Cover `PublishPostSeal` arriving before StorageService's replacement
 `Published` event and construction remaining pending. No in-flight request
 rebinds to a newly published storage generation,
 and no request observes a partial or mixed generation, including with
-PostgreSQL `TRUNCATE`. Verify ordinary sender
-teardown may close the installed receiver, channel closure is not a lifecycle
-signal, and a marker worker with an accepted delivery may outlive
-BlockProcessor Deactivate without retaining an RPC or DB client, then exits
-after delivery or receiver replacement.
+PostgreSQL `TRUNCATE`. Verify ordinary sender teardown may close the installed
+receiver. The runtime then becomes quiescent, does not reconstruct or change
+publication state, and remains owned until its later `shutdown()`. A marker
+worker with an accepted delivery may outlive BlockProcessor Deactivate without
+retaining an RPC or DB client, then exits after delivery or receiver
+replacement.
 
 Verify the [ApiService shutdown barrier](api-service.md#apiservice-shutdown--settled)
 from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`, and `Active`, including
@@ -1324,11 +1344,13 @@ serialization, detached response delivery, SSE wakeups, and API-generation
 publication on either side of Supervisor's terminal-shutdown cutoff. An update
 completed before the cutoff is cleared by shutdown; an event observed after
 the cutoff is discarded without an `update_api_db_generation` call, and a
-direct update call after ApiService shutdown begins is rejected. Admission and
-SSE close first; the graph receiver drop unblocks a waiting marker worker;
-every API task and database resource ends before method completion; no
-publication or revision mutation is emitted; and repeated `shutdown` is
-idempotent.
+direct update call after ApiDbState becomes `Stopped` is rejected. Admission
+closes first; runtime shutdown performs its ordinary terminal `Stale`
+transition and state-message emission before SSE closes; the graph receiver
+drop unblocks a waiting marker worker; every API task and database resource
+ends before method completion; no graph revision is emitted; and repeated
+`shutdown` is idempotent. Verify ApiDbState becomes `Stopped`, wakes a pending
+`current()`, and rejects later generation updates.
 Supervisor starts ApiService and ResyncEngine shutdown without waiting for one
 to complete before starting the other, awaits both method barriers, and only
 then calls NodeService shutdown followed by StorageService shutdown. Producer

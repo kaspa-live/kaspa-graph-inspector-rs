@@ -65,9 +65,53 @@ owns cache entry identities and delta-cache policy, while the
 [publication wire contract](api-protocol.md#publication-wire-observation--settled)
 owns client registration and wake scheduling.
 
+## Publication runtime — settled
+
+`PublicationRuntime` is a private `kgi-api-core` value whose lifetime is bound
+to one processing session. It owns that session's `GraphUpdateReceiver`, graph
+update worker, gap observation, seed construction, staging, alignment, and the
+writer side of every publication it activates. It also owns an
+`Arc<ApiDbState>` clone through which construction awaits the latest valid API
+database client. ApiService directly owns at most one runtime; the runtime is
+never exported, returned to a caller, or placed in a shared model crate.
+
+One runtime persists across every intra-session reconstruction and may activate
+successive publications. It owns at most one active
+`Arc<GraphPublication>`. On activation it may begin feeding that coherent
+publication and supplies an Arc clone to ApiService's current-publication slot.
+Supplying the clone has no acknowledgement or paired atomicity requirement:
+the runtime may feed its instance before or after ApiService installs the
+clone. Runtime ownership does not confer exclusive installation authority;
+the reset-time overlap and current-slot replacement rule belong to the
+[ApiService control contract](api-service.md#reset-control-and-recovery-effects--settled).
+
+The runtime exposes one private completed barrier:
+
+```rust
+impl PublicationRuntime {
+    async fn shutdown(&self) -> Result<(), PublicationRuntimeError>;
+}
+```
+
+`shutdown()` first stops consuming and applying graph updates, marks its active
+publication terminally `Stale` if one exists, cancels any seed attempt and
+abandons any unpublished candidate, stops and joins its workers, releases its
+receiver and its own publication Arc, and then completes. The behavior is the
+same for session replacement and ApiService shutdown. It is terminal and
+idempotent. The state transition uses the protocol-owned
+[`PublicationState` delivery](api-protocol.md#publication-wire-observation--settled).
+
+The runtime otherwise terminates only through `shutdown()`. A closed
+`GraphUpdateReceiver` makes it quiescent: it stops consuming and constructing,
+does not reconstruct or change publication state, and remains owned until a
+later reset or shutdown invokes the barrier. Operational failures named below
+use intra-session reconstruction instead of terminating the runtime. Task
+panic containment and cancellation mechanics remain part of ApiService task
+tracking rather than another publication lifecycle transition.
+
 ## Database seed extent and projection — settled
 
-ApiService obtains a `GraphViewSeed` through storage's
+`PublicationRuntime` obtains a `GraphViewSeed` through storage's
 [`ValidatedApiDbClient`](storage.md#api-graph-projection-reads--settled). The
 API-specific handle uses the separate capped read-only API pool; the processing
 `ValidatedDbClient` is never used for graph loads or historical requests.
@@ -127,20 +171,22 @@ consumed by alignment.
 
 ## Head-publication lifecycle and stream alignment — settled
 
-ApiService projects one processing session through these internal states:
+One `PublicationRuntime` projects its processing session through these internal
+states:
 
 ```text
-AwaitReset -- reset() --> PreSeal
-    -- PublishPostSeal --> Constructing
+PreSeal -- PublishPostSeal --> Constructing
     -- seed succeeds --> Aligning
     -- block and VSPC cuts crossed --> Active
 ```
 
-`reset` may preempt every installed-session state. Its complete topology and
-state effects are owned by the
+ApiService creates a fresh runtime in `PreSeal` for each accepted `reset`; a
+later reset replaces the whole runtime rather than moving the existing runtime
+back to `PreSeal`. The complete replacement topology and control effects are
+owned by the
 [reset contract](api-service.md#reset-and-recovery-time-availability--settled).
 
-In `PreSeal`, ApiService waits for the mandatory `PublishPostSeal` marker; the
+In `PreSeal`, the runtime waits for the mandatory `PublishPostSeal` marker; the
 producer gate prevents ordinary committed updates from entering the channel.
 The marker establishes the reconstruction cut, initializes the target
 publication state to `Synchronizing`, starts an empty staging buffer and a
@@ -188,7 +234,7 @@ post-snapshot update; this idle-source delay is accepted and has no timeout or
 synthetic fence.
 
 Exhausting the current staging buffer before both cuts cross is normal.
-ApiService remains in `Aligning` and applies the same per-source classification
+The runtime remains in `Aligning` and applies the same per-source classification
 to later updates. `Live` only updates the sticky target state and crosses
 neither cut. There is no direct `Constructing -> Active` transition.
 
@@ -218,13 +264,15 @@ generation.
 ## Universal API reconstruction — settled
 
 Every graph update is emitted only after the database commit it represents is
-definite. ApiService therefore uses one lossless reconstruction primitive for
+definite. `PublicationRuntime` therefore uses one lossless intra-session
+reconstruction primitive for
 graph-update gaps, staging overflow, construction or projection failure,
 construction-side API query or pool failure, construction-side API
 database-generation loss, and alignment invariant failure:
 
 ```text
 restart_construction():
+    cancel and abandon the current seed attempt, if any
     abandon the unpublished candidate, if any
     discard the current staging buffer
     drain the current session channel through the first observed Empty
@@ -238,8 +286,17 @@ restart_construction():
 Drained and dropped updates are covered by the newer database snapshot because
 their commits precede that snapshot. Updates received after the observed empty
 frontier are staged for the new attempt. A later gap-generation change invokes
-the same primitive again. Before activation, ApiService requires the recorded
-generation still to be current.
+the same primitive again. Before activation, the runtime requires the recorded
+gap generation still to be current.
+
+Each seed attempt first awaits the ApiService-owned `ApiDbState::current()` and
+captures its returned exact client without switching generations within that
+attempt. A `GenerationLost` result invokes `restart_construction()`; the runtime
+does not clear ApiDbState. `QueryFailed` and `InconsistentProjection` invoke the
+same reconstruction primitive while leaving the current client unchanged. A
+`None` result ends the pending construction work without starting another
+attempt. The [database-binding owner](api-service.md#api-database-generation-binding--settled)
+defines when either accessor returns a client or `None`.
 
 `PublishPostSeal` is not tracked during reconstruction. Entering
 `Constructing` already proves that the session consumed its mandatory marker;
@@ -271,12 +328,12 @@ and about 41 seconds at 100 updates per second.
 Operational measurements include staging occupancy and high-water mark,
 overflow count, and the resulting reconstruction count.
 
-Throughout reconstruction, a previous coherent publication remains readable
-as Stale.
+Throughout reconstruction, ApiService may continue serving the previous
+coherent publication as `Stale` while the runtime constructs its replacement.
 
 ## Publication state and revision — settled
 
-ApiService has three externally meaningful publication states:
+A `GraphPublication` has three externally meaningful states:
 
 ```text
 Stale | Synchronizing | Live
@@ -311,8 +368,14 @@ semantics owned by the [graph model](api-graph.md).
 
 The active Head consumes original committed updates and produces deltas; it
 never applies a delta to itself. Direct Head mutation failure, history append
-revision mismatch, unexpected failure to compose trusted retained history, or
-another Head/history invariant that prevents advancement is an API projection
-failure. In `Constructing` or `Aligning`, abandon the unpublished candidate and
-invoke `restart_construction()`. In `Active`, first mark the current publication
+revision mismatch, or another invariant failure in the publication's own
+Head/history advancement path is an API projection failure. In `Constructing`
+or `Aligning`, abandon the unpublished candidate and invoke
+`restart_construction()`. In `Active`, first mark the current publication
 terminally `Stale`, then invoke the same primitive.
+
+Read-only retained-history selection and composition for response or cache
+construction do not advance the publication. A failure in that request path is
+request-local under the
+[public delivery contract](api-protocol.md#public-delivery-failures--settled);
+it does not mark the publication `Stale` or invoke reconstruction.

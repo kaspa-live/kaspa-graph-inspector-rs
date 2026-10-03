@@ -11,7 +11,7 @@ SSE representation belongs to the [API protocol](api-protocol.md).
 
 ## Graph update consumption — settled
 
-ApiService consumes storage's
+The session's `PublicationRuntime` consumes storage's
 [`BlockCommitted`](storage.md#block-materialization-transaction--settled) and
 VspcProcessor's
 [`VspcCommitted`](vspc-processing.md#commit-and-graph-publication--settled)

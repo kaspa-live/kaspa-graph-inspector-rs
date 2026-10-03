@@ -5,8 +5,9 @@
 This document owns the per-session graph-update channel, its producer and
 receiver capabilities, the pre-seal delivery gate, lifecycle-marker delivery,
 and gap reporting. The producer documents own when committed values and marker
-commands are offered. [API publication](api-publication.md) owns how ApiService consumes
-the ordered stream and reconstructs its derived graph projection.
+commands are offered. [API publication](api-publication.md) owns how the private
+publication runtime consumes the ordered stream and reconstructs its derived
+graph projection.
 
 ## In-process graph-update feed — settled
 
@@ -90,9 +91,9 @@ impl GraphUpdateProducer {
 `GraphUpdateProducer` is the cloneable session-scoped producer capability that
 Supervisor supplies through ResyncEngine to both processors.
 `GraphUpdateReceiver` is the corresponding single-consumer session capability
-that Supervisor supplies through `ApiService::reset`. Every producer clone shares
-one `GraphUpdateGate`, initially `PreSeal`; the receiver does not expose that
-producer-side gate.
+that Supervisor supplies through `ApiService::reset` to the session's private
+publication runtime. Every producer clone shares one `GraphUpdateGate`,
+initially `PreSeal`; the receiver does not expose that producer-side gate.
 `GraphUpdateGapReporter` and the consumer-side `GraphUpdateGap` refer to the
 same session-local continuity state. These names fix the semantic capability
 split. The mutex around `GraphUpdateGateState` is settled; concrete channel,
@@ -119,16 +120,16 @@ The marker worker's `publish_live` operation requires `Open`, releases the
 state mutex, and then uses lossless delivery, awaiting channel capacity instead
 of reporting an ordinary-update gap. Its command FIFO preserves
 `PublishPostSeal` before `Live`; unrelated ordinary graph updates may
-interleave before `Live`. ApiService's reaction to a reported gap belongs to
+interleave before `Live`. The runtime's reaction to a reported gap belongs to
 the [publication reconstruction contract](api-publication.md#universal-api-reconstruction--settled).
 
 The [BlockProcessor marker contract](block-processing.md#graph-lifecycle-marker-delivery--settled)
 owns its worker and marker-command enqueue points. The
 [processing lifecycle](processing-lifecycle.md#live-admission) owns the global
-causality before the Live command. ApiService consumes the resulting channel
-order without reconstructing those producer decisions. The capacity provides
-about 51 seconds at an expected 20 updates per second and about 10 seconds at
-100 updates per second. Exact channel and wakeup primitives remain deferred in
+causality before the Live command. The publication runtime consumes the
+resulting channel order without reconstructing those producer decisions. The
+capacity provides about 51 seconds at an expected 20 updates per second and
+about 10 seconds at 100 updates per second. Exact channel and wakeup primitives remain deferred in
 the [decision register](../decisions/deferred.md).
 
 Operational measurements include current occupancy, high-water mark, reported

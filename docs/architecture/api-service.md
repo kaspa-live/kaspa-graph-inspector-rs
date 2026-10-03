@@ -23,7 +23,9 @@ ApiService's recovery-time control boundary.
 
 ## API database generation binding — settled
 
-ApiService owns its generation-update control value and local database state:
+ApiService owns one shared database state and gives a clone to each private
+`PublicationRuntime`. The state uses latest-value asynchronous delivery;
+`tokio::sync::watch` is the settled primitive:
 
 ```rust
 enum ApiDbGenerationEvent {
@@ -31,13 +33,25 @@ enum ApiDbGenerationEvent {
     Published(Arc<ValidatedApiDbClient>),
 }
 
+enum ApiDbSnapshot {
+    Running {
+        current: Option<Arc<ValidatedApiDbClient>>,
+        public_reads_enabled: bool,
+    },
+    Stopped,
+}
+
 struct ApiDbState {
-    current: Option<Arc<ValidatedApiDbClient>>,
-    public_reads_enabled: bool,
+    tx: tokio::sync::watch::Sender<ApiDbSnapshot>,
+}
+
+impl ApiDbState {
+    async fn current(&self) -> Option<Arc<ValidatedApiDbClient>>;
+    fn public_read_client(&self) -> Option<Arc<ValidatedApiDbClient>>;
 }
 ```
 
-It initializes as `current = None` and `public_reads_enabled = true`.
+It initializes with `Running { current: None, public_reads_enabled: true }`.
 StorageService owns generation retirement and autonomous replacement under the
 [storage lifecycle](storage.md#storageservice-lifecycle--settled). Supervisor
 maps StorageService's ordered API-generation variants to
@@ -45,41 +59,50 @@ maps StorageService's ordered API-generation variants to
 ApiService never calls StorageService, requests reacquisition, or emits a
 generation-loss event.
 
-`Published(client)` sets `current = Some(client)`. `Retired(lost)` clears
-`current` only when it still holds that exact `Arc`; a late retirement for an
-older generation cannot clear a newer binding. Repeating either event for the
-same `Arc` is idempotent. The reliable Supervisor call returns after this local
-state transition has completed.
+`Published(client)` sets `current = Some(client)` only for the valid published
+handle. `Retired(lost)` clears `current` only when it still holds that exact
+`Arc`; a late retirement for an older generation cannot clear a newer binding.
+Repeating either event for the same `Arc` is idempotent. Each accepted event
+publishes the resulting complete snapshot. The reliable Supervisor call
+returns after this local state transition has completed.
 
-A public database-backed request is admitted only when
-`public_reads_enabled` is true and `current` is `Some(client)`. It clones that
-exact `Arc`, releases the ApiService state lock, and performs its complete
-database phase without holding the lock, switching generations, or retrying
-transparently. A disabled gate or absent client rejects database-backed request
-admission; the [API protocol](api-protocol.md#anchored-graph-windows--settled)
-owns its HTTP response. A complete projection detached before a concurrent
+`public_read_client()` is an immediate snapshot read. It returns a clone only
+when the state is `Running`, public reads are enabled, a current client exists,
+and that client's storage-owned `is_valid()` state is true. It otherwise
+returns `None`, which rejects database-backed request admission under the
+[API protocol](api-protocol.md#anchored-graph-windows--settled). A request that
+obtains a client performs its complete database phase against that exact
+generation without holding an ApiDbState lock, switching generations, or
+retrying transparently. A complete projection detached before a concurrent
 state change may still finish delivery under the storage-owned replacement
 gate.
 
-Publication construction may use `current` independently of the public-read
-gate and captures one exact client for each database seed attempt. When no
-client is present, construction remains pending. `Published` wakes such pending
-work. If a public or construction operation returns `GenerationLost`,
-ApiService immediately clears the client only when it is still current. The
-public request fails under the public API mapping; construction invokes the
-publication-owned
-[`restart_construction()`](api-publication.md#universal-api-reconstruction--settled) and
-waits for or uses the latest binding. StorageService has already retired the
-failed generation and started autonomous reacquisition, so the later forwarded
-`Retired` event is an idempotent confirmation. For a construction seed attempt,
-`QueryFailed` and `InconsistentProjection` both abandon that attempt and invoke
-the publication-owned `restart_construction()` without clearing a still-current
-client.
+`current().await` is the construction-side accessor. It ignores the public-read
+gate and waits without a local timeout until a complete snapshot contains a
+current client whose storage-owned `is_valid()` state is true. It returns
+`Some(client)` for that exact generation and returns `None` only after the
+state becomes `Stopped`. Pending construction is therefore woken by a
+published replacement or service shutdown without an exposed subscription or
+separate wakeup API.
+
+If a public or construction operation returns `GenerationLost`, the exact
+client is already terminally invalid under the
+[storage-owned validity contract](storage.md#storageservice-lifecycle--settled).
+The public request fails under the public API mapping. Construction invokes
+the publication-owned
+[`restart_construction()`](api-publication.md#universal-api-reconstruction--settled),
+whose next seed awaits a valid current client. Neither path clears ApiDbState;
+the ordered forwarded `Retired` event performs exact-Arc housekeeping and
+wakes watchers. StorageService has already started autonomous reacquisition.
+For a construction seed attempt, `QueryFailed` and
+`InconsistentProjection` both abandon that attempt and invoke reconstruction
+without changing ApiDbState.
 
 For a public operation, `QueryFailed` and `InconsistentProjection` leave
 `ApiDbState` unchanged. Normal anchor-unavailability and invalid-request
-outcomes likewise do not enter generation-loss handling. Only
-`GenerationLost` performs the exact-current-client clearing above.
+outcomes likewise do not enter generation-loss handling. `GenerationLost`
+also changes no snapshot directly: invalidity makes the exact client
+immediately unusable, and the ordered generation event owns its removal.
 
 Generation events by themselves change no graph publication ID, state, view
 revision, history, or SSE cursor and do not invoke processing Resync or Rebuild.
@@ -110,44 +133,73 @@ impl ApiService {
 ```
 
 The methods are ApiService's complete Supervisor-facing control interface.
-Their private mailbox or event-loop mechanics remain internal to
-`kgi-api-core`. Successful `update_api_db_generation` returns after the local
-idempotent binding transition is complete. Successful `reset` means the
-operation was reliably accepted for ordered processing; it does not wait for
-application. Successful `shutdown` means ApiService completed the shutdown
-barrier. An unavailable component returns `ApiServiceError` under the
+Supervisor calls them directly on `Arc<ApiService>`; there is no separate
+Supervisor-facing command handle or command mailbox. Successful
+`update_api_db_generation` returns after the local idempotent binding
+transition is complete. Successful `reset` means the new runtime is installed
+and its predecessor, if any, completed shutdown. It does not wait for graph
+construction, alignment, publication activation, or processing progress.
+Successful `shutdown` means ApiService completed the shutdown barrier. An
+unavailable component returns `ApiServiceError` under the
 `Ownership(ManagedComponentUnavailable)` parent-to-child failure semantics
 owned by the
 [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
 
-`reset` installs the fresh session receiver supplied under the
-[graph-update ingress contract](api-ingress.md). `RecoveryMode` is the
+ApiService owns exactly one private runtime slot:
+
+```rust
+enum ApiRuntimeSlot {
+    AwaitReset,
+    Running(PublicationRuntime),
+    Stopped,
+}
+
+struct ApiService {
+    runtime: tokio::sync::Mutex<ApiRuntimeSlot>,
+    api_db: Arc<ApiDbState>,
+    // current publication and request infrastructure
+}
+```
+
+`PublicationRuntime` is a directly owned private `kgi-api-core` value, never a
+public capability or model value. Its complete behavior belongs to the
+[publication owner](api-publication.md#publication-runtime--settled). The
+runtime lifecycle mutex serializes each complete `reset` and `shutdown` call;
+the two operations cannot exchange or stop runtimes concurrently. API
+database-generation updates do not take this mutex and remain independently
+serialized by ApiDbState. Once ApiDbState becomes `Stopped`, later generation
+updates are rejected.
+
+`reset` gives the fresh session receiver supplied under the
+[graph-update ingress contract](api-ingress.md) to a new runtime.
+`RecoveryMode` is the
 Resync/Rebuild value owned by the
 [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
 
-ApiService accepts exactly one `reset` call for each processing attempt. It
-globally preempts `PreSeal`, `Constructing`, `Aligning`, or `Active`:
+ApiService accepts exactly one `reset` call for each processing attempt. Under
+the runtime lifecycle mutex it establishes the recovery-mode-specific
+ApiDbState effect below, starts a new runtime with the fresh receiver and an
+`Arc<ApiDbState>` clone, exchanges that runtime into the slot, then awaits the
+old runtime's `shutdown()`, if any. Starting the new runtime before stopping
+the old one lets the new receiver drain immediately. Successful return is a
+runtime-replacement barrier, but is not a processing, publication-activation,
+or database-replacement barrier.
 
-1. abandon any unpublished candidate and reconstruction state;
-2. mark any current non-Stale publication terminally Stale;
-3. drop the old `GraphUpdateReceiver` and install the fresh one;
-4. establish the recovery-mode-specific `ApiDbState` effects below; and
-5. enter `PreSeal`.
-
-The call is reliable but has no application-completion barrier. Supervisor may
-continue session startup after it returns; `reset` is not a processing barrier
-or a database-replacement barrier. A previous publication already Stale needs
-no additional graph or history mutation.
+During the bounded overlap, either still-running runtime may supply a coherent
+publication to ApiService's current-publication slot. Installation authority
+does not depend on which runtime occupies `ApiRuntimeSlot`; no runtime identity,
+revocable installation capability, or current-runtime check is used. The most
+recent completed installation is current. The publication owner defines
+runtime installation and shutdown effects.
 
 `PublishPostSeal` and `Live` are graph-update-feed markers rather than
 out-of-band controls. They have no publication-completion acknowledgement. A
 later session's `reset` call is the only session-supersession mechanism visible
 to ApiService.
 
-Ordinary teardown may drop the session's last producer and close the installed
-receiver. Channel closure is not an ApiService lifecycle signal and does not
-replace, invalidate, or reconstruct a publication. ApiService retains its
-current state until the next `reset` call or another defined state transition.
+Ordinary teardown may drop the session's last producer and close its receiver.
+The publication owner defines the runtime's quiescent reaction; closure is not
+a session-supersession control call.
 
 An ordinary Resync `reset` preserves both fields of `ApiDbState`. A Rebuild
 `reset` sets `public_reads_enabled = false` without clearing `current`; a
@@ -159,8 +211,8 @@ Keeping `current` does not authorize a stale Rebuild read. StorageService
 retires the old generation before database replacement, and the replacement
 gate prevents that handle from successfully observing replaced contents. If a
 construction attempt reaches the retired handle before Supervisor forwards its
-`Retired` event, `GenerationLost` clears it and invokes reconstruction. A
-`Published` replacement becomes immediately available to construction while
+`Retired` event, `GenerationLost` exposes its invalidity and invokes
+reconstruction. A `Published` replacement becomes immediately available to construction while
 the public-read gate remains disabled.
 
 On ordinary initialized startup, StorageService's initial `Published` event
@@ -202,34 +254,39 @@ gate boundary. `reset` does not participate in that exclusion mechanism.
 
 `shutdown` is a reliable completed-barrier operation. It is terminal,
 idempotent, valid from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`, and
-`Active`, and supersedes `reset` processing, publication construction,
-alignment, reconstruction, and Active update application. ApiService performs
-the local barrier in order:
+`Active`, and is serialized with `reset` by the runtime lifecycle mutex.
+ApiService performs the local barrier in order:
 
 1. close public graph HTTP and status admission;
-2. close every SSE stream;
-3. drop the installed `GraphUpdateReceiver` and stop gap observation;
-4. cancel publication construction, alignment, reconstruction, staging, and
-   background encoding or cache work;
-5. cancel and join every admitted request, serialization, delivery, and other
-   API-owned task;
+2. publish `ApiDbSnapshot::Stopped`, waking pending construction and making
+   public database reads unavailable;
+3. take the installed runtime, if any, and await its publication-owned
+   `shutdown()` barrier;
+4. close every SSE stream;
+5. cancel and join background encoding, cache, admitted request,
+   serialization, delivery, and other API-owned tasks;
 6. release every API DB permit, transaction, connection, validated client,
    pool handle, publication, and cache reference; and
-7. enter terminal `Stopped` and complete the `shutdown` call.
+7. set `ApiRuntimeSlot::Stopped` and complete the `shutdown` call.
 
 Successful method completion proves that no API admission, task, graph-update
 receiver, or API database resource remains. A repeated `shutdown` returns
-success for the already completed state. Once shutdown begins, ApiService
-accepts neither `reset` nor `update_api_db_generation`; an update completed
-before shutdown began is subsequently cleared by the shutdown barrier.
+success for the already completed state. Runtime-lifecycle serialization rejects
+`reset` once shutdown begins. Publishing `ApiDbSnapshot::Stopped` is the
+generation-update cutoff: an update linearized before that transition may
+complete and is then cleared by the transition, while a later update is
+rejected.
 ApiService adds no component-local timeout or escalation to this barrier; the
 Supervisor waiting policy belongs to the
 [processing lifecycle](processing-lifecycle.md#teardown-and-delivery-semantics--settled).
 
-`shutdown` creates no publication, `Stale` transition, graph revision, or SSE
-wakeup because external admission closes first. `ReceiverClosed` caused by
-this barrier is expected cancellation for the concurrently stopping processing
-session and must not request API reconstruction, Resync, or Rebuild.
+Publication-state and graph effects of the awaited runtime barrier belong to
+the [publication runtime contract](api-publication.md#publication-runtime--settled).
+Public HTTP admission is already closed, while SSE remains available for the
+protocol-owned state message produced by that transition and then closes in the
+next step. `ReceiverClosed` caused by this barrier is expected cancellation for
+the concurrently stopping processing session and must not request API
+reconstruction, Resync, or Rebuild.
 
 ## Status observation — settled
 

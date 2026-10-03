@@ -67,8 +67,8 @@ restating it.
 | `processing-lifecycle.md` | Supervisor, recovery intent, ResyncEngine, Resync/Rebuild preparation, the common pump, Catchup and Live admission, fault policy, retries, and teardown. |
 | `api-ingress.md` | Per-session graph-update channel, producer and receiver capabilities, pre-seal gate, lifecycle markers, and gap reporting. |
 | `api-graph.md` | Graph values, views, tracking policies, revisions, deltas, history, mutation and extraction behavior, composition, and retention. |
-| `api-publication.md` | Graph publication identity and lifecycle, database seed construction, stream alignment, activation, reconstruction, replacement, and publication-scoped response-reuse lifetime. |
-| `api-service.md` | ApiService control, database-generation binding, reset, shutdown, status aggregation, resource bulkheads, and saturation. |
+| `api-publication.md` | Private publication runtime, graph publication identity and lifecycle, database seed construction, stream alignment, activation, reconstruction, replacement, and publication-scoped response-reuse lifetime. |
+| `api-service.md` | ApiService control and runtime slot, database-generation binding, reset, shutdown, status aggregation, resource bulkheads, and saturation. |
 | `api-protocol.md` | Public HTTP and SSE graph contract, limits, cursors, windows, errors, ETags, response caching, and delivery behavior. |
 | `api.md` | Navigation for the focused API architecture documents. It contains no system behavior. |
 | `web.md` | Browser client behavior and presentation requirements. |

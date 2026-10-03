@@ -746,8 +746,9 @@ owns lifecycle-marker consumption and publication effects, while its
 owns the reaction to a reported gap. This document owns Supervisor's `reset`
 call point and processor command ordering;
 [BlockProcessor](block-processing.md#graph-lifecycle-marker-delivery--settled)
-owns marker-command enqueue points. `reset` returns after reliable acceptance,
-and processing never waits for its application or publication completion. A
+owns marker-command enqueue points. `reset` returns after runtime replacement
+and predecessor-runtime shutdown; processing never waits
+for construction or publication completion. A
 recoverably aborted session sends no invalidation control; the next processing
 attempt's `reset` call is the sole
 ApiService session-supersession event. Resync-to-Rebuild escalation therefore
@@ -761,9 +762,8 @@ owns the `PublishPostSeal` command enqueue. If reconciliation instead requests
 Rebuild, complete teardown and start the distinct Rebuild attempt with another
 `reset` call; no special API invalidation is required.
 
-For Rebuild, Supervisor calls `reset(Rebuild)` and then `start(Rebuild, ...)`
-without waiting for ApiService to apply the reset. StorageService's replacement
-gate, rather than `reset`,
+For Rebuild, Supervisor awaits `reset(Rebuild)` and then calls
+`start(Rebuild, ...)`. StorageService's replacement gate, rather than `reset`,
 excludes API database phases before `rebuild_from_pruning_point` changes data.
 After processor Begin, ResyncEngine permits no Catchup until it observes
 BlockProcessor's definitely committed `PpBoundarySealed` event and forwards it
@@ -777,9 +777,9 @@ Supervisor's `Rebuild -> Resync` downgrade.
 `PpBoundarySealed` has no API database-generation role. StorageService
 autonomously publishes the coherent replacement and Supervisor forwards that
 event independently. `PublishPostSeal` may arrive before the replacement
-`Published` event; ApiService then keeps construction pending until a current
-generation is available. The API owner alone opens public database-backed
-reads when the replacement publication becomes Active.
+`Published` event; the publication runtime then keeps construction pending
+until a current generation is available. The API owner alone opens public
+database-backed reads when the replacement publication becomes Active.
 
 When the global Live conditions are satisfied, ResyncEngine sends the existing
 processor Live commands and emits `EnteredLive`. The BlockProcessor marker
