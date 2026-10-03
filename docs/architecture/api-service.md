@@ -3,8 +3,9 @@
 ## Scope and ownership
 
 This document owns the ApiService Supervisor-facing control surface, API
-database-generation binding, reset and shutdown behavior, status aggregation,
-resource admission, bulkheads, saturation, and operational measurements.
+database-generation binding, current-publication slot, reset and shutdown
+behavior, status aggregation, resource admission, bulkheads, saturation, and
+operational measurements.
 [API graph publication](api-publication.md) owns publication construction and
 reconstruction. [The API protocol](api-protocol.md) owns HTTP, SSE, windows,
 cursors, public errors, and cache semantics.
@@ -157,7 +158,9 @@ enum ApiRuntimeSlot {
 struct ApiService {
     runtime: tokio::sync::Mutex<ApiRuntimeSlot>,
     api_db: Arc<ApiDbState>,
-    // current publication and request infrastructure
+    current_publication:
+        tokio::sync::watch::Sender<Option<Arc<GraphPublication>>>,
+    // request infrastructure
 }
 ```
 
@@ -191,6 +194,34 @@ does not depend on which runtime occupies `ApiRuntimeSlot`; no runtime identity,
 revocable installation capability, or current-runtime check is used. The most
 recent completed installation is current. The publication owner defines
 runtime installation and shutdown effects.
+
+The current-publication slot is a latest-value asynchronous value initialized
+to `None`. `tokio::sync::watch` is the settled primitive. Each runtime receives
+a sender clone and can install a complete publication with the equivalent of:
+
+```rust
+fn install_publication(
+    slot: &tokio::sync::watch::Sender<Option<Arc<GraphPublication>>>,
+    publication: Arc<GraphPublication>,
+) {
+    slot.send_replace(Some(publication));
+}
+
+fn current_publication(&self) -> Option<Arc<GraphPublication>> {
+    self.current_publication.borrow().clone()
+}
+```
+
+Installation atomically replaces the complete `Arc`; it never mutates a
+previous publication through the slot. A public operation reads and clones the
+slot once, retains that exact publication for its complete execution, and does
+not restart or rebind when another publication is installed. A concurrent
+replacement therefore affects later operations only. Publication replacement
+notification can observe the same watch value; no separate replacement signal
+or `arc-swap` dependency is required.
+
+A runtime never clears the slot. ApiService stores `None` only at initial
+construction and when terminal shutdown releases the current publication.
 
 `PublishPostSeal` and `Live` are graph-update-feed markers rather than
 out-of-band controls. They have no publication-completion acknowledgement. A
@@ -265,8 +296,9 @@ ApiService performs the local barrier in order:
 4. close every SSE stream;
 5. cancel and join background encoding, cache, admitted request,
    serialization, delivery, and other API-owned tasks;
-6. release every API DB permit, transaction, connection, validated client,
-   pool handle, publication, and cache reference; and
+6. replace the current-publication value with `None`, then release every API DB
+   permit, transaction, connection, validated client, pool handle, publication,
+   and cache reference; and
 7. set `ApiRuntimeSlot::Stopped` and complete the `shutdown` call.
 
 Successful method completion proves that no API admission, task, graph-update

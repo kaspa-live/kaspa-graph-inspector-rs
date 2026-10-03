@@ -2,20 +2,22 @@
 
 ## Scope and ownership
 
-This document owns `GraphPublication`, publication identity and lifecycle state,
-database seed construction, graph-update alignment, activation, reconstruction,
-replacement, and the lifetime of publication-scoped response reuse. The
+This document owns `GraphPublication`, its internal synchronization and request
+capture, publication identity and lifecycle state, database seed construction,
+graph-update alignment, activation, reconstruction, replacement, and the
+lifetime of publication-scoped response reuse. The
 [API graph model](api-graph.md) owns the contained view, delta, and history
-semantics. [ApiService control](api-service.md) owns reset and API
-database-generation binding. Public HTTP, SSE, window, cursor, cache-entry,
-selection, and delivery behavior belongs to the
+semantics. [ApiService control](api-service.md) owns reset, the current-
+publication slot, and API database-generation binding. Public HTTP, SSE,
+window, cursor, cache-entry, selection, and delivery behavior belongs to the
 [API protocol](api-protocol.md).
 
 ## Publication and seed values — settled
 
 The following conceptual shapes define publication state and construction.
-Container and collection types remain implementation choices. Window anchors,
-resolution, and normal anchor-unavailability outcomes remain public API values.
+The synchronization types shown here are settled; collection types not shown
+remain implementation choices. Window anchors, resolution, and normal
+anchor-unavailability outcomes remain public API values.
 
 ```rust
 enum GraphPublicationState {
@@ -24,11 +26,16 @@ enum GraphPublicationState {
     Stale,
 }
 
-struct GraphPublication {
-    publication_id: u64,
+struct GraphPublicationImage {
     state: GraphPublicationState,
     view: GraphView,
-    history: GraphHistory,
+}
+
+struct GraphPublication {
+    publication_id: u64,
+    mutation: tokio::sync::Mutex<()>,
+    image: tokio::sync::RwLock<GraphPublicationImage>,
+    history: tokio::sync::RwLock<GraphHistory>,
     cache: GraphCache,
     clients: DeltaClientRegistry,
 }
@@ -108,6 +115,96 @@ later reset or shutdown invokes the barrier. Operational failures named below
 use intra-session reconstruction instead of terminating the runtime. Task
 panic containment and cancellation mechanics remain part of ApiService task
 tracking rather than another publication lifecycle transition.
+
+## Publication synchronization and request capture — settled
+
+`GraphPublication.mutation` serializes graph mutations and lifecycle-state
+transitions. It is a writer gate rather than a container for graph state.
+`image` publishes the state and complete `GraphView` together, while `history`
+publishes the independently readable `GraphHistory`. Cache and client-registry
+synchronization is private to those values and never participates in the graph
+mutation critical section.
+
+For an original `BlockCommitted` or `VspcCommitted` update, the runtime:
+
+1. acquires `mutation` and requires the starting image and history revisions to
+   be equal;
+2. acquires the image write lock, applies the original update, and publishes
+   the complete resulting view revision;
+3. releases the image lock;
+4. when the update returned a delta, acquires the history write lock and
+   appends and publishes that complete delta entry; and
+5. releases the history lock and then `mutation`.
+
+A no-effect update changes neither value. A starting revision mismatch or a
+failed apply or append follows the publication-projection failure contract
+below. No next mutation can begin during the valid interval after the view has
+advanced and before its delta has reached history. Readers remain allowed in
+that interval; the graph model owns the meaning of its adjacent revisions. The
+equality check is therefore a mutation-entry precondition, not a continuously
+maintained equality invariant.
+
+A lifecycle-state transition acquires `mutation`, changes `image.state` under
+the image write lock, then releases both locks. It does not take the history
+lock or change a graph revision. Consequently, becoming terminally `Stale`
+waits for an in-progress graph mutation to finish, and the Stale image's final
+view revision is already present in history. Protocol state notification occurs
+only after those locks have been released.
+
+Read locks protect only bounded in-memory capture. Serialization, compression,
+cache work, database access, network delivery, and request waiting never hold
+an image or history lock. The private capture values are:
+
+```rust
+struct GraphViewCapture {
+    publication_id: u64,
+    state: GraphPublicationState,
+    view: GraphView,
+}
+
+struct GraphDeltaTargetCapture {
+    publication_id: u64,
+    state: GraphPublicationState,
+    revision: u64,
+    high_level: u64,
+}
+
+struct GraphLevelCapture {
+    publication_id: u64,
+    state: GraphPublicationState,
+    revision: u64,
+    levels: Arc<[HeadLevelValue]>,
+}
+```
+
+These are private `kgi-api-core` values rather than wire DTOs. `HeadLevelValue`
+is the protocol-owned level lookup value.
+
+The capture operations below run against the exact `Arc<GraphPublication>`
+supplied by ApiService's
+[current-publication slot](api-service.md#reset-control-and-recovery-effects--settled).
+The slot owner defines acquisition and replacement behavior.
+
+A Head snapshot or Head-backed window holds one image read lock while it
+captures the state and an owned `Frozen` graph view. A window performs its
+complete extraction against that same image. A level lookup similarly captures
+the state, revision, and every requested complete level under one image read
+lock; an unavailable level produces no partial capture.
+
+A canonical delta operation briefly captures its publication ID, state, view
+revision, and high level under one image read lock, releases it, and then asks
+history for a range ending at the captured revision. History may still be one
+revision behind that target. In that case the request uses the complete range
+currently available and the protocol reports the remaining progress through
+its ordinary continuation outcome; it neither waits for the append nor reloads
+the image. A Stale capture cannot encounter this interval because the state
+transition waits behind `mutation`.
+
+History range capture clones the selected immutable
+`Arc<GraphHistoryEntry>` values under the history read lock. Composition,
+budgeting, dictionary construction, JSON serialization, and gzip compression
+then proceed without the lock. Later history pruning cannot invalidate those
+captured entries.
 
 ## Database seed extent and projection — settled
 

@@ -735,6 +735,16 @@ direct and composed deltas only through `GraphDelta::new`; verify it
 rejects equal and backward revision endpoints, exposes the accepted endpoints
 through read-only accessors, and offers no revision mutation path.
 
+Exercise the publication-owned writer gate by pausing between image publication
+and history append. A concurrent image capture may observe `n+1`, a history
+capture may expose only `n`, and no second graph mutation or lifecycle-state
+transition may pass the gate. A delta request targeting `n+1` must return only
+complete history through `n` with the ordinary continuation metadata for its
+captured target, without waiting or recapturing the image. After append, a
+Stale transition must publish state only after both values expose `n+1`. Hold
+captured immutable history-entry Arcs across pruning and complete composition
+after releasing the history read lock.
+
 Verify `GraphHistory::range` checks target ordering before retained-boundary
 selection: a target below the start returns `BackwardTarget` and constructs no
 delta, while equality remains `UpToDate`. Public delta-to-current operations
@@ -1233,6 +1243,15 @@ indefinitely idle second source. Only after both cuts cross, apply all later
 interleaved updates through a captured activation frontier and leave newer
 arrivals for Active. Cover first publication revisions zero and above zero,
 plus independently atomic view and history visibility at adjacent revisions.
+
+Verify the current-publication watch starts at `None`, atomically installs a
+complete publication Arc, and uses the last linearized installation during
+reset-time runtime overlap without runtime identity checks or acknowledgement.
+A request captures the slot once and completes against that exact Arc after a
+concurrent replacement; a later request observes the replacement. Runtime
+shutdown never clears the slot, while terminal ApiService shutdown replaces it
+with `None` after the runtime barrier and before releasing publication
+resources.
 
 Pre-seal suppression produces no gap. Verify the database seed started after
 the marker covers every intentionally suppressed commit, including block and

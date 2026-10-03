@@ -67,8 +67,8 @@ restating it.
 | `processing-lifecycle.md` | Supervisor, recovery intent, ResyncEngine, Resync/Rebuild preparation, the common pump, Catchup and Live admission, fault policy, retries, and teardown. |
 | `api-ingress.md` | Per-session graph-update channel, producer and receiver capabilities, pre-seal gate, lifecycle markers, and gap reporting. |
 | `api-graph.md` | Graph values, views, tracking policies, revisions, deltas, history, mutation and extraction behavior, composition, and retention. |
-| `api-publication.md` | Private publication runtime, graph publication identity and lifecycle, database seed construction, stream alignment, activation, reconstruction, replacement, and publication-scoped response-reuse lifetime. |
-| `api-service.md` | ApiService control and runtime slot, database-generation binding, reset, shutdown, status aggregation, resource bulkheads, and saturation. |
+| `api-publication.md` | Private publication runtime, graph publication identity, lifecycle and synchronization, immutable request capture, database seed construction, stream alignment, activation, reconstruction, replacement, and publication-scoped response-reuse lifetime. |
+| `api-service.md` | ApiService control, runtime and current-publication slots, database-generation binding, reset, shutdown, status aggregation, resource bulkheads, and saturation. |
 | `api-protocol.md` | Public HTTP and SSE graph contract, limits, cursors, windows, errors, ETags, response caching, and delivery behavior. |
 | `api.md` | Navigation for the focused API architecture documents. It contains no system behavior. |
 | `web.md` | Browser client behavior and presentation requirements. |
@@ -119,7 +119,7 @@ behavior.
 | §11, Catchup, overlap, Live, and late transport messages | `processing-lifecycle.md` owns phase transitions, overlap-based admission, timing, and global Live entry. `block-processing.md` and `vspc-processing.md` own their local phase behavior. `node-service.md` owns routing and transport-message handling. | Verified and cut over |
 | §12, Teardown and delivery/failure semantics | `processing-lifecycle.md` owns teardown order, barriers, owner-directed faults, and session completion. Component-specific draining duties remain in the relevant component document. | Verified and cut over |
 | §13, In-process API and graph-update feed | `api-ingress.md`. Producer-side graph-update delivery guarantees remain in the relevant processor document and are referenced by `api-ingress.md`. | Verified and cut over |
-| §14, API snapshot, revision, delta, SSE, and ETags | `api-graph.md` owns graph values, views, revisions, deltas, and history. `api-publication.md` owns publication identity and lifecycle. `api-protocol.md` owns SSE, ETags, and public response behavior. | Verified and cut over |
+| §14, API snapshot, revision, delta, SSE, and ETags | `api-graph.md` owns graph values, views, revisions, deltas, and history. `api-publication.md` owns publication identity, lifecycle, synchronization, and request capture. `api-protocol.md` owns SSE, ETags, and public response behavior. | Verified and cut over |
 | §15, Reset and recovery-time API availability | `api-service.md` owns `reset`; `api-publication.md` owns publication behavior; `processing-lifecycle.md` owns the Supervisor `reset` call point and processor phase ordering; `block-processing.md` owns lifecycle-marker production; `storage.md` owns API-read exclusion during database replacement. | Verified and cut over |
 | §16, DAA navigation and window API | `api-protocol.md`. Storage query semantics needed by these endpoints remain in `storage.md`. | Verified and cut over |
 | §17, Web behavior | `web.md`. Wire contracts consumed by the browser belong to `api-protocol.md`. | Verified and cut over |

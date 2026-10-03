@@ -181,10 +181,12 @@ struct GraphHistoryEntry {
     cumulative_estimated_bytes: u64,
 }
 
+type GraphHistoryEntryList = Arc<[Arc<GraphHistoryEntry>]>;
+
 struct GraphHistory {
     current_revision_id: u64,
     current_cumulative_estimated_bytes: u64,
-    entries: OrderedGraphHistoryEntryList,
+    entries: VecDeque<Arc<GraphHistoryEntry>>,
 }
 
 impl GraphDelta {
@@ -261,8 +263,9 @@ from the selected edges rather than copied from the source. The nominal
 Extraction produces no delta or history and does not advance either revision.
 It can read a `Head`, `Fixed`, or `Frozen` source. Nested extraction is allowed
 when the next requested extent is contained in the frozen source's nominal
-extent. Concrete indexes, lock types, and immutable backing-data sharing remain
-implementation choices.
+extent. Concrete indexes and immutable backing-data sharing remain
+implementation choices. Enclosing publication synchronization belongs to the
+[publication owner](api-publication.md#publication-synchronization-and-request-capture--settled).
 
 `GraphView` owns application of `BlockCommitted`, `VspcCommitted`, and
 `GraphDelta`. A `Frozen` view refuses each mutation entry point with
@@ -315,7 +318,9 @@ advances `n` to `n + 1` and returns `GraphDelta(n, n + 1)`.
 This procedure also covers a committed block below `target_low`: its block and
 edges are not reintroduced, while a supplied level snapshot can still update
 an already retained external endpoint. Concrete indexes, collection types,
-mutation staging, and lock boundaries remain implementation choices.
+and internal mutation staging remain implementation choices. Enclosing
+publication synchronization belongs to the
+[publication owner](api-publication.md#publication-synchronization-and-request-capture--settled).
 
 ## Fixed updates through the Head cache — settled
 
@@ -451,7 +456,11 @@ either a direct one-step delta or an already aggregated delta. For an aggregate,
 `cumulative_estimated_bytes` is the final constituent's cumulative value.
 Consecutive stored entries remain gapless by their outer interval boundaries;
 history neither requires nor reconstructs internal revision boundaries within
-an aggregate.
+an aggregate. Once appended, a `GraphHistoryEntry` is immutable and shared by
+`Arc`. Append and pruning mutate the ordered stored collection while holding
+the publication's history write lock. A range capture clones the selected
+entry Arcs into an immutable `GraphHistoryEntryList`, so later pruning cannot
+invalidate work already detached by a reader.
 
 The exact raw-byte estimator belongs to the
 [canonical Head-delta protocol](api-protocol.md#canonical-head-delta-responses--settled).
