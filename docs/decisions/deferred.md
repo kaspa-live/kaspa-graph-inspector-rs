@@ -15,8 +15,7 @@ become durable project constraints.
 4. Detailed Tokio fairness, drain, graph-update gap counter/wakeup primitives,
    per-client revision-wakeup scheduling primitives,
    component-status watch primitives, BlockProcessor marker-worker primitives,
-   remaining ApiService background-task tracking, and concrete storage
-   synchronization mechanics.
+   and concrete storage synchronization mechanics.
    A shared mutation lock plus per-lane mutexes is one valid storage shape;
    exact lock types remain an implementation choice.
 5. Exact gzip compression quality for the settled graph delivery contract in

@@ -1183,11 +1183,17 @@ shorter prefix; that prefix remains valid and cacheable and derives
 continuation from its remaining Head distance. Also cover a CPU-oriented
 bridge shorter than four.
 
-Verify Stale preserves cache entries, permits existing and new jobs to finish
-against the stalled Head, and replacement or destruction cancels unfinished
-jobs and releases the cache. Evict an entry when its source revision leaves
-history and when its target level falls more than `MAX_CACHE_LEVEL_DISTANCE`
-behind Head; either miss reconstructs an equivalent response. At
+Verify Stale preserves cache entries and permits existing and new jobs to
+finish against the stalled Head. Publication replacement must allow a running
+job and every attached request to finish against their captured immutable
+history entries. Cancelling one request detaches only that waiter. Once the old
+publication has no remaining runtime, slot, request, or SSE reference, its
+cache and client registry are released; a detached job may complete its
+remaining waiters, but its weak cache insertion must then fail harmlessly.
+Terminal ApiService shutdown cancels and joins unfinished jobs. Evict an entry
+when its source revision leaves history and when its target level falls more
+than `MAX_CACHE_LEVEL_DISTANCE` behind Head; either miss reconstructs an
+equivalent response. At
 `DELTA_RELOAD_LEVEL_DISTANCE`, require a fresh window before starting a job.
 Historical DB
 windows bypass this cache.
@@ -1356,6 +1362,30 @@ worker with an accepted delivery may outlive BlockProcessor Deactivate without
 retaining an RPC or DB client, then exits after delivery or receiver
 replacement.
 
+Exercise the
+[publication-runtime worker](api-publication.md#publication-runtime--settled)
+as one long-lived worker started by the runtime constructor. During
+construction, make database seeding, graph-update receipt, and cancellation
+win its selection in turn; reconstruction drops an in-progress seed attempt
+without leaving a child task. Runtime shutdown cancels and joins the worker,
+marks an active publication Stale through the ordinary state path, and returns
+the same completed result on repetition. Closing the receiver makes the worker
+quiescent until shutdown without spinning, reconstructing, or changing
+publication state. An unexpected worker exit emits exactly one reliable
+`ApiServiceEvent::Failed` and enters Supervisor Fatal; expected shutdown emits
+no failure event.
+
+Exercise source-keyed cache single-flight with multiple waiters, one cancelled
+waiter, shared success and shared request-local failure, running-job removal,
+and weak insertion both before and after the origin cache is dropped. Verify
+all cache orchestration tasks are registered in the ApiService task tracker.
+For encoding, reserve bounded historical capacity before database work,
+release every database resource before submitting the detached projection,
+and enforce the settled total and historical concurrency limits. Scheduler
+shutdown rejects new work, cancels queued work, lets already active blocking
+serialization or compression finish while discarding its output, and joins
+the scheduler without a publication lock or database resource held.
+
 Verify the [ApiService shutdown barrier](api-service.md#apiservice-shutdown--settled)
 from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`, and `Active`, including
 races with `reset`, marker delivery, gap reconstruction, database projection,
@@ -1364,16 +1394,30 @@ publication on either side of Supervisor's terminal-shutdown cutoff. An update
 completed before the cutoff is cleared by shutdown; an event observed after
 the cutoff is discarded without an `update_api_db_generation` call, and a
 direct update call after ApiDbState becomes `Stopped` is rejected. Admission
-closes first; runtime shutdown performs its ordinary terminal `Stale`
-transition and state-message emission before SSE closes; the graph receiver
-drop unblocks a waiting marker worker; every API task and database resource
-ends before method completion; no graph revision is emitted; and repeated
+closes first. Runtime shutdown performs its ordinary terminal `Stale`
+transition and allows that mandatory state message to enter every currently
+registered client's normal ordered bounded SSE path before connections are
+cancelled. Shutdown does not await network delivery; a full client buffer
+invokes the ordinary slow-client disconnection rule. Verify API request guards
+remain held through complete body delivery, failure, disconnect, timeout, or
+cancellation; cancellation before response commitment returns the applicable
+unavailable outcome when possible, while cancellation after commitment
+terminates delivery without a second response. The graph receiver drop
+unblocks a waiting marker worker. Closing and cancelling the cache task tracker
+and shutting down the encoding scheduler leave no API task or database
+resource at method completion; no graph revision is emitted, and repeated
 `shutdown` is idempotent. Verify ApiDbState becomes `Stopped`, wakes a pending
 `current()`, and rejects later generation updates.
-Supervisor starts ApiService and ResyncEngine shutdown without waiting for one
-to complete before starting the other, awaits both method barriers, and only
-then calls NodeService shutdown followed by StorageService shutdown. Producer
-closure during that barrier requests no reconstruction or processing recovery.
+Supervisor signals Axum graceful shutdown, then starts ApiService and
+ResyncEngine shutdown without waiting for one to complete before starting the
+other. The listener accepts no new connection, existing connections remain
+available for final SSE buffering, and ordinary static responses may finish.
+Supervisor awaits both method barriers and the Axum server task, then calls
+NodeService shutdown followed by StorageService shutdown. Unexpected Axum
+return or panic while Running and unexpected permanent ApiService-worker exit
+each enter Fatal through their owner-defined observation path; expected
+shutdown completion does not. Producer closure during that barrier requests no
+reconstruction or processing recovery.
 NodeService and StorageService may continue their autonomous generation
 lifecycles until their later shutdown barriers. Supervisor drains and discards
 both reliable event streams after terminal shutdown rather than retaining a

@@ -52,6 +52,20 @@ existing `ProcessingSession`. Unexpected closure of either reliable event path
 while Supervisor is Running reports
 `Ownership(ManagedComponentUnavailable)` and enters the Fatal lifecycle.
 
+Supervisor also installs the reliable `ApiServiceEvent` path before
+ApiService starts either permanent worker. `ApiServiceEvent::Failed(error)`
+maps to `Ownership(UnexpectedWorkerTermination)` and enters the Fatal
+lifecycle. The ApiService owner defines exact-once emission and its absence
+during expected shutdown. Closure of that event path while Supervisor is
+Running reports `Ownership(ManagedComponentUnavailable)` and enters the Fatal
+lifecycle.
+Request-local cache, HTTP, and SSE failures never enter this path.
+
+Supervisor observes the Axum server task directly. Unexpected return or panic
+while Supervisor is Running reports
+`Ownership(UnexpectedWorkerTermination)` and enters the Fatal lifecycle;
+completion after Supervisor has initiated terminal shutdown is expected.
+
 When recovery is desired and the engine is Idle, Supervisor may retain either
 resource while the other is absent. It starts no run until both exact
 generations are present.
@@ -1067,17 +1081,21 @@ On Deactivate, ResyncEngine performs this barrier in order:
 
 The owning services may retain their validated generations after Deactivate.
 For global shutdown, Supervisor first enters terminal shutdown and starts no
-new recovery attempt. Supervisor then starts `ApiService::shutdown` and
-`ResyncEngine::shutdown` without waiting for either method to complete before
-starting the other. It awaits both completed method barriers before calling
-`NodeService::shutdown` and then `StorageService::shutdown`. This releases every
-processing and API client before their owning services stop and keeps
-StorageService last. Supervisor continues draining each reliable service-event
-stream until its owning service completes shutdown. After entering terminal
-shutdown it discards those events instead of retaining a generation, starting
-recovery, or forwarding a new API generation. Closure of a service-event path
-after that service's completed shutdown is expected termination rather than a
-fault.
+new recovery attempt. It signals graceful shutdown to its Axum server task,
+which stops accepting new connections while allowing existing connections to
+remain available for ApiService's final SSE delivery. Supervisor then starts
+`ApiService::shutdown` and `ResyncEngine::shutdown` without waiting for either
+method to complete before starting the other. It awaits both completed method
+barriers and the Axum server task before calling `NodeService::shutdown` and
+then `StorageService::shutdown`. This releases every processing and API client
+before their owning services stop and keeps StorageService last. Existing
+non-API static responses may complete through Axum's graceful server shutdown;
+ApiService's own request guards prove completion of API responses and SSE
+connections. Supervisor continues draining each reliable service-event stream
+until its owning service completes shutdown. After entering terminal shutdown
+it discards those events instead of retaining a generation, starting recovery,
+or forwarding a new API generation. Closure of a service-event path after that
+service's completed shutdown is expected termination rather than a fault.
 
 Dropping the graph-update receiver during this coordinated barrier unblocks a
 marker worker awaiting lossless delivery. Resulting producer closure is

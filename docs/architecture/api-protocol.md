@@ -1405,9 +1405,11 @@ entry is never promoted as Head advances; later requests from its exact source
 reuse it until structural eviction.
 
 The [publication lifecycle](api-publication.md#publication-state-and-revision--settled)
-owns preservation, cancellation, and release of the cache and its jobs across
-Stale and replacement. While the publication remains installed or is retained
-as Stale, evict a `CachedDelta` when its
+owns preservation and release of publication-scoped cache state across Stale
+and replacement. The
+[ApiService task contract](api-service.md#api-task-ownership-and-completion--settled)
+owns job completion and terminal cancellation. While the publication remains
+installed or is retained as Stale, evict a `CachedDelta` when its
 source revision is no longer retained or its target `high_level` is more than
 `MAX_CACHE_LEVEL_DISTANCE` behind that publication's Head. These structural
 bounds replace an independent encoded-byte cache cap.

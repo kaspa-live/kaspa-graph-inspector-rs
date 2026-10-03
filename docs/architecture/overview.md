@@ -571,6 +571,14 @@ static application delivery:
 /*                browser application fallback
 ```
 
+The top `kgi` crate's Supervisor owns the bound listener and Axum server task.
+ApiService owns `/api/v1` admission, request work, response delivery tracking,
+and SSE connection state after routing; it does not own the listener or static
+Web requests. An ordinary ApiService reset changes publication registrations
+without restarting the router, listener, HTTP request infrastructure, or SSE
+connections. Terminal server failure and graceful-shutdown ordering belong to
+the [Supervisor lifecycle](processing-lifecycle.md#teardown-and-delivery-semantics--settled).
+
 The production browser and API share one origin. Browser code uses the fixed
 relative `/api/v1` contract and obtains its own site identity from
 `window.location.origin`; neither value is deployment-specific Vite input.

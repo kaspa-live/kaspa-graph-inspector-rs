@@ -95,26 +95,42 @@ the reset-time overlap and current-slot replacement rule belong to the
 The runtime exposes one private completed barrier:
 
 ```rust
+struct PublicationRuntime {
+    cancellation: tokio_util::sync::CancellationToken,
+    completion: PublicationRuntimeCompletion,
+}
+
 impl PublicationRuntime {
     async fn shutdown(&self) -> Result<(), PublicationRuntimeError>;
 }
 ```
 
-`shutdown()` first stops consuming and applying graph updates, marks its active
-publication terminally `Stale` if one exists, cancels any seed attempt and
-abandons any unpublished candidate, stops and joins its workers, releases its
-receiver and its own publication Arc, and then completes. The behavior is the
-same for session replacement and ApiService shutdown. It is terminal and
-idempotent. The state transition uses the protocol-owned
+Each runtime starts exactly one long-lived worker as part of construction. The
+worker owns the receiver, phase state, staging buffer, current seed attempt,
+unpublished candidate, gap observation, and active publication Arc. During
+`Constructing`, it selects between its database-seed future, graph-update
+receiver, and cancellation rather than spawning an untracked seed task.
+Dropping that future cancels an abandoned attempt. Intra-session reconstruction
+remains inside the same worker.
+
+`shutdown()` signals the runtime cancellation token and awaits the worker's
+shared completion result. When the worker observes cancellation, it stops
+consuming and applying graph updates, marks its active publication terminally
+`Stale` if one exists, drops any seed attempt and unpublished candidate,
+releases its receiver and active publication Arc, and completes. Every
+potentially indefinite worker wait observes the same cancellation token, and
+no worker child task may survive completion. The behavior is the same for
+session replacement and ApiService shutdown. Repeated calls observe the same
+completed result. The state transition uses the protocol-owned
 [`PublicationState` delivery](api-protocol.md#publication-wire-observation--settled).
 
 The runtime otherwise terminates only through `shutdown()`. A closed
 `GraphUpdateReceiver` makes it quiescent: it stops consuming and constructing,
-does not reconstruct or change publication state, and remains owned until a
-later reset or shutdown invokes the barrier. Operational failures named below
-use intra-session reconstruction instead of terminating the runtime. Task
-panic containment and cancellation mechanics remain part of ApiService task
-tracking rather than another publication lifecycle transition.
+does not reconstruct or change publication state, and waits only for runtime
+cancellation without spinning. Operational failures named below use
+intra-session reconstruction instead of terminating the runtime. Unexpected
+worker return or panic follows the ApiService-owned permanent-worker failure
+path rather than defining another publication transition.
 
 ## Publication synchronization and request capture — settled
 
@@ -450,12 +466,17 @@ no additional state effect.
 
 Becoming Stale does not destroy the publication's response cache or cancel its
 response-construction jobs. The coherent view and history stop advancing.
-Replacement or destruction of the publication cancels and joins its unfinished
-cache jobs and releases all cache entries and that publication's client
-identifiers. The protocol owner defines how live SSE transports receive their
+Replacement does not cancel already running cache jobs or requests holding the
+old publication. New operations use the replacement. Once no runtime, slot,
+request, or SSE reference retains the old publication, dropping it releases
+its cache entries and client identifiers; detached jobs do not retain that
+publication-scoped state. The
+[ApiService task contract](api-service.md#api-task-ownership-and-completion--settled)
+owns detached-job completion, insertion after cache release, and terminal
+job cancellation. The protocol owner defines how live SSE transports receive
 replacement identifiers. Stale transition and client-registration behavior
-follow the protocol owner. Public access while Stale and
-ordinary entry eviction belong to the
+follow the protocol owner. Public access while Stale and ordinary entry
+eviction belong to the
 [API protocol](api-protocol.md#publication-scoped-head-response-cache--settled).
 
 `GraphPublication` owns lifecycle state; the contained graph values retain the

@@ -5,7 +5,7 @@
 This document owns the ApiService Supervisor-facing control surface, API
 database-generation binding, current-publication slot, reset and shutdown
 behavior, status aggregation, resource admission, bulkheads, saturation, and
-operational measurements.
+operational measurements, including API-owned task completion.
 [API graph publication](api-publication.md) owns publication construction and
 reconstruction. [The API protocol](api-protocol.md) owns HTTP, SSE, windows,
 cursors, public errors, and cache semantics.
@@ -16,6 +16,21 @@ KGI v2 includes an in-process `ApiService` and a complete bounded-by-level
 head-tracking `GraphView`, rather than directing each head request to expensive
 PostgreSQL graph queries. The [system overview](overview.md#resource-isolation-and-scalability--settled)
 owns deployment evolution and the single-writer constraint.
+
+ApiService installs one reliable upward event path before starting any
+permanent worker:
+
+```rust
+enum ApiServiceEvent {
+    Failed(ApiServiceError),
+}
+```
+
+An unexpected `PublicationRuntime` worker or encoding-scheduler return or panic
+emits `Failed` exactly once. Expected completion after its owning shutdown
+signal emits no event. Cache jobs, HTTP handlers, and SSE connections use their
+request-local outcomes and never emit this event. Supervisor owns the Fatal
+reaction and event-path closure policy.
 
 ## Reset and recovery-time availability — settled
 
@@ -160,7 +175,10 @@ struct ApiService {
     api_db: Arc<ApiDbState>,
     current_publication:
         tokio::sync::watch::Sender<Option<Arc<GraphPublication>>>,
-    // request infrastructure
+    cancellation: tokio_util::sync::CancellationToken,
+    cache_jobs: tokio_util::task::TaskTracker,
+    encoding: EncodingScheduler,
+    // admission and request infrastructure
 }
 ```
 
@@ -281,6 +299,83 @@ another database load or graph revision.
 The storage owner defines the `TRUNCATE`/MVCC safety requirement and detailed
 gate boundary. `reset` does not participate in that exclusion mechanism.
 
+## API task ownership and completion — settled
+
+ApiService tracks dynamic cache work with `tokio_util::task::TaskTracker` and
+owns one encoding scheduler. Fixed workers retain their own completion
+barriers; Axum owns handler execution, and ApiService proves handler completion
+through request guards rather than duplicate task handles.
+
+### Cache and encoding jobs
+
+On a source-keyed cache miss, ApiService captures the immutable history-entry
+Arcs and target, registers one running single-flight job, and spawns one
+tracked cache orchestration task. Concurrent requests from that source attach
+to its shared result even when Head advances. The job holds only detached
+immutable inputs and no image or history lock.
+
+Cancelling one request detaches that waiter without cancelling the shared job.
+On success, the job completes every waiter and installs its `CachedDelta` only
+when its weak reference to the originating cache can still be upgraded. On
+failure, it completes every waiter with the same request-local error. Either
+outcome removes the running-job registration and permits a later retry.
+The publication owner defines job preservation and release of the old cache
+and client registry across publication replacement.
+
+ApiService owns one scheduler with this semantic shape:
+
+```rust
+struct EncodingScheduler {
+    cancellation: tokio_util::sync::CancellationToken,
+    completion: EncodingSchedulerCompletion,
+    // bounded reservations, queued jobs, and active encoding permits
+}
+
+impl EncodingScheduler {
+    async fn shutdown(&self) -> Result<(), EncodingSchedulerError>;
+}
+```
+
+It owns every queued and active graph JSON serialization and gzip operation.
+Individual request and cache tasks never spawn untracked compression work.
+The scheduler enforces the existing total and historical limits and priority.
+A historical request reserves bounded queue capacity before database work,
+then submits the detached projection through that reservation after releasing
+all database resources.
+
+Scheduler shutdown rejects new reservations and submissions, cancels queued
+jobs, and completes their waiters with expected shutdown cancellation.
+Already running blocking serialization or compression cannot be interrupted
+safely; the bounded active jobs finish, their output is discarded, and the
+scheduler then completes.
+
+### HTTP requests and SSE connections
+
+Each admitted API request owns a private guard containing its applicable lane
+permit, service-cancellation observation, and completion notification:
+
+```rust
+struct ApiRequestGuard {
+    // admission permit, cancellation, and completion
+}
+```
+
+Axum executes the handler future. For a graph response, the response body
+retains the guard through complete delivery, delivery failure, client
+disconnect, delivery timeout, or shutdown cancellation. A request cancelled
+before response commitment returns the applicable unavailable result when
+possible; cancellation after commitment terminates the body or stream and
+never attempts a second response.
+
+Each accepted SSE connection owns an SSE admission guard, one bounded semantic
+message receiver, its current publication-local identifier and registration,
+and connection cancellation. It observes the current-publication watch. On
+replacement it performs the protocol-owned registration transition and ordered
+initial sequence. Normal disconnect or cancellation removes the current
+registration before releasing the guard. Mandatory-buffer admission follows
+the protocol-owned slow-client rule and never blocks publication mutation or
+shutdown.
+
 ## ApiService shutdown — settled
 
 `shutdown` is a reliable completed-barrier operation. It is terminal,
@@ -292,14 +387,23 @@ ApiService performs the local barrier in order:
 2. publish `ApiDbSnapshot::Stopped`, waking pending construction and making
    public database reads unavailable;
 3. take the installed runtime, if any, and await its publication-owned
-   `shutdown()` barrier;
-4. close every SSE stream;
-5. cancel and join background encoding, cache, admitted request,
-   serialization, delivery, and other API-owned tasks;
-6. replace the current-publication value with `None`, then release every API DB
+   `shutdown()` barrier, allowing its final `Stale` transition to propagate
+   through the normal ordered SSE path to currently registered clients;
+4. cancel every SSE connection, then cancel admitted HTTP operations and wait
+   for all SSE and request guards to be released;
+5. close `cache_jobs` to new registration and cancel every unfinished cache
+   job;
+6. signal encoding-scheduler shutdown and await both `cache_jobs.wait()` and
+   `EncodingScheduler::shutdown()`;
+7. replace the current-publication value with `None`, then release every API DB
    permit, transaction, connection, validated client, pool handle, publication,
    and cache reference; and
-7. set `ApiRuntimeSlot::Stopped` and complete the `shutdown` call.
+8. set `ApiRuntimeSlot::Stopped` and complete the `shutdown` call.
+
+Shutdown waits for the final Stale state to enter each currently registered
+client's bounded SSE buffer, not for its network delivery. A client whose
+buffer cannot accept that mandatory notification is disconnected under the
+normal slow-client rule before the remaining connections are cancelled.
 
 Successful method completion proves that no API admission, task, graph-update
 receiver, or API database resource remains. A repeated `shutdown` returns
@@ -314,11 +418,10 @@ Supervisor waiting policy belongs to the
 
 Publication-state and graph effects of the awaited runtime barrier belong to
 the [publication runtime contract](api-publication.md#publication-runtime--settled).
-Public HTTP admission is already closed, while SSE remains available for the
-protocol-owned state message produced by that transition and then closes in the
-next step. `ReceiverClosed` caused by this barrier is expected cancellation for
-the concurrently stopping processing session and must not request API
-reconstruction, Resync, or Rebuild.
+Public HTTP admission is already closed while the protocol-owned state message
+uses the still-open ordered SSE path. `ReceiverClosed` caused by this barrier
+is expected cancellation for the concurrently stopping processing session and
+must not request API reconstruction, Resync, or Rebuild.
 
 ## Status observation — settled
 
