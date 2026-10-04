@@ -1650,7 +1650,10 @@ and the next rejected request independently for Head, historical, status, and
 SSE work. Fill an SSE delivery buffer with coalescible graph wakeups, then with
 required ordered messages, and verify coalescing or disconnect respectively.
 An HTTP graph delivery exceeding its owner-defined duration closes after
-commitment and releases admission and response memory.
+commitment and releases admission and any request-owned body. A delivery from
+`GraphCache` must share the cached immutable `Bytes` allocation rather than
+copying the body per waiter; cancelling or timing out one waiter does not
+release the cache-owned allocation.
 
 For encoding work, fill the reservation queue before issuing a historical
 request and verify rejection performs no database access. With a reservation
@@ -1659,7 +1662,12 @@ the request must wait without a database resource and then encode when admitted.
 Exercise the queue timeout as temporary service unavailability, cancellation
 as reservation release, single-flight waiters without extra queue entries, and
 the focused-owner active and historical encoding limits. Publication and Head
-work must continue while historical encoders are saturated.
+work must continue while historical encoders are saturated. Assert that at
+most four encodes run concurrently and at most two are historical, that no
+second response-memory semaphore is acquired before or after encoding, and
+that many waiters on one source-keyed job still produce one encode. Track the
+transient encoding buffers, completed uncached delivery bodies, and cache-owned
+encoded bytes independently while exercising these paths.
 
 For historical request resource lifetime, stall response delivery after the
 complete database projection has been materialized and verify that no

@@ -550,6 +550,35 @@ publication and Head work. A cache hit that already owns final gzip bytes uses
 no encoding job. A request joining an existing single-flight job consumes no
 additional queue entry or active job.
 
+ApiService has no independent response-memory semaphore or admission lane.
+The existing owners bound response memory at the points where it is allocated
+and retained:
+
+- an active encoding job owns its transient JSON and gzip buffers, so
+  `MAX_GRAPH_ENCODING_JOBS` bounds simultaneous encoding allocations;
+- `GraphCache` owns completed cached bodies, and delivery clones their shared
+  immutable `Bytes` rather than copying the body for each waiter;
+- a completed uncached historical body remains owned by its request under the
+  historical HTTP permit until delivery ends; and
+- a Head-level lookup remains owned by its request under the Head HTTP permit
+  and its protocol-owned cardinality bound.
+
+Every HTTP request keeps its applicable admission guard through response
+delivery. Pre-reserving a response's maximum possible size would strand most
+of that capacity, while acquiring memory admission after encoding would allow
+the allocation first and could then retain a completed body while waiting.
+Charging every cache waiter for the shared body would instead count one
+allocation many times, and a separate request-memory permit would not bound the
+publication cache. The owner-based model avoids those mismatches while keeping
+all allocations within already bounded work.
+
+`MAX_GRAPH_ENCODING_JOBS = 4` is the initial processing-protective concurrency
+limit. Cache reuse and source-keyed single-flight mean concurrent client count
+does not determine the number of encodes, and the historical sublimit leaves
+two active slots for publication and Head work. Increase this limit only from
+observed encoding queue latency, Head response latency, idle CPU capacity,
+processor commit latency, and active encoding memory measurements.
+
 The encoding queue holds at most 32 reserved or ready jobs in addition to the
 four active jobs. Publication construction and Head work rank ahead of
 historical work. A database-backed request reserves queue capacity before
@@ -562,7 +591,8 @@ releases its reservation.
 
 The delivery timeout begins only when a complete gzip graph response is ready.
 A client that cannot receive it within the limit loses that response and its
-HTTP admission and response memory are released. SSE streams are exempt from
+HTTP admission and any request-owned body are released. A cached body remains
+owned by `GraphCache` independently of that waiter. SSE streams are exempt from
 this duration and use their bounded delivery behavior instead.
 
 The SSE client buffer capacity counts complete semantic messages. Numeric
@@ -593,11 +623,11 @@ acquire HTTP admission
 Before serialization or network delivery begins, the request owns an in-memory
 projection that borrows no PostgreSQL transaction, connection, row stream,
 cursor, or API DB permit. A slow client may retain its HTTP admission and
-bounded response-memory capacity, but never database capacity. Serialization,
-compression, response-size, and client-delivery failures after that boundary
-are API-local and do not retire a database generation or request processing
-recovery. A connection-level failure during the database phase retains
-StorageService's
+request-owned projection or completed body, but never database capacity.
+Serialization, compression, response-size, and client-delivery failures after
+that boundary are API-local and do not retire a database generation or request
+processing recovery. A connection-level failure during the database phase
+retains StorageService's
 [storage-generation failure classification](storage.md#storageservice-lifecycle--settled).
 
 Releasing database resources and detaching the complete projection ends the
@@ -631,7 +661,9 @@ V2 exposes these operational measurements:
 - database pool and public-read permit occupancy, query duration, and query
   timeouts;
 - encoding reservation, queue, and active-job occupancy, queue timeouts, and
-  encoding duration;
+  encoding duration, together with active transient uncompressed and gzip
+  buffer bytes;
+- completed uncached delivery bytes and publication-cache encoded bytes;
 - response delivery duration and delivery timeouts;
 - delta-journal resets; and
 - BlockProcessor and VspcProcessor commit latency.
