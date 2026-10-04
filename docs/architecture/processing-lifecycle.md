@@ -492,6 +492,17 @@ The graph-update feed is the exception: the
 reports a continuity gap without blocking processing, and the
 [API publication reconstruction contract](api-publication.md#universal-api-reconstruction--settled)
 rebuilds the derived image without requesting processing recovery.
+`GraphUpdateProducerError::ReceiverClosed` is also outside the processing
+session-channel fault table. During an active run, a processor that observes
+it reports no `ComponentFault`, does not change recovery intent, and completes
+the local processing work that follows its already-definite database commit.
+The receiver belongs to ApiService; an unexpected publication-runtime exit is
+reported through the separately installed `ApiServiceEvent::Failed` path and
+therefore reaches the Fatal disposition owned above. During session
+replacement, Deactivate, or shutdown, receiver closure is expected
+cancellation and has the same no-fault producer disposition. No
+`ReceiverClosed` outcome advances the graph-update gap or requests API
+reconstruction, because no receiver remains to consume that reconstruction.
 Detailed Tokio fairness and drain mechanics remain deferred in the
 [decision register](../decisions/deferred.md).
 

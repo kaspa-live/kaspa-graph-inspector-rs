@@ -249,6 +249,11 @@ lane's returned order when offering newly inserted `BlockCommitted` values.
 committed block and does not suppress `PersistedBlock`; the session producer
 reports the gap under the
 [API ingress contract](api-ingress.md#in-process-graph-update-feed--settled).
+If the offer instead returns `ReceiverClosed`, BlockProcessor still delivers
+the committed block's `PersistedBlock` to VspcProcessor and OrphanManager;
+materialization remains definite. The active-run and teardown handling of that
+result belongs to the
+[shared graph-update closure policy](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
 
 `PersistedBlock` delivery is asynchronous but cannot be silently lost after a
 successful commit. A full bounded destination reports

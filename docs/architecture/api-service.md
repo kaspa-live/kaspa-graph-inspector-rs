@@ -645,9 +645,10 @@ Supervisor waiting policy belongs to the
 Publication-state and graph effects of the awaited runtime barrier belong to
 the [publication runtime contract](api-publication.md#publication-runtime--settled).
 Public HTTP admission is already closed while the protocol-owned state message
-uses the still-open ordered SSE path. `ReceiverClosed` caused by this barrier
-is expected cancellation for the concurrently stopping processing session and
-must not request API reconstruction, Resync, or Rebuild.
+uses the still-open ordered SSE path. Releasing the graph-update receiver is
+the ApiService-side effect of this barrier; the resulting producer disposition
+belongs to the
+[processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
 
 ## Status observation — settled
 

@@ -694,6 +694,14 @@ visible edges, and fresh publication identity after each replacement. Fill the
 feed through its focused-owner capacity, verify the final admitted update
 preserves order, then verify the next ordinary offer reports a gap while a
 lossless lifecycle marker waits for capacity.
+Close the graph-update receiver after definite block and VSPC commits and
+verify both offers return `ReceiverClosed` without advancing the gap or
+reporting a processing fault. BlockProcessor must still deliver the committed
+`PersistedBlock`; VspcProcessor must retain its committed sink and history.
+For an unexpected active-run publication-worker exit, verify the independent
+`ApiServiceEvent::Failed` path enters Fatal exactly once. Repeat closure during
+session replacement and coordinated shutdown and verify it is expected
+cancellation with no processing recovery request.
 
 Cover `BlockCommitted` conversion to `GraphBlock`, including the selected-parent
 index for an ordinary block, the Genesis `None` case, and propagation of the

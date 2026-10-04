@@ -107,6 +107,11 @@ and `try_send`. A closed receiver returns `ReceiverClosed`. Otherwise, in
 commit and processing-tier delivery remain valid. In `Open`, successful
 delivery returns `Enqueued`; `Full` discards that delivery, advances the
 session's reliable, coalescing gap generation, and returns `GapReported`.
+Every producer operation returns `ReceiverClosed` without advancing the gap
+when the receiver is closed. The
+[processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
+owns its active-run and expected-teardown dispositions; producer owners define
+only the local work that follows the result.
 
 The marker worker's `publish_post_seal` operation holds the same state mutex,
 requires `PreSeal`, enqueues `GraphUpdate::PublishPostSeal`, changes the state
@@ -114,7 +119,7 @@ to `Open`, and releases the mutex. No ordinary value can enter before the
 marker or race between its enqueue and the state transition. Because pre-seal
 ordinary values are suppressed, this marker is the first value in the fresh
 positive-capacity channel and cannot encounter `Full`; receiver closure leaves
-the gate in `PreSeal` and reports supersession.
+the gate in `PreSeal` and returns `ReceiverClosed`.
 
 The marker worker's `publish_live` operation requires `Open`, releases the
 state mutex, and then uses lossless delivery, awaiting channel capacity instead

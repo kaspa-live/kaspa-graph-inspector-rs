@@ -385,6 +385,11 @@ Graph-update delivery is nonblocking for processing. A full channel reports a
 gap under the [API ingress contract](api-ingress.md#in-process-graph-update-feed--settled)
 rather than rolling back the committed VSPC transaction or requesting
 processing recovery.
+If the offer instead returns `ReceiverClosed`, VspcProcessor retains its
+already-advanced committed sink and history and continues processing until a
+lifecycle command stops it. The result's active-run and teardown handling
+belongs to the
+[shared graph-update closure policy](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
 
 The committed sink remains derived from materialized VSPC membership in
 storage. VspcProcessor does not persist a separate sink or checkpoint.
