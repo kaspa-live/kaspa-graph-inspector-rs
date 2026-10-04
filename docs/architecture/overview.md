@@ -688,12 +688,23 @@ has a different validator. The endpoint has no content negotiation or
 compression path: it always returns JSON regardless of `Accept`, ignores
 `Accept-Encoding`, and emits no `Content-Encoding`.
 
-`If-None-Match` uses the standard weak comparison required for GET. No current
-match returns `200 OK` with the complete representation. A matching list
-member or `*` returns `304 Not Modified` with the current `ETag` and
-`Cache-Control: no-cache`, no body, and no `Content-Type` or
-`Content-Encoding`. Malformed conditional headers follow ordinary HTTP header
-rejection rather than changing configuration semantics.
+The route supports `GET` and `HEAD`. `HEAD` follows the corresponding `GET`
+status and headers but carries no body. Every other method returns bodyless
+`405 Method Not Allowed` with `Allow: GET, HEAD` and `Cache-Control: no-store`,
+and without `Content-Type`, `Content-Encoding`, or `ETag`. Method selection
+precedes conditional-header parsing.
+
+For `GET` and `HEAD`, `If-None-Match` uses the standard weak comparison. No
+current match returns `200 OK`; `GET` carries the complete representation and
+`HEAD` carries its headers only. A matching list member or `*` returns `304 Not
+Modified` with the current `ETag` and `Cache-Control: no-cache`, no body, and
+no `Content-Type` or `Content-Encoding`.
+
+A syntactically malformed `If-None-Match` on either supported method returns
+bodyless `400 Bad Request` with `Cache-Control: no-store` and without
+`Content-Type`, `Content-Encoding`, or `ETag`. It does not serialize or hash
+the runtime configuration. An unsupported method therefore returns `405` even
+when it also carries a malformed conditional header.
 
 Hashed Vite assets use long-lived immutable caching. `index.html` and the
 runtime configuration require revalidation. The

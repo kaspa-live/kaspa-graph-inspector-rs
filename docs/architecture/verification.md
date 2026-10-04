@@ -1718,6 +1718,16 @@ matching list-member and `*` requests returning bodyless `304` responses with
 the current validator and cache directive. The endpoint remains uncompressed
 regardless of `Accept-Encoding`.
 
+Exercise `GET` and `HEAD` with absent, nonmatching, and matching validators.
+Each `HEAD` response has the corresponding `GET` status and headers without a
+body. A malformed `If-None-Match` on either supported method returns bodyless
+`400` with `Cache-Control: no-store` and no content type, content encoding, or
+ETag, without serializing or hashing the configuration. Every unsupported
+method returns bodyless `405` with `Allow: GET, HEAD`, the `no-store` cache
+directive, and none of those representation headers. Combine an unsupported
+method with a malformed validator and require `405` to prove method-first
+precedence.
+
 Web decoder tests accept the exact `null` and valid-string shapes, retain the
 previous validated value after `304`, and reject a missing property, an extra
 property, a non-string/non-null value, malformed JSON, and an invalid template.
