@@ -7,17 +7,19 @@ extraction, and two independent losslessness reviews are complete. The focused
 documents named by `docs/architecture/README.md` are the normative KGI v2
 architecture; the superseded handoffs are historical provenance.
 
-No production Rust implementation, tests, or migrations have started. The
-reviewed architecture baseline for implementation is commit
-`f2cab146a3633964a69ebcdcb045d4729c657f0a`. Open architecture requirements
-continue to block only their dependent work.
+The implementation foundation is in progress from reviewed architecture
+baseline commit `f2cab146a3633964a69ebcdcb045d4729c657f0a`. The buildable
+virtual Cargo workspace, settled crate dependency skeleton, storage migration
+location, Vite/React Web workspace, fixture locations, and atomic `xtask`
+bundle command are present. The crates remain behavior-free scaffolds;
+production service behavior, component tests, and database migrations have not
+started. Open architecture requirements continue to block only their dependent
+work.
 
-The Cargo repository layout, storage-owned migration placement, retained KGI
-v1 React source with a Vite build, Web test tooling, atomic release bundle,
-runtime Web configuration, Docker and conventional installation layouts, and
-file-log directory model are settled but not yet implemented. The
-Supervisor-owned `kgi-core::signals` termination adapter is also settled but
-not yet implemented.
+Importing the retained KGI v1 React source, runtime Web configuration, concrete
+Docker and conventional installation files, and the file-log directory model
+remain unimplemented. The `kgi-core::signals` module exists, while its
+Supervisor-owned termination adapter remains unimplemented.
 
 The public [graph wire format](../architecture/api-protocol.md#common-transport-dto-rules--settled)
 and [mandatory gzip delivery path](../architecture/api-protocol.md#graph-http-compression--settled)

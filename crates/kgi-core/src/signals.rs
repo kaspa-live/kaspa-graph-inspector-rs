@@ -1,0 +1,1 @@
+//! Platform termination signal integration.
