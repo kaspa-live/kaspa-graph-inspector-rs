@@ -74,6 +74,10 @@ with generic `data`, `status`, or `metadata` fields. A response with multiple
 semantic variants uses an explicit discriminator; a decoder never infers the
 variant from the incidental presence or absence of optional fields. Absence is
 distinct from zero, `false`, an empty collection, and every sentinel value.
+Every property declared by the selected response shape is present. An
+`Option<T>` encodes `Some(value)` as that value and `None` as explicit JSON
+`null`; optional properties are not omitted. Properties excluded by a selected
+discriminator variant are not part of that variant's shape.
 
 Every public `u64`, including revisions, levels, scores, timestamps, and
 publication IDs, is an unsigned decimal JSON string so browsers preserve its
@@ -271,10 +275,24 @@ struct GraphEdgeDto {
 ```
 
 `selected_parent_index` indexes the same block's `direct_parents` vector; it
-is unrelated to `HashRef` and is absent for Genesis. Direct parents and the
-blue and red merge sets preserve their graph-owned semantic order. Canonical
-and serialized graph values retain the full `u64` level, slot, level-size,
-timestamp, and score domains.
+is unrelated to `HashRef` and is JSON `null` for Genesis. `LevelDto.daa_score`
+is likewise JSON `null` when the semantic value is absent. Direct parents and
+the blue and red merge sets preserve their graph-owned semantic order.
+Canonical and serialized graph values retain the full `u64` level, slot,
+level-size, timestamp, and score domains.
+
+`BlockColor` uses this exact numeric JSON representation everywhere it appears
+in a graph body:
+
+```text
+0 = Gray
+1 = Blue
+2 = Red
+```
+
+The mapping applies to `GraphBlockDto.color` and every color mutation. These
+codes define only the protocol representation and add no numeric meaning to
+the domain enum. Any other JSON value is invalid.
 
 Levels, blocks, edges, and all change collections are unordered on the wire.
 Only their contents are significant; a client builds any indexes required for
@@ -344,6 +362,19 @@ struct GraphWindowResponseDto {
     graph: GraphDataDto,
 }
 ```
+
+`GraphWindowSourceDto` uses the exact discriminator property `type`. Its two
+JSON object shapes are:
+
+```json
+{"type":"head","publication_id":"42","revision":"123","revision_timestamp_us":"456789","head_high_level":"900"}
+{"type":"database"}
+```
+
+The exact discriminator values are `head` and `database`; JSON property order
+has no meaning. The Head object contains exactly the discriminator and its four
+lineage fields. The Database object contains only the discriminator and no
+lineage field.
 
 The `Head` variant carries the complete lineage and revision timestamp needed
 to consume and replay canonical Head deltas. `head_high_level` describes the
@@ -453,8 +484,9 @@ an entry or reconstructs internal boundaries discarded by earlier history
 composition.
 
 A level mutation with `Some(value)` installs that complete resulting level
-value; `None` removes the level. Membership and color mutations install their
-complete resulting field values. `block_upserts` and `edge_upserts` contain
+value; `None`, encoded as a present JSON `null`, removes the level. Membership
+and color mutations install their complete resulting field values.
+`block_upserts` and `edge_upserts` contain
 the serialized `Some(value)` results from that entry's canonical change maps.
 The arrays remain unordered within their semantic collections, while applying
 the collections of one decoded entry follows the sole

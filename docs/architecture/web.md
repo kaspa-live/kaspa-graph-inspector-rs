@@ -24,7 +24,10 @@ unchanged.
 For the protocol-owned JSON representation, the Web converts public `u64`
 decimal strings to `bigint` at its DTO boundary before constructing typed
 client values. Graph logic never routes those values through JavaScript
-`number`.
+`number`. The decoder likewise follows the protocol-owned
+[graph value and `BlockColor` representation](api-protocol.md#serialized-graph-values-and-hash-dictionary--settled)
+and rejects an unknown color code before constructing or mutating browser graph
+state; it does not define another color-to-number mapping.
 
 ## Update acquisition — settled
 

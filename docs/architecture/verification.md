@@ -841,6 +841,12 @@ contains publication state. Both carry one `GraphWindowResolution` and one
 complete `GraphDataDto`, do not echo the request anchor, and may retain
 external endpoint levels outside the effective nominal bounds.
 
+Require the nested source objects to use the exact `type` discriminator values
+`head` and `database`. The Head object contains its four lineage properties;
+the Database object contains no additional property. Reject a missing or
+unknown discriminator in the browser decoder rather than inferring a variant
+from field presence.
+
 For database-backed anchor misses, verify exact-level absence returns
 `LevelNotRetained`, an unknown or identity-only block hash returns
 `BlockNotMaterialized`, and a DAA score before every retained VSPC score returns
@@ -1038,6 +1044,13 @@ order, unordered collections remain semantically equivalent across different
 traversal orders, and no internal-only field enters a public payload. A
 representation-significant schema or encoding change must alter the internal
 representation version used by graph cache identity and Head ETags.
+
+Require every property declared by a selected response shape to be present.
+Encode absent level DAA score, Genesis selected-parent index, and removed-level
+mutation value as explicit JSON `null`; distinguish each from zero and from an
+ordinary value. Round-trip BlockColor codes `0`, `1`, and `2` through both a
+block upsert and a color mutation, and require the Web decoder to reject every
+other integer, string, `null`, or omitted color before changing graph state.
 
 Verify the protocol-owned
 [graph gzip contract](api-protocol.md#graph-http-compression--settled) across
