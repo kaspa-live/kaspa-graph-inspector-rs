@@ -858,9 +858,12 @@ request-local, revision-zero `Fixed` view whose `max_depth` is its effective
 nominal level count. `Fixed` selects its extent semantics; no updates are
 delivered to this request-local view. ApiService serializes it into one coherent
 HTTP response and then discards it. Because it is not placed in a
-`GraphPublication`, the response has no publication ID, history, SSE cursor,
-or public delta lineage. Its request-local failures return their ordinary API
-result and do not participate in the head-publication state machine.
+`GraphPublication`, the database-source body carries no publication ID,
+history, SSE cursor, or public delta lineage. The enclosing HTTP response still
+follows the common
+[publication-context header contract](#publication-context-response-headers--settled).
+Its request-local failures return their ordinary API result and do not
+participate in the head-publication state machine.
 
 The Head-extracted window path is separate. A window whose complete effective
 extent is extracted from the active Head publication carries that
