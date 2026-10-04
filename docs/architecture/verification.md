@@ -1043,6 +1043,18 @@ runtime configuration, and static assets do not inherit this graph-only rule.
 Force compression failure after successful serialization and size checking;
 require the existing request-local `500` outcome and no cache insertion.
 
+Build the [settled HTTP composition](overview.md#http-composition-and-runtime-web-configuration--settled)
+from the `kgi-api-core` router awaiting `Arc<ApiService>`, supply that state
+once at the composition root, and exercise API, runtime-configuration, asset,
+and browser-fallback routes through the completed application. An unknown
+`/api/v1` route returns the protocol `404`, and an unsupported method on a
+known API route returns its `405`; neither may serve `index.html`. A
+non-API browser route uses the SPA fallback, and an asset uses static-file
+delivery. The outer trace layer must preserve every response and streaming
+behavior. Verify graph bodies are compressed exactly once, SSE remains open
+beyond the ordinary graph-delivery timeout, and API lane saturation remains
+ApiService-owned rather than becoming router-wide backpressure.
+
 Verify graph-value serialization uses zero-based response-local `u32` hash
 references and a first-encounter dictionary built from the serializer's actual
 traversal. Repeat hashes across block identity, ordered parent and merge-set

@@ -559,10 +559,19 @@ healthy server without its UI.
 
 ## HTTP composition and runtime Web configuration — settled
 
-`kgi-api-core` exposes the Axum router for the
-[protocol-owned `/api/v1` surface](api-protocol.md#common-http-conventions--settled).
-The top `kgi` crate composes that router with the runtime Web configuration and
-static application delivery:
+`kgi-api-core` depends on Axum and exposes the routes for the
+[protocol-owned `/api/v1` surface](api-protocol.md#common-http-conventions--settled)
+as a router awaiting its application state:
+
+```rust
+pub fn router() -> axum::Router<Arc<ApiService>>;
+```
+
+`Arc<ApiService>` is Axum application state rather than a request extension.
+The top `kgi` crate owns that Arc, nests the API router at `/api/v1`, composes
+the runtime Web configuration and static application delivery, and calls
+`with_state(api_service)` once on the completed router before serving it.
+The resulting route ownership is:
 
 ```text
 /api/v1/...       kgi-api-core HTTP and SSE
@@ -570,6 +579,32 @@ static application delivery:
 /assets/...       immutable Vite assets
 /*                browser application fallback
 ```
+
+The API router owns an explicit protocol-compliant fallback and method
+handling. An unknown or unsupported `/api/v1` request therefore produces the
+API-owned `404` or `405` response and can never fall through to the browser
+application.
+
+The top crate uses Tower's `ServiceBuilder` for explicit middleware ordering
+and applies one outer `tower_http::trace::TraceLayer` to the completed HTTP
+application. Exact span fields, logging callbacks, and metrics integration
+remain implementation choices under the
+[observability deferral](../decisions/deferred.md). It uses
+`tower_http::services::ServeDir` for immutable Vite assets and
+`tower_http::services::ServeFile` for the browser-application fallback.
+
+KGI installs no global `CompressionLayer`, `TimeoutLayer`,
+`ConcurrencyLimitLayer`, `CorsLayer`, `CatchPanicLayer`, or request-body
+transformation layer. Graph compression is the API protocol's explicit
+single-representation path. Timeouts, concurrency, admission, cancellation,
+and panic disposition retain their focused owners and cannot be replaced by a
+router-wide default. SSE therefore inherits tracing but no ordinary HTTP
+timeout, concurrency, or compression policy. Production uses one origin and
+needs no CORS policy.
+
+Axum, Tower, and tower-http crate versions are implementation dependency
+choices. A version change is architectural only when it changes one of the
+settled behaviors above.
 
 The top `kgi` crate's Supervisor owns the bound listener and Axum server task.
 ApiService owns `/api/v1` admission, request work, response delivery tracking,
