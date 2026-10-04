@@ -1554,6 +1554,19 @@ both reliable event streams after terminal shutdown rather than retaining a
 generation, starting recovery, or forwarding another API generation. Event-path
 closure after its owning service completes shutdown is expected.
 
+Exercise the
+[ApiService cancellation domains](api-service.md#api-task-ownership-and-completion--settled)
+independently. Cancelling one HTTP child drops only its request-local work and
+detaches its cache waiter; sibling requests and the shared cache job continue.
+Cancelling one SSE child removes only that connection's registration and
+permit, while publication replacement preserves the connection token.
+ApiService reset cancels none of the HTTP, SSE, or cache-job roots. During
+terminal shutdown, the final Stale notification enters the ordinary SSE
+buffers before the SSE root is cancelled; the HTTP root follows, then the
+cache-job root after request and connection guards complete. Token
+cancellation alone must not satisfy a guard, task-tracker, runtime, or encoding
+completion barrier.
+
 Graph-update and API projection tests cover a non-Genesis block whose selected
 parent index addresses the expected member of `direct_parents`, plus Genesis
 with `selected_parent_index = None`, an empty `direct_parents` list, and no

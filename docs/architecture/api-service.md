@@ -171,17 +171,30 @@ enum ApiRuntimeSlot {
     Stopped,
 }
 
+struct ApiCancellation {
+    http: tokio_util::sync::CancellationToken,
+    sse: tokio_util::sync::CancellationToken,
+    cache_jobs: tokio_util::sync::CancellationToken,
+}
+
 struct ApiService {
     runtime: tokio::sync::Mutex<ApiRuntimeSlot>,
     api_db: Arc<ApiDbState>,
     current_publication:
         tokio::sync::watch::Sender<Option<Arc<GraphPublication>>>,
-    cancellation: tokio_util::sync::CancellationToken,
+    cancellation: ApiCancellation,
     cache_jobs: tokio_util::task::TaskTracker,
     encoding: EncodingScheduler,
     // admission and request infrastructure
 }
 ```
+
+The three ApiService cancellation tokens are independent roots. There is no
+universal parent token whose cancellation could bypass the ordered shutdown
+barrier. Runtime replacement does not cancel any of them. The
+`PublicationRuntime` and `EncodingScheduler` retain their separately owned
+tokens because their lifetimes and completion barriers differ from HTTP, SSE,
+and shared cache work.
 
 `PublicationRuntime` is a directly owned private `kgi-api-core` value, never a
 public capability or model value. Its complete behavior belongs to the
@@ -312,15 +325,19 @@ through request guards rather than duplicate task handles.
 
 On a source-keyed delta-cache miss, ApiService captures the immutable
 history-entry Arcs and target, registers one running single-flight job, and
-spawns one tracked cache orchestration task. Concurrent requests from that
-source attach to its shared result even when Head advances. A Head snapshot
-tier job instead captures one immutable Frozen extraction and is keyed by its
-derived tier depth. The mandatory tier-50 Prewarming job and later
-demand-triggered tier jobs use the same tracked scheduler and final response
-construction path. Every job holds only detached immutable inputs during JSON
-serialization and gzip and no image or history lock.
+spawns one tracked cache orchestration task with a child of
+`ApiCancellation::cache_jobs`. Concurrent requests from that source attach to
+its shared result even when Head advances. A Head snapshot tier job instead
+captures one immutable Frozen extraction and is keyed by its derived tier
+depth. The mandatory tier-50 Prewarming job and later demand-triggered tier
+jobs use the same tracked scheduler and final response construction path.
+Every job holds only detached immutable inputs during JSON serialization and
+gzip and no image or history lock.
 
 Cancelling one request detaches that waiter without cancelling the shared job.
+The job may finish and populate its originating publication cache after its
+last current waiter disappears. Publication replacement likewise does not
+cancel a job holding captured immutable inputs or remaining waiters.
 On success, the job completes every waiter and installs its `CachedDelta` or
 `CachedHeadSnapshot` only when its weak reference to the originating cache can
 still be upgraded. A Head-tier refresh atomically replaces only that tier. On
@@ -367,9 +384,18 @@ permit, service-cancellation observation, and completion notification:
 
 ```rust
 struct ApiRequestGuard {
-    // admission permit, cancellation, and completion
+    cancellation: tokio_util::sync::DropGuard,
+    // admission permit and completion registration
 }
 ```
+
+Admission creates a unique child of `ApiCancellation::http` and places its
+drop guard in `ApiRequestGuard`. Cancelling that child affects only the
+request. Dropping the handler or response body cancels its remaining
+request-local work; a request-local timeout may cancel the same child without
+affecting another request. Database and other request-local futures observe
+that token where cancellation is applicable. A cache wait observes it only to
+detach that waiter: it never receives or cancels the shared job token.
 
 Axum executes the handler future. For a graph response, the response body
 retains the guard through complete delivery, delivery failure, client
@@ -380,12 +406,19 @@ never attempts a second response.
 
 Each accepted SSE connection owns an SSE admission guard, one bounded semantic
 message receiver, its current publication-local identifier and registration,
-and connection cancellation. It observes the current-publication watch. On
-replacement it performs the protocol-owned registration transition and ordered
-initial sequence. Normal disconnect or cancellation removes the current
+and a drop guard for a unique child of `ApiCancellation::sse`. It observes the
+current-publication watch. On replacement it performs the protocol-owned
+registration transition and ordered initial sequence without replacing or
+cancelling that token. Normal disconnect, connection-local failure, slow-client
+disconnection, or cancellation affects only that child and removes the current
 registration before releasing the guard. Mandatory-buffer admission follows
 the protocol-owned slow-client rule and never blocks publication mutation or
 shutdown.
+
+Cancellation requests termination but does not prove cleanup. HTTP and SSE
+completion remains established by their guards, cache completion by
+`TaskTracker`, and runtime and encoding completion by their explicit shutdown
+barriers.
 
 ## ApiService shutdown — settled
 
@@ -401,10 +434,11 @@ ApiService performs the local barrier in order:
 3. take the installed runtime, if any, and await its publication-owned
    `shutdown()` barrier, allowing its final `Stale` transition to propagate
    through the normal ordered SSE path to currently registered clients;
-4. cancel every SSE connection, then cancel admitted HTTP operations and wait
-   for all SSE and request guards to be released;
-5. close `cache_jobs` to new registration and cancel every unfinished cache
-   job;
+4. cancel `ApiCancellation::sse`, then
+   `ApiCancellation::http`, and wait for all SSE and request guards to be
+   released;
+5. close `cache_jobs` to new registration, cancel
+   `ApiCancellation::cache_jobs`, and cancel every unfinished cache job;
 6. signal encoding-scheduler shutdown and await both `cache_jobs.wait()` and
    `EncodingScheduler::shutdown()`;
 7. replace the current-publication value with `None`, then release every API DB
