@@ -30,6 +30,15 @@ Modified` retains the previously validated value. A fetch failure, a malformed
 body, or a response that cannot be paired with a previously validated value
 leaves the explorer action hidden and never delays or changes graph behavior.
 
+When the user invokes the explorer action, the Web expands the retained raw
+template under the overview-owned rule using the selected `GraphBlock`'s
+complete canonical hexadecimal hash. It never substitutes a response-local
+dictionary index, abbreviated display label, database ID, or another block's
+hash. It navigates only to the serialized URL returned by the final parse. If
+expansion or final validation fails, it performs no navigation, hides the
+action for that retained configuration, and leaves graph state and selection
+unchanged.
+
 For the protocol-owned JSON representation, the Web converts public `u64`
 decimal strings to `bigint` at its DTO boundary before constructing typed
 client values. Graph logic never routes those values through JavaScript

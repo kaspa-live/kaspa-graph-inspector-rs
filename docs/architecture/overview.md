@@ -642,11 +642,33 @@ omitted property. A configured value encodes as a JSON string with ordinary
 JSON escaping. Serialization adds no insignificant whitespace or trailing
 newline.
 
-A configured template is a valid HTTP or HTTPS URL containing exactly one
-`{hash}` placeholder. It is public presentation configuration and may never
-contain credentials or expose environment variables generically. It is owned
-and served by the top `kgi` crate and does not belong to `kgi-api-core`,
-`kgi-api-model`, or `SystemStatus`. The
+A configured template is raw UTF-8 text containing exactly one literal,
+case-sensitive `{hash}` substring. Percent-encoded braces such as
+`%7Bhash%7D` are not a placeholder. Validation must not parse or normalize the
+raw template before locating and replacing that substring, because a URL
+parser may encode its braces.
+
+Startup validation replaces the placeholder with 64 ASCII zeroes, parses the
+expanded text as an absolute WHATWG URL, requires an `http` or `https` scheme,
+and requires empty username and password fields. The zero string has the same
+length and URL-safe character class as the complete canonical hexadecimal
+`BlockHash` text. A successful validation retains the original raw template,
+not the parsed probe URL.
+
+Expanding a validated template for a block performs the same operation with
+that block's complete
+[canonical hexadecimal hash text](api-protocol.md#common-http-conventions--settled):
+replace the one literal substring in the raw template, parse the result again
+as an absolute WHATWG URL, and reapply the scheme and credential checks. The
+parser's serialized URL is the destination. Any failed parse or check produces
+no destination. This expansion order and validity rule is shared by startup
+validation and the browser; neither side substitutes into an already parsed or
+normalized template.
+
+The template is public presentation configuration and may never expose
+environment variables generically. It is owned and served by the top `kgi`
+crate and does not belong to `kgi-api-core`, `kgi-api-model`, or
+`SystemStatus`. The
 [process configuration contract](#process-configuration-and-command-entry--settled)
 owns its operator sources and startup validation. Vite never reads that
 deployment setting.

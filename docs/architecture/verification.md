@@ -1721,6 +1721,18 @@ regardless of `Accept-Encoding`.
 Web decoder tests accept the exact `null` and valid-string shapes, retain the
 previous validated value after `304`, and reject a missing property, an extra
 property, a non-string/non-null value, malformed JSON, and an invalid template.
+Template validation covers zero and multiple literal placeholders, a lone
+percent-encoded `%7Bhash%7D`, non-HTTP schemes, credentials, and text whose
+probe expansion is not an absolute valid URL. Verify that substitution occurs
+in the raw template before WHATWG parsing can encode the braces and that
+startup retains the raw template rather than the normalized probe.
+
+For a known selected block, expand with its full canonical hash and assert the
+exact normalized destination serialized by the URL parser. Reject dictionary
+indices, abbreviated hashes, database IDs, and hashes from another block as
+substitution sources. Inject a final expansion or validation failure and
+verify that the Web performs no navigation, hides the action for that retained
+configuration, and preserves graph state and selection.
 Exercise fetch and decode failures with no prior valid value. Every absent,
 invalid, or unavailable value hides the explorer action without delaying or
 changing graph rendering. Packaging checks also cover console plus rotating
