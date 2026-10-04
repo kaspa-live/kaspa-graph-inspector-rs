@@ -1459,13 +1459,15 @@ ordinary deltas. Cover first publication revisions zero and above zero, plus
 independently atomic view and history visibility at adjacent revisions.
 
 Verify the current-publication watch starts at `None`, atomically installs a
-complete publication Arc, and uses the last linearized installation during
-reset-time runtime overlap without runtime identity checks or acknowledgement.
-A request captures the slot once and completes against that exact Arc after a
-concurrent replacement; a later request observes the replacement. Runtime
-shutdown never clears the slot, while terminal ApiService shutdown replaces it
-with `None` after the runtime barrier and before releasing publication
-resources.
+complete publication Arc, and accepts installation only from the current
+runtime generation. During reset-time overlap, let the successor install
+publication N before the predecessor attempts to install publication O; the
+predecessor receives `Superseded`, N remains current, and predecessor shutdown
+cannot mark N Stale or replace it. A request captures the slot once and
+completes against that exact Arc after a concurrent replacement; a later
+request observes the replacement. Runtime shutdown never clears the slot,
+while terminal ApiService shutdown replaces it with `None` after the runtime
+barrier and before releasing publication resources.
 
 Pre-seal suppression produces no gap. Verify the database seed started after
 the marker covers every intentionally suppressed commit, including block and
@@ -1553,9 +1555,13 @@ uniform shutdown before `reset` returns. Verify the new receiver can drain durin
 overlap and that reset completion waits for neither construction nor
 publication installation. Serialize concurrent reset and shutdown calls through
 the runtime mutex; reset after `Stopped` is rejected and repeated shutdown is
-successful. Permit either overlapping runtime to install a coherent
-publication without sender identity or a revocable installation capability;
-the most recently completed installation is current.
+successful. Advance the private runtime generation before the successor starts
+and reject every predecessor installation after that boundary. Exercise a
+successor installation followed by a predecessor installation attempt and
+predecessor shutdown; the successor publication remains current. During a
+later Rebuild reset, delay an older Rebuild runtime's activation until after
+the new generation disables public reads, then verify its `Superseded` outcome
+cannot install its publication or reopen the gate.
 Resync preserves public database-backed reads, and failed reconciliation followed by
 Rebuild calls `reset` again with a fresh ingress. Rebuild relies on
 StorageService rather than `reset` to close API database admission, retire the

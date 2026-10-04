@@ -98,17 +98,17 @@ to one processing session. It owns that session's `GraphUpdateReceiver`, graph
 update worker, gap observation, seed construction, staging, alignment,
 prewarming, and the writer side of every publication it installs. It also owns an
 `Arc<ApiDbState>` clone through which construction awaits the latest valid API
-database client. ApiService directly owns at most one runtime; the runtime is
-never exported, returned to a caller, or placed in a shared model crate.
+database client. ApiService's private runtime slot contains at most one runtime;
+during reset, ApiService may additionally retain the exchanged predecessor
+only until its shutdown barrier completes. A runtime is never exported,
+returned to a caller, or placed in a shared model crate.
 
 One runtime persists across every intra-session reconstruction and may install
 successive publications. It owns at most one unpublished Prewarming or visible
 Active `Arc<GraphPublication>`. It begins ordinary graph-update application
 while that publication is still Prewarming and later supplies an Arc clone to
-ApiService's current-publication slot. Supplying the clone has no
-acknowledgement or paired atomicity requirement. Runtime ownership does not
-confer exclusive installation authority;
-the reset-time overlap and current-slot replacement rule belong to the
+ApiService's generation-fenced installation operation. The reset-time overlap,
+installation authority, and current-slot replacement rule belong to the
 [ApiService control contract](api-service.md#reset-control-and-recovery-effects--settled).
 
 The runtime exposes one private completed barrier:
@@ -406,11 +406,14 @@ The mandatory tier-50 job uses the protocol-owned
 [completion-time cache eligibility rule](api-protocol.md#publication-scoped-head-response-cache--settled)
 and exposes terminal success to `PublicationRuntime` only for an admitted
 candidate. Until then the runtime remains in `Prewarming`. On that success,
-install the complete publication `Arc` into ApiService's current-publication
-slot and enter `Active`. Installation is only a visibility change: it creates
-no revision and does not drain a hidden update backlog. The cached snapshot
-revision can precede the publication's current revision; retained canonical
-deltas connect that exact cursor to the current Head.
+submit the complete publication `Arc` to ApiService's generation-fenced
+installation operation. `Installed` lets the runtime enter `Active`. On
+`Superseded`, the runtime abandons the candidate, does not reconstruct or
+report failure, becomes quiescent, and waits for the reset-driven shutdown
+cancellation. Installation creates no graph revision and does not drain a
+hidden update backlog. The cached
+snapshot revision can precede the publication's current revision; retained
+canonical deltas connect that exact cursor to the current Head.
 
 Failure of mandatory tier-50 capture, size checking, serialization, or
 compression prevents installation. `PublicationRuntime` remains responsible

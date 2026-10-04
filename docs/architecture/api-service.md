@@ -64,10 +64,15 @@ struct ApiDbState {
 impl ApiDbState {
     async fn current(&self) -> Option<Arc<ValidatedApiDbClient>>;
     fn public_read_client(&self) -> Option<Arc<ValidatedApiDbClient>>;
+    fn set_public_reads_enabled(&self, enabled: bool);
 }
 ```
 
 It initializes with `Running { current: None, public_reads_enabled: true }`.
+`set_public_reads_enabled` is a private synchronous mutation used only by
+ApiService's reset and publication-installation transitions while they hold the
+publication-install boundary. It updates a `Running` snapshot without changing
+`current` and cannot change `Stopped`.
 StorageService owns generation retirement and autonomous replacement under the
 [storage lifecycle](storage.md#storageservice-lifecycle--settled). Supervisor
 maps StorageService's ordered API-generation variants to
@@ -171,6 +176,15 @@ enum ApiRuntimeSlot {
     Stopped,
 }
 
+struct PublicationInstallState {
+    runtime_generation: u64,
+}
+
+enum PublicationInstallOutcome {
+    Installed,
+    Superseded,
+}
+
 struct ApiCancellation {
     http: tokio_util::sync::CancellationToken,
     sse: tokio_util::sync::CancellationToken,
@@ -179,6 +193,8 @@ struct ApiCancellation {
 
 struct ApiService {
     runtime: tokio::sync::Mutex<ApiRuntimeSlot>,
+    publication_install:
+        Arc<std::sync::Mutex<PublicationInstallState>>,
     api_db: Arc<ApiDbState>,
     current_publication:
         tokio::sync::watch::Sender<Option<Arc<GraphPublication>>>,
@@ -188,6 +204,10 @@ struct ApiService {
     // admission and request infrastructure
 }
 ```
+
+`PublicationInstallState` initializes with generation zero before any runtime
+exists. The first accepted reset advances it before constructing generation
+one; every later accepted reset advances it exactly once.
 
 The three ApiService cancellation tokens are independent roots. There is no
 universal parent token whose cancellation could bypass the ordered shutdown
@@ -212,45 +232,63 @@ Resync/Rebuild value owned by the
 [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
 
 ApiService accepts exactly one `reset` call for each processing attempt. Under
-the runtime lifecycle mutex it establishes the recovery-mode-specific
-ApiDbState effect below, starts a new runtime with the fresh receiver and an
-`Arc<ApiDbState>` clone, exchanges that runtime into the slot, then awaits the
-old runtime's `shutdown()`, if any. Starting the new runtime before stopping
-the old one lets the new receiver drain immediately. Successful return is a
-runtime-replacement barrier, but is not a processing, publication-installation,
-or database-replacement barrier.
+the runtime lifecycle mutex it briefly enters the publication-install
+synchronization boundary, advances `runtime_generation` with checked
+arithmetic, and applies the recovery-mode-specific ApiDbState effect below.
+Failure to advance leaves the topology and database-read gate unchanged and
+fails `reset`. The new generation becomes authoritative before the successor
+runtime starts, so this transition immediately revokes every predecessor's
+publication-installation and database-read-gate authority.
 
-During the bounded overlap, either still-running runtime may supply a coherent
-publication to ApiService's current-publication slot. Installation authority
-does not depend on which runtime occupies `ApiRuntimeSlot`; no runtime identity,
-revocable installation capability, or current-runtime check is used. The most
-recent completed installation is current. The publication owner defines
-runtime installation and shutdown effects.
+ApiService then starts a new runtime with the fresh receiver, the captured
+generation, and an `Arc<ApiDbState>` clone, exchanges that runtime into the
+slot, and awaits the old runtime's `shutdown()`, if any. Starting the new
+runtime before stopping the old one lets the new receiver drain immediately.
+Successful return is a runtime-replacement barrier, but is not a processing,
+publication-installation, or database-replacement barrier. The runtime slot
+contains at most one runtime; during this bounded overlap, `reset` additionally
+retains the exchanged predecessor only until its shutdown barrier completes.
 
 The current-publication slot is a latest-value asynchronous value initialized
 to `None`. `tokio::sync::watch` is the settled primitive. Each runtime receives
-a sender clone and can install a complete publication with the equivalent of:
+a sender clone and its captured generation. It can request installation only
+through the ApiService-owned operation equivalent to:
 
 ```rust
-fn install_publication(
-    slot: &tokio::sync::watch::Sender<Option<Arc<GraphPublication>>>,
-    publication: Arc<GraphPublication>,
-) {
-    slot.send_replace(Some(publication));
-}
+impl ApiService {
+    fn install_publication(
+        &self,
+        runtime_generation: u64,
+        recovery_mode: RecoveryMode,
+        publication: Arc<GraphPublication>,
+    ) -> PublicationInstallOutcome {
+        let state = self.publication_install.lock().unwrap();
+        if state.runtime_generation != runtime_generation {
+            return PublicationInstallOutcome::Superseded;
+        }
+        self.current_publication.send_replace(Some(publication));
+        if recovery_mode == RecoveryMode::Rebuild {
+            self.api_db.set_public_reads_enabled(true);
+        }
+        PublicationInstallOutcome::Installed
+    }
 
-fn current_publication(&self) -> Option<Arc<GraphPublication>> {
-    self.current_publication.borrow().clone()
+    fn current_publication(&self) -> Option<Arc<GraphPublication>> {
+        self.current_publication.borrow().clone()
+    }
 }
 ```
 
-Installation atomically replaces the complete `Arc`; it never mutates a
-previous publication through the slot. A public operation reads and clones the
-slot once, retains that exact publication for its complete execution, and does
-not restart or rebind when another publication is installed. A concurrent
-replacement therefore affects later operations only. Publication replacement
-notification can observe the same watch value; no separate replacement signal
-or `arc-swap` dependency is required.
+The generation check, complete-`Arc` replacement, and conditional Rebuild gate
+reopening are serialized against reset by the one publication-install
+boundary. A generation mismatch returns `Superseded` without changing either
+the slot or the gate. Installation never mutates a previous publication
+through the slot. A public operation reads and clones the slot once, retains
+that exact publication for its complete execution, and does not restart or
+rebind when another publication is installed. A concurrent replacement
+therefore affects later operations only. Publication replacement notification
+can observe the same watch value; no separate replacement signal or
+`arc-swap` dependency is required.
 
 A runtime never clears the slot. ApiService stores `None` only at initial
 construction and when terminal shutdown releases the current publication.
@@ -303,8 +341,9 @@ detached responses.
 
 After Rebuild, public database-backed reads reopen only when `Aligning` and
 `Prewarming` complete and the replacement publication becomes `Active`; that
-installation sets
-`public_reads_enabled = true`. If `current` is absent then, the graph
+current-generation installation sets `public_reads_enabled = true` under the
+publication-install boundary. A superseded runtime cannot reopen the gate. If
+`current` is absent then, the graph
 publication is still installed and database-backed requests continue receiving an
 unavailable admission outcome until StorageService publishes another
 generation. Processing does not wait for that publication. An ordered Live
