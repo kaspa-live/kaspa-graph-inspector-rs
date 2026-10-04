@@ -733,7 +733,12 @@ neither revision. History rejects a nongapless append and accepts a gapless
 aggregated interval without requiring internal one-step boundaries. Construct
 direct and composed deltas only through `GraphDelta::new`; verify it
 rejects equal and backward revision endpoints, exposes the accepted endpoints
-through read-only accessors, and offers no revision mutation path.
+and target timestamp through read-only accessors, and offers no revision
+mutation path. Revision zero has timestamp zero. Direct revisions receive the
+publication-local elapsed timestamp sampled for their creation; adjacent
+microsecond-quantized revisions may have equal timestamps. Composition adopts
+the final constituent's timestamp. Replace a publication and verify neither
+server nor Web compares the two publication-local timestamp domains.
 
 Exercise the publication-owned writer gate by pausing between image publication
 and history append. A concurrent image capture may observe `n+1`, a history
@@ -750,7 +755,8 @@ selection: a target below the start returns `BackwardTarget` and constructs no
 delta, while equality remains `UpToDate`. Public delta-to-current operations
 cannot express a backward target.
 
-Verify every subview extract inherits its source revision with
+Verify every subview extract inherits its source revision and revision
+timestamp with
 `TrackingPolicy::Frozen`. `BlockCommitted` and `VspcCommitted` mutation entry
 points return `GraphViewUpdateError::Frozen`; delta application returns
 `GraphDeltaApplyError::Frozen`. Each refuses before inspecting the input or
@@ -822,12 +828,12 @@ the retained Head image. Each response must use only one immutable source. The
 Head result carries its complete publication lineage and source Head level;
 the database result carries none and is discarded after serialization. Neither
 path may insert a response into `GraphCache`. Both successful paths carry the
-current `KGI-Publication-ID` and `KGI-Publication-State` headers outside the
+current `KGI-Publication-Id` and `KGI-Publication-State` headers outside the
 body.
 
 Decode both anchored-window source variants. The Head variant carries exactly
-its publication ID, revision, and source Head high level; the Database variant
-carries none of those fields and invents no revision-zero cursor. Neither body
+its publication ID, revision, revision timestamp, and source Head high level;
+the Database variant carries none of those fields and invents no revision-zero cursor. Neither body
 contains publication state. Both carry one `GraphWindowResolution` and one
 complete `GraphDataDto`, do not echo the request anchor, and may retain
 external endpoint levels outside the effective nominal bounds.
@@ -844,56 +850,87 @@ current-VSPC resolution.
 
 Verify the settled
 [fixed-window reuse of canonical Head deltas](api-protocol.md#fixed-window-reuse-of-canonical-head-deltas--settled)
-from a Head-extracted anchored window. Deliver the same canonical encoded body
-through a Head consumer and a fixed-window consumer. The Web must filter it to
-blocks inside the fixed extent, intersecting edges, nominal and retained
-endpoint levels, and membership or color changes for retained blocks. Cover
-crossing edges with neither endpoint block present and mutations entirely
-outside the extent. A filtered candidate with no visible mutation must still
-advance the browser cursor and adopt the canonical delta's Head high level
-without changing either fixed bound.
+from a Head-extracted anchored window. Deliver the same canonical encoded batch
+through a Head consumer and a fixed-window consumer. For every replay entry,
+the Web filters blocks inside the fixed extent, intersecting edges, nominal and
+retained endpoint levels, and membership or color changes for retained blocks.
+Cover crossing edges with neither endpoint block present and mutations entirely
+outside the extent. A filtered entry with no visible mutation must still
+advance the browser applied cursor and timestamp and adopt the canonical
+entry's Head high level without changing either fixed bound.
 
-While the target Head still contains the complete fixed extent, verify omitted
-canonical block and edge removals do not remove fixed objects. Then compose an
-add-then-remove transition whose target Head has crossed the fixed lower bound.
-The Web must detect the target bound from `GraphDelta.high_level`, apply none
-of that response, preserve its previous coherent revision and image, and
-freeze without reconstructing an intermediate prefix. Also cover publication
-replacement and expired history. A terminal Stale publication remains
-addressable: canonical catch-up and missing-level lookup continue through its
-final stalled Head.
+While successive target Heads still contain the complete fixed extent, verify
+omitted canonical block and edge removals do not remove fixed objects. Then
+supply a batch in which earlier entries remain eligible and a later entry's
+target Head has crossed the fixed lower bound. The Web applies the earlier
+entries, rejects the first ineligible entry and every later entry, preserves
+its last coherent image and applied cursor, and freezes. Repeat with one
+indivisible composed entry crossing the boundary and require that complete
+entry to remain unapplied. Also cover publication replacement and expired
+history. A terminal Stale publication remains addressable: canonical catch-up
+and missing-level lookup continue through its final stalled Head.
 
 Exercise
 `GET /api/v1/graph/levels?publication_id=P&level=L1[&level=L2...]`.
-Require one valid publication ID and at least one positive level, treat
-repeated level parameters and values as a set, and reject malformed or
-additional parameters. Deduplicate repeated values before enforcing the
-focused-owner cardinality; accept exactly the maximum and reject one distinct
-level beyond it before publication lookup. Capture one immutable
-`Synchronizing`, `Live`, or
+Require one valid publication ID and at least one positive level, treat repeated
+level parameters and values as a set, and reject malformed or additional
+parameters. Deduplicate repeated values before enforcing the focused-owner
+cardinality; accept exactly the maximum and reject one distinct level beyond it
+before publication lookup. Capture one immutable `Synchronizing`, `Live`, or
 `Stale` Head image and decode one `HeadLevelLookupResponseDto` containing
-exactly one complete unordered `LevelDto` per distinct requested level plus
-the capture's publication ID and revision. Require the same publication ID in
-`KGI-Publication-ID` and current state only in `KGI-Publication-State`, with no
-hash dictionary, ETag, or partial capture. Cover a value newer than the delta
-being enriched. A
-missing level returns one all-or-nothing `LevelUnavailable` outcome; an
-unaddressable publication returns
+exactly one complete unordered `LevelDto` per distinct requested level plus the
+capture's publication ID and revision. Require the same publication ID in
+`KGI-Publication-Id` and current state only in `KGI-Publication-State`, with no
+hash dictionary, ETag, or partial capture. Cover a value newer than the entry
+being enriched. A missing level returns one all-or-nothing `LevelUnavailable`
+outcome; an unaddressable publication returns
 `FreshViewRequired(PublicationMismatch)`. Neither outcome returns partial
 levels.
 
-When a retained edge needs an unchanged endpoint level, stage the lookup result
-with the locally filtered delta and apply both atomically. Preserve the local
-derived edge-usage counter while replacing the level's public size and DAA
-score. Lookup failure must apply no candidate mutation and freeze only the
-browser fixed image. The lookup never reads PostgreSQL, enters `GraphCache`,
-joins cache single-flight work, carries a hash dictionary or ETag, or omits
-`Cache-Control: no-store`.
+When retained edges in one or more queued entries need unchanged endpoint
+levels, group distinct missing levels up to the request maximum, split a larger
+set across complete requests, and retain no endpoint context in
+`GraphDeltaBatchDto`. Stage each result with its first dependent locally
+filtered entry and apply that entry atomically. Preserve the local derived
+edge-usage counter while replacing the level's public size and DAA score. Let
+earlier entries replay while a later lookup remains pending; reaching the
+dependent entry pauses there, and lookup completion recalculates replay against
+the unchanged deadline. Lookup failure applies no dependent entry, preserves
+earlier applied entries, and freezes only the browser fixed image. The lookup
+never reads PostgreSQL, enters `GraphCache`, joins cache single-flight work,
+carries a hash dictionary or ETag, or omits `Cache-Control: no-store`.
+
+Verify browser replay from a snapshot-initialized applied revision and
+timestamp. One admitted batch must replay at its observed publication-local
+pace and finish at its calculated deadline. Admit a later batch before the
+first finishes and require timer replacement plus acceleration across the
+complete remaining queue. Cover equal entry timestamps, zero remaining server
+interval, an expired deadline, and a calculated zero delay with immediate
+replay. Each graph entry applies atomically.
+
+Permit at most one delta request in flight and ten admitted batches. A valid
+tenth batch is admitted in full, a partially consumed batch still counts, and
+further acquisition pauses without discarding the response or advancing from
+the applied cursor. Finish the oldest batch, release its dictionary and DTO
+storage, and resume from the final received cursor while honoring the latest
+sticky continuation and coalesced SSE demand. Transport failure preserves
+valid queued work; an invalid or nongapless batch has no partial admission.
+Publication replacement, explicit refresh, view destruction, and shutdown
+cancel timers and release every batch.
+
+Adopt `KGI-Head-Revision-Id` and
+`KGI-Head-Revision-Timestamp-Us` only as one coherent HTTP pair. Calculate
+revision and time lag from the last applied entry rather than the first queued
+or last received entry. Do not combine an SSE revision with an older HTTP
+timestamp. Exercise the required observability for response entry count and
+span, cache result, raw and gzip size, browser queue occupancy, applied lag,
+replay acceleration or missed deadline, and Fixed level-lookup activity; exact
+metric names remain deferred.
 
 Verify deltas and client behavior across
 [API publication](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled) and
-[Web update acquisition](web.md#update-acquisition--settled): sequential delta
-composition and expiry, response-local hash dictionaries,
+[Web update acquisition](web.md#update-acquisition--settled): ordered batch
+replay and expiry, response-local hash dictionaries,
 terminal Stale state, replacement publication identity, SSE slow clients,
 fixed-view freeze, DAA focus, and Live arriving during construction,
 alignment, or Prewarming. The latter must install the completed image directly
@@ -902,8 +939,8 @@ as Live.
 Verify the settled
 [publication-state contract](api-publication.md#publication-state-and-revision--settled):
 initial Synchronizing, direct initial Live, visible `Synchronizing -> Live`,
-and terminal Stale transitions leave graph view and history revisions
-unchanged. Cover the runtime-replacement `reset` barrier without waiting for
+and terminal Stale transitions leave graph view and history revisions and
+timestamps unchanged. Cover the runtime-replacement `reset` barrier without waiting for
 construction, `Prewarming`, or installation, cancellation of unpublished work,
 no additional effect for an already Stale publication, canonical delta catch-up
 through the Stale publication's final Head, request-specific state-header
@@ -1040,7 +1077,7 @@ than emitting another outcome.
 Require `Cache-Control: no-cache` on successful Head snapshots and canonical
 deltas. Require `Cache-Control: no-store` on anchored windows, Head-level
 lookup, SSE, status, and every `4xx` or `5xx`. Cover the common paired
-`KGI-Publication-ID` and `KGI-Publication-State` headers on every Head snapshot,
+`KGI-Publication-Id` and `KGI-Publication-State` headers on every Head snapshot,
 canonical delta, anchored-window, and Head-level response produced after a
 coherent publication is selected, including bodyless success and `304`.
 Require the header ID to identify the exact retained publication and no
@@ -1065,8 +1102,8 @@ value above `MAX_WINDOW_DEPTH`, and accepts the inclusive valid range. Exercise
 rounding immediately below, at, and above each 50-level tier boundary. Every
 successful response comes only from one coherent in-memory cached Head extent,
 reports its actual bounds, carries a complete local hash dictionary plus the
-snapshot publication ID and revision, and never accesses PostgreSQL. It echoes
-neither `target_depth` nor the selected tier. Decode the exact
+snapshot publication ID, revision, and revision timestamp, and never accesses
+PostgreSQL. It echoes neither `target_depth` nor the selected tier. Decode the exact
 `HeadSnapshotResponseDto`, including one complete `GraphDataDto`, and allow
 retained external endpoint levels outside its nominal low/high bounds. Cover
 `Synchronizing`, `Live`, terminal `Stale`, and no coherent publication. Advance
@@ -1090,48 +1127,60 @@ weak identity and `304 Not Modified`. Every semantic identity change returns
 the complete snapshot. Verify `target_depth`, selected tier, and publication
 state do not enter ETag identity. A state-only transition keeps the same cached
 bytes and ETag, and both `200` and `304` carry the newly sampled
-`KGI-Publication-ID` and newly sampled `KGI-Publication-State`. Verify
+`KGI-Publication-Id` and newly sampled `KGI-Publication-State`. Verify
 `Cache-Control: no-cache`.
 
 Delta cases cover Frozen and revision compatibility as the only application
 checks, direct target-state installation, Head bound recalculation, fixed-bound
 retention, and equality between sequential application and a directly or
-incrementally composed interval;
-associative graph-state effects across three adjacent intervals; later-value,
-insertion-folding, final `high_level`, and response-dictionary composition;
-rejection of nongapless composition; and protocol rejection of a publication
-mismatch before history selection. Under a small response budget, verify
-advancement through complete stored entries. Cover a requested
-target inside an aggregate by extending through its right boundary, a future
-target by returning through current history, and a prefix ending at an earlier
-stored boundary. A starting cursor inside an aggregate is unavailable. A first
-stored entry that cannot fit requires a fresh snapshot rather than a partial
-delta.
+incrementally composed interval. Cover associative graph-state effects across
+three adjacent intervals; later-value, insertion-folding, final `high_level`,
+and final target-timestamp selection; and rejection of nongapless composition.
+Protocol selection must reject a publication mismatch before history work.
 
-At the serialization boundary, verify that a composed canonical delta retains
-every composition `before` value while `GraphDeltaBodyDto` emits only target
-values. Cover level installation and removal, membership and color target
-values, block and edge upserts, an all-empty mutation body that still advances
-the revision interval, and omission of block and edge removals under the public
-Head-window bound. Require body-bearing responses to start at the requested
-revision and advance to their encoded `to_revision_id`.
+For one body-bearing response, select an ordered gapless
+`GraphHistoryEntryList` containing ordinary one-step entries, an already
+composed entry, and both forms together. Require one `GraphDeltaEntryDto` per
+selected history entry and never reconstruct the composed entry's discarded
+internal boundaries. The first entry starts at the requested revision, every
+adjacent boundary matches, and the final entry supplies the returned cursor.
+A requested target inside an aggregate extends through its right boundary; a
+future target returns through available history; a starting cursor inside an
+aggregate is unavailable.
+
+At the serialization boundary, verify that every in-memory canonical delta
+retains its complete change maps and composition `before` values while its
+`GraphDeltaEntryDto` emits only target values. Cover level installation and
+removal, membership and color target values, block and edge upserts, and an
+all-empty mutation body that still advances the revision interval. Omit block
+and edge removals separately from every wire entry and omit hashes referenced
+only by those removals. Traverse all retained entries under one deterministic
+first-encounter hash dictionary; references in different entries to the same
+hash must share one dictionary item. `GraphDeltaBatchDto` contains no endpoint-
+level context.
 
 For every appended history entry, verify `estimated_raw_bytes` and the absolute
 `cumulative_estimated_bytes` boundary at `delta.to_revision_id`. Cover range
 cost subtraction before and after prefix pruning, the first retained left
 boundary derivation, and an aggregated entry exposing only its final cost
 boundary. Exercise the delta-to-Head regions at the exact half-distance and 80%
-boundaries. In the heat region, cover no heated boundary, competing destination
-counts, the outgoing-cache/job and youngest-revision tie breaks, and exclusion
-when a boundary leaves retained history or the moving heat region. Confirm
-request-from counts and continuation kinds do not change heat. In the
-CPU-oriented region, cover an exact cache hit, the shortest bridge to the
-nearest reachable completed cached source, exclusion of a running job as a
-bridge destination, and fallback to the youngest affordable ordinary boundary.
-Force the actual uncompressed JSON result over its hard limit and verify
-fallback to an earlier complete boundary, then the first-entry fresh-view
-outcome. A compressed body that fits the transport efficiently does not permit
-an over-limit uncompressed representation.
+level boundaries. In the heat region, cover no heated boundary, competing
+destination counts, the outgoing-cache/job and youngest-revision tie breaks,
+and exclusion when a boundary leaves retained history or the moving heat
+region. Confirm request-from counts and continuation kinds do not change heat.
+In the CPU-oriented region, cover an exact cache hit, the shortest bridge to
+the nearest reachable completed cached source, exclusion of a running job as a
+bridge destination, and bounded fallback when no bridge is reachable.
+
+Exercise the preferred 15-revision destination, heat-selected extensions
+through revision 30, a nearer captured or terminal Head, and an affordable
+short prefix. No newly selected ordinary batch crosses 30 revisions; an
+indivisible stored aggregate may do so. Force the complete batch's final
+uncompressed JSON over its hard limit and verify removal of complete entries
+from the right, rebuilding the shared dictionary for each candidate prefix.
+The first indivisible entry exceeding the limit requires a fresh view. A gzip
+body that transfers efficiently does not permit an over-limit uncompressed
+representation.
 
 For tiered Head snapshot reuse, derive exactly `50`, `100`, `150`, `200`, and
 `250` from the initial limits. Require tier `50` to finish before publication
@@ -1158,29 +1207,34 @@ successfully delivered waiter independently toward the destination heat. A
 cache hit reuses the exact gzip bytes and is never
 promoted or replaced because Head advanced; publication ID and state, outcome,
 continuation, wake boundary, and retry delay remain outside those bytes. Wrap
-one cached body with different valid request-specific headers without
+one cached batch body with different valid request-specific publication and
+coherent Head revision/timestamp headers without
 serializing, compressing, or decompressing it. Verify that `CachedDelta`
-retains the checked uncompressed JSON byte count and final gzip body. Verify
+retains the first and last boundaries, final `high_level`, checked
+uncompressed JSON byte count, and final gzip body without duplicating entry
+timestamps or count as semantic fields. Verify
 one immutable outgoing entry per source revision and
 convergence of distinct sources on a heated destination. Exercise an
 SSE-coordinated and an HTTP-only request from the same source and verify both
 reuse the same cache entry or join the same job.
 
-For a Live publication and interval four, cover no-delta waiting at Head
-distances one through three; target eligibility beginning at `F + 4`; no-heat
-fallback; `ReachedHead`, `ContinueImmediately`, and `WaitForWakeup`; one wakeup
+For a Live publication and preferred interval 15, cover no-delta waiting at
+Head distances one through fourteen; target eligibility beginning at
+`F + 15`; heat extension through `F + 30`; no-heat fallback; `ReachedHead`,
+`ContinueImmediately`, and `WaitForWakeup`; one wakeup
 at the armed boundary; suppression of further graph wakeups until rearming;
 and `PublicationState` or the replacement sequence bypassing the schedule.
 Verify the canonical
 `GET /api/v1/graph/deltas` endpoint requires `publication_id` and
 `from_revision_id`, accepts an optional `client_id`, rejects a public
-`to_revision_id`, and emits the exact publication, publication-state, outcome,
-and continuation headers required by the protocol. Require a body for
+`to_revision_id`, and emits the exact publication, publication-state, coherent
+Head revision/timestamp, outcome, and continuation headers required by the
+protocol. Require a batch body for
 `complete` and `prefix`; require an empty `200 OK` body for `up-to-date` and
 `wait-for-wakeup`. The wake-boundary header appears only for
 `wait-for-wakeup`. Neither typed `409 Conflict` delta error carries the delta
-success headers. Verify body-bearing results advance the cursor to the body
-right boundary while the two empty success outcomes preserve the request
+success headers. Verify body-bearing results advance the cursor to the final entry's right
+boundary while the two empty success outcomes preserve the request
 cursor. The opaque client ID selects only wake state, while every HTTP
 `from_revision_id` remains the authoritative graph cursor. Its omission must
 select HTTP-only polling without `ClientRegistrationRequired`; cover that
@@ -1214,9 +1268,10 @@ the final stalled Head revision. Verify `Last-Event-ID` has no graph-cursor,
 publication, registration, or replay meaning. Cover saturation rather than
 wrap at the maximum revision. Synchronizing never parks for the interval.
 Entering Stale reports state independently of graph-wakeup arming and permits
-an interval shorter than four through the final stalled Head without rearming.
+an interval shorter than 15 through the final stalled Head without rearming.
 For HTTP-only `head` and `wakeup`, verify the protocol-owned calculated
-`KGI-Delta-Retry-After-Ms` values at lags zero through three and its absence
+`KGI-Delta-Retry-After-Ms` values at representative lags zero through fourteen
+and its absence
 from `continue` and SSE-coordinated responses. At a Stale final Head require
 1000 milliseconds, repeated same-endpoint polling while that publication
 remains current, and a publication-mismatch outcome followed by a replacement
@@ -1225,7 +1280,7 @@ replacement wakeup instead.
 Force both an estimated and a final uncompressed JSON budget to select a
 shorter prefix; that prefix remains valid and cacheable and derives
 continuation from its remaining Head distance. Also cover a CPU-oriented
-bridge shorter than four.
+bridge shorter than 15.
 
 Verify Stale preserves cache entries and permits existing and new jobs to
 finish against the stalled Head. Publication replacement must allow a running
@@ -1246,8 +1301,9 @@ return `Cache-Control: no-store`, and produce no ETag. Fixed-window consumers
 must receive the same cached canonical Head response as other consumers. Cache
 work must not delay or fault processing.
 Verify every Head tier stores its post-compression gzip body, weak ETag, actual
-extent, snapshot cursor, and uncompressed JSON byte count while excluding
-`target_depth`, selected-tier metadata, and publication state from the body.
+extent, snapshot cursor and timestamp, and uncompressed JSON byte count while
+excluding `target_depth`, selected-tier metadata, and publication state from
+the body.
 Historical database-backed windows and
 Head-level lookups serialize, check their uncompressed JSON size, compress,
 deliver, and discard without entering `GraphCache`.

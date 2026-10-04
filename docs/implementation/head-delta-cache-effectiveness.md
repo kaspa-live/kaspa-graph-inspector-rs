@@ -1,6 +1,7 @@
 # Head delta cache effectiveness estimate
 
-Status: non-normative predictive analysis, recorded 1 October 2026.
+Status: non-normative predictive analysis, recorded 1 October 2026 and updated
+4 October 2026 for ordered delta-batch replay.
 
 This document preserves the initial effectiveness estimate and proposed
 observability for the settled Head delta cache and convergence design. It is
@@ -16,22 +17,27 @@ The initial estimate assumes:
 
 ```text
 average graph revision rate               about 20 revisions/s
-DELTA_CONVERGENCE_REVISION_INTERVAL       4 revisions
+DELTA_CONVERGENCE_REVISION_INTERVAL       15 revisions
+MAX_DELTA_CONVERGENCE_REVISION_INTERVAL   30 revisions
 ```
 
 The normal shared lane would therefore produce approximately:
 
 ```text
-20 / 4 = 5 CachedDelta entries/s
+20 / 15 = about 1.33 CachedDelta entries/s
 ```
 
-A continuously connected client's visible graph age would normally vary
-between zero and four revisions. Before transport and processing time, this
-corresponds to roughly:
+A normal shared response covers about 750 milliseconds of server activity,
+with heat allowed to extend a destination to at most about 1.5 seconds under
+this working rate. Because the first retained entry is applied immediately,
+the publication timestamps from the first through last target revision usually
+give replay intervals of about 700 milliseconds and 1.45 seconds,
+respectively. Exact visible lag depends on transport, rendering, and
+queued-batch acceleration rather than one fixed batching delay.
 
 ```text
-average batching delay    about 100 ms
-maximum batching delay    about 200 ms
+preferred source-to-target span   about 750 ms
+maximum source-to-target span     about 1,500 ms
 ```
 
 ## Expected steady-state sharing
@@ -39,7 +45,7 @@ maximum batching delay    about 200 ms
 Suppose `N` clients have converged on the same source revision:
 
 ```text
-F -- CachedDelta --> F+4
+F -- CachedDelta --> F+15
 ```
 
 The first request starts construction. Concurrent requests join its
@@ -47,10 +53,10 @@ single-flight job, and later requests receive the completed cached value.
 
 | Clients | Delta deliveries/s | Builds and encodes/s | Shared-work ratio |
 |---:|---:|---:|---:|
-| 1 | 5 | 5 | 0% |
-| 10 | 50 | about 5 | about 90% |
-| 100 | 500 | about 5 | about 99% |
-| 1,000 | 5,000 | about 5 | about 99.9% |
+| 1 | about 1.33 | about 1.33 | 0% |
+| 10 | about 13.3 | about 1.33 | about 90% |
+| 100 | about 133 | about 1.33 | about 99% |
+| 1,000 | about 1,333 | about 1.33 | about 99.9% |
 
 The estimated shared-work ratio is:
 
@@ -65,28 +71,28 @@ is shared.
 
 ## Expected request and CPU effects
 
-Compared with requesting after every revision, the four-revision interval
-would reduce normal delta-request and graph-wakeup frequency by approximately
-75%:
+Compared with requesting after every revision, the preferred interval would
+reduce normal delta-request and graph-wakeup frequency by approximately 93%:
 
 ```text
 before: 20 requests/client/s
-after:   5 requests/client/s
+after:   about 1.33 requests/client/s
 ```
 
 The expected cost order is:
 
 ```text
 delta range selection
-    < composition
-    < serialization and dictionary construction
+    < serialization and response-wide dictionary construction
     < compression
 ```
 
 The cache primarily eliminates repeated work from the expensive end. Each
 client still incurs lightweight request handling and response-envelope
-construction, but converged clients share composition, serialization,
-hash-dictionary construction, and compression.
+construction, but converged clients share history selection, serialization,
+response-wide hash-dictionary construction, and compression. The selected
+history entries remain separate replay units; response construction does not
+compose them merely for delivery.
 
 For 100 converged clients, the initial expectation is that these expensive
 operations approach one execution per shared lane entry instead of one per
@@ -110,17 +116,17 @@ expected to rise quickly after reconnect bursts.
 
 Under the protocol's CPU-oriented rule, the estimate assumes the shortest
 bridge to an existing cached source. The fresh-view distance gate is expected
-to prevent expensive long-range composition and low-value cache entries for
-much older clients.
+to prevent expensive long-range batch construction and low-value cache entries
+for much older clients.
 
 ## Expected cache extent
 
-The dominant lane creates roughly one entry per four revisions. A useful
+The dominant lane creates roughly one entry per fifteen revisions. A useful
 approximation is:
 
 ```text
 dominant cached entries
-    about retained revision count / 4
+    about retained revision count / 15
 ```
 
 Expressed through graph levels:
@@ -129,7 +135,7 @@ Expressed through graph levels:
 entries
     about MAX_CACHE_LEVEL_DISTANCE
         * average revisions per level
-        / 4
+        / 15
 ```
 
 Additional entries arise from unusual source cursors, response-budget
@@ -143,7 +149,7 @@ expected network benefits come from:
 
 - fewer HTTP requests and SSE wakeups;
 - one response envelope per several revisions;
-- potentially better compression across a larger delta; and
+- potentially better compression across a larger ordered batch; and
 - reuse of server-side encoded bytes.
 
 Total delivered response bytes still grow approximately linearly with the
@@ -207,7 +213,6 @@ Measure latency and CPU time independently for:
 
 ```text
 history selection
-delta composition
 hash-dictionary construction
 serialization
 compression
@@ -237,8 +242,28 @@ continue_immediately_outcomes
 
 Measure the elapsed time and revision distance between the client cursor, the
 wake boundary being reached, the HTTP request arriving, and the response being
-delivered. Under the working 10-BPS assumption, normal revision wake delay
-is expected to cluster near four revisions and roughly 200 ms.
+delivered. Under the working 10-BPS assumption, normal revision wake delay is
+expected to cluster near fifteen revisions and roughly 750 ms, with
+heat-selected destinations extending as far as thirty revisions.
+
+### Browser replay
+
+```text
+delta_batch_entries
+delta_batch_revision_span
+replay_batches_queued
+replay_entries_queued
+applied_revision_lag
+applied_time_lag_us
+replay_acceleration_ratio
+replay_deadline_misses
+fixed_level_lookup_requests
+fixed_level_lookup_latency
+```
+
+These measurements should distinguish server-side cache convergence from the
+visible client's paced progress and reveal whether the initial ten-batch queue
+bound is routinely reached.
 
 ### Recovery and fragmentation
 
@@ -260,12 +285,12 @@ the main lane. Frequent distance rejections would suggest that
 For multiple continuously connected clients, the initial prediction is:
 
 - 90-99% shared construction work with 10-100 clients;
-- approximately five dominant delta builds per second at 20 revisions/s;
-- approximately 75% fewer graph wakeups and delta requests than per-revision
+- approximately 1.33 dominant delta builds per second at 20 revisions/s;
+- approximately 93% fewer graph wakeups and delta requests than per-revision
   delivery;
 - one or a few dominant destination revisions per convergence interval;
-- roughly 100 ms average batching delay and 200 ms maximum batching delay,
-  excluding transport; and
+- entry-by-entry replay over a preferred roughly 750 ms server interval, with
+  acceleration when batches accumulate; and
 - one-off additional builds for new, reconnecting, or delayed source cursors.
 
 The recommended first implementation assessment prioritizes

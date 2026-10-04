@@ -33,6 +33,7 @@ struct GraphPublicationImage {
 
 struct GraphPublication {
     publication_id: u64,
+    revision_clock_origin: std::time::Instant,
     mutation: tokio::sync::Mutex<()>,
     image: tokio::sync::RwLock<GraphPublicationImage>,
     history: tokio::sync::RwLock<GraphHistory>,
@@ -71,6 +72,17 @@ runtime state;
 owns cache entry identities and Head response-cache policy, while the
 [publication wire contract](api-protocol.md#publication-wire-observation--settled)
 owns client registration and wake scheduling.
+
+Each construction candidate also receives a fresh monotonic clock origin when
+its construction begins. The origin moves into `GraphPublication` if that
+candidate reaches `Prewarming`; it is never exposed directly. Revision zero
+has timestamp zero. Every later successful graph mutation records the elapsed
+whole microseconds from that origin as its target revision timestamp. Values
+are nondecreasing and adjacent revisions may have equal timestamps after
+quantization. A replacement publication establishes a new clock domain, so
+timestamps are comparable only under one `publication_id`. The
+[graph owner](api-graph.md#revision-and-history-advancement--settled) owns the
+timestamp carried by `GraphView` and `GraphDelta` and its composition rule.
 
 ## Publication runtime — settled
 
@@ -148,8 +160,10 @@ For an original `BlockCommitted` or `VspcCommitted` update, the runtime:
 
 1. acquires `mutation` and requires the starting image and history revisions to
    be equal;
-2. acquires the image write lock, applies the original update, and publishes
-   the complete resulting view revision;
+2. acquires the image write lock and applies the original update; when it
+   produces a revision, it samples elapsed publication-local microseconds at
+   delta creation and publishes the complete resulting view revision and
+   timestamp;
 3. releases the image lock;
 4. when the update returned a delta, acquires the history write lock and
    appends and publishes that complete delta entry; and
@@ -184,6 +198,7 @@ struct GraphDeltaTargetCapture {
     publication_id: u64,
     state: GraphPublicationState,
     revision: u64,
+    revision_timestamp_us: u64,
     high_level: u64,
 }
 
@@ -211,8 +226,10 @@ state headers are finalized separately under the
 [protocol-owned publication-context rule](api-protocol.md#publication-context-response-headers--settled).
 
 A canonical delta operation briefly captures its publication ID, state, view
-revision, and high level under one image read lock, releases it, and then asks
-history for a range ending at the captured revision. History may still be one
+revision, revision timestamp, and high level under one image read lock,
+releases it, and then asks history for a range ending at the captured revision.
+The revision and timestamp form the coherent Head pair carried in the
+protocol-owned response headers. History may still be one
 revision behind that target. In that case the request uses the complete range
 currently available and the protocol reports the remaining progress through
 its ordinary continuation outcome; it neither waits for the append nor reloads
@@ -220,10 +237,10 @@ the image. A Stale capture cannot encounter this interval because the state
 transition waits behind `mutation`.
 
 History range capture clones the selected immutable
-`Arc<GraphHistoryEntry>` values under the history read lock. Composition,
-budgeting, dictionary construction, JSON serialization, and gzip compression
-then proceed without the lock. Later history pruning cannot invalidate those
-captured entries.
+`Arc<GraphHistoryEntry>` values under the history read lock. Target selection,
+budgeting, response-wide dictionary construction, JSON serialization, and gzip
+compression then proceed without the lock. Later history pruning cannot
+invalidate those captured entries.
 
 ## Database seed extent and projection — settled
 
@@ -498,8 +515,8 @@ Once a publication is visible, lifecycle events admit only
 `Synchronizing -> Live`, `Synchronizing -> Stale`, and `Live -> Stale`.
 `Stale` is terminal; a replacement always has a fresh `publication_id`. These
 state transitions do not modify `GraphView`, create `GraphDelta`, or advance
-either view or history revision. Repeating a terminal Stale transition creates
-no additional state effect.
+either view or history revision or revision timestamp. Repeating a terminal
+Stale transition creates no additional state effect.
 
 Becoming Stale does not destroy the publication's response cache or cancel its
 response-construction jobs. The coherent view and history stop advancing.
@@ -530,8 +547,8 @@ or `Aligning`, abandon the unpublished candidate and invoke
 and detach from its cache work before invoking the same primitive. In `Active`, first mark
 the current publication terminally `Stale`, then invoke the same primitive.
 
-Read-only retained-history selection and composition for response or cache
-construction do not advance the publication. A failure in that request path is
-request-local under the
+Read-only retained-history selection and response or cache construction do not
+advance the publication. A failure in that request path is request-local under
+the
 [public delivery contract](api-protocol.md#public-delivery-failures--settled);
 it does not mark the publication `Stale` or invoke reconstruction.

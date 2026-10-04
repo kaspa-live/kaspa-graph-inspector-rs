@@ -158,6 +158,7 @@ struct GraphView {
     low_level: u64,
     high_level: u64,
     current_revision_id: u64,
+    current_revision_timestamp_us: u64,
     tracking_policy: TrackingPolicy,
     levels: LevelSet, // each retained entry also keeps derived usage_count
     blocks: BlockSet,
@@ -167,6 +168,7 @@ struct GraphView {
 struct GraphDelta {
     from_revision_id: u64,
     to_revision_id: u64,
+    revision_timestamp_us: u64,
     high_level: u64,
     block_changes: HashMap<BlockHash, Option<GraphBlock>>,
     edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
@@ -193,6 +195,7 @@ impl GraphDelta {
     pub fn new(
         from_revision_id: u64,
         to_revision_id: u64,
+        revision_timestamp_us: u64,
         high_level: u64,
         block_changes: HashMap<BlockHash, Option<GraphBlock>>,
         edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
@@ -203,16 +206,18 @@ impl GraphDelta {
 
     pub fn from_revision_id(&self) -> u64;
     pub fn to_revision_id(&self) -> u64;
+    pub fn revision_timestamp_us(&self) -> u64;
 }
 ```
 
-A `GraphView` has no origin,
+A `GraphView` has no clock origin,
 liveness, database, or publication status. A view constructed from a database
-starts at revision zero. A subview extract inherits its source view's revision
-and has `TrackingPolicy::Frozen`. `Head` accepts updates and advances its
+starts at revision zero with revision timestamp zero. A subview extract
+inherits its source view's revision and revision timestamp and has
+`TrackingPolicy::Frozen`. `Head` accepts updates and advances its
 extent. `Fixed` accepts original committed updates only with the post-update
 Head view as its metadata cache while their extents overlap. `Frozen` retains
-both its captured contents and revision.
+its captured contents, revision, and revision timestamp.
 
 ## Frozen subview extraction — settled
 
@@ -240,6 +245,7 @@ low_level           = requested low_level
 high_level          = requested high_level
 max_depth           = high_level - low_level + 1
 current_revision_id = source.current_revision_id
+current_revision_timestamp_us = source.current_revision_timestamp_us
 tracking_policy     = Frozen
 ```
 
@@ -260,7 +266,8 @@ complete `size` and `daa_score`. Derived `usage_count` values are recomputed
 from the selected edges rather than copied from the source. The nominal
 `max_depth` does not include these additional endpoint levels.
 
-Extraction produces no delta or history and does not advance either revision.
+Extraction produces no delta or history and does not advance the revision or
+revision timestamp.
 It can read a `Head`, `Fixed`, or `Frozen` source. Nested extraction is allowed
 when the next requested extent is contained in the frozen source's nominal
 extent. Concrete indexes and immutable backing-data sharing remain
@@ -270,10 +277,12 @@ implementation choices. Enclosing publication synchronization belongs to the
 `GraphView` owns application of `BlockCommitted`, `VspcCommitted`, and
 `GraphDelta`. A `Frozen` view refuses each mutation entry point with
 `GraphViewUpdateError::Frozen` before inspecting whether the input would have a
-visible effect; its contents and revision remain unchanged. For `Head` and an
+visible effect; its contents, revision, and revision timestamp remain
+unchanged. For `Head` and an
 updating `Fixed` view, an update that changes no retained block, edge, or level
-returns no delta and leaves the revision unchanged. Any retained change
-advances that view's revision and returns the corresponding `GraphDelta`; a
+returns no delta and leaves the revision and timestamp unchanged. Any retained
+change advances that view's revision and revision timestamp and returns the
+corresponding `GraphDelta`; a
 retained level-size or DAA-score change is sufficient even when the triggering
 block itself is outside the block extent. Frozen refusal is distinct from an
 accepted no-effect update.
@@ -313,7 +322,8 @@ removals, every created, changed, or removed public level value, and
 `high_level = target_high`. Counter-only changes are derived maintenance and do
 not enter `LevelChange`. If every public change collection is empty, the
 operation returns `None` and does not advance the revision. Otherwise it
-advances `n` to `n + 1` and returns `GraphDelta(n, n + 1)`.
+advances `n` to `n + 1` and returns `GraphDelta(n, n + 1)` with the
+publication-supplied timestamp for revision `n + 1`.
 
 This procedure also covers a committed block below `target_low`: its block and
 edges are not reintroduced, while a supplied level snapshot can still update
@@ -408,6 +418,13 @@ composition constructs its results through the same checked constructor.
 Delta application and history append trust this construction invariant and do
 not check it again.
 
+`revision_timestamp_us` is the timestamp of the target revision. The graph
+model treats it as an opaque, nondecreasing value within one lineage. The
+[publication owner](api-publication.md#publication-and-seed-values--settled)
+supplies its publication-local clock domain. Microsecond quantization can give
+adjacent revisions equal timestamps. Timestamp values from different
+publications are never compared.
+
 ```rust
 impl GraphView {
     fn apply_delta(
@@ -439,8 +456,10 @@ low_level  = max(1, high_level - max_depth + 1)
 ```
 
 A Fixed view retains both nominal bounds. Every accepted view sets
-`current_revision_id = delta.to_revision_id`. An error leaves the complete view
-and revision unchanged. Direct application of a Head-generated delta remains
+`current_revision_id = delta.to_revision_id` and
+`current_revision_timestamp_us = delta.revision_timestamp_us`. An error leaves
+the complete view, revision, and timestamp unchanged. Direct application of a
+Head-generated delta remains
 prohibited for internal Fixed; only a delta from the same Fixed lineage has the
 required context.
 
@@ -688,9 +707,11 @@ compose(Delta(a,b), Delta(b,c)) = Delta(a,c)
 
 Composition requires exact equality between the left `to` and right `from`
 revisions. The result uses `a` as `from`, `c` as `to`, and delta `c`'s
-`high_level`. Composition is associative by graph-state effect. A composed
-delta must have the same graph-state effect as applying its constituent deltas
-in order.
+`high_level` and `revision_timestamp_us`. Composition is associative by
+graph-state effect. A composed delta must have the same graph-state effect as
+applying its constituent deltas in order. It is one replay unit whose timestamp
+therefore represents its final target revision; discarded internal timestamps
+are not reconstructed.
 
 ### Retained history range
 

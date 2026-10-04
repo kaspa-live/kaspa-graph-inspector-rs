@@ -279,10 +279,10 @@ timestamp, and score domains.
 Levels, blocks, edges, and all change collections are unordered on the wire.
 Only their contents are significant; a client builds any indexes required for
 display or mutation. The serializer converts directly from the captured
-`GraphView` or composed `GraphDelta`; it does not replace either canonical
-value earlier, compare repeated immutable values, or introduce a
-content-conflict validation step. Internal graph and service fields excluded
-by the common DTO rules never enter these values.
+`GraphView` or selected immutable `GraphHistoryEntry` values; it does not
+replace those canonical values earlier, compare repeated immutable values, or
+introduce a content-conflict validation step. Internal graph and service fields
+excluded by the common DTO rules never enter these values.
 
 ## Complete graph response DTOs — settled
 
@@ -310,6 +310,7 @@ The Head snapshot response is:
 struct HeadSnapshotResponseDto {
     publication_id: u64,
     revision: u64,
+    revision_timestamp_us: u64,
     low_level: u64,
     high_level: u64,
     graph: GraphDataDto,
@@ -318,7 +319,9 @@ struct HeadSnapshotResponseDto {
 
 `low_level..=high_level` is the actual nominal block extent and can be shorter
 than the selected cache tier near the pruning-point boundary.
-`(publication_id, revision)` is the canonical delta cursor. The request's
+`(publication_id, revision)` is the canonical delta cursor.
+`revision_timestamp_us` is that revision's publication-local monotonic
+timestamp and initializes browser replay timing. The request's
 `target_depth`, selected cache tier, publication state, `TrackingPolicy`, and
 weak ETag remain outside the body.
 
@@ -329,6 +332,7 @@ enum GraphWindowSourceDto {
     Head {
         publication_id: u64,
         revision: u64,
+        revision_timestamp_us: u64,
         head_high_level: u64,
     },
     Database,
@@ -341,11 +345,12 @@ struct GraphWindowResponseDto {
 }
 ```
 
-The `Head` variant carries the complete lineage needed to consume canonical
-Head deltas. `head_high_level` describes the source Head rather than the fixed
-window's effective end. The `Database` variant contains no publication ID,
-revision, or synthetic revision-zero cursor and creates no public delta
-lineage. Neither variant embeds publication state.
+The `Head` variant carries the complete lineage and revision timestamp needed
+to consume and replay canonical Head deltas. `head_high_level` describes the
+source Head rather than the fixed window's effective end. The `Database`
+variant contains no publication ID, revision, revision timestamp, or synthetic
+revision-zero cursor and creates no public delta lineage. Neither variant
+embeds publication state.
 
 `GraphWindowResolution.effective_start_level..=effective_end_level` is the
 nominal fixed block extent; the linked graph-owned projection can additionally
@@ -366,14 +371,14 @@ Every DAG query reports the identity and current state of its associated
 publication through this pair:
 
 ```http
-KGI-Publication-ID: 42
+KGI-Publication-Id: 42
 KGI-Publication-State: synchronizing | live | stale
 ```
 
 This applies to Head snapshots, canonical deltas, anchored windows, and
 Head-level lookups, including bodyless successful outcomes and `304 Not
 Modified`. A response produced after selecting a coherent publication retains
-that exact `Arc<GraphPublication>`. `KGI-Publication-ID` is its immutable
+that exact `Arc<GraphPublication>`. `KGI-Publication-Id` is its immutable
 unsigned decimal publication ID; ApiService samples the same publication's
 latest state when finalizing `KGI-Publication-State`. Consequently, the state
 can be newer than the immutable graph capture carried by the body. The two
@@ -387,7 +392,7 @@ not stored in compressed cache entries or used to invalidate graph bytes.
 Publication identity participates in an endpoint's ETag only where that
 endpoint's ETag contract says so; publication state never participates. A
 state-only transition can therefore produce `304 Not Modified` with the same
-`KGI-Publication-ID` and the new `KGI-Publication-State` value. Dedicated SSE
+`KGI-Publication-Id` and the new `KGI-Publication-State` value. Dedicated SSE
 `publication-state` messages and the status response retain their separately
 owned roles and are not cached DAG response bodies.
 
@@ -398,8 +403,9 @@ database-backed anchored window remains without a public delta lineage; its
 
 ## Canonical delta response DTOs — settled
 
-The canonical delta body contains only the target values required by a client
-to apply the patch:
+A body-bearing canonical delta response carries an ordered batch of complete
+retained history entries. Each entry contains only the target values required
+by a client to apply that replay unit:
 
 ```rust
 struct LevelMutationDto {
@@ -412,12 +418,11 @@ struct FieldMutationDto<T> {
     value: T,
 }
 
-struct GraphDeltaBodyDto {
+struct GraphDeltaEntryDto {
     from_revision_id: u64,
     to_revision_id: u64,
+    revision_timestamp_us: u64,
     high_level: u64,
-
-    hashes: Vec<BlockHash>,
 
     block_upserts: Vec<GraphBlockDto>,
     edge_upserts: Vec<GraphEdgeDto>,
@@ -425,30 +430,60 @@ struct GraphDeltaBodyDto {
     is_in_vspc_mutations: Vec<FieldMutationDto<bool>>,
     color_mutations: Vec<FieldMutationDto<BlockColor>>,
 }
+
+struct GraphDeltaBatchDto {
+    hashes: Vec<BlockHash>,
+    deltas: Vec<GraphDeltaEntryDto>,
+}
 ```
 
-`hashes` is the response-local dictionary for all hash references in the
-body. A level mutation with `Some(value)` installs that complete resulting
-level value; `None` removes the level. Membership and color mutations install
-their complete resulting field values. `block_upserts` and `edge_upserts`
-contain the serialized `Some(value)` results from the canonical change maps.
-The serializer omits block and edge removals under the settled public
-Head-window bound. It also omits each canonical change's composition-only
-`before` value: `before` remains present in the graph-owned delta through
-composition and is unnecessary for client application.
+`hashes` is one response-local dictionary shared by every hash reference in
+every entry. The serializer walks entries in their required replay order and
+their graph values in its actual serialization order, interning each hash on
+first encounter with the common vector plus hash-to-reference index. As with
+other graph bodies, unordered collection order and numeric references need not
+repeat across independent serializations of the same meaning.
 
-All change collections may be empty while the revision interval and
-`high_level` still advance. Collection ordering follows the
-[common graph-value rules](#serialized-graph-values-and-hash-dictionary--settled).
+Each entry represents one selected `GraphHistoryEntry`. It is normally an
+original one-step delta and may instead be an already composed, indivisible
+history entry. Its `revision_timestamp_us` is the publication-local timestamp
+of `to_revision_id`; a composed entry therefore carries its final
+constituent's timestamp. Entries are ordered and gapless. A batch never splits
+an entry or reconstructs internal boundaries discarded by earlier history
+composition.
+
+A level mutation with `Some(value)` installs that complete resulting level
+value; `None` removes the level. Membership and color mutations install their
+complete resulting field values. `block_upserts` and `edge_upserts` contain
+the serialized `Some(value)` results from that entry's canonical change maps.
+For every entry independently, the serializer omits removal-valued block and
+edge changes and excludes hashes referenced only by those omitted values from
+the shared dictionary. It omits each canonical change's composition-only
+`before` value. The complete in-memory `GraphDelta` remains unchanged; the
+serialization boundary is the sole omission point.
+
+All mutation collections in an entry may be empty while its revision interval,
+timestamp, and `high_level` still advance. The batch carries no auxiliary
+endpoint-level context. A Fixed browser view obtains a complete level absent
+from its own projection through the separately owned
+[Head-level lookup](#fixed-window-reuse-of-canonical-head-deltas--settled).
 
 Every successful canonical delta response carries the common publication-state
 header plus these exact delta headers:
 
 ```http
 KGI-Publication-Id: P
+KGI-Head-Revision-Id: H
+KGI-Head-Revision-Timestamp-Us: HT
 KGI-Delta-Outcome: complete | prefix | up-to-date | wait-for-wakeup
 KGI-Delta-Continuation: head | continue | wakeup
 ```
+
+`H` and `HT` are one coherent capture of the selected publication's Head
+revision and its publication-local timestamp. They are request-specific and
+stay outside cached bytes, so they may be newer than the final cursor in a
+reused batch. Both use unsigned decimal `u64` text. A client adopts them only
+as a pair.
 
 `wait-for-wakeup` additionally carries:
 
@@ -460,23 +495,26 @@ That header is absent for every other outcome. The HTTP-only polling rules may
 also add `KGI-Delta-Retry-After-Ms`. These request-specific headers do not
 enter the cacheable body.
 
-`complete` and `prefix` return one encoded `GraphDeltaBodyDto` as the response
-body. `up-to-date` and `wait-for-wakeup` return an empty body with `200 OK`;
-their headers make them meaningful successful outcomes rather than `204 No
-Content`. `ClientRegistrationRequired` and `FreshViewRequired(reason)` remain
-typed `409 Conflict` error bodies and carry none of the delta-success headers
-above. The common publication-context headers remain governed independently by
-whether the request selected a coherent publication.
+`complete` and `prefix` return one encoded `GraphDeltaBatchDto` containing at
+least one entry. `up-to-date` and `wait-for-wakeup` return an empty body with
+`200 OK`; their headers make them meaningful successful outcomes rather than
+`204 No Content`. `ClientRegistrationRequired` and
+`FreshViewRequired(reason)` remain typed `409 Conflict` error bodies and carry
+none of the delta-success headers above. The common publication-context headers
+remain governed independently by whether the request selected a coherent
+publication.
 
-For a body-bearing response, the request and body satisfy:
+For a body-bearing response:
 
 ```text
-request.from_revision_id == body.from_revision_id
-body.from_revision_id < body.to_revision_id
+request.from_revision_id == body.deltas.first.from_revision_id
+body.deltas[i].to_revision_id == body.deltas[i + 1].from_revision_id
+body.deltas.last.from_revision_id < body.deltas.last.to_revision_id
 ```
 
-Its resulting cursor is `(KGI-Publication-Id, body.to_revision_id)`. An
-`up-to-date` or `wait-for-wakeup` response leaves the request cursor unchanged.
+Its resulting cursor is
+`(KGI-Publication-Id, body.deltas.last.to_revision_id)`. An `up-to-date` or
+`wait-for-wakeup` response leaves the request cursor unchanged.
 
 ## Head-level lookup response DTO — settled
 
@@ -694,8 +732,8 @@ enum DeltaResponseOutcome {
     WaitForWakeup {
         wake_at_revision_id: u64,
     },
-    Complete(GraphDelta),
-    Prefix(GraphDelta),
+    Complete(GraphHistoryEntryList),
+    Prefix(GraphHistoryEntryList),
     FreshViewRequired(FreshViewReason),
 }
 
@@ -1041,7 +1079,8 @@ boundary. Define:
 ```text
 DELTA_RELOAD_LEVEL_DISTANCE = 400
 HOT_DESTINATION_LEVEL_DISTANCE = 250
-DELTA_CONVERGENCE_REVISION_INTERVAL = 4
+DELTA_CONVERGENCE_REVISION_INTERVAL = 15
+MAX_DELTA_CONVERGENCE_REVISION_INTERVAL = 30
 ```
 
 If the source boundary's distance behind the publication Head reaches or
@@ -1054,13 +1093,15 @@ distance is half of it.
 Wake-boundary addition saturates at `u64::MAX`; revision arithmetic never
 wraps.
 
-The required initial v2 value is four. It is measured in graph revisions rather
-than time. A later accepted tuning change may replace the value without
-changing the convergence model. At the expected average of roughly twenty
-graph revisions per second on a 10-BPS network, four revisions provide about
-200 milliseconds for grouping clients without imposing a long live-view lag.
-In the rules below, `I` denotes
-`DELTA_CONVERGENCE_REVISION_INTERVAL`.
+Both intervals are measured in graph revisions rather than time and are
+initial tuning values. `DELTA_CONVERGENCE_REVISION_INTERVAL` is the preferred
+response span and wake boundary. Heat may extend a selected destination up to
+`MAX_DELTA_CONVERGENCE_REVISION_INTERVAL` so clients converge on a shared
+younger cache point without creating an unbounded replay unit. Budget fallback,
+a nearer captured Head or Stale terminal Head, and an existing nearer cache
+boundary can produce a shorter interval. An indivisible composed history entry
+can cross the maximum because the protocol never splits it. In the rules below,
+`I` denotes the preferred interval and `M` the maximum interval.
 
 After the distance gate and before cache lookup, a Live delta-to-current
 request with source `F` and Head `H` returns
@@ -1076,22 +1117,29 @@ For an eligible `GraphHistoryRange::Deltas`, ApiService uses the entries'
 cumulative estimated costs to find the youngest complete boundary `Y` under
 `SOFT_DELTA_ESTIMATED_BYTES`. If no complete boundary fits that estimate,
 the first complete stored entry remains the candidate for the mandatory hard
-uncompressed-JSON-size check. A completed cache entry keyed by the
-request's source revision is immutable and is served directly. On a cache miss,
-delta-to-current target selection uses the approximate source-level distance:
+uncompressed-JSON-size check. From that affordable prefix, let `C` be the
+youngest complete boundary no later than `F.saturating_add(M)`. If the first
+stored entry itself crosses that boundary, its indivisible right boundary is
+`C`. A completed cache entry keyed by the request's source revision is
+immutable and is served directly; every entry built under this contract
+already observes that maximum except for an indivisible aggregate. On a cache
+miss, delta-to-current target selection uses the approximate source-level
+distance:
 
 1. At or inside `HOT_DESTINATION_LEVEL_DISTANCE`, use heat-oriented selection.
-   When `Y >= F.saturating_add(I)`, choose the hottest retained complete
-   boundary `T` in `[F.saturating_add(I), Y]`; if none has heat, choose `Y`.
-   When `Y < F.saturating_add(I)`, choose `Y` as the necessary size-limited
-   short target. Synchronizing chooses from the currently affordable range
-   without imposing the minimum interval.
+   When `C >= F.saturating_add(I)`, let `P` be the first complete boundary at
+   or beyond `F.saturating_add(I)`. Choose the hottest retained complete
+   boundary `T` in `[P, C]`; if none has heat, choose `P`. When `C` is earlier
+   than the preferred interval, choose `C` as the necessary short target.
+   Synchronizing chooses from the currently affordable bounded range without
+   imposing the preferred minimum.
 2. Beyond `HOT_DESTINATION_LEVEL_DISTANCE` but before
    `DELTA_RELOAD_LEVEL_DISTANCE`,
    minimize new CPU work. Choose the nearest younger boundary `R` that is the
    source of a completed `CachedDelta` and is reachable under the response
-   budget, then construct the shortest bridge `F -> R`. A running job is not a
-   completed bridge destination. If no such source exists, choose `Y`.
+   budget through `C`, then construct the shortest bridge `F -> R`. A running
+   job is not a completed bridge destination. If no such source exists, choose
+   `C`.
 
 Heat for a revision is the number of canonical Head delta responses
 successfully delivered with that actual `to_revision_id`, including every
@@ -1110,39 +1158,39 @@ removals that the serializer will omit, is additive across entries, and
 performs no graph encoding or compression. Exact weights remain deferred; the
 estimate selects a candidate and never authorizes an oversized response.
 
-The target is captured when the single-flight job starts and does not advance
-with Head while that job is running. Compose the chosen entries through the
-graph-owned [delta composition operation](api-graph.md#graph-delta-composition),
-construct the response-local hash dictionary, serialize the JSON once, and
-check its uncompressed byte length against the hard response limit. If the
-uncompressed JSON exceeds that limit, retry at an earlier complete boundary,
-preferring another eligible heated destination in the heat region. If even the
-first complete stored entry cannot fit, return
+The selected cache destination is fixed when the single-flight job starts and
+does not advance with Head while that job is running. Preserve the chosen
+`GraphHistoryEntryList` as ordered replay units, construct one response-local
+hash dictionary across the complete list, serialize one `GraphDeltaBatchDto`,
+and check its uncompressed byte length against the hard response limit. If the
+batch exceeds that limit, remove complete entries from the right and retry at
+the resulting earlier boundary, preferring another eligible heated destination
+in the heat region. Recompute the shared dictionary for the retained prefix. If
+even the first complete stored entry cannot fit, return
 `FreshViewRequired(FirstStoredDeltaExceedsBudget)`. An aggregated stored entry
 is indivisible and is never truncated or split.
 
-Every returned delta is complete under the public Head-window contract and
-reports its actual `to_revision_id`. It may be later than the selected target
-because the graph range extended through an indivisible aggregate or earlier
-because budgeting selected a prefix.
-Composition operates on graph hashes through the graph-owned operation; public
-encoding then constructs a new response-local hash dictionary for the result.
-The emitted response is one composed patch whose uncompressed JSON must remain
-within the configured byte limit. Gzip compression and cache insertion occur
-only after that check succeeds.
+Every returned entry is complete under the public Head-window contract. The
+batch's actual right boundary is its last `to_revision_id`; it may be later
+than the selected target because the graph range extended through an
+indivisible aggregate or earlier because the hard budget selected a prefix.
+The graph-owned composition operation remains available for history compaction
+and other graph uses, but cache construction does not compose the selected
+entries merely to create the public response. Gzip compression and cache
+insertion occur only after the complete batch passes the hard check.
 
-Return `Complete` when the actual returned right boundary reaches or extends
-through the captured target. Return `Prefix` when target selection or
-uncompressed-JSON-size fallback stops at an earlier complete boundary.
-These are request-specific envelope outcomes rather than fields of the encoded
-delta body. A later request may therefore wrap the same cached body differently
-as Head advances.
+For each delivery, return `Complete` when the actual returned right boundary
+reaches or extends through that request's coherently captured Head revision.
+Return `Prefix` when cache-destination selection or uncompressed-JSON-size
+fallback stops at an earlier complete boundary. These are request-specific
+envelope outcomes rather than fields of the encoded batch. A later request may
+therefore wrap the same cached body differently as Head advances.
 
 Every successful delta-to-current response uses the
 [canonical delta response headers](#canonical-delta-response-dtos--settled).
 The continuation is request-specific response metadata and is not part of the
-immutable encoded delta body. For a Live publication, after a response ending
-at cursor `T` against the then-observed Head `H`:
+immutable encoded delta-batch body. For a Live publication, after a response
+ending at cursor `T` against the then-observed Head `H`:
 
 ```text
 T == H        => ReachedHead
@@ -1181,22 +1229,22 @@ The HTTP-only client waits at least `N` milliseconds before requesting again.
 The retry header is absent from `continue` responses and from all
 SSE-coordinated responses.
 
-Synchronizing never parks a client for the four-revision interval: an
+Synchronizing never parks a client for the preferred revision interval: an
 intermediate response uses `ContinueImmediately`, and ordinary graph wakeups
 remain available. Stale cannot wait for future graph progress; entering Stale
 emits `PublicationState` regardless of the graph wake schedule, intermediate
 responses use `ContinueImmediately`, and reaching the final stalled Head uses
 `ReachedHead` without arming another graph-revision wakeup. The final Stale
-interval may be shorter than four revisions. At that final Head an HTTP-only
-response carries `KGI-Delta-Retry-After-Ms: 1000`; the client polls this same
-delta endpoint until publication replacement produces
+interval may be shorter than the preferred interval. At that final Head an
+HTTP-only response carries `KGI-Delta-Retry-After-Ms: 1000`; the client polls
+this same delta endpoint until publication replacement produces
 `FreshViewRequired(PublicationMismatch)`, then obtains the replacement Head
 snapshot. The SSE-coordinated response omits the retry header and does not
 rearm graph-revision delivery; publication replacement remains observable
 through the existing SSE transport.
 
 The soft estimate and hard uncompressed-JSON-size limit take precedence over
-ordinary four-revision spacing. A size fallback may therefore produce and
+ordinary preferred-interval spacing. A size fallback may therefore produce and
 cache a shorter complete prefix. Its continuation depends only on the remaining
 distance to the then-observed Head. CPU-oriented bridges may also be shorter
 because their purpose is to join an existing cached lane.
@@ -1205,8 +1253,8 @@ The serialized cached Head-delta body omits block and edge removals. Under the
 strict [public graph-limit bound](#public-graph-limits-and-identity--settled),
 the publication removal frontier cannot reach any
 block or child-owned edge retained by an eligible client window. The client
-uses `GraphDelta.high_level` according to its view policy. A Head-following
-client advances its lower bound and removes objects that leave it; the
+uses each serialized entry's `high_level` according to its view policy. A
+Head-following client advances its lower bound and removes objects that leave it; the
 [Web contract](web.md#fixed-views--settled) owns
 the fixed-window reaction. VSPC membership and color changes remain ordinary
 field mutations and are never discarded by this rule. Required level changes
@@ -1214,12 +1262,13 @@ remain present.
 
 Every in-memory `GraphDelta` retains the complete canonical contract through
 history selection, composition, target capture, and delivery to the serializer.
-The serializer is the sole omission point: while producing the cacheable wire
-body, it skips removal-valued entries in `block_changes` and `edge_changes` and
-omits their unused hashes from the response-local dictionary. It does not
-construct a filtered `GraphDelta`. `CachedDelta` retains only the resulting
-gzip body and its uncompressed JSON byte count. No canonical delta in history,
-composition, or ApiService's Head view loses those removals.
+The serializer is the sole omission point: for each selected entry, while
+producing the cacheable batch, it skips removal-valued entries in
+`block_changes` and `edge_changes` and omits hashes used only by those removed
+values from the response-local dictionary. It does not construct a filtered
+`GraphDelta`. `CachedDelta` retains only the resulting gzip body and its
+uncompressed JSON byte count. No canonical delta in history, composition, or
+ApiService's Head view loses those removals.
 
 ## Fixed-window reuse of canonical Head deltas — settled
 
@@ -1227,17 +1276,20 @@ A public anchored window extracted from an addressable Head publication follows
 that publication through the canonical
 [`GET /api/v1/graph/deltas`](#canonical-head-delta-responses--settled)
 operation. There is no dedicated Fixed-delta endpoint and no server-side
-extent projection. The response remains the canonical Head delta selected,
-constructed, cached, and encoded under that endpoint's ordinary contract.
+extent projection. The response remains the canonical Head delta batch
+selected, constructed, cached, and encoded under that endpoint's ordinary
+contract.
 
 The initial window supplies the fixed effective extent and source Head cursor.
 The [Web owner](web.md#fixed-views--settled) owns
-containment, extent filtering, missing-level detection, atomic application,
-and its terminal freeze behavior. ApiService retains no registration for the
-fixed extent and reconstructs no extent-specific intermediate prefix.
+per-entry containment, extent filtering, missing-level detection and lookup,
+atomic application, and terminal freeze behavior. ApiService retains no
+registration for the fixed extent and reconstructs no extent-specific
+intermediate prefix.
 
-A retained edge in the filtered result can require an endpoint level that was
-unchanged and therefore absent from the canonical delta. The public lookup is:
+A retained edge in a filtered replay entry can require an endpoint level that
+was unchanged in Head and therefore absent from that canonical delta. Atomic
+delivery does not supply unchanged source state. The public lookup is:
 
 ```http
 GET /api/v1/graph/levels?publication_id=P&level=L1[&level=L2...]
@@ -1407,7 +1459,7 @@ Resync or Rebuild.
 
 SSE carries ordered registration, publication-state, and graph-wakeup messages;
 it is not the graph data channel. Each client has a bounded delivery buffer.
-Live history advancement follows the registered four-revision graph-wakeup
+Live history advancement follows the registered preferred-interval graph-wakeup
 schedule, while `PublicationState` and the replacement sequence bypass it.
 Synchronizing continues to emit ordinary coalesced graph wakeups. Pending
 graph wakeups may coalesce to the latest cursor; registration and state
@@ -1446,11 +1498,16 @@ struct CachedDelta {
 ```
 
 `gzip_body` is the final compressed JSON encoding of
-[`GraphDeltaBodyDto`](#canonical-delta-response-dtos--settled).
+[`GraphDeltaBatchDto`](#canonical-delta-response-dtos--settled).
 `uncompressed_json_bytes` is the byte length checked against the hard response
 limit before compression; `gzip_body.len()` is the transferred body size. The
-cached value contains no publication ID, publication state, response-outcome
-discriminator, continuation, wake boundary, or retry delay. ApiService reuses
+cached `from_revision_id` and `to_revision_id` are the first and last entry
+boundaries, and `high_level` is the last entry's target Head level. The entry
+timestamps and count remain inside the immutable encoded body; they need no
+second semantic representation in `CachedDelta`. The
+cached value contains no publication ID, publication state, sampled Head
+revision/timestamp pair, response-outcome discriminator, continuation, wake
+boundary, or retry delay. ApiService reuses
 those exact compressed bytes and adds request-specific HTTP headers. Whether
 that lightweight HTTP wrapper is also retained is an implementation detail.
 
@@ -1487,6 +1544,12 @@ compressed once, delivered, and discarded. They and SSE remain uncached in
 v2; the lookup also bypasses cache single-flight. Cache work cannot affect
 graph correctness or processing.
 
+Canonical delta delivery observes the selected and delivered entry count and
+revision span, cache hit/join/build result, uncompressed and gzip byte sizes,
+and soft- or hard-budget fallback. These measurements tune the initial 15/30
+revision intervals and response estimates; they never alter cursor validity or
+graph contents. Exact metric names and export mechanics remain deferred.
+
 ### Tiered Head snapshot cache
 
 `GraphCache` also contains one completed-entry slot and one single-flight job
@@ -1497,6 +1560,7 @@ shape:
 struct CachedHeadSnapshot {
     depth: u64,
     revision: u64,
+    revision_timestamp_us: u64,
     low_level: u64,
     high_level: u64,
     uncompressed_json_bytes: u64,
@@ -1507,9 +1571,9 @@ struct CachedHeadSnapshot {
 
 The containing publication supplies the publication ID. The gzip body is the
 final encoding of `HeadSnapshotResponseDto` and therefore contains that ID and
-the snapshot cursor, but contains no publication state, request
-`target_depth`, or cache-tier field. Each entry is individually subject to
-`MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES`. The fixed number of tiers and that
+the snapshot cursor and revision timestamp, but contains no publication state,
+request `target_depth`, or cache-tier field. Each entry is individually subject
+to `MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES`. The fixed number of tiers and that
 per-entry limit structurally bound this cache without another total byte cap.
 
 For a valid request, derive its selected depth using the public tier formula.
