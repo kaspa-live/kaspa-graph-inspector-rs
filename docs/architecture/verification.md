@@ -821,14 +821,16 @@ complete Head extraction and database fallback for an anchor or extent outside
 the retained Head image. Each response must use only one immutable source. The
 Head result carries its complete publication lineage and source Head level;
 the database result carries none and is discarded after serialization. Neither
-path may insert a response into `GraphCache`.
+path may insert a response into `GraphCache`. Both successful paths carry the
+current `KGI-Publication-ID` and `KGI-Publication-State` headers outside the
+body.
 
 Decode both anchored-window source variants. The Head variant carries exactly
-its publication ID, revision, state, and source Head high level; the Database
-variant carries none of those fields and invents no revision-zero cursor. Both
-carry one `GraphWindowResolution` and one complete `GraphDataDto`, do not echo
-the request anchor, and may retain external endpoint levels outside the
-effective nominal bounds.
+its publication ID, revision, and source Head high level; the Database variant
+carries none of those fields and invents no revision-zero cursor. Neither body
+contains publication state. Both carry one `GraphWindowResolution` and one
+complete `GraphDataDto`, do not echo the request anchor, and may retain
+external endpoint levels outside the effective nominal bounds.
 
 For database-backed anchor misses, verify exact-level absence returns
 `LevelNotRetained`, an unknown or identity-only block hash returns
@@ -871,8 +873,10 @@ level beyond it before publication lookup. Capture one immutable
 `Synchronizing`, `Live`, or
 `Stale` Head image and decode one `HeadLevelLookupResponseDto` containing
 exactly one complete unordered `LevelDto` per distinct requested level plus
-the capture's publication ID, revision, and state. Require no hash dictionary,
-ETag, or partial capture. Cover a value newer than the delta being enriched. A
+the capture's publication ID and revision. Require the same publication ID in
+`KGI-Publication-ID` and current state only in `KGI-Publication-State`, with no
+hash dictionary, ETag, or partial capture. Cover a value newer than the delta
+being enriched. A
 missing level returns one all-or-nothing `LevelUnavailable` outcome; an
 unaddressable publication returns
 `FreshViewRequired(PublicationMismatch)`. Neither outcome returns partial
@@ -891,18 +895,20 @@ Verify deltas and client behavior across
 [Web update acquisition](web.md#update-acquisition--settled): sequential delta
 composition and expiry, response-local hash dictionaries,
 terminal Stale state, replacement publication identity, SSE slow clients,
-fixed-view freeze, DAA focus, and Live arriving during construction or
-alignment. The latter must publish the completed image directly as Live.
+fixed-view freeze, DAA focus, and Live arriving during construction,
+alignment, or Prewarming. The latter must install the completed image directly
+as Live.
 
 Verify the settled
 [publication-state contract](api-publication.md#publication-state-and-revision--settled):
 initial Synchronizing, direct initial Live, visible `Synchronizing -> Live`,
 and terminal Stale transitions leave graph view and history revisions
 unchanged. Cover the runtime-replacement `reset` barrier without waiting for
-construction or activation, cancellation of unpublished construction, no
-additional effect for an already Stale publication, canonical delta catch-up
-through the Stale publication's final Head, head-snapshot state and ETag
-changes, and immutable delta bytes across later state changes. SSE cases cover dedicated `PublicationState`
+construction, `Prewarming`, or installation, cancellation of unpublished work,
+no additional effect for an already Stale publication, canonical delta catch-up
+through the Stale publication's final Head, request-specific state-header
+changes with unchanged Head snapshot bytes and ETag, and immutable delta bytes
+across later state changes. SSE cases cover dedicated `PublicationState`
 delivery without a graph revision, reconnect reporting current state, Web
 adoption without a delta request, and a fresh publication ID for a replacement
 image.
@@ -916,8 +922,8 @@ command enum. In particular, verify the
 Supervisor can call `reset` and await the `shutdown` barrier while
 `kgi-processing` remains independent of `kgi-api-core`; `reset` returns after
 the new runtime is installed and its predecessor has shut down, without waiting
-for graph construction or publication activation. Verify status observations are
-latest-value and lossy, remain available through the separate memory-only
+for graph construction, `Prewarming`, or publication installation. Verify
+status observations are latest-value and lossy, remain available through the separate memory-only
 lane, and never influence lifecycle decisions. Node status begins without a
 validated observation, replaces it before each Ready publication, and
 preserves it with explicit last-successfully-validated meaning through every
@@ -1033,8 +1039,18 @@ than emitting another outcome.
 
 Require `Cache-Control: no-cache` on successful Head snapshots and canonical
 deltas. Require `Cache-Control: no-store` on anchored windows, Head-level
-lookup, SSE, status, and every `4xx` or `5xx`. No successful graph response may
-be truncated; a delta prefix is complete through its reported target. Cover
+lookup, SSE, status, and every `4xx` or `5xx`. Cover the common paired
+`KGI-Publication-ID` and `KGI-Publication-State` headers on every Head snapshot,
+canonical delta, anchored-window, and Head-level response produced after a
+coherent publication is selected, including bodyless success and `304`.
+Require the header ID to identify the exact retained publication and no
+publication-state field in any of those graph bodies. Sample that publication's
+latest state while finalizing headers; a pre-admission
+rejection or graph-unavailable response with no publication omits both headers.
+Cover a body capture followed by a state transition and require the newer
+header with the unchanged immutable body. No cached gzip bytes or ETag identity
+may include that state. No successful graph response may be truncated; a delta
+prefix is complete through its reported target. Cover
 every exact category/code mapping and require one direct JSON error object with
 all fields present. Exercise each typed window-anchor detail, Head-level detail,
 and fresh-view reason; encode absent details as explicit `null`, public `u64`
@@ -1044,25 +1060,38 @@ settled `Allow` and `Retry-After` headers, and client control independent of the
 human message. No response exposes internal variants, generations, diagnostics,
 stack traces, SQL or filesystem information, or serialization-library text.
 
-Verify `GET /api/v1/graph/head` requires `max_depth`, rejects zero, accepts the
-inclusive `1..=MAX_WINDOW_DEPTH` range, and caps larger well-formed values.
-Every successful response comes only from one coherent in-memory Head extent,
-reports its effective capped depth and actual bounds, carries a complete local
-hash dictionary plus the captured publication ID, revision, and state, and
-never accesses PostgreSQL. Decode the exact `HeadSnapshotResponseDto`, including
-one complete `GraphDataDto`, and allow retained external endpoint levels
-outside its nominal low/high bounds. Cover `Synchronizing`, `Live`, terminal
-`Stale`, and no coherent publication. Advance or replace the publication during
-response serialization and verify the captured response remains internally
-coherent. The endpoint neither accepts nor returns `client_id`.
+Verify `GET /api/v1/graph/head` requires `target_depth`, rejects zero and every
+value above `MAX_WINDOW_DEPTH`, and accepts the inclusive valid range. Exercise
+rounding immediately below, at, and above each 50-level tier boundary. Every
+successful response comes only from one coherent in-memory cached Head extent,
+reports its actual bounds, carries a complete local hash dictionary plus the
+snapshot publication ID and revision, and never accesses PostgreSQL. It echoes
+neither `target_depth` nor the selected tier. Decode the exact
+`HeadSnapshotResponseDto`, including one complete `GraphDataDto`, and allow
+retained external endpoint levels outside its nominal low/high bounds. Cover
+`Synchronizing`, `Live`, terminal `Stale`, and no coherent publication. Advance
+or replace the publication during delivery and verify the cached response
+remains internally coherent. The endpoint neither accepts nor returns
+`client_id`.
 
-Exercise `If-None-Match` across an unchanged response, graph revision advance,
-effective-extent change, state-only transition, and publication replacement.
+For every successful Head response, require the body tier to cover
+`target_depth` except for the natural pruning-point boundary. Have the Web trim
+a larger tier to the requested nominal extent, remove edges with removed
+children, retain external parent endpoint levels, and derive its local usage
+counters. No cache-selected response may require a placeholder or
+progressive-fill presentation.
+
+Exercise `If-None-Match` across an unchanged response, snapshot revision
+change, actual-extent change, state-only transition, and publication
+replacement.
 Require a weak Head ETag. Independently serialize the same semantic snapshot
 with different unordered collection and dictionary orders and require the same
 weak identity and `304 Not Modified`. Every semantic identity change returns
-the complete snapshot. Verify `Cache-Control: no-cache`, including a state-only
-ETag change at an unchanged revision.
+the complete snapshot. Verify `target_depth`, selected tier, and publication
+state do not enter ETag identity. A state-only transition keeps the same cached
+bytes and ETag, and both `200` and `304` carry the newly sampled
+`KGI-Publication-ID` and newly sampled `KGI-Publication-State`. Verify
+`Cache-Control: no-cache`.
 
 Delta cases cover Frozen and revision compatibility as the only application
 checks, direct target-state installation, Head bound recalculation, fixed-bound
@@ -1104,9 +1133,24 @@ fallback to an earlier complete boundary, then the first-entry fresh-view
 outcome. A compressed body that fits the transport efficiently does not permit
 an over-limit uncompressed representation.
 
-For encoded head-response reuse, issue concurrent identical snapshot requests
-at one cursor and effective window and verify that they share one construction,
-serialization, and compression result. For canonical Head deltas, verify one
+For tiered Head snapshot reuse, derive exactly `50`, `100`, `150`, `200`, and
+`250` from the initial limits. Require tier `50` to finish before publication
+installation and require every later build or refresh to be request-driven.
+Exercise selection in this order: eligible selected entry; smallest eligible
+completed larger entry plus selected-tier construction; selected-tier job;
+smallest covering larger job without concurrent selected-tier construction;
+and a new selected-tier job. Concurrent requests joining one tier must share
+one capture, serialization, and compression result.
+
+At distances 39, 40, 99, and 100, verify respectively direct reuse; reuse plus
+one demand-triggered refresh; reuse plus that same single refresh; and complete
+entry exclusion with shared reconstruction. Head advancement without a request
+must start no refresh, including for tier `50`. A successful refresh atomically
+replaces only its tier. Failure gives all on-demand waiters the same typed
+error, preserves the previous entry, removes the job, and permits retry. A
+Stale publication can reuse and construct tiers against its final Head.
+
+For canonical Head deltas, verify one
 publication-owned job per source revision: concurrent requests join it after
 its target is captured, success publishes one `CachedDelta`, and failure gives
 all waiters the same request-local error before removing the job. Count every
@@ -1201,8 +1245,10 @@ Head-level lookups also bypass cache lookup, insertion, and cache single-flight,
 return `Cache-Control: no-store`, and produce no ETag. Fixed-window consumers
 must receive the same cached canonical Head response as other consumers. Cache
 work must not delay or fault processing.
-Verify optional exact-revision Head reuse stores its post-compression gzip body
-and uncompressed JSON byte count. Historical database-backed windows and
+Verify every Head tier stores its post-compression gzip body, weak ETag, actual
+extent, snapshot cursor, and uncompressed JSON byte count while excluding
+`target_depth`, selected-tier metadata, and publication state from the body.
+Historical database-backed windows and
 Head-level lookups serialize, check their uncompressed JSON size, compress,
 deliver, and discard without entering `GraphCache`.
 
@@ -1238,17 +1284,25 @@ generation loss cannot consume or retire a processing-pool connection.
 Lifecycle cases cover ApiService `AwaitReset`, construction of a fresh private
 runtime in `PreSeal`, waiting for the first-channel PostSeal marker while
 producer-side suppression remains active,
-`Constructing -> Aligning`, and the prohibition on direct
-construction-to-activation. Alignment covers block IDs at and below the
-snapshot cut, a first greater ID with no retained effect, a first greater ID
+`Constructing -> Aligning -> Prewarming -> Active`, and the prohibition on
+direct construction-to-installation. Alignment covers block IDs at and below
+the snapshot cut, a first greater ID with no retained effect, a first greater ID
 that returns a delta, and the matching VSPC source. Exercise both crossing
 orders. After one cut crosses, later updates from that source apply while the
 other source continues its snapshot-relative filtering. Empty staging and
 either single-cut state remain Aligning and publish no candidate, including an
 indefinitely idle second source. Only after both cuts cross, apply all later
-interleaved updates through a captured activation frontier and leave newer
-arrivals for Active. Cover first publication revisions zero and above zero,
-plus independently atomic view and history visibility at adjacent revisions.
+interleaved updates through a captured prewarming frontier, assign the
+publication identity, and continue applying newer arrivals normally while the
+tier-50 capture is serialized and compressed. Cache work must create no graph
+revision and must not accumulate a hidden update backlog. Install only after
+the tier is complete and less than 100 levels behind the then-current Head.
+Cover a tier that becomes hard-ineligible during construction and is rebuilt
+from a newer capture, mandatory tier failure and retry without installation,
+and installation with the current publication revision ahead of the cached
+snapshot cursor. The first client catches up from that cursor through retained
+ordinary deltas. Cover first publication revisions zero and above zero, plus
+independently atomic view and history visibility at adjacent revisions.
 
 Verify the current-publication watch starts at `None`, atomically installs a
 complete publication Arc, and uses the last linearized installation during
@@ -1266,8 +1320,11 @@ transition enters the channel instead. No pre-seal seed or second marker is
 required.
 
 Exercise the runtime's universal intra-session reconstruction primitive from
-Constructing, Aligning, and Active. The first two cancel any seed attempt and
-abandon their candidate; Active first becomes terminally Stale. In every case,
+`Constructing`, `Aligning`, `Prewarming`, and `Active`. The first two cancel any
+seed attempt and abandon their candidate; `Prewarming` abandons its unpublished
+publication and detaches its mandatory tier waiter while the tracked job may
+finish without inserting; `Active` first becomes terminally Stale. In every
+case,
 drain through the first observed channel Empty, discard graph mutations,
 preserve sticky Live, capture the newest gap generation, and start a newer
 seed. Updates after the empty frontier must be staged, while a later
@@ -1325,21 +1382,22 @@ current client. StorageService retirement prevents the old client from reading
 replaced contents, emits `ApiDbRetired`, and autonomously publishes the coherent
 replacement. Supervisor forwards both events in order. `Published(G2)` makes
 `G2` available to construction while public reads remain disabled; replacement
-publication activation enables reads. If the current generation is lost after
-the seed has detached but before activation, alignment may finish, activation
-still enables the gate, and database-backed requests remain `503` until a later
-`Published(G3)`. Repeated retirement/publication delivery is idempotent, and
+publication installation after `Prewarming` enables reads. If the current
+generation is lost after the seed has detached but before installation,
+alignment and `Prewarming` may finish, installation still enables the gate, and
+database-backed requests remain `503` until a later `Published(G3)`. Repeated
+retirement/publication delivery is idempotent, and
 neither generation turnover nor an absent current client invalidates an
 otherwise advancing Active graph publication.
 
 Verify [Reset and recovery-time availability](api-service.md#reset-and-recovery-time-availability--settled)
 with ordinary Resync and Rebuild integration scenarios. Verify the fresh
-`GraphUpdateReceiver` and exact recovery mode. From PreSeal, Constructing,
-Aligning, and Active, start the fresh runtime before exchanging it into the
-private lifecycle slot, then await the old runtime's uniform shutdown before
-`reset` returns. Verify the new receiver can drain during the bounded runtime
+`GraphUpdateReceiver` and exact recovery mode. From `PreSeal`, `Constructing`,
+`Aligning`, `Prewarming`, and `Active`, start the fresh runtime before
+exchanging it into the private lifecycle slot, then await the old runtime's
+uniform shutdown before `reset` returns. Verify the new receiver can drain during the bounded runtime
 overlap and that reset completion waits for neither construction nor
-publication activation. Serialize concurrent reset and shutdown calls through
+publication installation. Serialize concurrent reset and shutdown calls through
 the runtime mutex; reset after `Stopped` is rejected and repeated shutdown is
 successful. Permit either overlapping runtime to install a coherent
 publication without sender identity or a revocable installation capability;
@@ -1349,8 +1407,9 @@ Rebuild calls `reset` again with a fresh ingress. Rebuild relies on
 StorageService rather than `reset` to close API database admission, retire the
 old API generation, and boundedly drain or cancel active database phases.
 Verify a detached old projection may complete delivery while
-an undetached request returns 503, public reads reopen only after the aligned
-replacement becomes Active, and `PpBoundarySealed` has no API generation role.
+an undetached request returns 503, public reads reopen only after the
+replacement completes `Prewarming` and becomes `Active`, and
+`PpBoundarySealed` has no API generation role.
 Cover `PublishPostSeal` arriving before StorageService's replacement
 `Published` event and construction remaining pending. No in-flight request
 rebinds to a newly published storage generation,
@@ -1379,7 +1438,9 @@ Exercise source-keyed cache single-flight with multiple waiters, one cancelled
 waiter, shared success and shared request-local failure, running-job removal,
 and weak insertion both before and after the origin cache is dropped. Verify
 all cache orchestration tasks are registered in the ApiService task tracker.
-For encoding, reserve bounded historical capacity before database work,
+Include tier-keyed Head snapshot jobs and mandatory `Prewarming` work in the
+same tracked cache and encoding infrastructure. For encoding, reserve bounded
+historical capacity before database work,
 release every database resource before submitting the detached projection,
 and enforce the settled total and historical concurrency limits. Scheduler
 shutdown rejects new work, cancels queued work, lets already active blocking
@@ -1387,8 +1448,9 @@ serialization or compression finish while discarding its output, and joins
 the scheduler without a publication lock or database resource held.
 
 Verify the [ApiService shutdown barrier](api-service.md#apiservice-shutdown--settled)
-from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`, and `Active`, including
-races with `reset`, marker delivery, gap reconstruction, database projection,
+from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`, `Prewarming`, and
+`Active`, including races with `reset`, marker delivery, gap reconstruction,
+database projection,
 serialization, detached response delivery, SSE wakeups, and API-generation
 publication on either side of Supervisor's terminal-shutdown cutoff. An update
 completed before the cutoff is cleared by shutdown; an event observed after

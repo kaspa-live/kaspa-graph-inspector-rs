@@ -39,8 +39,10 @@ Query parameters select cursors, revisions, depths, level extents, anchors,
 and other request-specific projections. Cursors and block hashes do not become
 path segments. Parameter names are case-sensitive lowercase snake_case and use
 the architecture's semantic names, including `publication_id`,
-`from_revision_id`, `to_revision_id`, `max_depth`, `block_hash`, `daa_score`,
-and `client_id`; abbreviated aliases are not accepted.
+`from_revision_id`, `to_revision_id`, `target_depth`, `max_depth`,
+`block_hash`, `daa_score`, and `client_id`; abbreviated aliases are not
+accepted. `target_depth` belongs only to the canonical Head endpoint;
+`max_depth` remains the bounded projection depth for anchored windows.
 
 Unsigned integer parameters use unsigned decimal text, block hashes use their
 canonical hexadecimal representation, boolean parameters use exactly `true`
@@ -154,14 +156,40 @@ Define:
 MAX_WINDOW_DEPTH = 250
 MAX_CACHE_LEVEL_DISTANCE = 500
 MAX_CACHE_LEVEL_DISTANCE + MAX_WINDOW_DEPTH < MAX_CACHE_DEPTH
+
+CACHED_HEAD_WINDOW_DEPTH_STEP = 50
+PREWARMED_HEAD_WINDOW_DEPTH = 50
+CACHED_WINDOW_REFRESH_LEVEL_DISTANCE = 40
+CACHED_WINDOW_MAX_LEVEL_DISTANCE = 100
 ```
 
 With the graph-owned `MAX_CACHE_DEPTH = 1000`, the public limits leave 250
 complete levels between the oldest eligible cached-delta source and the oldest
-level of the largest client window. Every windowed endpoint caps requested
-depth to `MAX_WINDOW_DEPTH` and reports the effective range. An oversized Head
-snapshot request cannot fall back to DB; it is capped. The
+level of the largest client window. Anchored-window requests cap positive
+depth to `MAX_WINDOW_DEPTH` and report the effective range. A Head
+`target_depth` must instead be in `1..=MAX_WINDOW_DEPTH`; an oversized value is
+invalid request input and cannot fall back to the database. The
 [graph model](api-graph.md) owns `MAX_CACHE_DEPTH` and complete-level retention.
+
+The Head cache derives its finite tiers rather than accepting arbitrary cache
+keys:
+
+```text
+selected_depth =
+    min(round_up(target_depth, CACHED_HEAD_WINDOW_DEPTH_STEP),
+        MAX_WINDOW_DEPTH)
+```
+
+The initial values therefore produce depths `50`, `100`, `150`, `200`, and
+`250`. `PREWARMED_HEAD_WINDOW_DEPTH` must be one derived tier. The refresh and
+maximum distances measure the cached snapshot's `high_level` behind its
+publication's current Head and satisfy:
+
+```text
+CACHED_WINDOW_REFRESH_LEVEL_DISTANCE
+    < CACHED_WINDOW_MAX_LEVEL_DISTANCE
+    < MAX_CACHE_LEVEL_DISTANCE
+```
 
 The domain-owned `CompactId` crosses into ApiService only as the private
 alignment cut and `BlockCommitted.id`; it is never a public block identity or
@@ -282,18 +310,16 @@ The Head snapshot response is:
 struct HeadSnapshotResponseDto {
     publication_id: u64,
     revision: u64,
-    state: GraphPublicationState,
-    max_depth: u64,
     low_level: u64,
     high_level: u64,
     graph: GraphDataDto,
 }
 ```
 
-`max_depth` is the effective capped request depth. `low_level..=high_level` is
-the actual nominal block extent and can be shorter than `max_depth` near the
-pruning-point boundary. `(publication_id, revision)` is the canonical delta
-cursor and `state` is the captured publication state. `TrackingPolicy` and the
+`low_level..=high_level` is the actual nominal block extent and can be shorter
+than the selected cache tier near the pruning-point boundary.
+`(publication_id, revision)` is the canonical delta cursor. The request's
+`target_depth`, selected cache tier, publication state, `TrackingPolicy`, and
 weak ETag remain outside the body.
 
 An anchored window uses an explicit source discriminator:
@@ -303,7 +329,6 @@ enum GraphWindowSourceDto {
     Head {
         publication_id: u64,
         revision: u64,
-        state: GraphPublicationState,
         head_high_level: u64,
     },
     Database,
@@ -319,8 +344,8 @@ struct GraphWindowResponseDto {
 The `Head` variant carries the complete lineage needed to consume canonical
 Head deltas. `head_high_level` describes the source Head rather than the fixed
 window's effective end. The `Database` variant contains no publication ID,
-revision, state, or synthetic revision-zero cursor and creates no public delta
-lineage.
+revision, or synthetic revision-zero cursor and creates no public delta
+lineage. Neither variant embeds publication state.
 
 `GraphWindowResolution.effective_start_level..=effective_end_level` is the
 nominal fixed block extent; the linked graph-owned projection can additionally
@@ -328,11 +353,48 @@ retain external endpoint levels. The response does not echo the requested
 anchor because `resolved_level` is the retained fixed focus after level,
 block-hash, or DAA resolution.
 
-Each response comes from one immutable capture: one Head image for a Head
-snapshot, one Head extraction for a Head-backed window, or one detached
-consistent database projection for a database-backed window. Advancement or
-replacement during serialization does not alter the captured response. Graph
-data, resolution, and lineage are never mixed across captures.
+Each response body comes from one immutable capture: one cached Head snapshot,
+one Head extraction for a Head-backed window, or one detached consistent
+database projection for a database-backed window. Advancement or replacement
+during serialization does not alter that body. Graph data, resolution, and
+lineage are never mixed across captures. The publication-context headers
+follow the independent rule below.
+
+## Publication-context response headers — settled
+
+Every DAG query reports the identity and current state of its associated
+publication through this pair:
+
+```http
+KGI-Publication-ID: 42
+KGI-Publication-State: synchronizing | live | stale
+```
+
+This applies to Head snapshots, canonical deltas, anchored windows, and
+Head-level lookups, including bodyless successful outcomes and `304 Not
+Modified`. A response produced after selecting a coherent publication retains
+that exact `Arc<GraphPublication>`. `KGI-Publication-ID` is its immutable
+unsigned decimal publication ID; ApiService samples the same publication's
+latest state when finalizing `KGI-Publication-State`. Consequently, the state
+can be newer than the immutable graph capture carried by the body. The two
+headers always appear together. A request rejected before selecting a
+publication, and the graph-unavailable response when no coherent publication
+exists, carries neither.
+
+`GraphPublicationState` never appears in a Head snapshot, canonical delta,
+anchored-window, or Head-level body. Both headers are request-specific and are
+not stored in compressed cache entries or used to invalidate graph bytes.
+Publication identity participates in an endpoint's ETag only where that
+endpoint's ETag contract says so; publication state never participates. A
+state-only transition can therefore produce `304 Not Modified` with the same
+`KGI-Publication-ID` and the new `KGI-Publication-State` value. Dedicated SSE
+`publication-state` messages and the status response retain their separately
+owned roles and are not cached DAG response bodies.
+
+The header ID describes the publication context of the response. It does not
+create graph lineage that the body does not carry. In particular, a
+database-backed anchored window remains without a public delta lineage; its
+`GraphWindowSourceDto::Database` discriminator remains authoritative.
 
 ## Canonical delta response DTOs — settled
 
@@ -379,11 +441,11 @@ All change collections may be empty while the revision interval and
 `high_level` still advance. Collection ordering follows the
 [common graph-value rules](#serialized-graph-values-and-hash-dictionary--settled).
 
-Every successful canonical delta response carries these exact headers:
+Every successful canonical delta response carries the common publication-state
+header plus these exact delta headers:
 
 ```http
 KGI-Publication-Id: P
-KGI-Publication-State: synchronizing | live | stale
 KGI-Delta-Outcome: complete | prefix | up-to-date | wait-for-wakeup
 KGI-Delta-Continuation: head | continue | wakeup
 ```
@@ -402,8 +464,9 @@ enter the cacheable body.
 body. `up-to-date` and `wait-for-wakeup` return an empty body with `200 OK`;
 their headers make them meaningful successful outcomes rather than `204 No
 Content`. `ClientRegistrationRequired` and `FreshViewRequired(reason)` remain
-typed `409 Conflict` error bodies and carry none of the canonical delta-success
-outcome headers.
+typed `409 Conflict` error bodies and carry none of the delta-success headers
+above. The common publication-context headers remain governed independently by
+whether the request selected a coherent publication.
 
 For a body-bearing response, the request and body satisfy:
 
@@ -423,15 +486,15 @@ The successful retained Head-level lookup response is:
 struct HeadLevelLookupResponseDto {
     publication_id: u64,
     revision: u64,
-    state: GraphPublicationState,
     levels: Vec<LevelDto>,
 }
 ```
 
 `levels` is unordered and contains exactly one complete `LevelDto` for every
-distinct requested level. All entries and the publication fields come from one
+distinct requested level. All entries and the publication cursor come from one
 immutable Head capture. The response carries no hash dictionary because no
-value references a block hash.
+value references a block hash. Publication state follows the common graph
+response-header contract rather than entering the DTO.
 
 Success returns this DTO with `200 OK`, `Cache-Control: no-store`, and no ETag.
 An unavailable requested level remains the typed all-or-nothing `404` outcome;
@@ -651,7 +714,6 @@ enum HeadLevelLookupOutcome {
     Complete {
         publication_id: u64,
         revision: u64,
-        state: GraphPublicationState,
         levels: Arc<[HeadLevelValue]>,
     },
     LevelUnavailable {
@@ -711,7 +773,8 @@ component observation's lifecycle and current-versus-last meaning; the
 owns its availability in the composite response.
 `SystemStatus` has no ApiService-status field: successful status admission
 already proves that the memory-only status lane is serving, while graph
-publication state is exposed through its own graph responses and SSE wakeups.
+publication state is exposed through graph-response headers and dedicated SSE
+state messages.
 
 ## Window construction and publication lineage — settled
 
@@ -874,32 +937,36 @@ Reconnection instead creates a new registration and delivers the current
 state and graph cursor through the ordered initial sequence above.
 
 The API response envelope, rather than `GraphView` or `GraphDelta`, carries the
-owning `publication_id`. A published view response pairs it with the view's
-current revision and publication state; every successful delta response pairs
-it with the history interval actually returned and the captured publication
-state.
+owning `publication_id`. A published graph body pairs it with the revision of
+the immutable representation. Publication state remains independent under the
+[common response-header contract](#publication-context-response-headers--settled).
 
 ## Head snapshot endpoint — settled
 
 The canonical Head snapshot operation is:
 
 ```http
-GET /api/v1/graph/head?max_depth=N
+GET /api/v1/graph/head?target_depth=N
 ```
 
-`max_depth` is required. Values in `1..=MAX_WINDOW_DEPTH` are accepted as
-requested; a larger well-formed value is capped to `MAX_WINDOW_DEPTH`; zero is
-an invalid semantic value. Missing or malformed input follows the
+`target_depth` is required and records the browser's presentation intent and
+the corresponding request metric. Values in `1..=MAX_WINDOW_DEPTH` are
+accepted. Zero and a value above `MAX_WINDOW_DEPTH` are invalid semantic
+values. Missing or malformed input follows the
 [common request rules](#common-http-conventions--settled).
 
-The endpoint extracts one coherent extent exclusively from the current
-in-memory Head publication. It never reads PostgreSQL and never falls back to a
+The endpoint selects the derived cache tier for `target_depth` and serves a
+coherent cached snapshot exclusively from the current in-memory Head
+publication. It never reads PostgreSQL and never falls back to a
 database-backed window. A successful logical response contains the owning
-`publication_id`, captured revision, captured `GraphPublicationState`, the
-effective capped depth and actual low/high extent, the complete graph
-projection, and its response-local hash dictionary through the
+`publication_id`, snapshot revision, actual low/high extent, complete graph
+projection, and response-local hash dictionary through the
 [`HeadSnapshotResponseDto`](#complete-graph-response-dtos--settled). Internal
-`TrackingPolicy` is not a public value.
+`TrackingPolicy`, `target_depth`, and selected tier are not public body values.
+The selected tier is at least `target_depth`; the Web trims a larger nominal
+extent to its requested presentation depth. Caching therefore never
+deliberately returns a shorter extent. The natural pruning-point boundary can
+still make the available extent shorter.
 
 The captured `(publication_id, revision)` is the cursor for subsequent
 depth-independent canonical Head deltas. Snapshot acquisition neither accepts
@@ -907,21 +974,21 @@ nor returns an SSE `client_id`; that identifier coordinates an established SSE
 registration with delta-to-current requests.
 
 `Synchronizing`, `Live`, and terminal `Stale` publications can each serve a
-coherent snapshot with their exact state. Without a coherent publication, the
-endpoint returns the graph-unavailable outcome. Head advancement or publication
-replacement during serialization does not restart the request: the completed
-response remains valid for its captured publication, revision, state, and
-effective extent.
+coherent snapshot. Without a coherent publication, the endpoint returns the
+graph-unavailable outcome. A cached snapshot can precede the publication's
+current revision; its body cursor remains the exact starting point for
+canonical delta catch-up. Head advancement or publication replacement during
+delivery does not restart the request. The exact retained publication's ID and
+latest state are added under the common publication-context header contract.
 
 The endpoint accepts `If-None-Match` and emits a weak ETag. Its semantic
-identity contains the publication ID, revision, effective capped depth and
-actual level extent, `representation_version`, and publication state. The weak
-validator permits independently serialized equivalent snapshots to order
-unordered collections and assign response-local hash references differently.
-An exact semantic match returns `304 Not Modified`; otherwise the endpoint
-returns the complete captured snapshot. A state-only transition therefore
-changes the ETag even when the graph revision is unchanged, because the
-self-contained snapshot carries that state. Responses use
+identity contains the publication ID, snapshot revision, actual level extent,
+and `representation_version`. It excludes `target_depth`, selected tier, and
+publication state. The weak validator permits independently serialized
+equivalent snapshots to order unordered collections and assign response-local
+hash references differently. An exact semantic match returns `304 Not
+Modified` with the current publication-context headers; otherwise the endpoint
+returns the complete cached snapshot. Responses use
 `Cache-Control: no-cache`, requiring revalidation before reuse.
 
 ## Canonical Head delta responses — settled
@@ -1196,8 +1263,8 @@ ApiService captures one immutable image of the identified Head publication and
 looks up every requested level in that image. `Synchronizing`, `Live`, and
 terminal `Stale` publications are all eligible while addressable. Success
 returns `HeadLevelLookupOutcome::Complete` with the captured publication ID,
-revision, state, and one complete absolute `Level` value per distinct
-requested level, serialized as the
+revision, and one complete absolute `Level` value per distinct requested level,
+serialized as the
 [`HeadLevelLookupResponseDto`](#head-level-lookup-response-dto--settled). A
 value can be newer than the canonical delta being enriched; it is presentation
 context and does not change cursor continuity, containment, or mutation
@@ -1363,10 +1430,10 @@ compression and leaves only exact gzip quality to implementation tuning.
 For the publication-owned `GraphCache`, defined by the
 [publication value](api-publication.md#publication-and-seed-values--settled),
 internal identities omit `publication_id` because the containing publication
-already supplies it. `GraphCache` contains the source-keyed completed entries,
-source-keyed single-flight jobs, and destination-response heat counters. Heat
-and request-source counters saturate rather than wrap. Concrete collections
-remain deferred. The canonical cached delta value is:
+already supplies it. `GraphCache` contains tier-keyed Head snapshot entries and
+jobs, source-keyed delta entries and jobs, and destination-response heat
+counters. Heat and request-source counters saturate rather than wrap. Concrete
+collections remain deferred. The canonical cached delta value is:
 
 ```rust
 struct CachedDelta {
@@ -1384,9 +1451,8 @@ struct CachedDelta {
 limit before compression; `gzip_body.len()` is the transferred body size. The
 cached value contains no publication ID, publication state, response-outcome
 discriminator, continuation, wake boundary, or retry delay. ApiService reuses
-those exact compressed bytes and adds the request-specific HTTP headers from
-the captured request target, publication state, and Head. Whether that
-lightweight HTTP wrapper is also retained is an implementation detail.
+those exact compressed bytes and adds request-specific HTTP headers. Whether
+that lightweight HTTP wrapper is also retained is an implementation detail.
 
 Every `CachedDelta` is individually bounded by
 `MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES`. `GraphCache` has no independent total
@@ -1415,13 +1481,87 @@ source revision is no longer retained or its target `high_level` is more than
 bounds replace an independent encoded-byte cache cap.
 
 An encoded-cache miss or eviction affects performance only: reconstruct the
-response from the current `GraphView` or retained `GraphHistory`. Optional
-exact-revision Head-view response reuse belongs to the same publication, stores
-only its final gzip body and uncompressed JSON byte length, and may be dropped
-at any time. Historical database-backed windows and Head-level lookup are
-serialized, size-checked, compressed once, delivered, and discarded. They and
-SSE remain uncached in v2; the lookup also bypasses cache single-flight.
-Cache work cannot affect graph correctness or processing.
+response from the current `GraphView` or retained `GraphHistory`. Historical
+database-backed windows and Head-level lookup are serialized, size-checked,
+compressed once, delivered, and discarded. They and SSE remain uncached in
+v2; the lookup also bypasses cache single-flight. Cache work cannot affect
+graph correctness or processing.
+
+### Tiered Head snapshot cache
+
+`GraphCache` also contains one completed-entry slot and one single-flight job
+slot for each derived Head snapshot depth. A completed entry has this semantic
+shape:
+
+```rust
+struct CachedHeadSnapshot {
+    depth: u64,
+    revision: u64,
+    low_level: u64,
+    high_level: u64,
+    uncompressed_json_bytes: u64,
+    etag: HeadEtag,
+    gzip_body: Bytes,
+}
+```
+
+The containing publication supplies the publication ID. The gzip body is the
+final encoding of `HeadSnapshotResponseDto` and therefore contains that ID and
+the snapshot cursor, but contains no publication state, request
+`target_depth`, or cache-tier field. Each entry is individually subject to
+`MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES`. The fixed number of tiers and that
+per-entry limit structurally bound this cache without another total byte cap.
+
+For a valid request, derive its selected depth using the public tier formula.
+Choose work and response reuse in this order:
+
+1. If the selected tier has an eligible completed snapshot, serve it.
+2. Otherwise, if one or more larger tiers have eligible completed snapshots,
+   serve the smallest such tier immediately and ensure one selected-tier job
+   is running.
+3. Otherwise, if a selected-tier job is running, join it.
+4. Otherwise, if one or more larger covering jobs are running, join the
+   smallest such job and do not start a concurrent selected-tier job.
+5. Otherwise start and join one selected-tier job.
+
+Serving or joining a larger tier does not change the request's selected tier.
+Case 2 creates the selected tier for later requests; case 4 avoids duplicating
+expensive extraction, serialization, and compression during the same demand
+burst. If no later request follows a larger running job, the missing selected
+tier requires no speculative construction.
+
+For an entry with captured `high_level = C` and current publication Head level
+`H`, define `distance = H - C`; Head levels do not decrease within a
+publication. An entry is handled as follows:
+
+```text
+distance < CACHED_WINDOW_REFRESH_LEVEL_DISTANCE
+    eligible; serve without refresh
+
+CACHED_WINDOW_REFRESH_LEVEL_DISTANCE
+    <= distance < CACHED_WINDOW_MAX_LEVEL_DISTANCE
+    eligible; when served as the request's selected tier, ensure one
+    demand-driven refresh job for that tier
+
+distance >= CACHED_WINDOW_MAX_LEVEL_DISTANCE
+    ineligible; never serve it
+```
+
+The `50` tier is constructed preemptively only while opening a new
+publication. No tier, including `50`, is refreshed merely because Head
+advances. Every later construction or refresh is triggered by request demand.
+A refresh retains the previous completed entry until the replacement succeeds
+and atomically replaces only that tier. Failure preserves any previous
+completed entry. Waiter completion, job removal, and retry availability belong
+to the
+[ApiService task contract](api-service.md#api-task-ownership-and-completion--settled).
+
+`Synchronizing` and `Live` use the moving distance rules. A terminal `Stale`
+publication stops advancing, so its eligible entries remain usable and its
+missing tiers can still be built on demand while the publication remains
+addressable. Publication replacement releases the complete tier cache with
+the containing publication under the publication-lifetime contract.
+
 Concrete cache collections and the estimator weights remain deferred in the
 [decision register](../decisions/deferred.md).
 

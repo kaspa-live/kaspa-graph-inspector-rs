@@ -68,7 +68,7 @@ Only `GraphPublication` has a `publication_id`. Each publication receives a
 fresh random nonzero `u64`. `GraphCache` and `DeltaClientRegistry` are private
 runtime state;
 [API protocol](api-protocol.md#publication-scoped-head-response-cache--settled)
-owns cache entry identities and delta-cache policy, while the
+owns cache entry identities and Head response-cache policy, while the
 [publication wire contract](api-protocol.md#publication-wire-observation--settled)
 owns client registration and wake scheduling.
 
@@ -76,19 +76,19 @@ owns client registration and wake scheduling.
 
 `PublicationRuntime` is a private `kgi-api-core` value whose lifetime is bound
 to one processing session. It owns that session's `GraphUpdateReceiver`, graph
-update worker, gap observation, seed construction, staging, alignment, and the
-writer side of every publication it activates. It also owns an
+update worker, gap observation, seed construction, staging, alignment,
+prewarming, and the writer side of every publication it installs. It also owns an
 `Arc<ApiDbState>` clone through which construction awaits the latest valid API
 database client. ApiService directly owns at most one runtime; the runtime is
 never exported, returned to a caller, or placed in a shared model crate.
 
-One runtime persists across every intra-session reconstruction and may activate
-successive publications. It owns at most one active
-`Arc<GraphPublication>`. On activation it may begin feeding that coherent
-publication and supplies an Arc clone to ApiService's current-publication slot.
-Supplying the clone has no acknowledgement or paired atomicity requirement:
-the runtime may feed its instance before or after ApiService installs the
-clone. Runtime ownership does not confer exclusive installation authority;
+One runtime persists across every intra-session reconstruction and may install
+successive publications. It owns at most one unpublished Prewarming or visible
+Active `Arc<GraphPublication>`. It begins ordinary graph-update application
+while that publication is still Prewarming and later supplies an Arc clone to
+ApiService's current-publication slot. Supplying the clone has no
+acknowledgement or paired atomicity requirement. Runtime ownership does not
+confer exclusive installation authority;
 the reset-time overlap and current-slot replacement rule belong to the
 [ApiService control contract](api-service.md#reset-control-and-recovery-effects--settled).
 
@@ -107,7 +107,8 @@ impl PublicationRuntime {
 
 Each runtime starts exactly one long-lived worker as part of construction. The
 worker owns the receiver, phase state, staging buffer, current seed attempt,
-unpublished candidate, gap observation, and active publication Arc. During
+unpublished candidate or Prewarming publication, gap observation, and Active
+publication Arc. During
 `Constructing`, it selects between its database-seed future, graph-update
 receiver, and cancellation rather than spawning an untracked seed task.
 Dropping that future cancels an abandoned attempt. Intra-session reconstruction
@@ -117,7 +118,9 @@ remains inside the same worker.
 shared completion result. When the worker observes cancellation, it stops
 consuming and applying graph updates, marks its active publication terminally
 `Stale` if one exists, drops any seed attempt and unpublished candidate,
-releases its receiver and active publication Arc, and completes. Every
+abandons an unpublished Prewarming publication and detaches from its mandatory
+cache job,
+releases its receiver and publication Arc, and completes. Every
 potentially indefinite worker wait observes the same cancellation token, and
 no worker child task may survive completion. The behavior is the same for
 session replacement and ApiService shutdown. Repeated calls observe the same
@@ -174,7 +177,6 @@ an image or history lock. The private capture values are:
 ```rust
 struct GraphViewCapture {
     publication_id: u64,
-    state: GraphPublicationState,
     view: GraphView,
 }
 
@@ -187,7 +189,6 @@ struct GraphDeltaTargetCapture {
 
 struct GraphLevelCapture {
     publication_id: u64,
-    state: GraphPublicationState,
     revision: u64,
     levels: Arc<[HeadLevelValue]>,
 }
@@ -201,11 +202,13 @@ supplied by ApiService's
 [current-publication slot](api-service.md#reset-control-and-recovery-effects--settled).
 The slot owner defines acquisition and replacement behavior.
 
-A Head snapshot or Head-backed window holds one image read lock while it
-captures the state and an owned `Frozen` graph view. A window performs its
-complete extraction against that same image. A level lookup similarly captures
-the state, revision, and every requested complete level under one image read
-lock; an unavailable level produces no partial capture.
+A Head snapshot-cache job or Head-backed window holds one image read lock while
+it captures an owned `Frozen` graph view. A window performs its complete
+extraction against that same image. A level lookup similarly captures the
+revision and every requested complete level under one image read lock; an
+unavailable level produces no partial capture. Public publication identity and
+state headers are finalized separately under the
+[protocol-owned publication-context rule](api-protocol.md#publication-context-response-headers--settled).
 
 A canonical delta operation briefly captures its publication ID, state, view
 revision, and high level under one image read lock, releases it, and then asks
@@ -290,7 +293,8 @@ states:
 ```text
 PreSeal -- PublishPostSeal --> Constructing
     -- seed succeeds --> Aligning
-    -- block and VSPC cuts crossed --> Active
+    -- block and VSPC cuts crossed --> Prewarming
+    -- tier 50 ready and eligible --> Active
 ```
 
 ApiService creates a fresh runtime in `PreSeal` for each accepted `reset`; a
@@ -338,7 +342,7 @@ neither condition substitutes for the other. Once one source has crossed its
 cut, apply every later update from that source normally while continuing the
 snapshot-relative classification for the other source.
 
-The candidate may enter `Active` only after both conditions are true. A block
+The candidate may leave `Aligning` only after both conditions are true. A block
 with an ID above the snapshot cut satisfies the block condition even when it
 has no retained effect and `GraphView::apply` returns no delta. Observing only
 one cut is insufficient. Consequently, an otherwise coherent candidate remains
@@ -353,12 +357,38 @@ neither cut. There is no direct `Constructing -> Active` transition.
 
 After both crossing updates have been applied, discard `snapshot_vspc_sink`,
 stop all snapshot-relative classification, apply every later staged graph
-update in channel order, and advance through a captured activation frontier.
-Updates arriving after that frontier remain for ordinary Active processing;
-activation does not require an empty channel. Publish the completed view and
-history independently and atomically, assign a fresh publication ID, use the
-sticky target state, and enter `Active`. Neither the candidate nor its
-partially replayed state is externally visible before activation.
+update in channel order, and advance through a captured prewarming frontier.
+Assign a fresh publication ID, publish the completed view and history
+independently and atomically inside one still-unpublished
+`Arc<GraphPublication>`, use the sticky target state, and enter `Prewarming`.
+Neither the candidate nor its partially replayed state is externally visible.
+
+`Prewarming` applies every later graph update through the same ordinary
+mutation path as `Active`; it performs no snapshot-relative classification and
+does not buffer updates while encoding. It captures one immutable
+`PREWARMED_HEAD_WINDOW_DEPTH` snapshot, releases every graph lock, then performs
+JSON serialization and gzip through the ApiService-owned encoding scheduler.
+Cache construction creates no graph revision. While that detached work runs,
+the unpublished publication continues advancing its view and history at the
+ordinary update rate.
+
+When the tier-50 job succeeds, install it in the publication cache and compare
+its captured `high_level` with the publication's then-current Head. If the
+distance is at least `CACHED_WINDOW_MAX_LEVEL_DISTANCE`, discard that entry and
+repeat prewarming from a newer coherent capture. Otherwise install the complete
+publication `Arc` into ApiService's current-publication slot and enter
+`Active`. Installation is only a visibility change: it creates no revision and
+does not drain a hidden update backlog. The cached snapshot revision can
+precede the publication's current revision; retained canonical deltas connect
+that exact cursor to the current Head.
+
+Failure of mandatory tier-50 capture, size checking, serialization, or
+compression prevents installation. `PublicationRuntime` remains responsible
+for retrying from a newer coherent capture. A previous coherent publication
+remains independently servable as `Stale`, while initial startup has no graph
+publication until prewarming succeeds. The
+[protocol cache contract](api-protocol.md#publication-scoped-head-response-cache--settled)
+owns the tier values, distance rules, and public selection behavior.
 
 An `Active` publication has no snapshot sink, alignment state, or database
 matching duty. Each ordinary graph update goes directly through
@@ -387,6 +417,8 @@ database-generation loss, and alignment invariant failure:
 restart_construction():
     cancel and abandon the current seed attempt, if any
     abandon the unpublished candidate, if any
+    abandon the unpublished Prewarming publication and detach from its
+        mandatory cache job, if any
     discard the current staging buffer
     drain the current session channel through the first observed Empty
     discard drained BlockCommitted and VspcCommitted values
@@ -399,8 +431,9 @@ restart_construction():
 Drained and dropped updates are covered by the newer database snapshot because
 their commits precede that snapshot. Updates received after the observed empty
 frontier are staged for the new attempt. A later gap-generation change invokes
-the same primitive again. Before activation, the runtime requires the recorded
-gap generation still to be current.
+the same primitive again. Before entering Prewarming, the runtime requires the
+recorded gap generation still to be current; a later change during Prewarming
+invokes the same reconstruction primitive.
 
 Each seed attempt first awaits the ApiService-owned `ApiDbState::current()` and
 captures its returned exact client without switching generations within that
@@ -416,12 +449,15 @@ defines when either accessor returns a client or `None`.
 API-local reconstruction in that session remains post-seal and requires no
 second marker.
 
-The primitive is identical from `Constructing`, `Aligning`, and `Active`.
-`Constructing` or `Aligning` first abandons its unpublished candidate. `Active`
-first marks its current publication terminally `Stale` and stops applying
-updates to it. A previously Live target, or `Live` encountered while draining,
-remains sticky, so its replacement is initially Live. API-local reconstruction
-never requests processing Resync or Rebuild.
+The primitive is identical from `Constructing`, `Aligning`, `Prewarming`, and
+`Active`. `Constructing` or `Aligning` first abandons its unpublished
+candidate. `Prewarming` abandons its unpublished publication and any mandatory
+tier-50 waiter. The ApiService-owned tracked job can finish against detached
+inputs and its weak insertion then fails harmlessly. `Active` first marks its
+current publication terminally `Stale`
+and stops applying updates to it. A previously Live target, or `Live`
+encountered while draining, remains sticky, so its replacement is initially
+Live. API-local reconstruction never requests processing Resync or Rebuild.
 
 Define:
 
@@ -452,10 +488,11 @@ A `GraphPublication` has three externally meaningful states:
 Stale | Synchronizing | Live
 ```
 
-Publication activation establishes its initial state without inventing a
-lifecycle delta. The aligned replacement is normally `Synchronizing`. If the
-ordered Live marker arrived while construction or alignment was pending,
-publish the completed image directly as `Live`.
+Publication installation establishes its initial externally visible state
+without inventing a lifecycle delta. The aligned replacement is normally
+`Synchronizing`. If the ordered Live marker arrived while construction,
+alignment, or prewarming was pending, install the completed image directly as
+`Live`.
 
 Once a publication is visible, lifecycle events admit only
 `Synchronizing -> Live`, `Synchronizing -> Stale`, and `Live -> Stale`.
@@ -489,8 +526,9 @@ never applies a delta to itself. Direct Head mutation failure, history append
 revision mismatch, or another invariant failure in the publication's own
 Head/history advancement path is an API projection failure. In `Constructing`
 or `Aligning`, abandon the unpublished candidate and invoke
-`restart_construction()`. In `Active`, first mark the current publication
-terminally `Stale`, then invoke the same primitive.
+`restart_construction()`. In `Prewarming`, abandon the unpublished publication
+and detach from its cache work before invoking the same primitive. In `Active`, first mark
+the current publication terminally `Stale`, then invoke the same primitive.
 
 Read-only retained-history selection and composition for response or cache
 construction do not advance the publication. A failure in that request path is

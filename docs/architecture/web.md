@@ -31,8 +31,10 @@ client values. Graph logic never routes those values through JavaScript
 The v1 Web's fast repeated polling is replaced by SSE cursor wakeups and HTTP
 delta/snapshot catch-up for cached views. The Web keeps one in-flight catch-up
 loop and coalesces desired cursors. Because SSE reconnection is not
-exactly-once, each wakeup is a desired `(publication_id, revision)` cursor; graph
-state comes from HTTP delta or snapshot responses.
+exactly-once, each wakeup is a desired `(publication_id, revision)` cursor. The
+paired `KGI-Publication-ID` and `KGI-Publication-State` headers describe the
+publication context of HTTP DAG responses; graph state also arrives through
+the dedicated SSE state message and never through a graph body.
 
 Head-following stays prompt. On publication change, a head-following view
 automatically reloads.
@@ -57,10 +59,11 @@ For canonical Head-delta catch-up, the Web supplies its current opaque SSE
 `ContinueImmediately`, it requests again from the returned `to_revision_id`;
 after `ReachedHead` or `WaitForWakeup`, it waits for the next SSE wakeup. A
 no-delta wait response leaves the graph cursor unchanged. The Web adopts each
-delta response's captured publication state. At a Stale publication's final
-Head it waits for the replacement wakeup instead of polling that terminal
-cursor. The Web adopts each dedicated `ClientRegistration`, then the API-owned
-`PublicationState`, before processing the following `PublicationWakeup`. This
+delta response's publication-context header pair. At a Stale publication's
+final Head it waits for the replacement wakeup instead of polling that
+terminal cursor. The Web adopts each dedicated `ClientRegistration`, then the
+API-owned `PublicationState`, before processing the following
+`PublicationWakeup`. This
 replaces its opaque identifier on initial connection, reconnection, and
 publication replacement without embedding registration or publication state
 in the graph wakeup. Every HTTP request continues to supply the Web's actual
@@ -80,6 +83,30 @@ receives an internal `GraphView`, observes `TrackingPolicy`, or applies updates
 to an ApiService subview. Internal subview extraction belongs exclusively to
 the [API graph contract](api-graph.md#frozen-subview-extraction--settled).
 Serialized graph-window contents follow the API-owned extraction contract.
+
+## Head snapshots — settled
+
+The Web requests the canonical Head endpoint with its presentation
+`target_depth`. It retains that value locally; the response body does not echo
+it. The API can return any cached tier whose nominal depth covers the target.
+The Web trims a larger snapshot to exactly its presentation depth before
+constructing the visible image.
+
+For response `high_level = H` and target depth `D`, the desired nominal lower
+bound is `max(1, H - D + 1)`. Retain blocks within that nominal extent. Remove
+an edge when trimming removes its child; retain the parent endpoint and its
+level for every retained edge, including an endpoint below the nominal lower
+bound. Retain every nominal level and every referenced endpoint level, and
+derive local edge-usage counters from the retained edges. These are the same
+browser graph rules used when a moving Head later removes its lowest child
+level.
+
+Because the selected cache tier is never smaller than a valid
+`target_depth`, caching requires no placeholder or progressive-fill UI. A
+snapshot can still be naturally shorter at the pruning-point boundary. The Web
+adopts the snapshot's exact `(publication_id, revision)` cursor and current
+publication-context headers, then uses ordinary canonical delta catch-up
+toward its desired cursor.
 
 ## Fixed views — settled
 
