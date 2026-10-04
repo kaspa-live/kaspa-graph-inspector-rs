@@ -935,10 +935,12 @@ releases the old publication's identifier, the server registers the connection
 in the replacement publication and emits, in order, a new
 `ClientRegistrationDto`, the replacement `PublicationStateDto`, and the
 replacement `PublicationWakeupDto`. The registration message still contains
-only the new identifier. A state transition within one publication emits only
-`PublicationStateDto` and does not allocate another identifier or pretend that
-a graph revision occurred. State delivery and the replacement sequence
-bypass the ordinary graph-revision wake schedule.
+only the new identifier. Any ordinary old-publication wakeup still queued when
+the old registration is removed is discarded before this sequence; required
+old messages already queued retain their order. A state transition within one
+publication emits only `PublicationStateDto` and does not allocate another
+identifier or pretend that a graph revision occurred. State delivery and the
+replacement sequence bypass the ordinary graph-revision wake schedule.
 
 A delta-to-current HTTP request may carry the current identifier so ApiService
 can update the matching publication-local wake schedule after choosing the
@@ -957,17 +959,21 @@ struct DeltaClientWakeState {
 ```
 
 `DeltaClientRegistry` is the publication-local mapping from each live opaque
-identifier to exactly one such scheduling value; its concrete collection
-remains an implementation choice.
+identifier to exactly one such scheduling value. The
+[ApiService task contract](api-service.md#client-wake-registry-and-sse-mailbox)
+owns its concrete collection, synchronization, mailbox, and readiness
+primitive.
 
 No current or highest graph revision is stored in this value. Registration
 initializes the boundary from the client-supplied cursor and marks the
 connection's mandatory initial graph wakeup sent. Disconnect removes the
 registration. Reconnection and publication replacement each create a new
-opaque identifier. A supplied expired or wrong-publication identifier returns
-`ClientRegistrationRequired`; the client first establishes a current SSE
-registration. An omitted identifier creates no registry entry and never
-returns that outcome.
+opaque identifier. Replacement initializes its otherwise inert sent boundary
+from the replacement Head because it has no new client-supplied cursor; the
+first delta response establishes the useful schedule. A supplied expired or
+wrong-publication identifier returns `ClientRegistrationRequired`; the client
+first establishes a current SSE registration. An omitted identifier creates
+no registry entry and never returns that outcome.
 
 SSE delivery is not exactly once and provides no event replay. KGI does not
 use SSE `Last-Event-ID` as a graph revision, publication ID, or `client_id`.
@@ -1210,6 +1216,14 @@ immediate continuation and no duplicate SSE wakeup is needed for the
 already-satisfied boundary. `UpToDate` uses the same rule with the request's
 starting revision. `PublicationState` and the ordered publication-replacement
 sequence are delivered independently of this graph-revision schedule.
+
+Schedule replacement and graph advancement are serialized by the
+ApiService-owned registry. Rearming first removes an ordinary wakeup still
+queued under the old schedule. It then compares the replacement boundary with
+the registry's latest history-published Head revision; an unsent boundary
+already reached queues an immediate wakeup and becomes sent. A wakeup already
+taken by the SSE task cannot be withdrawn and may still arrive. SSE is not
+exactly once, and this extra prompt changes no graph cursor or correctness.
 
 An HTTP-only request has no wake schedule. `continue` instructs it to request
 again immediately from `T`. A Live or Synchronizing response carrying `head`
@@ -1463,10 +1477,20 @@ it is not the graph data channel. Each client has a bounded delivery buffer.
 Live history advancement follows the registered preferred-interval graph-wakeup
 schedule, while `PublicationState` and the replacement sequence bypass it.
 Synchronizing continues to emit ordinary coalesced graph wakeups. Pending
-graph wakeups may coalesce to the latest cursor; registration and state
-messages retain the ordering required by their owning contract. A persistently
-slow client is disconnected and recovers by reconnecting SSE and using HTTP
-delta or view requests.
+graph wakeups coalesce to the latest cursor; registration and state messages
+retain the ordering required by their owning contract.
+
+The initial three-message sequence, the replacement three-message sequence,
+and every later `PublicationStateDto` are required mailbox items. Each complete
+sequence is admitted atomically and in order. An ordinary scheduled
+`PublicationWakeupDto` is the only coalescible item. When one is already
+queued for that publication, replace it with the newer value and move it after
+required messages enqueued since the previous value. This consumes one
+semantic-message slot throughout. Required admission never evicts an ordinary
+wakeup. A required item or batch that cannot fit, or a first ordinary wakeup
+that finds the buffer full of required items, disconnects the client under the
+slow-client rule. The client recovers by reconnecting SSE and using HTTP delta
+or view requests.
 
 `representation_version` is the settled term for the graph payload schema.
 The single JSON graph format follows the common transport DTO rules above.

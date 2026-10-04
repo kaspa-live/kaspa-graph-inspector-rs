@@ -75,6 +75,11 @@ owns cache entry identities and Head response-cache policy, while the
 [publication wire contract](api-protocol.md#publication-wire-observation--settled)
 owns client registration and wake scheduling.
 
+When construction creates a `GraphPublication`, it initializes
+`DeltaClientRegistry` with the same publication state and current revision as
+the initial image before exposing either value. The registry therefore always
+has a coherent observation for a concurrently established SSE registration.
+
 Each construction candidate also receives a fresh monotonic clock origin when
 its construction begins. The origin moves into `GraphPublication` if that
 candidate reaches `Prewarming`; it is never exposed directly. Revision zero
@@ -155,8 +160,10 @@ path rather than defining another publication transition.
 transitions. It is a writer gate rather than a container for graph state.
 `image` publishes the state and complete `GraphView` together, while `history`
 publishes the independently readable `GraphHistory`. Cache and client-registry
-synchronization is private to those values and never participates in the graph
-mutation critical section.
+synchronization is private to those values. Cache work never participates in
+the graph mutation critical section. The short nonblocking client-registry
+operations described below run at its tail so SSE observation preserves graph
+and lifecycle order.
 
 For an original `BlockCommitted` or `VspcCommitted` update, the runtime:
 
@@ -169,7 +176,9 @@ For an original `BlockCommitted` or `VspcCommitted` update, the runtime:
 3. releases the image lock;
 4. when the update returned a delta, acquires the history write lock and
    appends and publishes that complete delta entry; and
-5. releases the history lock and then `mutation`.
+5. releases the history lock, calls the ApiService-owned client registry's
+   nonblocking `advance_head` with the appended revision, and then releases
+   `mutation`.
 
 A no-effect update changes neither value. A starting revision mismatch or a
 failed apply or append follows the publication-projection failure contract
@@ -180,11 +189,13 @@ equality check is therefore a mutation-entry precondition, not a continuously
 maintained equality invariant.
 
 A lifecycle-state transition acquires `mutation`, changes `image.state` under
-the image write lock, then releases both locks. It does not take the history
-lock or change a graph revision. Consequently, becoming terminally `Stale`
-waits for an in-progress graph mutation to finish, and the Stale image's final
-view revision is already present in history. Protocol state notification occurs
-only after those locks have been released.
+the image write lock, releases the image lock, and publishes the required state
+message through the ApiService-owned client registry before releasing
+`mutation`. It does not take the history lock or change a graph revision. The
+registry operation does not await. Consequently, becoming terminally `Stale`
+waits for an in-progress graph mutation to finish, the Stale image's final view
+revision is already present in history, and its state message precedes any
+later mutation's graph wakeup.
 
 Read locks protect only bounded in-memory capture. Serialization, compression,
 cache work, database access, network delivery, and request waiting never hold

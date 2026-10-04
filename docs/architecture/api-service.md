@@ -436,6 +436,106 @@ Already running blocking serialization or compression cannot be interrupted
 safely; the bounded active jobs finish, their output is discarded, and the
 scheduler then completes.
 
+### Client wake registry and SSE mailbox
+
+ApiService implements each publication's protocol-owned client scheduling with
+one small synchronous registry and one ordered mailbox per SSE connection:
+
+```rust
+struct DeltaClientRegistry {
+    state: std::sync::Mutex<DeltaClientRegistryState>,
+}
+
+struct DeltaClientRegistryState {
+    publication_state: GraphPublicationState,
+    head_revision_id: u64,
+    clients: HashMap<u64, DeltaClientRegistration>,
+}
+
+struct DeltaClientRegistration {
+    wake_at_revision_id: u64,
+    wake_sent: bool,
+    mailbox: Weak<SseMailbox>,
+    disconnect: tokio_util::sync::CancellationToken,
+}
+
+struct SseMailbox {
+    state: std::sync::Mutex<SseMailboxState>,
+    ready: tokio::sync::Notify,
+}
+
+struct SseMailboxState {
+    closed: bool,
+    queue: VecDeque<SseMailboxItem>,
+}
+
+enum SseMailboxItem {
+    Required(SseMessage),
+    GraphWakeup(PublicationWakeupDto),
+}
+
+enum SseMessage {
+    ClientRegistration(ClientRegistrationDto),
+    PublicationWakeup(PublicationWakeupDto),
+    PublicationState(PublicationStateDto),
+}
+```
+
+The map key is the random `u64` whose wire encoding is owned by the
+[publication protocol](api-protocol.md#publication-wire-observation--settled).
+The registry's publication-wide Head revision is the latest revision already
+published in history. It closes the race between graph advancement and an HTTP
+response rearming a client and is not a per-client highest revision. Each SSE
+connection owns the strong `Arc<SseMailbox>`, while the registry retains only
+a weak reference and the connection-local cancellation token.
+
+Registry operations and mailbox mutation use only short synchronous critical
+sections. The sole lock order is registry then mailbox. The mailbox receiver
+takes only its mailbox lock, and disconnect cleanup takes only the registry
+lock. No lock guard crosses an `.await`. `Notify` is a readiness hint for the
+single receiver; the bounded queue remains the sole owner of message ordering
+and contents.
+
+Registration generates and collision-checks its random key while serialized
+by the registry, admits the complete protocol-owned initial message batch, and
+then inserts the registration. The initial schedule is already marked sent.
+Publication replacement removes the old registration and any still-queued
+ordinary wakeup for that old publication before performing the same operation
+against the replacement registry and mailbox. Required old messages already
+in the mailbox retain their order. Failure to admit a required batch installs
+no partial registration.
+
+A lifecycle notification records the new publication state, then attempts its
+required message against every registered mailbox in the same registry
+critical section. Registration racing before that operation receives the old
+initial state followed by the new message; registration racing after it
+receives the new state in its initial batch. Failed weak upgrades and clients
+whose mailbox rejects required admission are removed; their connection tokens
+are cancelled after releasing the locks.
+
+After history publishes a new graph revision, `advance_head` first records the
+revision and then linearly scans registrations. For an unsent boundary already
+reached, it queues the ordinary graph wakeup and marks it sent. For a sent
+schedule whose ordinary wakeup is still queued, it coalesces that item to the
+newer revision. A delta response rearm removes any still-queued ordinary
+wakeup, replaces the schedule, and compares its boundary with the registry's
+current Head before releasing the registry lock. If the new unsent boundary
+is already reached, it queues the wakeup immediately and marks it sent. Head
+advancement before or after rearming therefore cannot lose the notification.
+An ordinary wakeup already taken by the SSE task cannot be withdrawn and may
+arrive after rearming; this is harmless under the protocol's non-exactly-once
+SSE contract.
+
+The scan is bounded by `MAX_SSE_CLIENTS`. With the initial 1,024-client limit,
+a direct scan avoids a second boundary index and its rearm, replacement, and
+disconnect maintenance. The registry creates no timer and no per-client task;
+the existing Axum SSE handler is the mailbox's only receiver. Mailbox admission,
+coalescing, required-batch atomicity, and slow-client behavior belong to the
+[public delivery contract](api-protocol.md#public-delivery-failures--settled).
+The mailbox queue never exceeds `SSE_CLIENT_BUFFER_CAPACITY`. Closing a mailbox
+rejects later admission and notifies its receiver; the receiver returns no
+further item after the closed queue has been drained.
+
 ### HTTP requests and SSE connections
 
 Each admitted API request owns a private guard containing its applicable lane
@@ -463,14 +563,14 @@ before response commitment returns the applicable unavailable result when
 possible; cancellation after commitment terminates the body or stream and
 never attempts a second response.
 
-Each accepted SSE connection owns an SSE admission guard, one bounded semantic
-message receiver, its current publication-local identifier and registration,
-and a drop guard for a unique child of `ApiCancellation::sse`. It observes the
+Each accepted SSE connection owns an SSE admission guard, one bounded
+`SseMailbox`, its current publication-local identifier and registration, and a
+drop guard for a unique child of `ApiCancellation::sse`. It observes the
 current-publication watch. On replacement it performs the protocol-owned
 registration transition and ordered initial sequence without replacing or
 cancelling that token. Normal disconnect, connection-local failure, slow-client
 disconnection, or cancellation affects only that child and removes the current
-registration before releasing the guard. Mandatory-buffer admission follows
+registration before releasing the guard. Mandatory-mailbox admission follows
 the protocol-owned slow-client rule and never blocks publication mutation or
 shutdown.
 

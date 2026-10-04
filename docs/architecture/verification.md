@@ -1272,6 +1272,38 @@ regenerate a forced active-registry collision. Reject malformed token syntax,
 while a canonical unknown or wrong-publication token produces
 `ClientRegistrationRequired`.
 
+Exercise the concrete client registry and mailbox with the final admissible
+client and the saturated next registration. Require one synchronous registry
+critical section to collision-check the random key, admit the complete initial
+three-message batch, and install the registration. The batch must appear
+entirely or not at all. Repeat for publication replacement after removing the
+old registration, using the same mailbox, a fresh identifier, and the
+replacement Head as the inert sent boundary. Drop the mailbox owner without
+cleanup and verify its weak registry entry is removed on the next operation.
+No registry or mailbox mutex guard may cross an `.await`.
+
+Queue an ordinary old-publication wakeup before replacement and verify old
+registration removal discards it before appending the replacement batch.
+Required old messages already queued must remain ahead of that complete new
+batch.
+
+Advance Head repeatedly while an ordinary graph wakeup remains queued. Verify
+that the mailbox retains one coalescible item with the latest cursor and moves
+it after any required state item enqueued in the meantime. Required admission
+must never evict that graph item. Fill the remaining queue with required items
+and verify that the next required item or atomic batch disconnects the client;
+also verify that a first ordinary wakeup against a queue already full of
+required items disconnects it. The mailbox's `Notify` wakes its single receiver
+without becoming a second source of message contents or ordering.
+
+Race an HTTP rearm against Head advancement in both orders. Rearming must
+remove an ordinary wakeup still queued under the previous schedule and must
+immediately enqueue a newly armed boundary already reached by the registry's
+latest history-published Head. If the SSE task already took the prior wakeup,
+permit that non-exactly-once prompt without changing the authoritative HTTP
+cursor. Assert that the registry scan never creates a timer or per-client
+task.
+
 Replace a publication without reconnecting its SSE transport and verify the
 old ID is invalidated before the same three-message sequence reports the
 replacement. A state transition emits only `PublicationStateDto`, does not
