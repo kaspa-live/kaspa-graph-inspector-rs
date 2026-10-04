@@ -628,8 +628,21 @@ struct WebRuntimeConfig {
 }
 ```
 
-`GET /kgi-config.json` always returns the complete public representation. A
-configured template is a valid HTTP or HTTPS URL containing exactly one
+`GET /kgi-config.json` always returns the complete public representation. The
+exact absent form and one configured example are:
+
+```json
+{"block_explorer_url_template":null}
+{"block_explorer_url_template":"https://explorer.example/block/{hash}"}
+```
+
+The exact property name is `block_explorer_url_template`; it is always present
+and is the object's only property. `None` encodes as JSON `null`, never as an
+omitted property. A configured value encodes as a JSON string with ordinary
+JSON escaping. Serialization adds no insignificant whitespace or trailing
+newline.
+
+A configured template is a valid HTTP or HTTPS URL containing exactly one
 `{hash}` placeholder. It is public presentation configuration and may never
 contain credentials or expose environment variables generically. It is owned
 and served by the top `kgi` crate and does not belong to `kgi-api-core`,
@@ -638,10 +651,32 @@ and served by the top `kgi` crate and does not belong to `kgi-api-core`,
 owns its operator sources and startup validation. Vite never reads that
 deployment setting.
 
+Every body-bearing successful response is uncompressed and carries:
+
+```http
+Content-Type: application/json
+Cache-Control: no-cache
+ETag: "kgi-config-<sha256>"
+```
+
+`<sha256>` is the 64-character lowercase hexadecimal SHA-256 of the exact
+UTF-8 response body. This is a strong ETag: the same public representation has
+the same validator across process restarts, while a different representation
+has a different validator. The endpoint has no content negotiation or
+compression path: it always returns JSON regardless of `Accept`, ignores
+`Accept-Encoding`, and emits no `Content-Encoding`.
+
+`If-None-Match` uses the standard weak comparison required for GET. No current
+match returns `200 OK` with the complete representation. A matching list
+member or `*` returns `304 Not Modified` with the current `ETag` and
+`Cache-Control: no-cache`, no body, and no `Content-Type` or
+`Content-Encoding`. Malformed conditional headers follow ordinary HTTP header
+rejection rather than changing configuration semantics.
+
 Hashed Vite assets use long-lived immutable caching. `index.html` and the
-runtime configuration require revalidation; the latter has a configuration
-ETag. The [Web contract](web.md#delivery-and-runtime-configuration--settled)
-owns browser behavior when consuming the optional value.
+runtime configuration require revalidation. The
+[Web contract](web.md#delivery-and-runtime-configuration--settled) owns browser
+behavior when consuming the optional value.
 
 ## Deployment and logging — settled
 

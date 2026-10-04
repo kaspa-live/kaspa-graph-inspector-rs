@@ -1708,7 +1708,21 @@ Verify the
 the bundle exposes no partial final directory, contains one matching binary
 and complete Web build, derives the standard Web root, rejects a missing root,
 and serves the deployment-neutral application with its runtime configuration.
-Exercise absent and valid external-explorer templates without delaying or
+For `/kgi-config.json`, verify the exact compact absent-template body, the
+exact property name and configured-string encoding, the `application/json`
+content type, `Cache-Control: no-cache`, absence of content encoding, and the
+strong `"kgi-config-<sha256>"` validator computed over the exact body.
+Verify stable validators for identical bodies across restart, changed
+validators for changed bodies, nonmatching conditional `200` responses, and
+matching list-member and `*` requests returning bodyless `304` responses with
+the current validator and cache directive. The endpoint remains uncompressed
+regardless of `Accept-Encoding`.
+
+Web decoder tests accept the exact `null` and valid-string shapes, retain the
+previous validated value after `304`, and reject a missing property, an extra
+property, a non-string/non-null value, malformed JSON, and an invalid template.
+Exercise fetch and decode failures with no prior valid value. Every absent,
+invalid, or unavailable value hides the explorer action without delaying or
 changing graph rendering. Packaging checks also cover console plus rotating
 file logging, explicit file-log disablement, invalid simultaneous log options,
 and writable log-volume replacement without local correctness state.

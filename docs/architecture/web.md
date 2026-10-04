@@ -21,6 +21,15 @@ graph rendering. Until a valid optional template is available, or when its
 value is absent, the external explorer action is hidden; graph behavior is
 unchanged.
 
+The browser decoder follows the overview-owned
+[`/kgi-config.json` representation](overview.md#http-composition-and-runtime-web-configuration--settled).
+It requires the exact `block_explorer_url_template` property, accepts only
+`null` or a string satisfying the configured-template rules, and rejects a
+missing property, an additional property, or any other value type. A `304 Not
+Modified` retains the previously validated value. A fetch failure, a malformed
+body, or a response that cannot be paired with a previously validated value
+leaves the explorer action hidden and never delays or changes graph behavior.
+
 For the protocol-owned JSON representation, the Web converts public `u64`
 decimal strings to `bigint` at its DTO boundary before constructing typed
 client values. Graph logic never routes those values through JavaScript
