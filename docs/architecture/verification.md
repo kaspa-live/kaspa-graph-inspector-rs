@@ -1221,6 +1221,17 @@ replaces only its tier. Failure gives all on-demand waiters the same typed
 error, preserves the previous entry, removes the job, and permits retry. A
 Stale publication can reuse and construct tiers against its final Head.
 
+Pause a demand-built Head-tier job during detached encoding and advance Head
+across its completion thresholds. A candidate completing at distance 40 or 99
+is installed and delivered; when served as the request's selected tier it
+ensures one successor refresh, while use as a larger covering tier does not.
+A candidate completing at distance 100 is neither inserted nor published as a
+terminal result: the same job remains pending, every concurrent waiter stays
+joined, and a newer capture eventually supplies their one shared eligible
+result. Advancing Head after an eligible candidate's admission must not revoke
+that installed entry or its already waiting responses. Repeat the hard-age
+case for mandatory prewarming.
+
 For canonical Head deltas, verify one
 publication-owned job per source revision: concurrent requests join it after
 its target is captured, success publishes one `CachedDelta`, and failure gives

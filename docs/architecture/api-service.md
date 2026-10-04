@@ -374,6 +374,16 @@ the same tracked scheduler and final response construction path. Every job
 holds only detached immutable inputs during JSON serialization and gzip and no
 image, history, or cache-state lock.
 
+For a Head-tier job, successful encoding is one candidate attempt rather than
+terminal job completion. The orchestration task applies the protocol-owned
+completion-time eligibility check against the containing publication. A
+hard-aged candidate is dropped, while the same `CacheJob` stays `Pending` in
+the same running slot and captures and submits a newer Frozen attempt. It does
+not notify waiters or expose the discarded bytes. Only an eligible candidate
+continues into the success path below. This retry remains one tracked
+single-flight job; later requests join it rather than creating another capture
+or encoding task for that tier.
+
 Each waiter subscribes to the job's `watch` sender and selects terminal job
 completion against its own request cancellation token. Cancelling one request
 drops only that receiver and does not modify a waiter collection or cancel the
@@ -381,18 +391,18 @@ shared job. The job may finish and populate its originating publication cache
 after its last current waiter disappears. Publication replacement likewise
 does not cancel a job holding captured immutable inputs or remaining waiters.
 
-On success, the job upgrades its `Weak<GraphCache>`, locks the cache, and
-verifies that the applicable running slot still points to that exact job. It
-then installs the shared completed `Arc`, clears the running slot, releases the
-lock, and publishes the same terminal result through `watch`. A Head-tier
-refresh atomically replaces only that tier. On failure or terminal
-cancellation, it clears the matching running slot while preserving any prior
-completed entry, releases the lock, and then publishes one shared result. Job
-completion uses `watch::Sender::send_replace`, so the terminal value is stored
-even if every current waiter has already detached. A later request may
-therefore retry without rejoining the failed job. If the originating cache can
-no longer be upgraded, the job skips insertion but still completes its
-existing receivers.
+On delta success or an eligible Head-tier success, the job upgrades its
+`Weak<GraphCache>`, locks the cache, and verifies that the applicable running
+slot still points to that exact job. It then installs the shared completed
+`Arc`, clears the running slot, releases the lock, and publishes the same
+terminal result through `watch`. A Head-tier refresh atomically replaces only
+that tier. On failure or terminal cancellation, it clears the matching running
+slot while preserving any prior completed entry, releases the lock, and then
+publishes one shared result. Job completion uses
+`watch::Sender::send_replace`, so the terminal value is stored even if every
+current waiter has already detached. A later request may therefore retry
+without rejoining the failed job. If the originating cache can no longer be
+upgraded, the job skips insertion but still completes its existing receivers.
 
 The cache mutex protects only map operations, counter changes, and pointer
 identity checks. No guard may cross an `.await`, extraction, history capture,

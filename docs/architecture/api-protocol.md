@@ -1670,6 +1670,28 @@ distance >= CACHED_WINDOW_MAX_LEVEL_DISTANCE
     ineligible; never serve it
 ```
 
+The current-Head eligibility observation occurs both when selecting a completed
+entry and when admitting a newly encoded Head-tier candidate. After extraction,
+JSON serialization, size checking, and gzip complete, a tier job captures the
+publication's then-current Head level and evaluates the candidate with the same
+distance rules before cache insertion, terminal job completion, or waiter
+delivery. A candidate in the soft refresh range is eligible and may be
+installed and delivered. A waiter receiving that candidate from its selected
+tier ensures one successor refresh under the ordinary rule above; receiving it
+as a larger covering tier does not create another tier or refresh merely due to
+that completion.
+
+A candidate at or beyond the hard distance is discarded without becoming a
+cache entry, successful job result, or `CacheBuildError`. The same tier job
+remains pending with all current waiters, preserves any previous completed
+entry in that slot, and repeats from a newer coherent Frozen capture through
+the encoding scheduler. Concurrent demand whose selection reaches that running
+tier continues to join the same job. Once a candidate passes this completion
+check, its eligibility is fixed for that cache admission and its already
+waiting responses; later Head advancement does not revoke the entry, terminal
+completion, or an in-flight response. A later request performs a new
+current-Head eligibility check.
+
 The `50` tier is constructed preemptively only while opening a new
 publication. No tier, including `50`, is refreshed merely because Head
 advances. Every later construction or refresh is triggered by request demand.

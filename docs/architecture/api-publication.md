@@ -402,15 +402,15 @@ Cache construction creates no graph revision. While that detached work runs,
 the unpublished publication continues advancing its view and history at the
 ordinary update rate.
 
-When the tier-50 job succeeds, install it in the publication cache and compare
-its captured `high_level` with the publication's then-current Head. If the
-distance is at least `CACHED_WINDOW_MAX_LEVEL_DISTANCE`, discard that entry and
-repeat prewarming from a newer coherent capture. Otherwise install the complete
-publication `Arc` into ApiService's current-publication slot and enter
-`Active`. Installation is only a visibility change: it creates no revision and
-does not drain a hidden update backlog. The cached snapshot revision can
-precede the publication's current revision; retained canonical deltas connect
-that exact cursor to the current Head.
+The mandatory tier-50 job uses the protocol-owned
+[completion-time cache eligibility rule](api-protocol.md#publication-scoped-head-response-cache--settled)
+and exposes terminal success to `PublicationRuntime` only for an admitted
+candidate. Until then the runtime remains in `Prewarming`. On that success,
+install the complete publication `Arc` into ApiService's current-publication
+slot and enter `Active`. Installation is only a visibility change: it creates
+no revision and does not drain a hidden update backlog. The cached snapshot
+revision can precede the publication's current revision; retained canonical
+deltas connect that exact cursor to the current Head.
 
 Failure of mandatory tier-50 capture, size checking, serialization, or
 compression prevents installation. `PublicationRuntime` remains responsible
