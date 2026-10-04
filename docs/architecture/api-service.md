@@ -479,6 +479,11 @@ enum SseMessage {
     PublicationWakeup(PublicationWakeupDto),
     PublicationState(PublicationStateDto),
 }
+
+enum DeltaCompletionResult {
+    Accepted,
+    RegistrationMissing,
+}
 ```
 
 The map key is the random `u64` whose wire encoding is owned by the
@@ -517,14 +522,20 @@ After history publishes a new graph revision, `advance_head` first records the
 revision and then linearly scans registrations. For an unsent boundary already
 reached, it queues the ordinary graph wakeup and marks it sent. For a sent
 schedule whose ordinary wakeup is still queued, it coalesces that item to the
-newer revision. A delta response rearm removes any still-queued ordinary
-wakeup, replaces the schedule, and compares its boundary with the registry's
-current Head before releasing the registry lock. If the new unsent boundary
-is already reached, it queues the wakeup immediately and marks it sent. Head
-advancement before or after rearming therefore cannot lose the notification.
-An ordinary wakeup already taken by the SSE task cannot be withdrawn and may
-arrive after rearming; this is harmless under the protocol's non-exactly-once
-SSE contract.
+newer revision. A delta response completion acquires the registry once and
+looks up the supplied identifier. Absence returns `RegistrationMissing`
+without changing another registration. Presence applies the protocol-selected
+schedule action and returns `Accepted`; the final Stale-Head action validates
+the registration without installing a schedule. Rearming removes any
+still-queued ordinary wakeup, replaces the schedule, and compares its boundary
+with the registry's current Head before releasing the registry lock. If the new
+unsent boundary is already reached, it queues the wakeup immediately and marks
+it sent. The HTTP handler commits its successful response only after
+`Accepted`; `RegistrationMissing` maps to the protocol-owned
+`ClientRegistrationRequired` outcome. Head advancement before or after
+rearming therefore cannot lose the notification. An ordinary wakeup already
+taken by the SSE task cannot be withdrawn and may arrive after rearming; this
+is harmless under the protocol's non-exactly-once SSE contract.
 
 The scan is bounded by `MAX_SSE_CLIENTS`. With the initial 1,024-client limit,
 a direct scan avoids a second boundary index and its rearm, replacement, and

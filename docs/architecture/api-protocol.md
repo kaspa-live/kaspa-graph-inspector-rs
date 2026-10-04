@@ -1070,7 +1070,9 @@ Public outcomes map as follows:
 - publication mismatch returns
   `FreshViewRequired(PublicationMismatch)`;
 - a request carrying an expired or wrong-publication `client_id` returns
-  `ClientRegistrationRequired` before cache or history work;
+  `ClientRegistrationRequired` before cache or history work, and the same
+  outcome replaces a selected success when that registration no longer exists
+  at response completion;
 - `GraphHistoryRangeError::StartPruned` returns
   `FreshViewRequired(StartPruned)`;
 - `GraphHistoryRangeError::StartUnavailable` returns
@@ -1224,6 +1226,18 @@ the registry's latest history-published Head revision; an unsent boundary
 already reached queues an immediate wakeup and becomes sent. A wakeup already
 taken by the SSE task cannot be withdrawn and may still arrive. SSE is not
 exactly once, and this extra prompt changes no graph cursor or correctness.
+
+Every SSE-coordinated request binds its response to the supplied registration.
+After selecting the complete request-specific outcome and before committing a
+successful HTTP response, ApiService checks that registration again. For an
+outcome that establishes a graph-wakeup schedule, this completion check and
+schedule replacement are one atomic registry operation. At the final Stale
+Head, where no graph wakeup is armed, the same operation validates the
+registration without installing a schedule. If the registration has
+disappeared, ApiService discards the selected request-specific success and
+returns `ClientRegistrationRequired`; a completed shared cache entry or cache
+job result remains available. The error carries none of the delta-success
+headers. HTTP-only requests have no corresponding completion check.
 
 An HTTP-only request has no wake schedule. `continue` instructs it to request
 again immediately from `T`. A Live or Synchronizing response carrying `head`

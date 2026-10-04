@@ -144,6 +144,7 @@ and export mechanics remain deferred.
 
 For canonical Head-delta catch-up, the Web supplies its current opaque SSE
 `client_id` and retains the newest response continuation while replay proceeds.
+Each coordinated request captures the identifier with which it was issued.
 `ContinueImmediately` requests again from `received_revision_id` as soon as
 queue capacity permits. `ReachedHead` and `WaitForWakeup` wait for the next SSE
 wakeup before requesting again; once it arrives, acquisition may proceed from
@@ -161,6 +162,15 @@ replacement, explicit refresh, fixed-view destruction, and Web shutdown cancel
 in-flight acquisition and replay timers and release every queued batch. A
 replacement snapshot establishes the new publication's timestamp domain.
 
+Adopting a fresh `client_id` for the same publication cancels an in-flight
+delta request issued with the previous identifier but preserves every admitted
+batch, both graph cursors, and replay timing. Acquisition retries from the
+unchanged `received_revision_id` with the fresh identifier when queue capacity
+and the newest desired cursor permit. A response associated with an identifier
+that is no longer current is ignored in full, including its graph body,
+continuation, and Head headers, even when transport cancellation lost the race
+with response delivery.
+
 The Web adopts each delta response's publication-context header pair. At a
 Stale publication's final Head it replays every admitted entry and waits for the
 replacement wakeup instead of polling that terminal cursor. The Web adopts each
@@ -170,7 +180,9 @@ identifier on initial connection, reconnection, and publication replacement
 without embedding registration or publication state in the graph wakeup. Every
 HTTP request continues to supply the Web's actual `received_revision_id` as its
 authoritative acquisition cursor. `ClientRegistrationRequired` reconnects SSE
-and retries from that unchanged cursor.
+and retries from that unchanged cursor when the failed request identifier is
+still current. If a newer identifier has already been adopted, it retries with
+that identifier without reconnecting again.
 
 Under the API-owned
 [cached Head-delta wire contract](api-protocol.md#canonical-head-delta-responses--settled),

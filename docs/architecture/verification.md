@@ -1251,7 +1251,11 @@ cursor. The opaque client ID selects only wake state, while every HTTP
 `from_revision_id` remains the authoritative graph cursor. Its omission must
 select HTTP-only polling without `ClientRegistrationRequired`; cover that
 outcome for an expired and wrong-publication supplied identifier before cache
-or history work. Exercise
+or history work. Remove a validated registration while its request waits for a
+shared cache job, then require the completion-time atomic rearm to return
+`ClientRegistrationRequired` instead of committing the selected success. The
+shared cache result remains reusable and no other registration changes.
+Exercise
 `GET /api/v1/graph/wakeups?publication_id=P&from_revision_id=F`: require both
 cursor parameters, reject unsupported parameters, and return graph unavailable
 without opening a stream when no coherent publication exists. A successful
@@ -1303,6 +1307,14 @@ latest history-published Head. If the SSE task already took the prior wakeup,
 permit that non-exactly-once prompt without changing the authoritative HTTP
 cursor. Assert that the registry scan never creates a timer or per-client
 task.
+
+Reconnect SSE within one publication while a coordinated delta request using
+the previous identifier is in flight. The Web must cancel that request,
+preserve its admitted queue and cursors, ignore a late old-identifier response
+in full, and retry from the unchanged received cursor with the fresh
+identifier. Cover both `ClientRegistrationRequired` arriving before the fresh
+registration and arriving after it: only the former reconnects SSE again. The
+successful retry must atomically arm the fresh registration.
 
 Replace a publication without reconnecting its SSE transport and verify the
 old ID is invalidated before the same three-message sequence reports the
