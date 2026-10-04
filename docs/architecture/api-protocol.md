@@ -1053,9 +1053,14 @@ request and does not accept `to_revision_id`; exact-target range selection
 remains internal to ApiService. Missing, malformed, duplicate, or additional
 parameters follow the [common request rules](#common-http-conventions--settled).
 
-ApiService rejects a publication mismatch before consulting history. A
-delta-to-current request then validates a supplied publication-local
-`client_id`.
+ApiService rejects a publication mismatch before consulting history. It then
+compares `from_revision_id` with the coherently captured Head revision. A
+future cursor greater than that Head returns `400 Bad Request` with category
+and code `invalid-request` and `details: null`; this occurs before client
+registration validation, cache lookup, or history work. Equality remains the
+ordinary `UpToDate` case. Every remaining request then validates a supplied
+publication-local `client_id` before the equality or forward-range result is
+selected.
 A publication in `Synchronizing`, `Live`, or terminal `Stale` state is
 otherwise eligible. Stale history no longer advances, but clients may catch up
 through its final stalled Head. For an eligible request ApiService calls the
@@ -1069,6 +1074,8 @@ Public outcomes map as follows:
 
 - publication mismatch returns
   `FreshViewRequired(PublicationMismatch)`;
+- `from_revision_id` greater than the captured Head revision returns the
+  common `400 invalid-request` response;
 - a request carrying an expired or wrong-publication `client_id` returns
   `ClientRegistrationRequired` before cache or history work, and the same
   outcome replaces a selected success when that registration no longer exists
@@ -1078,6 +1085,12 @@ Public outcomes map as follows:
 - `GraphHistoryRangeError::StartUnavailable` returns
   `FreshViewRequired(StartUnavailable)`; and
 - `GraphHistoryRange::UpToDate` returns `DeltaResponseOutcome::UpToDate`.
+
+Consequently, this public path never supplies `GraphHistory::range` with a
+target below its start. `GraphHistoryRangeError::BackwardTarget` remains an
+internal range-call safeguard; observing it after the public comparison is an
+internal invariant failure governed by the common `500 internal-error`
+response rather than a client cursor-recovery outcome.
 
 Before cache lookup, joining a job, or constructing a delta-to-Head response,
 use the first selected stored

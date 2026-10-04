@@ -752,8 +752,11 @@ after releasing the history read lock.
 
 Verify `GraphHistory::range` checks target ordering before retained-boundary
 selection: a target below the start returns `BackwardTarget` and constructs no
-delta, while equality remains `UpToDate`. Public delta-to-current operations
-cannot express a backward target.
+delta, while equality remains `UpToDate`. Separately, send the public canonical
+delta endpoint a `from_revision_id` greater than its coherently captured Head.
+It must return the common `400 invalid-request` response before client
+registration validation, cache lookup, or history work, so `BackwardTarget`
+cannot arise from that public input.
 
 Verify every subview extract inherits its source revision and revision
 timestamp with
