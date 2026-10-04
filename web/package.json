@@ -14,11 +14,22 @@
     "test:browser:full": "playwright test"
   },
   "dependencies": {
+    "@createjs/core": "2.0.0-beta.4",
+    "@createjs/tweenjs": "2.0.0-beta.4",
+    "@emotion/react": "11.14.0",
+    "@emotion/styled": "11.14.1",
+    "@mui/icons-material": "5.18.0",
+    "@mui/material": "5.18.0",
+    "@pixi/graphics-extras": "6.5.10",
+    "@react-spring/web": "10.1.2",
+    "pixi.js-legacy": "6.5.10",
+    "quick-lru": "6.1.2",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",
+    "@types/node": "24.19.1",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "6.1.1",
