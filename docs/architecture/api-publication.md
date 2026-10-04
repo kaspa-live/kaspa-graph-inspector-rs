@@ -37,7 +37,7 @@ struct GraphPublication {
     mutation: tokio::sync::Mutex<()>,
     image: tokio::sync::RwLock<GraphPublicationImage>,
     history: tokio::sync::RwLock<GraphHistory>,
-    cache: GraphCache,
+    cache: Arc<GraphCache>,
     clients: DeltaClientRegistry,
 }
 
@@ -67,7 +67,9 @@ enum GraphViewSeedOutcome {
 
 Only `GraphPublication` has a `publication_id`. Each publication receives a
 fresh random nonzero `u64`. `GraphCache` and `DeltaClientRegistry` are private
-runtime state;
+runtime state. The publication retains the cache's sole durable strong `Arc`;
+cache jobs retain only `Weak<GraphCache>`.
+
 [API protocol](api-protocol.md#publication-scoped-head-response-cache--settled)
 owns cache entry identities and Head response-cache policy, while the
 [publication wire contract](api-protocol.md#publication-wire-observation--settled)

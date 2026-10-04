@@ -1158,11 +1158,12 @@ removals that the serializer will omit, is additive across entries, and
 performs no graph encoding or compression. Exact weights remain deferred; the
 estimate selects a candidate and never authorizes an oversized response.
 
-The selected cache destination is fixed when the single-flight job starts and
-does not advance with Head while that job is running. Preserve the chosen
-`GraphHistoryEntryList` as ordered replay units, construct one response-local
-hash dictionary across the complete list, serialize one `GraphDeltaBatchDto`,
-and check its uncompressed byte length against the hard response limit. If the
+Once the elected builder selects the cache destination, that destination is
+fixed and does not advance with Head while the job is running. Preserve the
+chosen `GraphHistoryEntryList` as ordered replay units, construct one
+response-local hash dictionary across the complete list, serialize one
+`GraphDeltaBatchDto`, and check its uncompressed byte length against the hard
+response limit. If the
 batch exceeds that limit, remove complete entries from the right and retry at
 the resulting earlier boundary, preferring another eligible heated destination
 in the heat region. Recompute the shared dictionary for the retained prefix. If
@@ -1484,8 +1485,10 @@ For the publication-owned `GraphCache`, defined by the
 internal identities omit `publication_id` because the containing publication
 already supplies it. `GraphCache` contains tier-keyed Head snapshot entries and
 jobs, source-keyed delta entries and jobs, and destination-response heat
-counters. Heat and request-source counters saturate rather than wrap. Concrete
-collections remain deferred. The canonical cached delta value is:
+counters. Heat and request-source counters saturate rather than wrap. The
+[ApiService task contract](api-service.md#api-task-ownership-and-completion--settled)
+owns the cache's concrete slot collections, mutual exclusion, single-flight
+completion transport, and task execution. The canonical cached delta value is:
 
 ```rust
 struct CachedDelta {
@@ -1626,7 +1629,7 @@ missing tiers can still be built on demand while the publication remains
 addressable. Publication replacement releases the complete tier cache with
 the containing publication under the publication-lifetime contract.
 
-Concrete cache collections and the estimator weights remain deferred in the
+The estimator weights remain deferred in the
 [decision register](../decisions/deferred.md).
 
 ## Anchored graph windows — settled

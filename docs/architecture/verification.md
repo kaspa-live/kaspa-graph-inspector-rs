@@ -1214,7 +1214,7 @@ Stale publication can reuse and construct tiers against its final Head.
 For canonical Head deltas, verify one
 publication-owned job per source revision: concurrent requests join it after
 its target is captured, success publishes one `CachedDelta`, and failure gives
-all waiters the same request-local error before removing the job. Count every
+all waiters the same request-local error after removing the job. Count every
 successfully delivered waiter independently toward the destination heat. A
 cache hit reuses the exact gzip bytes and is never
 promoted or replaced because Head advanced; publication ID and state, outcome,
@@ -1505,10 +1505,22 @@ no failure event.
 Exercise source-keyed cache single-flight with multiple waiters, one cancelled
 waiter, shared success and shared request-local failure, running-job removal,
 and weak insertion both before and after the origin cache is dropped. Verify
-all cache orchestration tasks are registered in the ApiService task tracker.
-Include tier-keyed Head snapshot jobs and mandatory `Prewarming` work in the
-same tracked cache and encoding infrastructure. For encoding, reserve bounded
-historical capacity before database work,
+that one short cache critical section elects exactly one builder, installs its
+pending job after required pre-cache checks and before cache-build target
+selection or build-input retention, and lets every concurrent miss join that
+job. No cache mutex guard may survive
+into capture, extraction, an `.await`, encoding, delivery, or waiter
+suspension. On success, require completed insertion before the shared `watch`
+result; on failure, require matching-job removal before the shared error so an
+immediate retry starts new work. A cancelled receiver must not alter the job,
+and a dropped origin cache must prevent insertion without preventing receiver
+completion. Exercise completion after every waiter has detached and require
+`send_replace` to retain the terminal job value without restoring a cache slot.
+
+Verify all cache orchestration tasks are registered in the ApiService task
+tracker. Include tier-keyed Head snapshot jobs and mandatory `Prewarming` work
+in the same tracked cache and encoding infrastructure. For encoding, reserve
+bounded historical capacity before database work,
 release every database resource before submitting the detached projection,
 and enforce the settled total and historical concurrency limits. Scheduler
 shutdown rejects new work, cancels queued work, lets already active blocking

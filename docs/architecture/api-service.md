@@ -323,28 +323,87 @@ through request guards rather than duplicate task handles.
 
 ### Cache and encoding jobs
 
-On a source-keyed delta-cache miss, ApiService captures the immutable
-history-entry Arcs and target, registers one running single-flight job, and
-spawns one tracked cache orchestration task with a child of
-`ApiCancellation::cache_jobs`. Concurrent requests from that source attach to
-its shared result even when Head advances. A Head snapshot tier job instead
-captures one immutable Frozen extraction and is keyed by its derived tier
-depth. The mandatory tier-50 Prewarming job and later demand-triggered tier
-jobs use the same tracked scheduler and final response construction path.
-Every job holds only detached immutable inputs during JSON serialization and
-gzip and no image or history lock.
+ApiService owns the runtime synchronization inside the protocol-owned
+`GraphCache`. It uses a small custom publication-local cache rather than a
+general cache library:
 
-Cancelling one request detaches that waiter without cancelling the shared job.
-The job may finish and populate its originating publication cache after its
-last current waiter disappears. Publication replacement likewise does not
-cancel a job holding captured immutable inputs or remaining waiters.
-On success, the job completes every waiter and installs its `CachedDelta` or
-`CachedHeadSnapshot` only when its weak reference to the originating cache can
-still be upgraded. A Head-tier refresh atomically replaces only that tier. On
-failure, an on-demand job completes every waiter with the same request-local
-error, preserves any previous completed entry, removes the running-job
-registration, and permits a later retry. The unpublished publication runtime
-consumes the result of its mandatory Prewarming job under the
+```rust
+struct GraphCache {
+    state: std::sync::Mutex<GraphCacheState>,
+}
+
+struct GraphCacheState {
+    delta_slots: HashMap<u64, CacheSlot<CachedDelta>>,
+    head_slots: HashMap<u64, CacheSlot<CachedHeadSnapshot>>,
+    destination_heat: HashMap<u64, u64>,
+}
+
+struct CacheSlot<T> {
+    completed: Option<Arc<T>>,
+    running: Option<Arc<CacheJob<T>>>,
+}
+
+enum CacheJobState<T> {
+    Pending,
+    Complete(Arc<Result<Arc<T>, CacheBuildError>>),
+}
+
+struct CacheJob<T> {
+    state: tokio::sync::watch::Sender<CacheJobState<T>>,
+}
+```
+
+Key meaning, entry eligibility, covering-tier selection, and checks which must
+precede cache lookup belong to the
+[protocol cache contract](api-protocol.md#publication-scoped-head-response-cache--settled).
+After those checks, one short cache critical section applies the required slot
+operation atomically. A miss joins the running job or installs a `Pending` job
+and designates that caller as its only builder. Head selection may instead
+return an eligible completed covering entry while installing the required
+selected-tier or refresh job in another slot. The pending slot is installed
+before the builder performs cache-build target selection, build-input
+retention, extraction, serialization, or compression. This prevents a
+concurrent miss burst from duplicating preparation or encoding work. The
+builder releases the cache lock before every such operation and spawns one
+tracked orchestration task with a child of `ApiCancellation::cache_jobs`.
+
+A source-keyed delta job captures its immutable history-entry Arcs and fixed
+target. A Head snapshot tier job captures one immutable Frozen extraction.
+The mandatory tier-50 Prewarming job and later demand-triggered tier jobs use
+the same tracked scheduler and final response construction path. Every job
+holds only detached immutable inputs during JSON serialization and gzip and no
+image, history, or cache-state lock.
+
+Each waiter subscribes to the job's `watch` sender and selects terminal job
+completion against its own request cancellation token. Cancelling one request
+drops only that receiver and does not modify a waiter collection or cancel the
+shared job. The job may finish and populate its originating publication cache
+after its last current waiter disappears. Publication replacement likewise
+does not cancel a job holding captured immutable inputs or remaining waiters.
+
+On success, the job upgrades its `Weak<GraphCache>`, locks the cache, and
+verifies that the applicable running slot still points to that exact job. It
+then installs the shared completed `Arc`, clears the running slot, releases the
+lock, and publishes the same terminal result through `watch`. A Head-tier
+refresh atomically replaces only that tier. On failure or terminal
+cancellation, it clears the matching running slot while preserving any prior
+completed entry, releases the lock, and then publishes one shared result. Job
+completion uses `watch::Sender::send_replace`, so the terminal value is stored
+even if every current waiter has already detached. A later request may
+therefore retry without rejoining the failed job. If the originating cache can
+no longer be upgraded, the job skips insertion but still completes its
+existing receivers.
+
+The cache mutex protects only map operations, counter changes, and pointer
+identity checks. No guard may cross an `.await`, extraction, history capture,
+serialization, compression, response delivery, or waiter suspension. The
+custom slots are required because completed-value reuse, exact running-job
+identity, weak publication-local insertion, destination heat, and structural
+eviction form one cache protocol; a general-purpose cache would not replace
+that synchronization.
+
+The unpublished publication runtime consumes the result of its mandatory
+Prewarming job under the
 [publication lifecycle](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled);
 that job has no public request waiters.
 The publication owner defines job preservation and release of the old cache
