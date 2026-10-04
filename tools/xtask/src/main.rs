@@ -33,60 +33,33 @@ fn bundle(arguments: Vec<String>) -> Result<(), String> {
         None => rust_host(&workspace)?,
     };
 
-    run_command(
-        Command::new("npm")
-            .arg("ci")
-            .current_dir(workspace.join("web")),
-        "install Web dependencies",
-    )?;
-    run_command(
-        Command::new("npm")
-            .args(["run", "build"])
-            .current_dir(workspace.join("web")),
-        "build Web assets",
-    )?;
+    run_command(Command::new("npm").arg("ci").current_dir(workspace.join("web")), "install Web dependencies")?;
+    run_command(Command::new("npm").args(["run", "build"]).current_dir(workspace.join("web")), "build Web assets")?;
 
     let mut cargo = Command::new("cargo");
-    cargo
-        .args(["build", "--locked", "--package", "kgi", "--profile"])
-        .arg(&options.profile)
-        .current_dir(&workspace);
+    cargo.args(["build", "--locked", "--package", "kgi", "--profile"]).arg(&options.profile).current_dir(&workspace);
     if options.explicit_target {
         cargo.args(["--target", &target]);
     }
     run_command(&mut cargo, "build the KGI binary")?;
 
     let version = env!("CARGO_PKG_VERSION");
-    let final_directory = workspace
-        .join("dist")
-        .join(format!("kgi-{version}-{target}"));
-    let temporary_directory = workspace.join("dist").join(format!(
-        ".kgi-{version}-{target}.tmp-{}",
-        std::process::id()
-    ));
+    let final_directory = workspace.join("dist").join(format!("kgi-{version}-{target}"));
+    let temporary_directory = workspace.join("dist").join(format!(".kgi-{version}-{target}.tmp-{}", std::process::id()));
     if temporary_directory.exists() {
-        fs::remove_dir_all(&temporary_directory)
-            .map_err(|error| format!("remove stale bundle directory: {error}"))?;
+        fs::remove_dir_all(&temporary_directory).map_err(|error| format!("remove stale bundle directory: {error}"))?;
     }
 
-    let result = construct_bundle(
-        &workspace,
-        &temporary_directory,
-        &target,
-        &options.profile,
-        options.explicit_target,
-    );
+    let result = construct_bundle(&workspace, &temporary_directory, &target, &options.profile, options.explicit_target);
     if let Err(error) = result {
         let _ = fs::remove_dir_all(&temporary_directory);
         return Err(error);
     }
 
     if final_directory.exists() {
-        fs::remove_dir_all(&final_directory)
-            .map_err(|error| format!("remove previous complete bundle: {error}"))?;
+        fs::remove_dir_all(&final_directory).map_err(|error| format!("remove previous complete bundle: {error}"))?;
     }
-    fs::rename(&temporary_directory, &final_directory)
-        .map_err(|error| format!("publish bundle atomically: {error}"))?;
+    fs::rename(&temporary_directory, &final_directory).map_err(|error| format!("publish bundle atomically: {error}"))?;
     println!("created {}", final_directory.display());
     Ok(())
 }
@@ -100,10 +73,8 @@ fn construct_bundle(
 ) -> Result<(), String> {
     let binary_directory = temporary_directory.join("bin");
     let web_directory = temporary_directory.join("share/kgi/web");
-    fs::create_dir_all(&binary_directory)
-        .map_err(|error| format!("create bundle binary directory: {error}"))?;
-    copy_directory(&workspace.join("web/dist"), &web_directory)
-        .map_err(|error| format!("copy Web build: {error}"))?;
+    fs::create_dir_all(&binary_directory).map_err(|error| format!("create bundle binary directory: {error}"))?;
+    copy_directory(&workspace.join("web/dist"), &web_directory).map_err(|error| format!("copy Web build: {error}"))?;
 
     let profile_directory = if profile == "dev" { "debug" } else { profile };
     let mut binary_source = workspace.join("target");
@@ -113,47 +84,27 @@ fn construct_bundle(
     binary_source.push(profile_directory);
     binary_source.push(executable_name("kgi"));
 
-    fs::copy(
-        &binary_source,
-        binary_directory.join(executable_name("kgi")),
-    )
-    .map_err(|error| format!("copy {}: {error}", binary_source.display()))?;
-    fs::copy(
-        workspace.join("LICENSE"),
-        temporary_directory.join("LICENSE"),
-    )
-    .map_err(|error| format!("copy license: {error}"))?;
+    fs::copy(&binary_source, binary_directory.join(executable_name("kgi")))
+        .map_err(|error| format!("copy {}: {error}", binary_source.display()))?;
+    fs::copy(workspace.join("LICENSE"), temporary_directory.join("LICENSE")).map_err(|error| format!("copy license: {error}"))?;
 
-    let source_commit = command_output(
-        Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(workspace),
-        "read source commit",
-    )?;
+    let source_commit = command_output(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(workspace), "read source commit")?;
     let release = format!(
         "{{\n  \"version\": \"{}\",\n  \"source_commit\": \"{}\",\n  \"target\": \"{}\"\n}}\n",
         env!("CARGO_PKG_VERSION"),
         source_commit.trim(),
         target
     );
-    fs::write(temporary_directory.join("release.json"), release)
-        .map_err(|error| format!("write release provenance: {error}"))?;
+    fs::write(temporary_directory.join("release.json"), release).map_err(|error| format!("write release provenance: {error}"))?;
     Ok(())
 }
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("xtask must remain under tools/xtask")
-        .to_owned()
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().and_then(Path::parent).expect("xtask must remain under tools/xtask").to_owned()
 }
 
 fn rust_host(workspace: &Path) -> Result<String, String> {
-    let output = command_output(
-        Command::new("rustc").arg("-vV").current_dir(workspace),
-        "read Rust host target",
-    )?;
+    let output = command_output(Command::new("rustc").arg("-vV").current_dir(workspace), "read Rust host target")?;
     output
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
@@ -162,28 +113,16 @@ fn rust_host(workspace: &Path) -> Result<String, String> {
 }
 
 fn executable_name(name: &str) -> String {
-    if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_owned()
-    }
+    if cfg!(windows) { format!("{name}.exe") } else { name.to_owned() }
 }
 
 fn run_command(command: &mut Command, purpose: &str) -> Result<(), String> {
-    let status = command
-        .status()
-        .map_err(|error| format!("{purpose}: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{purpose}: command exited with {status}"))
-    }
+    let status = command.status().map_err(|error| format!("{purpose}: {error}"))?;
+    if status.success() { Ok(()) } else { Err(format!("{purpose}: command exited with {status}")) }
 }
 
 fn command_output(command: &mut Command, purpose: &str) -> Result<String, String> {
-    let output = command
-        .output()
-        .map_err(|error| format!("{purpose}: {error}"))?;
+    let output = command.output().map_err(|error| format!("{purpose}: {error}"))?;
     if !output.status.success() {
         return Err(format!("{purpose}: command exited with {}", output.status));
     }
@@ -228,20 +167,10 @@ impl BundleOptions {
                 _ => return Err(format!("unknown bundle argument `{argument}`")),
             }
         }
-        Ok(Self {
-            explicit_target: target.is_some(),
-            target,
-            profile,
-        })
+        Ok(Self { explicit_target: target.is_some(), target, profile })
     }
 }
 
-fn next_value(
-    arguments: &mut impl Iterator<Item = String>,
-    option: &str,
-) -> Result<String, String> {
-    arguments
-        .next()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("{option} requires a value"))
+fn next_value(arguments: &mut impl Iterator<Item = String>, option: &str) -> Result<String, String> {
+    arguments.next().filter(|value| !value.is_empty()).ok_or_else(|| format!("{option} requires a value"))
 }
