@@ -1,0 +1,895 @@
+# ApiService architecture
+
+## Scope and ownership
+
+This document owns the ApiService Supervisor-facing control surface, API
+database-generation binding, current-publication slot, reset and shutdown
+behavior, status aggregation, resource admission, bulkheads, saturation, and
+operational measurements, including API-owned task completion.
+[API graph publication](api-publication.md) owns publication construction and
+reconstruction. [The API protocol](api-protocol.md) owns HTTP, SSE, windows,
+cursors, public errors, and cache semantics.
+
+## Service shape — settled
+
+KGI v2 includes an in-process `ApiService` and a complete bounded-by-level
+head-tracking `GraphView`, rather than directing each head request to expensive
+PostgreSQL graph queries. The [system overview](overview.md#resource-isolation-and-scalability--settled)
+owns deployment evolution and the single-writer constraint.
+
+ApiService installs one reliable upward event path before starting any
+permanent worker:
+
+```rust
+enum ApiServiceEvent {
+    Failed(ApiServiceError),
+}
+```
+
+An unexpected `PublicationRuntime` worker or encoding-scheduler return or panic
+emits `Failed` exactly once. Expected completion after its owning shutdown
+signal emits no event. Cache jobs, HTTP handlers, and SSE connections use their
+request-local outcomes and never emit this event. Supervisor owns the Fatal
+reaction and event-path closure policy.
+
+## Reset and recovery-time availability — settled
+
+The following database binding, reset, and shutdown contracts form
+ApiService's recovery-time control boundary.
+
+## API database generation binding — settled
+
+ApiService owns one shared database state and gives a clone to each private
+`PublicationRuntime`. The state uses latest-value asynchronous delivery;
+`tokio::sync::watch` is the settled primitive:
+
+```rust
+enum ApiDbGenerationEvent {
+    Retired(Arc<ValidatedApiDbClient>),
+    Published(Arc<ValidatedApiDbClient>),
+}
+
+enum ApiDbSnapshot {
+    Running {
+        current: Option<Arc<ValidatedApiDbClient>>,
+        public_reads_enabled: bool,
+    },
+    Stopped,
+}
+
+struct ApiDbState {
+    tx: tokio::sync::watch::Sender<ApiDbSnapshot>,
+}
+
+impl ApiDbState {
+    async fn current(&self) -> Option<Arc<ValidatedApiDbClient>>;
+    fn public_read_client(&self) -> Option<Arc<ValidatedApiDbClient>>;
+    fn set_public_reads_enabled(&self, enabled: bool);
+}
+```
+
+It initializes with `Running { current: None, public_reads_enabled: true }`.
+`set_public_reads_enabled` is a private synchronous mutation used only by
+ApiService's reset and publication-installation transitions while they hold the
+publication-install boundary. It updates a `Running` snapshot without changing
+`current` and cannot change `Stopped`.
+StorageService owns generation retirement and autonomous replacement under the
+[storage lifecycle](storage.md#storageservice-lifecycle--settled). Supervisor
+maps StorageService's ordered API-generation variants to
+`ApiDbGenerationEvent` and forwards them through the control method below.
+ApiService never calls StorageService, requests reacquisition, or emits a
+generation-loss event.
+
+`Published(client)` sets `current = Some(client)` only for the valid published
+handle. `Retired(lost)` clears `current` only when it still holds that exact
+`Arc`; a late retirement for an older generation cannot clear a newer binding.
+Repeating either event for the same `Arc` is idempotent. Each accepted event
+publishes the resulting complete snapshot. The reliable Supervisor call
+returns after this local state transition has completed.
+
+`public_read_client()` is an immediate snapshot read. It returns a clone only
+when the state is `Running`, public reads are enabled, a current client exists,
+and that client's storage-owned `is_valid()` state is true. It otherwise
+returns `None`, which rejects database-backed request admission under the
+[API protocol](api-protocol.md#anchored-graph-windows--settled). A request that
+obtains a client performs its complete database phase against that exact
+generation without holding an ApiDbState lock, switching generations, or
+retrying transparently. A complete projection detached before a concurrent
+state change may still finish delivery under the storage-owned replacement
+gate.
+
+`current().await` is the construction-side accessor. It ignores the public-read
+gate and waits without a local timeout until a complete snapshot contains a
+current client whose storage-owned `is_valid()` state is true. It returns
+`Some(client)` for that exact generation and returns `None` only after the
+state becomes `Stopped`. Pending construction is therefore woken by a
+published replacement or service shutdown without an exposed subscription or
+separate wakeup API.
+
+If a public or construction operation returns `GenerationLost`, the exact
+client is already terminally invalid under the
+[storage-owned validity contract](storage.md#storageservice-lifecycle--settled).
+The public request fails under the public API mapping. Construction invokes
+the publication-owned
+[`restart_construction()`](api-publication.md#universal-api-reconstruction--settled),
+whose next seed awaits a valid current client. Neither path clears ApiDbState;
+the ordered forwarded `Retired` event performs exact-Arc housekeeping and
+wakes watchers. StorageService has already started autonomous reacquisition.
+For a construction seed attempt, `QueryFailed` and
+`InconsistentProjection` both abandon that attempt and invoke reconstruction
+without changing ApiDbState.
+
+For a public operation, `QueryFailed` and `InconsistentProjection` leave
+`ApiDbState` unchanged. Normal anchor-unavailability and invalid-request
+outcomes likewise do not enter generation-loss handling. `GenerationLost`
+also changes no snapshot directly: invalidity makes the exact client
+immediately unusable, and the ordered generation event owns its removal.
+
+Generation events by themselves change no graph publication ID, state, view
+revision, history, or SSE cursor and do not invoke processing Resync or Rebuild.
+An Active graph publication therefore remains usable while database-backed
+reads are temporarily unavailable.
+
+## Reset control and recovery effects — settled
+
+`reset` is the sole out-of-band ApiService session-supersession operation
+because it replaces the graph-update input topology.
+Supervisor owns `Arc<ApiService>` and uses this public control surface:
+
+```rust
+impl ApiService {
+    async fn update_api_db_generation(
+        &self,
+        event: ApiDbGenerationEvent,
+    ) -> Result<(), ApiServiceError>;
+
+    async fn reset(
+        &self,
+        graph_updates: GraphUpdateReceiver,
+        recovery_mode: RecoveryMode,
+    ) -> Result<(), ApiServiceError>;
+
+    async fn shutdown(&self) -> Result<(), ApiServiceError>;
+}
+```
+
+The methods are ApiService's complete Supervisor-facing control interface.
+Supervisor calls them directly on `Arc<ApiService>`; there is no separate
+Supervisor-facing command handle or command mailbox. Successful
+`update_api_db_generation` returns after the local idempotent binding
+transition is complete. Successful `reset` means the new runtime is installed
+and its predecessor, if any, completed shutdown. It does not wait for graph
+construction, alignment, prewarming, publication installation, or processing
+progress.
+Successful `shutdown` means ApiService completed the shutdown barrier. An
+unavailable component returns `ApiServiceError` under the
+`Ownership(ManagedComponentUnavailable)` parent-to-child failure semantics
+owned by the
+[processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
+
+ApiService owns exactly one private runtime slot:
+
+```rust
+enum ApiRuntimeSlot {
+    AwaitReset,
+    Running(PublicationRuntime),
+    Stopped,
+}
+
+struct PublicationInstallState {
+    runtime_generation: u64,
+}
+
+enum PublicationInstallOutcome {
+    Installed,
+    Superseded,
+}
+
+struct ApiCancellation {
+    http: tokio_util::sync::CancellationToken,
+    sse: tokio_util::sync::CancellationToken,
+    cache_jobs: tokio_util::sync::CancellationToken,
+}
+
+struct ApiService {
+    runtime: tokio::sync::Mutex<ApiRuntimeSlot>,
+    publication_install:
+        Arc<std::sync::Mutex<PublicationInstallState>>,
+    api_db: Arc<ApiDbState>,
+    current_publication:
+        tokio::sync::watch::Sender<Option<Arc<GraphPublication>>>,
+    cancellation: ApiCancellation,
+    cache_jobs: tokio_util::task::TaskTracker,
+    encoding: EncodingScheduler,
+    // admission and request infrastructure
+}
+```
+
+`PublicationInstallState` initializes with generation zero before any runtime
+exists. The first accepted reset advances it before constructing generation
+one; every later accepted reset advances it exactly once.
+
+The three ApiService cancellation tokens are independent roots. There is no
+universal parent token whose cancellation could bypass the ordered shutdown
+barrier. Runtime replacement does not cancel any of them. The
+`PublicationRuntime` and `EncodingScheduler` retain their separately owned
+tokens because their lifetimes and completion barriers differ from HTTP, SSE,
+and shared cache work.
+
+`PublicationRuntime` is a directly owned private `kgi-api-core` value, never a
+public capability or model value. Its complete behavior belongs to the
+[publication owner](api-publication.md#publication-runtime--settled). The
+runtime lifecycle mutex serializes each complete `reset` and `shutdown` call;
+the two operations cannot exchange or stop runtimes concurrently. API
+database-generation updates do not take this mutex and remain independently
+serialized by ApiDbState. Once ApiDbState becomes `Stopped`, later generation
+updates are rejected.
+
+`reset` gives the fresh session receiver supplied under the
+[graph-update ingress contract](api-ingress.md) to a new runtime.
+`RecoveryMode` is the
+Resync/Rebuild value owned by the
+[processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
+
+ApiService accepts exactly one `reset` call for each processing attempt. Under
+the runtime lifecycle mutex it briefly enters the publication-install
+synchronization boundary, advances `runtime_generation` with checked
+arithmetic, and applies the recovery-mode-specific ApiDbState effect below.
+Failure to advance leaves the topology and database-read gate unchanged and
+fails `reset`. The new generation becomes authoritative before the successor
+runtime starts, so this transition immediately revokes every predecessor's
+publication-installation and database-read-gate authority.
+
+ApiService then starts a new runtime with the fresh receiver, the captured
+generation, and an `Arc<ApiDbState>` clone, exchanges that runtime into the
+slot, and awaits the old runtime's `shutdown()`, if any. Starting the new
+runtime before stopping the old one lets the new receiver drain immediately.
+Successful return is a runtime-replacement barrier, but is not a processing,
+publication-installation, or database-replacement barrier. The runtime slot
+contains at most one runtime; during this bounded overlap, `reset` additionally
+retains the exchanged predecessor only until its shutdown barrier completes.
+
+The current-publication slot is a latest-value asynchronous value initialized
+to `None`. `tokio::sync::watch` is the settled primitive. Each runtime receives
+a sender clone and its captured generation. It can request installation only
+through the ApiService-owned operation equivalent to:
+
+```rust
+impl ApiService {
+    fn install_publication(
+        &self,
+        runtime_generation: u64,
+        recovery_mode: RecoveryMode,
+        publication: Arc<GraphPublication>,
+    ) -> PublicationInstallOutcome {
+        let state = self.publication_install.lock().unwrap();
+        if state.runtime_generation != runtime_generation {
+            return PublicationInstallOutcome::Superseded;
+        }
+        self.current_publication.send_replace(Some(publication));
+        if recovery_mode == RecoveryMode::Rebuild {
+            self.api_db.set_public_reads_enabled(true);
+        }
+        PublicationInstallOutcome::Installed
+    }
+
+    fn current_publication(&self) -> Option<Arc<GraphPublication>> {
+        self.current_publication.borrow().clone()
+    }
+}
+```
+
+The generation check, complete-`Arc` replacement, and conditional Rebuild gate
+reopening are serialized against reset by the one publication-install
+boundary. A generation mismatch returns `Superseded` without changing either
+the slot or the gate. Installation never mutates a previous publication
+through the slot. A public operation reads and clones the slot once, retains
+that exact publication for its complete execution, and does not restart or
+rebind when another publication is installed. A concurrent replacement
+therefore affects later operations only. Publication replacement notification
+can observe the same watch value; no separate replacement signal or
+`arc-swap` dependency is required.
+
+A runtime never clears the slot. ApiService stores `None` only at initial
+construction and when terminal shutdown releases the current publication.
+
+`PublishPostSeal` and `Live` are graph-update-feed markers rather than
+out-of-band controls. They have no publication-completion acknowledgement. A
+later session's `reset` call is the only session-supersession mechanism visible
+to ApiService.
+
+Ordinary teardown may drop the session's last producer and close its receiver.
+The publication owner defines the runtime's quiescent reaction; closure is not
+a session-supersession control call.
+
+An ordinary Resync `reset` preserves both fields of `ApiDbState`. A Rebuild
+`reset` sets `public_reads_enabled = false` without clearing `current`; a
+repeated Rebuild reset has the same idempotent effect. During Rebuild, public
+database-backed request admission remains disabled in `PreSeal`, `Constructing`,
+`Aligning`, and `Prewarming`.
+
+Keeping `current` does not authorize a stale Rebuild read. StorageService
+retires the old generation before database replacement, and the replacement
+gate prevents that handle from successfully observing replaced contents. If a
+construction attempt reaches the retired handle before Supervisor forwards its
+`Retired` event, `GenerationLost` exposes its invalidity and invokes
+reconstruction. A `Published` replacement becomes immediately available to construction while
+the public-read gate remains disabled.
+
+On ordinary initialized startup, StorageService's initial `Published` event
+provides the first usable generation and the normal Resync reset preserves it.
+A coherent network-bound Empty database may likewise supply that generation;
+its valid anchored requests produce ordinary typed anchor-unavailability
+outcomes. If the initial Resync then leads to a distinct Rebuild run under the
+[processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled),
+that run's Rebuild reset disables public database reads as above.
+
+ApiService never rebinds an in-flight public request or seed attempt to a newly
+published API DB generation. Each operation finishes against its captured
+client or reports its actual failure. If `reset` processing lags behind storage
+replacement, exact-`Arc` retirement and publication updates still prevent a
+late old-generation event from clearing the replacement.
+
+StorageService, rather than `reset`, owns database-replacement exclusion. Its
+[replacement gate](storage.md#api-read-exclusion-during-database-replacement--settled)
+governs the API database phase. On the ApiService side, a request that already
+detached its complete in-memory projection may finish delivering the old
+coherent response; a request whose database phase the gate denies or cancels
+reports database-backed read unavailability to the public API. ApiService
+neither coordinates replacement nor waits for the remaining delivery of
+detached responses.
+
+After Rebuild, public database-backed reads reopen only when `Aligning` and
+`Prewarming` complete and the replacement publication becomes `Active`; that
+current-generation installation sets `public_reads_enabled = true` under the
+publication-install boundary. A superseded runtime cannot reopen the gate. If
+`current` is absent then, the graph
+publication is still installed and database-backed requests continue receiving an
+unavailable admission outcome until StorageService publishes another
+generation. Processing does not wait for that publication. An ordered Live
+marker changes the sticky target or the Active publication state without
+another database load or graph revision.
+
+The storage owner defines the `TRUNCATE`/MVCC safety requirement and detailed
+gate boundary. `reset` does not participate in that exclusion mechanism.
+
+## API task ownership and completion — settled
+
+ApiService tracks dynamic cache work with `tokio_util::task::TaskTracker` and
+owns one encoding scheduler. Fixed workers retain their own completion
+barriers; Axum owns handler execution, and ApiService proves handler completion
+through request guards rather than duplicate task handles.
+
+### Cache and encoding jobs
+
+ApiService owns the runtime synchronization inside the protocol-owned
+`GraphCache`. It uses a small custom publication-local cache rather than a
+general cache library:
+
+```rust
+struct GraphCache {
+    state: std::sync::Mutex<GraphCacheState>,
+}
+
+struct GraphCacheState {
+    delta_slots: HashMap<u64, CacheSlot<CachedDelta>>,
+    head_slots: HashMap<u64, CacheSlot<CachedHeadSnapshot>>,
+    destination_heat: HashMap<u64, u64>,
+}
+
+struct CacheSlot<T> {
+    completed: Option<Arc<T>>,
+    running: Option<Arc<CacheJob<T>>>,
+}
+
+enum CacheJobState<T> {
+    Pending,
+    Complete(Arc<Result<Arc<T>, CacheBuildError>>),
+}
+
+struct CacheJob<T> {
+    state: tokio::sync::watch::Sender<CacheJobState<T>>,
+}
+```
+
+Key meaning, entry eligibility, covering-tier selection, and checks which must
+precede cache lookup belong to the
+[protocol cache contract](api-protocol.md#publication-scoped-head-response-cache--settled).
+After those checks, one short cache critical section applies the required slot
+operation atomically. A miss joins the running job or installs a `Pending` job
+and designates that caller as its only builder. Head selection may instead
+return an eligible completed covering entry while installing the required
+selected-tier or refresh job in another slot. The pending slot is installed
+before the builder performs cache-build target selection, build-input
+retention, extraction, serialization, or compression. This prevents a
+concurrent miss burst from duplicating preparation or encoding work. The
+builder releases the cache lock before every such operation and spawns one
+tracked orchestration task with a child of `ApiCancellation::cache_jobs`.
+
+A source-keyed delta job captures its immutable history-entry Arcs and fixed
+target. A Head snapshot tier job captures one immutable Frozen extraction.
+The mandatory tier-50 Prewarming job and later demand-triggered tier jobs use
+the same tracked scheduler and final response construction path. Every job
+holds only detached immutable inputs during JSON serialization and gzip and no
+image, history, or cache-state lock.
+
+For a Head-tier job, successful encoding is one candidate attempt rather than
+terminal job completion. The orchestration task applies the protocol-owned
+completion-time eligibility check against the containing publication. A
+hard-aged candidate is dropped, while the same `CacheJob` stays `Pending` in
+the same running slot and captures and submits a newer Frozen attempt. It does
+not notify waiters or expose the discarded bytes. Only an eligible candidate
+continues into the success path below. This retry remains one tracked
+single-flight job; later requests join it rather than creating another capture
+or encoding task for that tier.
+
+Each waiter subscribes to the job's `watch` sender and selects terminal job
+completion against its own request cancellation token. Cancelling one request
+drops only that receiver and does not modify a waiter collection or cancel the
+shared job. The job may finish and populate its originating publication cache
+after its last current waiter disappears. Publication replacement likewise
+does not cancel a job holding captured immutable inputs or remaining waiters.
+
+On delta success or an eligible Head-tier success, the job upgrades its
+`Weak<GraphCache>`, locks the cache, and verifies that the applicable running
+slot still points to that exact job. It then installs the shared completed
+`Arc`, clears the running slot, releases the lock, and publishes the same
+terminal result through `watch`. A Head-tier refresh atomically replaces only
+that tier. On failure or terminal cancellation, it clears the matching running
+slot while preserving any prior completed entry, releases the lock, and then
+publishes one shared result. Job completion uses
+`watch::Sender::send_replace`, so the terminal value is stored even if every
+current waiter has already detached. A later request may therefore retry
+without rejoining the failed job. If the originating cache can no longer be
+upgraded, the job skips insertion but still completes its existing receivers.
+
+The cache mutex protects only map operations, counter changes, and pointer
+identity checks. No guard may cross an `.await`, extraction, history capture,
+serialization, compression, response delivery, or waiter suspension. The
+custom slots are required because completed-value reuse, exact running-job
+identity, weak publication-local insertion, destination heat, and structural
+eviction form one cache protocol; a general-purpose cache would not replace
+that synchronization.
+
+The unpublished publication runtime consumes the result of its mandatory
+Prewarming job under the
+[publication lifecycle](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled);
+that job has no public request waiters.
+The publication owner defines job preservation and release of the old cache
+and client registry across publication replacement.
+
+ApiService owns one scheduler with this semantic shape:
+
+```rust
+struct EncodingScheduler {
+    cancellation: tokio_util::sync::CancellationToken,
+    completion: EncodingSchedulerCompletion,
+    // bounded reservations, queued jobs, and active encoding permits
+}
+
+impl EncodingScheduler {
+    async fn shutdown(&self) -> Result<(), EncodingSchedulerError>;
+}
+```
+
+It owns every queued and active graph JSON serialization and gzip operation.
+Individual request and cache tasks never spawn untracked compression work.
+The scheduler enforces the existing total and historical limits and priority.
+A historical request reserves bounded queue capacity before database work,
+then submits the detached projection through that reservation after releasing
+all database resources.
+
+Scheduler shutdown rejects new reservations and submissions, cancels queued
+jobs, and completes their waiters with expected shutdown cancellation.
+Already running blocking serialization or compression cannot be interrupted
+safely; the bounded active jobs finish, their output is discarded, and the
+scheduler then completes.
+
+### Client wake registry and SSE mailbox
+
+ApiService implements each publication's protocol-owned client scheduling with
+one small synchronous registry and one ordered mailbox per SSE connection:
+
+```rust
+struct DeltaClientRegistry {
+    state: std::sync::Mutex<DeltaClientRegistryState>,
+}
+
+struct DeltaClientRegistryState {
+    publication_state: GraphPublicationState,
+    head_revision_id: u64,
+    clients: HashMap<u64, DeltaClientRegistration>,
+}
+
+struct DeltaClientRegistration {
+    wake_at_revision_id: u64,
+    wake_sent: bool,
+    mailbox: Weak<SseMailbox>,
+    disconnect: tokio_util::sync::CancellationToken,
+}
+
+struct SseMailbox {
+    state: std::sync::Mutex<SseMailboxState>,
+    ready: tokio::sync::Notify,
+}
+
+struct SseMailboxState {
+    closed: bool,
+    queue: VecDeque<SseMailboxItem>,
+}
+
+enum SseMailboxItem {
+    Required(SseMessage),
+    GraphWakeup(PublicationWakeupDto),
+}
+
+enum SseMessage {
+    ClientRegistration(ClientRegistrationDto),
+    PublicationWakeup(PublicationWakeupDto),
+    PublicationState(PublicationStateDto),
+}
+
+enum DeltaCompletionResult {
+    Accepted,
+    RegistrationMissing,
+}
+```
+
+The map key is the random `u64` whose wire encoding is owned by the
+[publication protocol](api-protocol.md#publication-wire-observation--settled).
+The registry's publication-wide Head revision is the latest revision already
+published in history. It closes the race between graph advancement and an HTTP
+response rearming a client and is not a per-client highest revision. Each SSE
+connection owns the strong `Arc<SseMailbox>`, while the registry retains only
+a weak reference and the connection-local cancellation token.
+
+Registry operations and mailbox mutation use only short synchronous critical
+sections. The sole lock order is registry then mailbox. The mailbox receiver
+takes only its mailbox lock, and disconnect cleanup takes only the registry
+lock. No lock guard crosses an `.await`. `Notify` is a readiness hint for the
+single receiver; the bounded queue remains the sole owner of message ordering
+and contents.
+
+Registration generates and collision-checks its random key while serialized
+by the registry, admits the complete protocol-owned initial message batch, and
+then inserts the registration. The initial schedule is already marked sent.
+Publication replacement removes the old registration and any still-queued
+ordinary wakeup for that old publication before performing the same operation
+against the replacement registry and mailbox. Required old messages already
+in the mailbox retain their order. Failure to admit a required batch installs
+no partial registration.
+
+A lifecycle notification records the new publication state, then attempts its
+required message against every registered mailbox in the same registry
+critical section. Registration racing before that operation receives the old
+initial state followed by the new message; registration racing after it
+receives the new state in its initial batch. Failed weak upgrades and clients
+whose mailbox rejects required admission are removed; their connection tokens
+are cancelled after releasing the locks.
+
+After history publishes a new graph revision, `advance_head` first records the
+revision and then linearly scans registrations. For an unsent boundary already
+reached, it queues the ordinary graph wakeup and marks it sent. For a sent
+schedule whose ordinary wakeup is still queued, it coalesces that item to the
+newer revision. A delta response completion acquires the registry once and
+looks up the supplied identifier. Absence returns `RegistrationMissing`
+without changing another registration. Presence applies the protocol-selected
+schedule action and returns `Accepted`; the final Stale-Head action validates
+the registration without installing a schedule. Rearming removes any
+still-queued ordinary wakeup, replaces the schedule, and compares its boundary
+with the registry's current Head before releasing the registry lock. If the new
+unsent boundary is already reached, it queues the wakeup immediately and marks
+it sent. The HTTP handler commits its successful response only after
+`Accepted`; `RegistrationMissing` maps to the protocol-owned
+`ClientRegistrationRequired` outcome. Head advancement before or after
+rearming therefore cannot lose the notification. An ordinary wakeup already
+taken by the SSE task cannot be withdrawn and may arrive after rearming; this
+is harmless under the protocol's non-exactly-once SSE contract.
+
+The scan is bounded by `MAX_SSE_CLIENTS`. With the initial 1,024-client limit,
+a direct scan avoids a second boundary index and its rearm, replacement, and
+disconnect maintenance. The registry creates no timer and no per-client task;
+the existing Axum SSE handler is the mailbox's only receiver. Mailbox admission,
+coalescing, required-batch atomicity, and slow-client behavior belong to the
+[public delivery contract](api-protocol.md#public-delivery-failures--settled).
+The mailbox queue never exceeds `SSE_CLIENT_BUFFER_CAPACITY`. Closing a mailbox
+rejects later admission and notifies its receiver; the receiver returns no
+further item after the closed queue has been drained.
+
+### HTTP requests and SSE connections
+
+Each admitted API request owns a private guard containing its applicable lane
+permit, service-cancellation observation, and completion notification:
+
+```rust
+struct ApiRequestGuard {
+    cancellation: tokio_util::sync::DropGuard,
+    // admission permit and completion registration
+}
+```
+
+Admission creates a unique child of `ApiCancellation::http` and places its
+drop guard in `ApiRequestGuard`. Cancelling that child affects only the
+request. Dropping the handler or response body cancels its remaining
+request-local work; a request-local timeout may cancel the same child without
+affecting another request. Database and other request-local futures observe
+that token where cancellation is applicable. A cache wait observes it only to
+detach that waiter: it never receives or cancels the shared job token.
+
+Axum executes the handler future. For a graph response, the response body
+retains the guard through complete delivery, delivery failure, client
+disconnect, delivery timeout, or shutdown cancellation. A request cancelled
+before response commitment returns the applicable unavailable result when
+possible; cancellation after commitment terminates the body or stream and
+never attempts a second response.
+
+Each accepted SSE connection owns an SSE admission guard, one bounded
+`SseMailbox`, its current publication-local identifier and registration, and a
+drop guard for a unique child of `ApiCancellation::sse`. It observes the
+current-publication watch. On replacement it performs the protocol-owned
+registration transition and ordered initial sequence without replacing or
+cancelling that token. Normal disconnect, connection-local failure, slow-client
+disconnection, or cancellation affects only that child and removes the current
+registration before releasing the guard. Mandatory-mailbox admission follows
+the protocol-owned slow-client rule and never blocks publication mutation or
+shutdown.
+
+Cancellation requests termination but does not prove cleanup. HTTP and SSE
+completion remains established by their guards, cache completion by
+`TaskTracker`, and runtime and encoding completion by their explicit shutdown
+barriers.
+
+## ApiService shutdown — settled
+
+`shutdown` is a reliable completed-barrier operation. It is terminal,
+idempotent, valid from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`,
+`Prewarming`, and `Active`, and is serialized with `reset` by the runtime
+lifecycle mutex.
+ApiService performs the local barrier in order:
+
+1. close public graph HTTP and status admission;
+2. publish `ApiDbSnapshot::Stopped`, waking pending construction and making
+   public database reads unavailable;
+3. take the installed runtime, if any, and await its publication-owned
+   `shutdown()` barrier, allowing its final `Stale` transition to propagate
+   through the normal ordered SSE path to currently registered clients;
+4. cancel `ApiCancellation::sse`, then
+   `ApiCancellation::http`, and wait for all SSE and request guards to be
+   released;
+5. close `cache_jobs` to new registration, cancel
+   `ApiCancellation::cache_jobs`, and cancel every unfinished cache job;
+6. signal encoding-scheduler shutdown and await both `cache_jobs.wait()` and
+   `EncodingScheduler::shutdown()`;
+7. replace the current-publication value with `None`, then release every API DB
+   permit, transaction, connection, validated client, pool handle, publication,
+   and cache reference; and
+8. set `ApiRuntimeSlot::Stopped` and complete the `shutdown` call.
+
+Shutdown waits for the final Stale state to enter each currently registered
+client's bounded SSE buffer, not for its network delivery. A client whose
+buffer cannot accept that mandatory notification is disconnected under the
+normal slow-client rule before the remaining connections are cancelled.
+
+Successful method completion proves that no API admission, task, graph-update
+receiver, or API database resource remains. A repeated `shutdown` returns
+success for the already completed state. Runtime-lifecycle serialization rejects
+`reset` once shutdown begins. Publishing `ApiDbSnapshot::Stopped` is the
+generation-update cutoff: an update linearized before that transition may
+complete and is then cleared by the transition, while a later update is
+rejected.
+ApiService adds no component-local timeout or escalation to this barrier; the
+Supervisor waiting policy belongs to the
+[processing lifecycle](processing-lifecycle.md#teardown-and-delivery-semantics--settled).
+
+Publication-state and graph effects of the awaited runtime barrier belong to
+the [publication runtime contract](api-publication.md#publication-runtime--settled).
+Public HTTP admission is already closed while the protocol-owned state message
+uses the still-open ordered SSE path. Releasing the graph-update receiver is
+the ApiService-side effect of this barrier; the resulting producer disposition
+belongs to the
+[processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
+
+## Status observation — settled
+
+ApiService receives the Supervisor, NodeService, StorageService, and processing
+observation sources under the
+[shared status-delivery contract](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
+and combines their latest values with the running executable's static version
+to construct the protocol-owned
+[`SystemStatus`](api-protocol.md#public-api-values--settled).
+
+The composition root wires these sources without creating a dependency from
+`kgi-api-core` to `kgi-node` or `kgi-processing`. Exact watch primitives remain
+an implementation choice. Reads do not wait for a cross-component barrier, so
+`SystemStatus` is eventually consistent and must never drive synchronization,
+recovery, command admission, or resource selection.
+
+`SystemStatus` lives in `kgi-api-model`; its component values live in
+`kgi-model` and retain their focused component owners. ApiService exposes the
+latest received `NodeServiceStatus` unchanged: `last_validated = None` makes
+network and node-version information unavailable, while `Some(value)` keeps
+that information present regardless of the accompanying node state.
+NodeService owns the value's lifecycle and current-versus-last meaning.
+ApiService does not call NodeService or persist this observation.
+
+## Resource isolation and saturation — settled
+
+ApiService uses mandatory bulkheads beneath the system-wide processing
+priority:
+
+- a capped read-only API database pool separate from processing database
+  capacity;
+- bounded HTTP concurrency, query duration, response bytes and serialization
+  CPU;
+- bounded SSE clients and per-client buffers;
+- level-scoped delta history, publication-scoped structurally bounded response
+  reuse, and bounded historical-read work;
+- a separate memory-only status admission lane, so graph saturation
+  cannot hide service state; and
+- distinct budgets for head delivery and historical database reads.
+
+The initial v2 limits are:
+
+```text
+MAX_HEAD_HTTP_REQUESTS = 64
+MAX_HISTORICAL_HTTP_REQUESTS = 8
+MAX_STATUS_HTTP_REQUESTS = 16
+
+API_DB_POOL_SIZE = 8
+MAX_PUBLIC_HISTORICAL_DB_READS = 6
+API_DB_QUERY_TIMEOUT = 30 seconds
+
+MAX_GRAPH_ENCODING_JOBS = 4
+MAX_QUEUED_GRAPH_ENCODING_JOBS = 32
+MAX_HISTORICAL_ENCODING_JOBS = 2
+GRAPH_ENCODING_QUEUE_TIMEOUT = 30 seconds
+
+GRAPH_HTTP_DELIVERY_TIMEOUT = 60 seconds
+
+MAX_SSE_CLIENTS = 1024
+SSE_CLIENT_BUFFER_CAPACITY = 8
+```
+
+The Head lane admits Head snapshots, canonical deltas, and Head-level lookups.
+The historical lane admits database-backed anchored windows. The independent
+status lane admits only the memory-only status operation. Admission is
+nonblocking; the [API protocol](api-protocol.md#common-http-outcomes--settled)
+owns the public saturation response.
+
+Public historical reads may occupy at most six of the eight API pool
+connections. The remaining pool capacity is available to publication
+construction, generation validation, and replacement work. ApiService applies
+the query timeout to the complete database phase. Timeout cancels that phase,
+releases its transaction, permit, and connection, and follows the existing
+request-local internal-failure path; it does not by itself retire the API
+database generation.
+
+The four active encoding jobs cover graph JSON serialization and gzip
+compression. Historical work may occupy at most two, preserving capacity for
+publication and Head work. A cache hit that already owns final gzip bytes uses
+no encoding job. A request joining an existing single-flight job consumes no
+additional queue entry or active job.
+
+ApiService has no independent response-memory semaphore or admission lane.
+The existing owners bound response memory at the points where it is allocated
+and retained:
+
+- an active encoding job owns its transient JSON and gzip buffers, so
+  `MAX_GRAPH_ENCODING_JOBS` bounds simultaneous encoding allocations;
+- `GraphCache` owns completed cached bodies, and delivery clones their shared
+  immutable `Bytes` rather than copying the body for each waiter;
+- a completed uncached historical body remains owned by its request under the
+  historical HTTP permit until delivery ends; and
+- a Head-level lookup remains owned by its request under the Head HTTP permit
+  and its protocol-owned cardinality bound.
+
+Every HTTP request keeps its applicable admission guard through response
+delivery. Pre-reserving a response's maximum possible size would strand most
+of that capacity, while acquiring memory admission after encoding would allow
+the allocation first and could then retain a completed body while waiting.
+Charging every cache waiter for the shared body would instead count one
+allocation many times, and a separate request-memory permit would not bound the
+publication cache. The owner-based model avoids those mismatches while keeping
+all allocations within already bounded work.
+
+`MAX_GRAPH_ENCODING_JOBS = 4` is the initial processing-protective concurrency
+limit. Cache reuse and source-keyed single-flight mean concurrent client count
+does not determine the number of encodes, and the historical sublimit leaves
+two active slots for publication and Head work. Increase this limit only from
+observed encoding queue latency, Head response latency, idle CPU capacity,
+processor commit latency, and active encoding memory measurements.
+
+The encoding queue holds at most 32 reserved or ready jobs in addition to the
+four active jobs. Publication construction and Head work rank ahead of
+historical work. A database-backed request reserves queue capacity before
+starting its database phase. Failure to reserve performs no database work and
+is admission saturation. Once reserved, the detached projection waits for an
+encoder without retaining any database resource. If it cannot begin within
+`GRAPH_ENCODING_QUEUE_TIMEOUT`, remove the job and report temporary service
+unavailability under the API protocol. Cancellation removes a queued job and
+releases its reservation.
+
+The delivery timeout begins only when a complete gzip graph response is ready.
+A client that cannot receive it within the limit loses that response and its
+HTTP admission and any request-owned body are released. A cached body remains
+owned by `GraphCache` independently of that waiter. SSE streams are exempt from
+this duration and use their bounded delivery behavior instead.
+
+The SSE client buffer capacity counts complete semantic messages. Numeric
+client and buffer limits do not weaken the protocol-owned coalescing, ordered
+registration and state delivery, or slow-client disconnect rules.
+
+API snapshot reload ranks above historical queries and below processing. On
+saturation, reject or degrade API work explicitly. HTTP, database,
+serialization, cache, and client saturation must not block processing,
+truncate a response or cache image presented as complete, or silently lose a
+graph update. Ordinary graph-update delivery and loss reporting follow the
+[graph-update ingress contract](api-ingress.md).
+
+Every historical database-backed HTTP request separates database work from
+response construction in this order:
+
+```text
+acquire HTTP admission
+    -> reserve bounded encoding-queue capacity
+    -> acquire API DB permit and connection
+    -> open one consistent read-only transaction
+    -> resolve the anchor and materialize the complete bounded projection
+    -> finish the transaction and release the connection and DB permit
+    -> use bounded serialization/compression capacity
+    -> deliver the response
+```
+
+Before serialization or network delivery begins, the request owns an in-memory
+projection that borrows no PostgreSQL transaction, connection, row stream,
+cursor, or API DB permit. A slow client may retain its HTTP admission and
+request-owned projection or completed body, but never database capacity.
+Serialization, compression, response-size, and client-delivery failures after
+that boundary are API-local and do not retire a database generation or request
+processing recovery. A connection-level failure during the database phase
+retains StorageService's
+[storage-generation failure classification](storage.md#storageservice-lifecycle--settled).
+
+Releasing database resources and detaching the complete projection ends the
+request's participation in StorageService's replacement gate. Response
+construction cannot issue follow-up database reads. `reset` need not wait for or
+cancel the remaining serialization and delivery work.
+
+If the complete Head depth required by the [graph model](api-graph.md) exceeds
+the graph-view memory allowance, first drop an optional older coherent image
+when useful. Otherwise mark Head temporarily unavailable and retry a complete
+reload. Never publish partial levels. Encoded delta reuse has no independent
+ApiService-owned resource rule beyond the structural bounds owned by the
+[API protocol](api-protocol.md#publication-scoped-head-response-cache--settled).
+Slow SSE clients follow the bounded coalescing and disconnect contract in the
+[API protocol](api-protocol.md#public-delivery-failures--settled).
+
+V2 exposes these operational measurements:
+
+- request count, latency, and response bytes by endpoint;
+- admission occupancy and rejection count for the Head, historical, and status
+  lanes;
+- active and rejected SSE clients, per-client buffer high-water marks, graph
+  wakeup coalescing, and slow-client disconnects;
+- encoded-response cache hits, misses, evictions, and coalesced identical
+  requests, including raw requested Head depth, selected Head tier, tier age,
+  larger-tier fallback, tier-job joins, construction and refresh duration,
+  construction failure, and hard-age prewarming retries;
+- destination concentration, request-source counts, cached segment length,
+  per-client revision wakeups, requests per catch-up, and size-limited
+  short-prefix frequency;
+- database pool and public-read permit occupancy, query duration, and query
+  timeouts;
+- encoding reservation, queue, and active-job occupancy, queue timeouts, and
+  encoding duration, together with active transient uncompressed and gzip
+  buffer bytes;
+- completed uncached delivery bytes and publication-cache encoded bytes;
+- response delivery duration and delivery timeouts;
+- delta-journal resets; and
+- BlockProcessor and VspcProcessor commit latency.
+
+The metrics export mechanism and labels remain deferred in the
+[decision register](../decisions/deferred.md).
+
+API traffic up to the settled rejection limits must not materially increase
+either processor's commit latency.
