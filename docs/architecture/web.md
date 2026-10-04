@@ -55,6 +55,13 @@ before admission, including that its first boundary equals
 and replays entries one at a time. It never assumes one response reaches the
 original target.
 
+For both Head replay and a locally filtered Fixed candidate, the Web stages the
+complete entry and commits it atomically under the sole
+[graph-owned delta phase order](api-graph.md#revision-and-history-advancement--settled).
+Filtering may omit mutations but does not reorder the retained semantic
+collections. JSON object-field order and collection iteration order never
+determine which value wins.
+
 Define the initial client replay bound:
 
 ```text

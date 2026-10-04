@@ -911,6 +911,13 @@ complete remaining queue. Cover equal entry timestamps, zero remaining server
 interval, an expired deadline, and a calculated zero delay with immediate
 replay. Each graph entry applies atomically.
 
+Replay an indivisible composed wire entry whose block upsert carries earlier
+membership and color values while that same hash also has final membership and
+color mutations. Under both ordinary Head replay and retained Fixed replay,
+apply the graph-owned phases once and require the visible block to end with
+both field-mutation target values. JSON field order and collection iteration
+must not alter the result.
+
 Permit at most one delta request in flight and ten admitted batches. A valid
 tenth batch is admitted in full, a partially consumed batch still counts, and
 further acquisition pauses without discarding the response or advancing from

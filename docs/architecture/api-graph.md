@@ -445,17 +445,27 @@ impl GraphHistory {
 `apply_delta` first rejects `Frozen`, then requires
 `current_revision_id == delta.from_revision_id`. It performs no target-level,
 level-prestate, or mutation-content validation. After those checks, it applies
-the complete delta atomically. Absolute block and edge changes maintain the
-derived edge counters; every `LevelChange.after` directly supplies the public
-level result; membership changes precede color changes so those field maps
-supersede projection values carried by an added block. A Head view then sets:
+the complete delta atomically in this canonical phase order:
+
+1. absolute block and edge changes, including derived edge-counter effects;
+2. level changes, where every `LevelChange.after` directly supplies the public
+   level result;
+3. VSPC-membership changes;
+4. color changes; and
+5. the applicable bounds, revision, and revision-timestamp advancement.
+
+This phase order governs the semantic collections of every original or
+composed delta, including a decoded public delta entry. Projection or filtering
+may omit mutations but cannot reorder the retained phases. Membership and
+color maps therefore supersede projection values carried by a block upsert in
+the same delta. In the final phase, a Head view sets:
 
 ```text
 high_level = delta.high_level
 low_level  = max(1, high_level - max_depth + 1)
 ```
 
-A Fixed view retains both nominal bounds. Every accepted view sets
+A Fixed view retains both nominal bounds. Every accepted view then sets
 `current_revision_id = delta.to_revision_id` and
 `current_revision_timestamp_us = delta.revision_timestamp_us`. An error leaves
 the complete view, revision, and timestamp unchanged. Direct application of a

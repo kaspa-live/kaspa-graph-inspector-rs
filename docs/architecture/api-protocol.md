@@ -456,6 +456,11 @@ A level mutation with `Some(value)` installs that complete resulting level
 value; `None` removes the level. Membership and color mutations install their
 complete resulting field values. `block_upserts` and `edge_upserts` contain
 the serialized `Some(value)` results from that entry's canonical change maps.
+The arrays remain unordered within their semantic collections, while applying
+the collections of one decoded entry follows the sole
+[graph-owned delta phase order](api-graph.md#revision-and-history-advancement--settled).
+JSON object-field order, array traversal, and hash-dictionary encounter order
+never define mutation precedence.
 For every entry independently, the serializer omits removal-valued block and
 edge changes and excludes hashes referenced only by those omitted values from
 the shared dictionary. It omits each canonical change's composition-only
