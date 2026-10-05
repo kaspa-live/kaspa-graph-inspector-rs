@@ -21,10 +21,11 @@ tranche begins; unresolved choices remain in the
   status observations; and
 - `vspc`: normalized and ready VSPC transition values.
 
-`lib.rs` re-exports the public value surface. A value remains in the module for
-its semantic concern even when another crate constructs it. These boundaries
-can split when a module gains independent behavior; crate ownership and the
-acyclic dependency graph remain unchanged.
+`lib.rs` exposes these as public modules without re-exporting their contents at
+the crate root. Consumers use qualified imports such as
+`kgi_model::lifecycle::RecoveryMode`, preserving the semantic concern in each
+type's path. These boundaries can split when a module gains independent
+behavior; crate ownership and the acyclic dependency graph remain unchanged.
 
 `kgi-api-ingress` starts with:
 
@@ -96,3 +97,12 @@ errors until command dispatch has selected the process result, and they must
 apply the architecture's secret-redaction requirements.
 
 Tests use direct typed matching rather than formatted-message matching.
+
+### Rust test runner
+
+Use `cargo nextest run --workspace --locked` for workspace unit and integration
+tests, following rusty-kaspa's test-runner split. Run
+`cargo test --doc --workspace --locked` separately because Nextest does not run
+rustdoc tests. Targeted development runs may narrow the package or test filter
+while retaining Nextest. No custom Nextest profile is added until a concrete
+test needs repository-specific retry, timeout, or grouping behavior.

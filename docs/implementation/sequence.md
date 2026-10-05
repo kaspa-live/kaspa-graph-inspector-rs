@@ -40,10 +40,10 @@ Execute it as these small, ordered changes:
    lifecycle-marker delivery. Exercise concurrent gate ordering, PreSeal
    suppression, full-channel gaps, closure, marker ordering, and wakeup
    coalescing with deterministic tests.
-4. Run formatting, workspace tests, Clippy with warnings denied, and the Web
-   build/test baseline. Update `status.md` with the durable choices and exact
-   completed scope, then submit this increment for review before adding worker
-   or API consumers.
+4. Run formatting, workspace unit and integration tests through Nextest,
+   Cargo doctests, Clippy with warnings denied, and the Web build/test baseline.
+   Update `status.md` with the durable choices and exact completed scope, then
+   submit this increment for review before adding worker or API consumers.
 
 After that increment, proceed in this order:
 

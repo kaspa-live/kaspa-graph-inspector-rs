@@ -15,10 +15,12 @@ bundle command are present. The retained KGI v1 browser source and replay
 fixtures have been imported from source commit
 `2ec895375f1161af1e57a58ed94db5977584d97d`; its Create React App build seam
 has been replaced by Vite and the imported source builds with the workspace's
-React 19 and TypeScript 7 toolchain. The crates remain behavior-free scaffolds;
-production service behavior, component tests, and database migrations have not
-started. Open architecture requirements continue to block only their dependent
-work.
+React 19 and TypeScript 7 toolchain. The shared `kgi-model` domain, lifecycle,
+fault, status, VSPC, and committed graph-update values are implemented against
+the selected rusty-kaspa `v2.0.1` value crates. The remaining crates are still
+behavior-free scaffolds; production service behavior and database migrations
+have not started. Open architecture requirements continue to block only their
+dependent work.
 
 The imported browser still uses the v1 graph data source, models, and update
 behavior, so it is not yet compatible with the v2 HTTP, SSE, publication, and
@@ -32,11 +34,12 @@ and [mandatory gzip delivery path](../architecture/api-protocol.md#graph-http-co
 are settled. Exact gzip quality remains deferred; optional later binary-format
 benchmarking does not block implementation.
 
-The first production tranche is ready to implement. Its initial module
+The first production tranche is in progress. Its initial module
 boundaries, upstream value-crate pin, graph-update channel and gap primitives,
 and error conventions are recorded in
 [implementation choices](choices.md#5-october-2026-shared-model-and-graph-update-ingress).
-No production behavior has been added yet.
+The shared model portion is complete; the session-scoped graph-update ingress
+is next.
 
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.
