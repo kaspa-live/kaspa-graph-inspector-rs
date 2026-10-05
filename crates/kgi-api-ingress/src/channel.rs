@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+};
 
 use kgi_model::graph_update::{BlockCommitted, GraphUpdate, VspcCommitted};
 use thiserror::Error;
@@ -87,14 +90,15 @@ impl GraphUpdateIngressMetrics {
         Self { inner: Arc::new(Mutex::new(GraphUpdateIngressMetricsInner::default())) }
     }
 
-    fn enqueued(&self) -> bool {
+    fn send_reserved(&self, permit: mpsc::Permit<'_, GraphUpdate>, update: GraphUpdate) -> Result<(), GraphUpdateProducerError> {
         let mut inner = self.inner.lock().expect("graph-update metrics mutex poisoned");
         if inner.receiver_closed {
-            return false;
+            return Err(GraphUpdateProducerError::ReceiverClosed);
         }
 
         Self::record_enqueue(&mut inner);
-        true
+        permit.send(update);
+        Ok(())
     }
 
     fn try_send(&self, tx: &mpsc::Sender<GraphUpdate>, update: GraphUpdate) -> Result<(), GraphUpdateTrySendError> {
@@ -129,16 +133,18 @@ impl GraphUpdateIngressMetrics {
         Some(generation)
     }
 
-    fn receiver_closed(&self) {
+    fn close_receiver(&self, rx: &mut mpsc::Receiver<GraphUpdate>) {
         let mut inner = self.inner.lock().expect("graph-update metrics mutex poisoned");
+        rx.close();
         if !inner.receiver_closed {
             inner.receiver_closed = true;
             inner.receiver_closure_count = inner.receiver_closure_count.checked_add(1).expect("receiver-closure count overflow");
         }
     }
 
-    fn receiver_dropped(&self) {
+    fn drop_receiver(&self, rx: &mut mpsc::Receiver<GraphUpdate>) {
         let mut inner = self.inner.lock().expect("graph-update metrics mutex poisoned");
+        rx.close();
         if !inner.receiver_closed {
             inner.receiver_closed = true;
             inner.receiver_closure_count = inner.receiver_closure_count.checked_add(1).expect("receiver-closure count overflow");
@@ -250,17 +256,21 @@ impl GraphUpdateProducer {
     ///
     /// Panics when the shared producer gate is not open.
     pub async fn publish_live(&self) -> Result<(), GraphUpdateProducerError> {
+        self.publish_live_after_reservation(std::future::ready(())).await
+    }
+
+    async fn publish_live_after_reservation<F>(&self, after_reservation: F) -> Result<(), GraphUpdateProducerError>
+    where
+        F: Future<Output = ()>,
+    {
         {
             let state = self.gate.state.lock().expect("graph-update gate mutex poisoned");
             assert_eq!(*state, GraphUpdateGateState::Open, "Live requires an open graph-update gate");
         }
 
         let permit = self.tx.reserve().await.map_err(|_| GraphUpdateProducerError::ReceiverClosed)?;
-        if !self.metrics.enqueued() {
-            return Err(GraphUpdateProducerError::ReceiverClosed);
-        }
-        permit.send(GraphUpdate::Live);
-        Ok(())
+        after_reservation.await;
+        self.metrics.send_reserved(permit, GraphUpdate::Live)
     }
 
     #[must_use]
@@ -352,8 +362,7 @@ impl GraphUpdateReceiver {
 
     /// Stops new producer delivery while retaining already queued updates.
     pub fn close(&mut self) {
-        self.rx.close();
-        self.metrics.receiver_closed();
+        self.metrics.close_receiver(&mut self.rx);
     }
 
     #[must_use]
@@ -364,8 +373,7 @@ impl GraphUpdateReceiver {
 
 impl Drop for GraphUpdateReceiver {
     fn drop(&mut self) {
-        self.rx.close();
-        self.metrics.receiver_dropped();
+        self.metrics.drop_receiver(&mut self.rx);
     }
 }
 
@@ -506,6 +514,35 @@ mod tests {
             assert!(matches!(receiver.recv_update().await, Some(GraphUpdate::VspcCommitted(_))));
         }
         assert_eq!(receiver.recv_update().await, Some(GraphUpdate::Live));
+    }
+
+    #[tokio::test]
+    async fn live_reports_receiver_closed_when_receiver_drops_after_reservation() {
+        let (producer, receiver) = graph_update_channel();
+        producer.publish_post_seal().expect("receiver is open");
+
+        let reserved = Arc::new(tokio::sync::Barrier::new(2));
+        let continue_send = Arc::new(tokio::sync::Barrier::new(2));
+        let producer_task = producer.clone();
+        let reserved_task = reserved.clone();
+        let continue_task = continue_send.clone();
+        let live = tokio::spawn(async move {
+            producer_task
+                .publish_live_after_reservation(async move {
+                    reserved_task.wait().await;
+                    continue_task.wait().await;
+                })
+                .await
+        });
+
+        reserved.wait().await;
+        drop(receiver);
+        continue_send.wait().await;
+
+        assert_eq!(live.await.expect("task joins"), Err(GraphUpdateProducerError::ReceiverClosed));
+        let metrics = producer.metrics();
+        assert_eq!(metrics.current_occupancy, 0);
+        assert_eq!(metrics.receiver_closure_count, 1);
     }
 
     #[tokio::test]
