@@ -32,5 +32,11 @@ and [mandatory gzip delivery path](../architecture/api-protocol.md#graph-http-co
 are settled. Exact gzip quality remains deferred; optional later binary-format
 benchmarking does not block implementation.
 
+The first production tranche is ready to implement. Its initial module
+boundaries, upstream value-crate pin, graph-update channel and gap primitives,
+and error conventions are recorded in
+[implementation choices](choices.md#5-october-2026-shared-model-and-graph-update-ingress).
+No production behavior has been added yet.
+
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.
