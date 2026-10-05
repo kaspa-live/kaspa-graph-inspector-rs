@@ -21,6 +21,7 @@ repository = "https://github.com/kaspa-live/kaspa-graph-inspector-rs"
 edition = "2024"
 
 [workspace.dependencies]
+kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
 kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
 kaspa-math = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
 thiserror = "2.0.18"

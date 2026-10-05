@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+kaspa-consensus-core.workspace = true
 kaspa-hashes.workspace = true
 kaspa-math.workspace = true
 thiserror.workspace = true

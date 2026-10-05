@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use kaspa_consensus_core::network::NetworkId;
+
 /// Recovery strength. Ordering is not lifecycle or execution order.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum RecoveryMode {
@@ -138,6 +140,49 @@ pub struct SupervisorStatus {
     pub lifecycle: SupervisorLifecycle,
     pub desired_recovery: Option<RecoveryMode>,
     pub active_recovery: Option<RecoveryMode>,
+}
+
+/// Observable lifecycle state of the permanent node service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeServiceStatusState {
+    Connecting,
+    Ready,
+    Unavailable,
+    Rejected,
+    Stopped,
+}
+
+/// Identity and RPC metadata from a successfully validated node connection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedNodeStatus {
+    pub network_id: NetworkId,
+    pub server_version: String,
+    pub rpc_api_version: Option<u16>,
+    pub rpc_api_revision: Option<u16>,
+}
+
+/// Current node-service state and its latest successful validation metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeServiceStatus {
+    pub state: NodeServiceStatusState,
+    pub last_validated: Option<ValidatedNodeStatus>,
+}
+
+/// Observable lifecycle state of the permanent storage service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageServiceStatusState {
+    Connecting,
+    AwaitingInitialization,
+    Ready,
+    Unavailable,
+    Rejected,
+    Stopped,
+}
+
+/// Current storage-service observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StorageServiceStatus {
+    pub state: StorageServiceStatusState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

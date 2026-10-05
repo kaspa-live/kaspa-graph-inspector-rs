@@ -44,14 +44,18 @@ adapter is implemented.
 Use the following workspace dependency declarations for Kaspa value crates:
 
 ```toml
+kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
 kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
 kaspa-math = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
 ```
 
-`kgi-model::BlockHash` aliases
-`kaspa_hashes::Hash`; `kgi-model::BlueWork` aliases
+The component status values use
+`kaspa_consensus_core::network::NetworkId`;
+`kgi_model::block::BlockHash` aliases `kaspa_hashes::Hash`; and
+`kgi_model::block::BlueWork` aliases
 `kaspa_math::Uint192`. This keeps upstream representation and ordering while
-avoiding a dependency from `kgi-model` on consensus, RPC, or service crates.
+avoiding a dependency from `kgi-model` on consensus processing, RPC, or service
+crates.
 The committed Cargo lockfile records the resolved source commit. The upstream
 tag currently resolves to `cfafeb4c093fa37a303f1b9f19c58f986b870ce3`.
 
