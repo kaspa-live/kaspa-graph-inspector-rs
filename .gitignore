@@ -1,1 +1,15 @@
 docs/chats/
+
+# Rust
+/target/
+
+# Release bundles
+/dist/
+
+# Web
+/web/dist/
+/web/node_modules/
+/web/coverage/
+/web/playwright-report/
+/web/test-results/
+/web/*.tsbuildinfo

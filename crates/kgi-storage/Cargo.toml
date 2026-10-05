@@ -1,0 +1,13 @@
+[package]
+name = "kgi-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kgi-api-model = { path = "../kgi-api-model" }
+kgi-model = { path = "../kgi-model" }
+
+[lints]
+workspace = true

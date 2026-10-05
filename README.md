@@ -10,3 +10,31 @@ Decision status and remaining choices are tracked in
 rusty-kaspa issues found during KGI v2 development are tracked in the
 [local issue register](docs/rk-issues/README.md). These records are
 non-normative and have no KGI collaboration-role authority.
+
+## Development
+
+Check the Rust workspace with:
+
+```text
+cargo check --workspace --locked
+cargo nextest run --workspace --locked
+cargo test --doc --workspace --locked
+```
+
+Unit and integration tests use
+[`cargo-nextest`](https://nexte.st/). Cargo remains the doctest runner because
+Nextest does not execute rustdoc tests.
+
+The Web workspace uses the Node version recorded in `web/.nvmrc`:
+
+```text
+cd web
+npm ci
+npm run build
+```
+
+Build the portable application bundle with:
+
+```text
+cargo xtask bundle
+```

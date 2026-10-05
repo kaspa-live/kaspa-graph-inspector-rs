@@ -1,0 +1,15 @@
+[package]
+name = "kgi-api-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kgi-api-ingress = { path = "../kgi-api-ingress" }
+kgi-api-model = { path = "../kgi-api-model" }
+kgi-model = { path = "../kgi-model" }
+kgi-storage = { path = "../kgi-storage" }
+
+[lints]
+workspace = true

@@ -1,0 +1,34 @@
+[workspace]
+members = [
+    "crates/kgi",
+    "crates/kgi-api-core",
+    "crates/kgi-api-ingress",
+    "crates/kgi-api-model",
+    "crates/kgi-core",
+    "crates/kgi-model",
+    "crates/kgi-node",
+    "crates/kgi-processing",
+    "crates/kgi-storage",
+    "tools/xtask",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["kaspa-live developers"]
+license = "ISC"
+repository = "https://github.com/kaspa-live/kaspa-graph-inspector-rs"
+edition = "2024"
+
+[workspace.dependencies]
+kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
+kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
+kaspa-math = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
+thiserror = "2.0.18"
+tokio = { version = "1.42.1", features = ["macros", "rt", "sync", "time"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
