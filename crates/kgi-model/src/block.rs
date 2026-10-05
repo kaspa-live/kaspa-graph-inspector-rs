@@ -1,4 +1,5 @@
 use std::fmt;
+
 use thiserror::Error;
 
 /// Immutable Kaspa block identity.

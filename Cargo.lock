@@ -933,6 +933,8 @@ name = "kgi-api-ingress"
 version = "0.1.0"
 dependencies = [
  "kgi-model",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
-use crate::block::{BlockColor, BlockCoordinate, BlockHash, CompactId, Timestamp};
 use std::sync::Arc;
+
+use crate::block::{BlockColor, BlockCoordinate, BlockHash, CompactId, Timestamp};
 
 /// A committed direct-parent projection.
 #[derive(Clone, Debug, Eq, PartialEq)]

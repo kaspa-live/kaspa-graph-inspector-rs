@@ -1,4 +1,5 @@
 use std::sync::Arc;
+
 use crate::block::{BlockHash, CompactId, VspcPoint};
 
 /// Normalized hash-level VSPC transition.

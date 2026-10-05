@@ -17,10 +17,12 @@ fixtures have been imported from source commit
 has been replaced by Vite and the imported source builds with the workspace's
 React 19 and TypeScript 7 toolchain. The shared `kgi-model` domain, lifecycle,
 fault, status, VSPC, and committed graph-update values are implemented against
-the selected rusty-kaspa `v2.0.1` value crates. The remaining crates are still
-behavior-free scaffolds; production service behavior and database migrations
-have not started. Open architecture requirements continue to block only their
-dependent work.
+the selected rusty-kaspa `v2.0.1` value crates. The session-scoped graph-update
+ingress implements the shared pre-seal gate, nonblocking ordinary offers,
+lossless lifecycle markers, coalescing gap observation, and ingress metrics.
+The remaining crates are still behavior-free scaffolds; production service
+behavior and database migrations have not started. Open architecture
+requirements continue to block only their dependent work.
 
 The imported browser still uses the v1 graph data source, models, and update
 behavior, so it is not yet compatible with the v2 HTTP, SSE, publication, and
@@ -38,8 +40,9 @@ The first production tranche is in progress. Its initial module
 boundaries, upstream value-crate pin, graph-update channel and gap primitives,
 and error conventions are recorded in
 [implementation choices](choices.md#5-october-2026-shared-model-and-graph-update-ingress).
-The shared model portion is complete; the session-scoped graph-update ingress
-is next.
+The shared model and session-scoped graph-update ingress portions are complete.
+The next tranche can introduce processor-facing worker commands and the
+Supervisor-facing component interfaces that depend on these shared values.
 
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.

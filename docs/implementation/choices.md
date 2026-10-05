@@ -34,8 +34,10 @@ behavior; crate ownership and the acyclic dependency graph remain unchanged.
 - `gap`: the session-local coalescing continuity-generation reporter and
   consumer observation.
 
-The crate root re-exports the public capability surface. Operational counters
-stay next to the channel state until a common metrics adapter is implemented.
+`lib.rs` exposes these as public modules without re-exporting their contents at
+the crate root, matching `kgi-model`'s module-qualified import style.
+Operational counters stay next to the channel state until a common metrics
+adapter is implemented.
 
 ### Upstream value crates and revision
 
