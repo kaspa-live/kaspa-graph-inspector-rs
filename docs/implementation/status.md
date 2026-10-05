@@ -36,13 +36,16 @@ and [mandatory gzip delivery path](../architecture/api-protocol.md#graph-http-co
 are settled. Exact gzip quality remains deferred; optional later binary-format
 benchmarking does not block implementation.
 
-The first production tranche is in progress. Its initial module
+The first production tranche is complete through graph-update ingress commit
+`4ed0d2f`. Its initial module
 boundaries, upstream value-crate pin, graph-update channel and gap primitives,
 and error conventions are recorded in
 [implementation choices](choices.md#5-october-2026-shared-model-and-graph-update-ingress).
 The shared model and session-scoped graph-update ingress portions are complete.
-The next tranche can introduce processor-facing worker commands and the
-Supervisor-facing component interfaces that depend on these shared values.
+Workspace formatting, Cargo check, Nextest, doctests, and Clippy with warnings
+denied pass. The Web Vitest baseline passes with no test files present, and the
+Vite production build passes with its existing large-chunk warning. This
+increment is ready for review before worker or API consumers are added.
 
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.
