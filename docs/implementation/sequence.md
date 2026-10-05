@@ -15,6 +15,52 @@ production change.
 Open architecture requirements still block their dependent implementation;
 they do not reinstate a repository-wide implementation hold.
 
+## Immediate implementation tranche
+
+The first reviewable production increment is the shared model plus one complete
+session-scoped graph-update ingress. It establishes a real cross-crate contract
+used by processing and ApiService without depending on node connectivity,
+PostgreSQL, HTTP, or the imported Web application.
+
+Execute it as these small, ordered changes:
+
+1. Record only the deferred choices needed by this tranche: the initial
+   `kgi-model` and `kgi-api-ingress` module boundaries, the exact pinned
+   rusty-kaspa crates used for hash and work values, Tokio channel primitives,
+   the gap-generation/wakeup primitive, and error-library conventions. Keep
+   the PostgreSQL and replacement-gate choices for the first storage change.
+2. Implement the shared domain values and graph-update payloads in
+   `kgi-model`, including identity, coordinate, score-range, consensus-order,
+   VSPC, recovery/fault, status, and committed-update values required by the
+   ingress boundary. Add focused tests for value invariants and recovery-mode
+   ordering rather than tests that only mirror derives.
+3. Implement `kgi-api-ingress` as the complete bounded session capability:
+   channel construction, cloneable producer, single receiver, shared gate,
+   coalescing gap observation, ordinary nonblocking offers, and lossless
+   lifecycle-marker delivery. Exercise concurrent gate ordering, PreSeal
+   suppression, full-channel gaps, closure, marker ordering, and wakeup
+   coalescing with deterministic tests.
+4. Run formatting, workspace tests, Clippy with warnings denied, and the Web
+   build/test baseline. Update `status.md` with the durable choices and exact
+   completed scope, then submit this increment for review before adding worker
+   or API consumers.
+
+After that increment, proceed in this order:
+
+1. implement `kgi-core` configuration values and signal handling, then the
+   top-crate configuration resolver and command entry;
+2. implement NodeService normalization and validated-generation lifecycle
+   against the accepted pinned upstream evidence;
+3. select and record the PostgreSQL stack, then implement StorageService
+   bootstrap, schema lifecycle, ownership lock, and validated processing/API
+   generations; and
+4. continue with persistence transactions and workers under the sequence
+   below.
+
+The first tranche deliberately avoids placeholder service APIs and broad mock
+frameworks. Add a public component surface when its owning behavior is
+implemented and can be verified end to end at the narrowest useful level.
+
 ## Sequence after the gate
 
 | Step | Work and prerequisite | Completion evidence |
