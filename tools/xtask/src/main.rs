@@ -37,11 +37,15 @@ fn bundle(arguments: Vec<String>) -> Result<(), String> {
     run_command(Command::new("npm").args(["run", "build"]).current_dir(workspace.join("web")), "build Web assets")?;
 
     let mut cargo = Command::new("cargo");
-    cargo.args(["build", "--locked", "--package", "kgi", "--profile"]).arg(&options.profile).current_dir(&workspace);
+    cargo
+        .args(["build", "--locked", "--package", "kgi", "--profile"])
+        .arg(&options.profile)
+        .arg("--message-format=json-render-diagnostics")
+        .current_dir(&workspace);
     if options.explicit_target {
         cargo.args(["--target", &target]);
     }
-    run_command(&mut cargo, "build the KGI binary")?;
+    let binary_source = cargo_binary_output(&mut cargo)?;
 
     let version = env!("CARGO_PKG_VERSION");
     let final_directory = workspace.join("dist").join(format!("kgi-{version}-{target}"));
@@ -50,7 +54,7 @@ fn bundle(arguments: Vec<String>) -> Result<(), String> {
         fs::remove_dir_all(&temporary_directory).map_err(|error| format!("remove stale bundle directory: {error}"))?;
     }
 
-    let result = construct_bundle(&workspace, &temporary_directory, &target, &options.profile, options.explicit_target);
+    let result = construct_bundle(&workspace, &temporary_directory, &target, &binary_source);
     if let Err(error) = result {
         let _ = fs::remove_dir_all(&temporary_directory);
         return Err(error);
@@ -64,27 +68,16 @@ fn bundle(arguments: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-fn construct_bundle(
-    workspace: &Path,
-    temporary_directory: &Path,
-    target: &str,
-    profile: &str,
-    explicit_target: bool,
-) -> Result<(), String> {
+fn construct_bundle(workspace: &Path, temporary_directory: &Path, target: &str, binary_source: &Path) -> Result<(), String> {
     let binary_directory = temporary_directory.join("bin");
     let web_directory = temporary_directory.join("share/kgi/web");
     fs::create_dir_all(&binary_directory).map_err(|error| format!("create bundle binary directory: {error}"))?;
     copy_directory(&workspace.join("web/dist"), &web_directory).map_err(|error| format!("copy Web build: {error}"))?;
 
-    let profile_directory = if profile == "dev" { "debug" } else { profile };
-    let mut binary_source = workspace.join("target");
-    if explicit_target {
-        binary_source.push(target);
-    }
-    binary_source.push(profile_directory);
-    binary_source.push(executable_name("kgi"));
-
-    fs::copy(&binary_source, binary_directory.join(executable_name("kgi")))
+    let binary_name = binary_source
+        .file_name()
+        .ok_or_else(|| format!("Cargo reported an executable without a filename: {}", binary_source.display()))?;
+    fs::copy(binary_source, binary_directory.join(binary_name))
         .map_err(|error| format!("copy {}: {error}", binary_source.display()))?;
     fs::copy(workspace.join("LICENSE"), temporary_directory.join("LICENSE")).map_err(|error| format!("copy license: {error}"))?;
 
@@ -112,13 +105,47 @@ fn rust_host(workspace: &Path) -> Result<String, String> {
         .ok_or_else(|| "rustc did not report a host target".to_owned())
 }
 
-fn executable_name(name: &str) -> String {
-    if cfg!(windows) { format!("{name}.exe") } else { name.to_owned() }
-}
-
 fn run_command(command: &mut Command, purpose: &str) -> Result<(), String> {
     let status = command.status().map_err(|error| format!("{purpose}: {error}"))?;
     if status.success() { Ok(()) } else { Err(format!("{purpose}: command exited with {status}")) }
+}
+
+fn cargo_binary_output(command: &mut Command) -> Result<PathBuf, String> {
+    let output = command.output().map_err(|error| format!("build the KGI binary: {error}"))?;
+    let stdout = String::from_utf8(output.stdout).map_err(|error| format!("parse Cargo build output: {error}"))?;
+    let executable = kgi_executable_from_cargo_messages(&stdout)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("build the KGI binary: command exited with {}\n{}", output.status, stderr.trim()));
+    }
+
+    executable.ok_or_else(|| "Cargo completed without reporting the KGI binary artifact".to_owned())
+}
+
+fn kgi_executable_from_cargo_messages(messages: &str) -> Result<Option<PathBuf>, String> {
+    let mut executable = None;
+    for line in messages.lines().filter(|line| !line.is_empty()) {
+        let message: serde_json::Value = serde_json::from_str(line).map_err(|error| format!("parse Cargo build message: {error}"))?;
+
+        if message["reason"] == "compiler-message" {
+            if let Some(rendered) = message["message"]["rendered"].as_str() {
+                eprint!("{rendered}");
+            }
+            continue;
+        }
+
+        let is_kgi_binary = message["reason"] == "compiler-artifact"
+            && message["target"]["name"] == "kgi"
+            && message["target"]["kind"].as_array().is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"));
+        if is_kgi_binary {
+            let path = message["executable"]
+                .as_str()
+                .ok_or_else(|| "Cargo reported the KGI binary artifact without an executable path".to_owned())?;
+            executable = Some(PathBuf::from(path));
+        }
+    }
+    Ok(executable)
 }
 
 fn command_output(command: &mut Command, purpose: &str) -> Result<String, String> {
@@ -173,4 +200,32 @@ impl BundleOptions {
 
 fn next_value(arguments: &mut impl Iterator<Item = String>, option: &str) -> Result<String, String> {
     arguments.next().filter(|value| !value.is_empty()).ok_or_else(|| format!("{option} requires a value"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::kgi_executable_from_cargo_messages;
+
+    #[test]
+    fn uses_reported_test_profile_executable() {
+        let messages = concat!(
+            r#"{"reason":"compiler-artifact","target":{"name":"dependency","kind":["lib"]},"executable":null}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"kgi","kind":["bin"]},"executable":"/workspace/target/debug/kgi"}"#,
+        );
+
+        assert_eq!(kgi_executable_from_cargo_messages(messages), Ok(Some(PathBuf::from("/workspace/target/debug/kgi"))));
+    }
+
+    #[test]
+    fn preserves_target_executable_suffix() {
+        let messages = r#"{"reason":"compiler-artifact","target":{"name":"kgi","kind":["bin"]},"executable":"/workspace/target/x86_64-pc-windows-gnu/release/kgi.exe"}"#;
+
+        assert_eq!(
+            kgi_executable_from_cargo_messages(messages),
+            Ok(Some(PathBuf::from("/workspace/target/x86_64-pc-windows-gnu/release/kgi.exe")))
+        );
+    }
 }
