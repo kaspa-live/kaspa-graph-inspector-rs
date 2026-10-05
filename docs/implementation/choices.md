@@ -125,6 +125,13 @@ source-loading, and resolution dependencies belong to `kgi`, while
 adapter. Direct dependency versions shared with rusty-kaspa follow its pinned
 `v2.0.1` workspace where applicable.
 
+Retain the logging system from rusty-kaspa's `core/src/log` when process
+logging is implemented. `LoggingConfig.level` therefore carries that logger's
+root-or-subsystem filter expression, and its optional directory maps directly
+to file logging being enabled or disabled. Logger initialization remains a
+later top-crate startup step; the current configuration increment defines only
+the resolved values it will consume.
+
 Do not use clap's environment-variable integration. Capture the supported
 environment variables once into an explicit input and pass that input, the
 parsed CLI layer, and any parsed TOML layer to the resolver. This makes source

@@ -26,6 +26,7 @@ kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.
 kaspa-math = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
 thiserror = "2.0.18"
 tokio = { version = "1.42.1", features = ["macros", "rt", "sync", "time"] }
+url = "2.5.8"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
