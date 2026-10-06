@@ -102,6 +102,7 @@ pub enum OwnershipFault {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FaultKind {
     ServiceGenerationLost(ServiceKind),
+    RpcRequestFailed,
     SessionContinuityLost,
     NotificationInputInvalid(NotificationInputKind),
     RecoveryInputInvalid(RecoveryInputKind),

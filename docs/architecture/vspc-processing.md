@@ -278,10 +278,10 @@ definitive not-found:
     AttributionBlockUnavailable
 ```
 
-A malformed probe remains `MalformedGetBlock`. Transport, cancellation, or
-generation loss establishes no attribution and retains its existing typed node
-error. VspcProcessor reports the attribution result together with the candidate
-source, or reports that probe error unchanged. The
+A malformed probe remains `MalformedGetBlock`. `RpcRequestFailed`,
+cancellation, or generation loss establishes no attribution and retains its
+existing typed node error. VspcProcessor reports the attribution result
+together with the candidate source, or reports that probe error unchanged. The
 [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
 solely owns their retirement, retry-budget, and recovery-strength consequences.
 Definite readiness commits through

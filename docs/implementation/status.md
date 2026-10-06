@@ -64,6 +64,10 @@ test seams are recorded in
 the private raw-response normalizers for Genesis discovery, full blocks,
 recovery headers, pruning-point and Catchup samples, GetBlocks pages, and VSPC
 V2 responses. The normalizers preserve the minimized trusted-node boundary.
+The architecture-level GetBlock not-found representation blocker is resolved
+by the NodeService-owned
+[compatibility contract](../architecture/node-service.md#getblock-not-found-compatibility-classification)
+and the lifecycle-owned opaque RPC-failure disposition.
 Validated-generation RPC execution, notification routing, and the permanent
 NodeService lifecycle have not started.
 

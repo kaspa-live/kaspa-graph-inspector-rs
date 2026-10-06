@@ -93,10 +93,11 @@ public API.
 
 Library crates use explicit typed error enums derived with `thiserror::Error`.
 They do not return `anyhow::Error`, boxed dynamic errors, or select control flow
-from error strings. Component-local errors may retain concrete upstream
-sources; before an error crosses an ownership boundary it is classified into
-the shared typed fault vocabulary, with `Arc<str>` used only for diagnostic
-context.
+from error strings except for the single NodeService-owned
+[GetBlock compatibility adapter](../architecture/node-service.md#getblock-not-found-compatibility-classification).
+Component-local errors may retain concrete upstream sources; before an error
+crosses an ownership boundary it is classified into the shared typed fault
+vocabulary, with `Arc<str>` used only for diagnostic context.
 
 The top binary and `xtask` may use `anyhow` for command-boundary context where
 no caller branches on the error. They must still preserve typed component

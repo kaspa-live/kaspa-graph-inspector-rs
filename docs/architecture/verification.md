@@ -157,9 +157,9 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
    the exact RPC generation.
 3. Genesis discovery request construction with `low_hash = None`, blocks and
    transactions disabled, plus response handling for a nonempty hash vector,
-   either empty or nonempty ignored block vectors, transport failure, and an
-   empty hash vector. Given a valid response, NodeService uses its first hash
-   without substituting a local Genesis constant.
+   either empty or nonempty ignored block vectors, opaque RPC-call failure,
+   and an empty hash vector. Given a valid response, NodeService uses its first
+   hash without substituting a local Genesis constant.
 4. Consensus parameter resolution uses exact `NetworkId` parameters when
    supported. Mainnet emits no divergence warning. Every non-mainnet profile,
    including supported testnet and simnet, warns with the exact network,
@@ -210,12 +210,12 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
    [current pruning-point block contract](node-service.md#current-pruning-point-block)
    with success, canonical Genesis construction, non-Genesis selected-parent
    membership, every listed malformed response condition, exact-generation
-   retirement, and transport or generation loss without inferring a database
-   mismatch. A repeated response-network value is ignored. An exact-Genesis
-   response with a nonzero or out-of-range raw blue score still normalizes to
-   the domain-owned zero and may produce the zero boundary threshold. Supervisor
-   may already have completed a failed attempt's `reset` call; the next attempt
-   supersedes it with a fresh ingress.
+   retirement, and `RpcRequestFailed` or generation loss without inferring a
+   database mismatch. A repeated response-network value is ignored. An
+   exact-Genesis response with a nonzero or out-of-range raw blue score still
+   normalizes to the domain-owned zero and may produce the zero boundary
+   threshold. Supervisor may already have completed a failed attempt's `reset`
+   call; the next attempt supersedes it with a fresh ingress.
 10. Verify the
     [Catchup sink-sample contract](node-service.md#catchup-sink-sample) with
     ordinary and exact-Genesis success, ORIGIN, an advertised sink that is
@@ -226,12 +226,19 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
     `MalformedCatchupSinkResponse`, retires the exact RPC generation, and
     consumes the shared malformed-input budget.
     Cover an out-of-range DAA score without generation retirement or budget
-    consumption, transport and generation loss as session faults, and a
-    distinct cancellation outcome.
+    consumption, `RpcRequestFailed` and generation loss as session faults, and
+    a distinct cancellation outcome.
 11. Individual full-block GetBlock validates the requested hash and every
     `ValidatedNodeBlock` invariant. Malformed output retires the exact RPC
-    generation; definitive not-found and transport failure retain their
-    distinct classifications.
+    generation; definitive not-found and `RpcRequestFailed` retain their
+    distinct classifications. Exercise the NodeService-owned
+    [GetBlock compatibility classification](node-service.md#getblock-not-found-compatibility-classification):
+    the exact `RpcError::General` message produced for the requested hash yields
+    definitive not-found, while a different hash, changed case, leading or
+    trailing content, and unrelated general errors do not. Every nonmatch
+    becomes `RpcRequestFailed`, leaves the exact generation valid, and exposes
+    its message only as diagnostics. After this adapter, only its typed result
+    may select caller or lifecycle behavior.
 12. BlockAdded normalization failure disables routing, enqueues no block, and
     reports `NotificationInputInvalid(MalformedBlockAdded)` without retiring
     the RPC generation.
@@ -459,7 +466,7 @@ exact no-transactions GetBlock header. Cover:
   requiring Rebuild;
 - an absent or identity-only current node PP requiring Rebuild without
   retiring the valid RPC generation;
-- transport or session failure without inferring Rebuild; and
+- `RpcRequestFailed` or another session failure without inferring Rebuild; and
 - a response carrying the wrong trusted header hash or missing required header
   DAA score or blue work, plus an ordinary response missing blue score, as
   `MalformedGetBlock`, retiring the exact RPC generation without inferring
@@ -485,8 +492,8 @@ StorageService's API-read replacement gate, and passes that same
 `ValidatedNodeBlock` to `rebuild_from_pruning_point` rather than rediscovering
 it or mixing RPC generations. Its successful threshold and returned anchor populate the same
 `PreparedSync` and exact BlockProcessor Begin payload. Malformed pruning-point
-responses use the shared malformed-input budget; transport and generation loss
-retain their session-fault disposition.
+responses use the shared malformed-input budget; `RpcRequestFailed` and
+generation loss retain their session-fault disposition.
 
 Also cover a coherent Genesis-anchored database below anticone finalization
 depth, Empty-versus-Genesis discrimination, exact node/database
@@ -600,13 +607,15 @@ with injected clocks and deterministic jitter:
   source policy; a synthetic conflict on both sides records Rebuild, retires and
   counts the generation, while the notification form records Rebuild without
   retirement or malformed-budget consumption;
-- malformed, definitively absent, transport-failed, cancelled, and
+- malformed, definitively absent, `RpcRequestFailed`, cancelled, and
   generation-lost attribution probes retain their distinct dispositions; and
 - both `BoundedStateExhausted` variants atomically reject the triggering input,
   disable both notification streams, require Resync without weakening Rebuild,
   retire no RPC generation, consume no malformed-input budget, and proceed
   through complete session teardown; and
-- typed fault kinds, never diagnostics, drive policy and counters.
+- after the NodeService-owned GetBlock compatibility adapter has produced its
+  typed result, typed fault kinds rather than diagnostics drive policy and
+  counters.
 
 Exercise every row of the lifecycle-owned
 [ownership and session-channel disposition table](processing-lifecycle.md#supervisor-and-recovery-intent--settled),
