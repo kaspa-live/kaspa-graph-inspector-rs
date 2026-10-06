@@ -15,6 +15,27 @@ rewrite. `rusty-kaspa` is the node reference. Go KGI and
 `simply-kaspa-indexer` are behavioral references, not implementation
 templates.
 
+## Node trust boundary — settled
+
+KGI treats the configured node as an administratively trusted Kaspa consensus
+authority. It trusts the node to enforce Kaspa consensus and to supply the
+consensus-derived block, GhostDAG, VSPC, DAA, pruning-point, and sink values
+that KGI consumes. KGI does not independently recompute block hashes, GhostDAG,
+VSPC, DAA, pruning-point, sink, graph acyclicity, or other consensus results.
+
+RPC responses and notifications must still contain the fields required to
+construct KGI values and must satisfy the minimum structural, attribution,
+representability, cursor-progress, connection-generation, and sequencing
+conditions on which KGI's own processing, storage, API, and lifecycle
+invariants depend. Every such check must identify the KGI invariant it
+protects. An observable or inexpensive consistency check is not sufficient
+reason to enlarge the validation surface.
+
+The [NodeService contract](node-service.md) owns those concrete boundary
+operations. Storage and processing may validate their own database-relative
+and session-relative invariants; those checks do not turn either component
+into a second node-consensus validator.
+
 ## System shape — settled
 
 ```text

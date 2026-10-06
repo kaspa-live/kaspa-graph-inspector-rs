@@ -120,6 +120,9 @@ update between them.
 These pending structures share one bounded capacity. A single
 `HashMap<BlockHash, Vec<VspcChange>>` cannot represent multi-dependency
 readiness and ordered candidate selection.
+For one pending change, associate its pending ID at most once with each
+distinct missing hash even if the ordered VSPC vectors repeat that hash. Keep
+the original vectors unchanged on the pending change.
 Define:
 
 ```text
@@ -211,14 +214,15 @@ VspcProcessor maintains pending/history state, constructs `ReadyVspcChange`,
 and invokes the precise storage operations below. `BLOCK_READY` is established
 only by the destination history entry described above.
 
-An actionable reorg calls
-`ValidatedDbClient::resolve_materialized_ids(removed + added)` once. The
-ordered, cache-first result preserves input positions, including repeats, and
-distinguishes absent from boundary-identity members. The batch proves the
-semantic Materialized state for directly named chain members, but it does not
-supply the destination point or create the history entry required by
-`BLOCK_READY`. Added-only changes derive their source and member IDs from
-retained materialization history without that database read.
+An actionable reorg collects the distinct hashes from `removed + added` and
+calls `ValidatedDbClient::resolve_materialized_ids(distinct_hashes)` once. It
+maps those results back to every position in the unchanged ordered vectors when
+constructing `ReadyVspcChange`. The cache-first batch distinguishes absent from
+boundary-identity members and proves the semantic Materialized state for
+directly named chain members, but it does not supply the destination point or
+create the history entry required by `BLOCK_READY`. Added-only changes derive
+their source and member IDs from retained materialization history without that
+database read.
 
 Endpoint `VspcPoint` consensus order comes from `PersistedBlock` history. The
 database batch resolves member IDs; it does not derive endpoint order or load

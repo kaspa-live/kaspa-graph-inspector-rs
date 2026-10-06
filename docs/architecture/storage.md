@@ -941,7 +941,8 @@ committed `CompactId`.
 The parent payload contains actual direct parents only. For every non-Genesis
 block, `selected_parent_index` is `Some(index)`, the index is representable as
 `u32` and in bounds for `direct_parents`, and that entry is the block's selected
-parent. Its coordinate can be `None` at the outside-PP boundary. Genesis has an
+parent. Storage uses the first matching direct-parent position. Its coordinate
+can be `None` at the outside-PP boundary. Genesis has an
 empty `direct_parents` payload and `selected_parent_index = None`. Synthetic
 ORIGIN is Genesis's persisted selected-parent identity, but it is never inserted
 into `direct_parents` or emitted as a graph parent. The payload therefore
@@ -1072,21 +1073,17 @@ struct VspcPathConflict {
     expected_parent: BlockHash,
     stored_parent: BlockHash,
 }
-
-enum VspcMemberSetViolation {
-    DuplicateChainMember,
-    RemovedAddedIntersection,
-}
 ```
 
 Storage requires the supplied source to equal the currently committed sink.
-Every block directly named in `removed` or `added` must be materialized; the
-vectors contain no duplicates or intersection. As a defensive transaction
-check, a violation returns the typed
-`VspcMemberSetViolation(DuplicateChainMember)` or
-`VspcMemberSetViolation(RemovedAddedIntersection)` before mutation. Storage
-does not attribute that violation to an input source. Storage loads each added
-block's merge sets internally. Before mutation it also loads the persisted
+Every block directly named in `removed` or `added` must be materialized.
+Storage checks materiality and loads persisted relationship data once per
+distinct supplied `CompactId` while applying every original position in the
+ordered ID vectors. It performs no member-set rejection merely because a
+member repeats or appears in both vectors. The normal source, materiality, and
+selected-parent path checks still apply. For an admitted change, the ordered
+mutation rules below determine final state. Storage loads each added block's
+merge sets internally. Before mutation it also loads the persisted
 selected-parent identity for every directly named chain member and validates:
 
 ```text

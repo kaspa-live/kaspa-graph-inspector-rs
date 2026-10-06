@@ -167,8 +167,6 @@ enum Component {
 enum ServiceKind { Node, Storage }
 enum MalformedVspcNotificationReason {
     RemovedChainWithoutAddedPath,
-    DuplicateChainMember,
-    RemovedAddedIntersection,
     ResolvedSourceDiscontinuity,
     SelectedParentPathDiscontinuity,
     DuplicatePendingTransition,
@@ -182,9 +180,7 @@ enum NotificationInputKind {
 enum MalformedVspcResponseReason {
     RemovedChainWithoutAddedPath,
     NonAdvancingAddedCursor,
-    DuplicateChainMember,
-    RemovedAddedIntersection,
-    LowHashPathMismatch,
+    RemovedSourceMismatch,
     ResolvedSourceDiscontinuity,
     SelectedParentPathDiscontinuity,
 }
@@ -354,14 +350,6 @@ RPC generation: during active recovery it consumes the shared malformed-input
 budget, while in Live it requires Resync without consuming that recovery-only
 budget. Attribution transport, cancellation, or generation loss is a session
 fault and establishes neither candidate nor database blame.
-
-A defensive storage `VspcMemberSetViolation` maps by candidate source. For a
-synthetic candidate it becomes
-`RecoveryInputInvalid(MalformedVspcResponse(reason))`; for a notification it
-becomes `NotificationInputInvalid(MalformedVspcChange(reason))`. The reason is
-the corresponding `DuplicateChainMember` or `RemovedAddedIntersection`
-variant. Apply the same recovery-response or notification-source disposition
-defined above; storage does not decide it.
 
 When Supervisor still holds the same published RPC and processing DB
 generations, whole-attempt recovery retries use nominal
@@ -627,11 +615,10 @@ otherwise:
     checked(boundary_blue_score + anticone_finalization_depth)
 ```
 
-The Genesis branch consumes the zero-blue-score invariant already established
-by either NodeService's normalized block or StorageService's processing-valid
-database snapshot; it does not accept an arbitrary Genesis score. A malformed
-node Genesis is rejected before this function and therefore before database
-replacement.
+The Genesis branch consumes the domain-owned zero produced by NodeService's
+canonical Genesis normalization or held by StorageService's processing-valid
+database snapshot. It does not inspect a redundant node-reported Genesis blue
+score.
 
 The result must be at most the shared `MAX_BLUE_SCORE`. `Overflow` or
 `AboveMaximum` reports `ScoreOutOfRange(BoundarySealThreshold)` with Fatal

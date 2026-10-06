@@ -14,6 +14,7 @@ These proposals were considered and not accepted.
 | Derive a destination from a nonempty removed chain with an empty added path. | The malformed shape has no valid destination. | [VSPC processing](../architecture/vspc-processing.md) |
 | Admit a wholly empty `VirtualChainChanged` to VspcProcessor. | It is a valid transport no-op with no processor work. | [NodeService](../architecture/node-service.md) |
 | Enable local routing before both remote subscriptions start. | It does not close the remote subscription gap. | [NodeService](../architecture/node-service.md) |
+| Recompute or partially audit node consensus results at the RPC boundary. | The configured node is the trusted Kaspa consensus authority; checks without a KGI-owned invariant only enlarge the validation surface. | [Overview](../architecture/overview.md#node-trust-boundary--settled) |
 | Require zero unresolved orphans before Live. | Unrelated valid pending work need not block Live eligibility. | [Processing lifecycle](../architecture/processing-lifecycle.md) |
 | Add a VSPC coverage phase, freeze acknowledgement, checkpoint, or synthetic-stream terminal marker. | The existing phase transition requires none of them. | [Processing lifecycle](../architecture/processing-lifecycle.md), [VSPC processing](../architecture/vspc-processing.md) |
 | Escalate an arbitrary count of failed Resync attempts to Rebuild. | Recovery strength follows typed evidence. | [Processing lifecycle](../architecture/processing-lifecycle.md) |

@@ -39,8 +39,6 @@ pub enum ServiceKind {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MalformedVspcNotificationReason {
     RemovedChainWithoutAddedPath,
-    DuplicateChainMember,
-    RemovedAddedIntersection,
     ResolvedSourceDiscontinuity,
     SelectedParentPathDiscontinuity,
     DuplicatePendingTransition,
@@ -58,9 +56,7 @@ pub enum NotificationInputKind {
 pub enum MalformedVspcResponseReason {
     RemovedChainWithoutAddedPath,
     NonAdvancingAddedCursor,
-    DuplicateChainMember,
-    RemovedAddedIntersection,
-    LowHashPathMismatch,
+    RemovedSourceMismatch,
     ResolvedSourceDiscontinuity,
     SelectedParentPathDiscontinuity,
 }

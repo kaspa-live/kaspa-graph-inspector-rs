@@ -23,6 +23,10 @@ NodeService lifecycle worker
 
 `ValidatedRpcClient` represents exactly one validated physical connection
 lifetime. Processing code receives this capability, not `NodeService`.
+Its `Arc` identity is the generation identity; no separate generation number
+is required. A clone never resolves through NodeService to a newer connection.
+Every composite operation, runtime RPC, and subscription started through the
+handle remains bound to that physical generation.
 
 ```rust
 enum NodeServiceState {
@@ -83,6 +87,14 @@ first, and then emits `Rejected`. For an operation-detected generation failure,
 NodeService completes retirement and enqueues `RpcRetired` before returning the
 typed operation result to its caller. Events report lifecycle transitions;
 they do not initiate reconnection.
+
+Operation completion and retirement have one linearized result. An operation
+that completes while its exact generation remains valid may return that
+generation's result. If retirement wins first, the operation returns generation
+loss or cancellation and never retries or completes through a replacement.
+Retirement prevents new work through every clone. A fault or retirement report
+always names the exact `Arc`, so a late report from an older generation cannot
+retire or clear its replacement.
 
 `shutdown` is terminal and idempotent; successful completion means
 NodeService is `Stopped` and has released its owned connection resources.
@@ -337,10 +349,10 @@ KGI relies on `None` selecting the node's configured Genesis as the low hash
 and the first returned `block_hashes` member being that Genesis. The
 [PUAR](verification.md#current-puar-result) checks this upstream assumption
 against the reference revision. Validation requires a nonempty hash vector and
-an empty block vector, then copies the first hash into
-`ValidatedNodeInfo.genesis_hash`. Transport failure or malformed output fails
-that validation attempt; NodeService never guesses or substitutes a locally
-known Genesis hash.
+copies its first hash into `ValidatedNodeInfo.genesis_hash`. The block vector is
+unused and ignored. Transport failure or an empty hash vector fails that
+validation attempt; NodeService never guesses or substitutes a locally known
+Genesis hash.
 
 This discovery call is deliberately distinct from `get_blocks` normalization
 below. It neither constructs a synchronization page nor applies the explicit
@@ -372,18 +384,16 @@ Disabled | Enabled | Retired
   [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
   owns both dispositions.
 - Before attempting the bounded VSPC send, validate raw
-  VirtualChainChanged notification structure in this order:
+  VirtualChainChanged notification structure:
   1. Empty `removed` and empty `added` is the valid upstream no-op. Discard it;
      it consumes no channel capacity, earns no overlap credit, changes no
      committed state, and requests no recovery.
   2. Nonempty `removed` with empty `added` is
      `RemovedChainWithoutAddedPath`.
-  3. A repeated hash within either vector is `DuplicateChainMember`.
-  4. A hash present in both vectors is `RemovedAddedIntersection`.
 
-  For cases 2 through 4, enqueue nothing, disable both streams, and report
-  `NotificationInputInvalid(MalformedVspcChange(reason))`. This ordering makes
-  the reason stable when more than one defect is present. The
+  For case 2, enqueue nothing, disable both streams, and report
+  `NotificationInputInvalid(MalformedVspcChange(reason))`. This rejection makes
+  no attempt to derive a destination from an incomplete transition. The
   [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
   owns the typed fault's disposition.
 - Retired never routes again.
@@ -391,6 +401,10 @@ Disabled | Enabled | Retired
 The subscription state belongs to `ValidatedRpcClient` and cannot outlive its
 connection. The handle is clonable through `Arc` and protects notification
 state with a private mutex.
+The router preserves the node's ordered `removed` and `added` vectors without
+duplicate-member or removed/added-intersection validation. Those are trusted
+Kaspa path properties under the
+[node trust boundary](overview.md#node-trust-boundary--settled).
 
 Enable ordering:
 
@@ -424,6 +438,9 @@ replay dropped callbacks. The consequences for Live admission and a block that
 later becomes required belong to the
 [processing lifecycle](processing-lifecycle.md#recovery-scope-and-omitted-body-tips).
 Disabling is an immediate local cutoff, not a quiescence or transport fence.
+An item whose bounded enqueue linearized before retirement may remain in the
+old session's channel; processor gates and complete session teardown discard
+such old-session work before another generation is activated.
 
 The [PUAR](verification.md#current-puar-result) establishes that virtual
 processing can emit a fully empty VirtualChainChanged notification when
@@ -461,36 +478,58 @@ NodeService reports active and permit-waiting runtime RPC operations.
 #### Full-block normalization
 
 NodeService is the sole constructor of `ValidatedNodeBlock`. One common
-normalizer extracts the flattened fields and enforces the intrinsic validity
-contract owned by the
+normalizer extracts the flattened fields and enforces the construction contract
+owned by the
 [domain model](domain-model.md#shared-value-types--settled). Raw `RpcBlock`,
 optional verbose data, and an unvalidated shared-block wrapper never cross the
-NodeService boundary. Transactions are ignored.
+NodeService boundary.
 
-The common normalizer checks raw DAA and blue scores against the domain-owned
-`MAX_DAA_SCORE` and `MAX_BLUE_SCORE`. Apply the same checks to header-only node
-responses before their scores enter a `MaterializedSyncAnchor`, Catchup
-calculation, or other processing input. An excessive score returns the typed
-`ScoreOutOfRange(DaaScore)` or `ScoreOutOfRange(BlueScore)` result. It is not a
-malformed RPC shape and is never remapped to a source-specific malformed-input
-kind.
+For an ordinary non-Genesis block, the normalizer consumes the header's cached
+`hash`, level-zero `parents_by_level`, `timestamp`, `daa_score`, `blue_score`,
+and `blue_work`, plus verbose `selected_parent_hash`,
+`merge_set_blues_hashes`, and `merge_set_reds_hashes`. Verbose data is therefore
+mandatory for an ordinary `ValidatedNodeBlock`; absence returns the obtaining
+operation's source-specific malformed-input result. The selected-parent hash
+must occur in the level-zero direct-parent sequence.
+
+The cached header hash is authoritative block identity and is never
+recomputed. The normalizer does not require unique parents or merge-set
+members, reject self-reference, or compare redundant reported hashes. It
+preserves the node's parent and merge-set order.
 
 For the exact Genesis hash of the validated RPC generation, the normalizer
-also enforces the domain-owned zero-blue-score invariant. A nonzero value is an
-intrinsic block-validation failure rather than a range failure and therefore
-retains the obtaining operation's source-specific malformed-input
-classification.
+does not require verbose data. It copies the header hash, timestamp, DAA score,
+and blue work, then constructs the domain-owned representation with synthetic
+ORIGIN as selected parent, empty direct-parent and merge-set vectors, and blue
+score zero. It ignores equivalent raw relationship and blue-score fields
+rather than auditing the node's Genesis representation.
+
+Transactions, parents above level zero, verbose hash, difficulty, transaction
+IDs, `is_header_only`, verbose blue score, children hashes, and
+`is_chain_block` are unused and ignored. In particular, an unexpected
+transaction payload is not rejected merely because KGI requested
+`include_transactions = false`.
+
+The common normalizer checks every consumed DAA score and every consumed
+ordinary blue score against the domain-owned `MAX_DAA_SCORE` and
+`MAX_BLUE_SCORE`. Apply the same checks to header-only node responses before
+their scores enter a `MaterializedSyncAnchor`, Catchup calculation, or other
+processing input. Genesis blue score is the synthesized zero. An excessive
+score returns the typed `ScoreOutOfRange(DaaScore)` or
+`ScoreOutOfRange(BlueScore)` result. It is not a malformed RPC shape and is
+never remapped to a source-specific malformed-input kind.
 
 The normalizer copies the domain-owned informational `Timestamp` unchanged and
 performs no timestamp range validation. Storage owns its lossless `BIGINT`
 encoding.
 
-The operation that obtained a raw block additionally validates its contextual
-expected hash. Source-specific response classification remains outside the
-common normalizer for every other intrinsic failure: GetBlocks, individual
-GetBlock, current-pruning-point, Catchup sink-sample, and BlockAdded inputs
-retain their distinct fault classifications and lifecycle dispositions. The
-[processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
+The operation that obtained a raw block additionally compares the trusted
+header hash with any contextual requested or advertised identity on which
+response attribution depends. Source-specific response classification remains
+outside the common normalizer for every other construction failure: GetBlocks,
+individual GetBlock, current-pruning-point, Catchup sink-sample, and BlockAdded
+inputs retain their distinct fault classifications and lifecycle dispositions.
+The [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
 owns range-fault and malformed-input dispositions.
 
 #### Current pruning-point block
@@ -506,18 +545,20 @@ impl ValidatedRpcClient {
 }
 ```
 
-The operation calls `GetBlockDagInfo`, requires the response network to equal
-`ValidatedNodeInfo.network_id`, reads a non-ORIGIN `pruning_point_hash`, and
-then calls `GetBlock(pruning_point_hash, include_transactions = false)` on the
-same generation. The returned block hash must equal `pruning_point_hash`, and
-the result must pass common full-block normalization.
+The operation calls `GetBlockDagInfo`, reads a non-ORIGIN
+`pruning_point_hash`, and then calls
+`GetBlock(pruning_point_hash, include_transactions = false)` on the same
+generation. The returned trusted header hash must equal
+`pruning_point_hash`, and the result must pass common full-block
+normalization. A repeated network value in `GetBlockDagInfo` is ignored: the
+exact client already owns the network identity validated before publication.
 
 The [processing lifecycle](processing-lifecycle.md) owns when Resync and Rebuild
 invoke this operation and how they consume its normalized result.
 
-A mismatched response network, ORIGIN pruning-point hash, wrong returned block
-hash, definitive not-found for the advertised pruning point, or failure of
-common full-block normalization for a reason other than score range is
+An ORIGIN pruning-point hash, wrong returned trusted header hash, definitive
+not-found for the advertised pruning point, or failure of common full-block
+normalization for a reason other than score range is
 `RecoveryInputInvalid(MalformedPruningPointResponse)`. The exact validated RPC
 generation is retired and the shared malformed recovery-input policy applies.
 A transport failure, cancellation, or generation loss remains a session fault
@@ -543,10 +584,10 @@ impl ValidatedRpcClient {
 
 The operation calls `GetSink()`, rejects ORIGIN, then calls
 `GetBlock(sink_hash, include_transactions = false)` on the same generation.
-The immutable header must be present, its computed hash and every separately
-reported block hash must equal `sink_hash`, and its DAA score must be in the
-domain-owned representable range. The exact validated Genesis hash is a valid
-sink under the domain-owned Genesis rules.
+The immutable header must be present, its trusted cached hash must equal
+`sink_hash`, and its DAA score must be in the domain-owned representable range.
+No verbose data or redundant reported hash is consumed. The exact validated
+Genesis hash is a valid sink under the domain-owned Genesis rules.
 
 ORIGIN, definitive not-found for the just-advertised sink, missing or malformed
 header data, or a hash mismatch is
@@ -564,18 +605,23 @@ and refresh call ordering, marker replacement, and recovery reaction.
 
 `get_blocks(low_hash, include_blocks = true)` is normalized inside NodeService:
 
-- raw hash and block vectors must have equal length;
-- the raw response must be nonempty and start with `low_hash`;
-- hashes must match returned blocks;
-- duplicate hashes are invalid;
-- strip the inclusive `low_hash` entry;
+- ignore the parallel `block_hashes` vector;
+- require a nonempty block vector whose first trusted header hash is
+  `low_hash`;
+- strip that inclusive boundary block without normalizing its unused payload;
 - accept zero normalized blocks after stripping that entry;
 - normalize every remaining full block before returning any of them; and
-- return `Vec<ValidatedNodeBlock>`; a parallel hash vector is unnecessary.
+- preserve their node-provided order and return `Vec<ValidatedNodeBlock>`.
 
-Unequal vectors, an empty raw response, a first hash other than `low_hash`, a
-hash/block disagreement, any duplicate, or any member that fails common
-full-block normalization for a reason other than score range is
+For a nonempty normalized result, the final trusted header hash must differ
+from `low_hash`; that final hash is the pump's unambiguous candidate next
+cursor. An anchor-only response deliberately supplies no next cursor. KGI does
+not validate duplicate members, parent-before-child order, consensus order, or
+other graph topology in the page.
+
+An empty block vector, a first trusted header hash other than `low_hash`, a
+nonempty result whose final hash is `low_hash`, or any retained member that
+fails common full-block normalization for a reason other than score range is
 `RecoveryInputInvalid(MalformedGetBlocks)` when encountered by the recovery
 pump. Reject the complete page before advancing its cursor or sending any
 member to a processor. A valid anchor-only response that normalizes to zero
@@ -602,30 +648,35 @@ response violations precisely:
 
 ```text
 empty added with nonempty removed -> RemovedChainWithoutAddedPath
-duplicate within either vector    -> DuplicateChainMember
-hash present in both vectors      -> RemovedAddedIntersection
+nonempty removed whose first hash differs from low_hash
+                                  -> RemovedSourceMismatch
 added.last() equals low_hash      -> NonAdvancingAddedCursor
-removed.first() differs from low_hash, or low_hash occurs earlier in added
-                                  -> LowHashPathMismatch
 ```
 
 Apply the table in order so an input with more than one defect has one stable
 reason. Each is
 `RecoveryInputInvalid(MalformedVspcResponse(reason))` and follows the shared
 [malformed recovery-response policy](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
-Evaluate all of these hash-observable conditions before returning a normalized
-response. Internal selected-parent continuity is not observable from the RPC
-hash vectors; the
+Evaluate these framing conditions before returning a normalized response or
+advancing the provisional cursor. Preserve the original ordered vectors. KGI
+does not reject duplicate members, removed/added intersections, or another
+occurrence of `low_hash` inside `added`; those are trusted path properties
+under the [node trust boundary](overview.md#node-trust-boundary--settled).
+Internal selected-parent continuity is not observable from the RPC hash
+vectors; the
 [atomic VSPC transaction](storage.md#atomic-vspc-transaction--settled) owns its
 validation.
 
 #### Individual recovery GetBlock
 
 During Resync preparation, `GetBlock(sink_hash, false)` must return exactly the
-requested hash and the header data required to construct
-`MaterializedSyncAnchor`. A different hash or missing required GhostDAG header
-data is `RecoveryInputInvalid(MalformedGetBlock)`. A definitive not-found
-response and a returned DAA score that disagrees with committed storage remain
+requested trusted header hash and the header DAA score, blue work, and blue
+score required to construct `MaterializedSyncAnchor`. Storage supplies the
+materialized hash, ID, selected parent, and stored DAA score. This operation
+does not require verbose data, direct parents, merge sets, timestamp, or
+transactions. A different hash or missing required header data is
+`RecoveryInputInvalid(MalformedGetBlock)`. A definitive not-found response and
+a returned DAA score that disagrees with committed storage remain
 reconciliation evidence under the processing-lifecycle contract rather than
 malformed transport shapes.
 
@@ -645,8 +696,8 @@ impl ValidatedRpcClient {
 ```
 
 The operation calls `GetBlock(hash, include_transactions = false)`, requires
-the returned hash to equal `hash`, and applies common full-block normalization.
-A wrong hash or non-range intrinsic normalization failure is
+the returned trusted header hash to equal `hash`, and applies common full-block
+normalization. A wrong hash or non-range construction failure is
 `RecoveryInputInvalid(MalformedGetBlock)`. A definitive not-found result is
 reported separately so each caller can apply its source-specific contract.
 Transport, cancellation, and generation loss remain session faults. The

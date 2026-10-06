@@ -78,20 +78,26 @@ upstream `u64` values can never exceed them.
 
 `ValidatedNodeBlock` is the sole full-block value allowed to cross from
 NodeService into processing or storage. It is a flattened normalized value,
-not a wrapper around the raw RPC block. NodeService constructs it only after
-the raw header and verbose data supply every field above, all reported and
-computed hashes agree, direct parents are unique, and no direct-parent or
-merge-set reference contradictorily names the block itself. Only level-zero
-parents become `direct_parents`.
+not a wrapper around the raw RPC block. Its `hash` is the authoritative block
+identity carried downstream. Only level-zero parents become `direct_parents`.
 
 For an ordinary non-Genesis block, `selected_parent` must occur in
-`direct_parents`. The sole exception is the exact Genesis hash discovered for
-the validated RPC generation: Genesis has synthetic ORIGIN as selected parent
-and no actual direct parents, and its blue score is zero. Genesis has no
-special DAA-score constraint beyond the common representable range; a
-configured Genesis DAA score may be nonzero. Ordered merge-set vectors preserve
-node order. The type proves intrinsic node-block validity only; it makes no
-claim that any referenced hash is materialized in the current database.
+`direct_parents`; absence cannot produce KGI's later selected-parent index.
+Parent and merge-set vectors otherwise preserve node order without uniqueness,
+self-reference, or graph-validity checks.
+
+The sole membership exception is the exact Genesis hash discovered for the
+validated RPC generation. KGI gives Genesis its domain-owned canonical
+representation: synthetic ORIGIN as selected parent, empty direct-parent and
+merge-set vectors, and blue score zero. Genesis has no special DAA-score
+constraint beyond the common representable range; a configured Genesis DAA
+score may be nonzero.
+
+The type proves that every field KGI consumes is present and representable and
+that an ordinary selected parent can be encoded by index. Under the
+[node trust boundary](overview.md#node-trust-boundary--settled), it does not
+prove consensus correctness, uniqueness or acyclicity, and it makes no claim
+that any referenced hash is materialized in the current database.
 
 `BlockHash` is the immutable block identity. Every accepted representation of
 one hash denotes the same block and the same deterministic consensus metadata,
@@ -208,6 +214,9 @@ struct VspcChange {
 }
 ```
 
+Both vectors preserve node order, including repeated members. `VspcChange`
+does not assert uniqueness or disjointness.
+
 After endpoint and member resolution, VspcProcessor uses:
 
 ```rust
@@ -221,4 +230,6 @@ struct ReadyVspcChange {
 
 `destination` carries mandatory consensus order through `VspcPoint`.
 `ReadyVspcChange` contains the IDs and endpoint order required for readiness
-and sequencing. Storage loads added-block merge sets inside its transaction.
+and sequencing. Its ID vectors preserve the positions of the corresponding
+hash vectors, including repeats. Storage loads added-block merge sets inside
+its transaction.

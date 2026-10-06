@@ -9,6 +9,7 @@ mechanics.
 | Identity and materiality | Separate persistent identity, materiality, PP-boundary, and ORIGIN semantics. | [Domain model](../architecture/domain-model.md), [storage](../architecture/storage.md) |
 | Database lifecycle | Network-bound idempotent bootstrap and explicit database replacement. | [Storage](../architecture/storage.md) |
 | Node capability | Validated RPC generations and normalized node inputs. | [NodeService](../architecture/node-service.md) |
+| Node trust boundary | Treat the configured node as the Kaspa consensus authority and validate only the boundary conditions required by KGI-owned invariants. | [Overview](../architecture/overview.md#node-trust-boundary--settled) |
 | Block processing | Phase-aware block admission, materialization, and dependency recovery. | [Block processing](../architecture/block-processing.md), [storage](../architecture/storage.md) |
 | VSPC processing | Ordered readiness-gated VSPC processing and publication. | [VSPC processing](../architecture/vspc-processing.md) |
 | Recovery lifecycle | Explicit Resync/Rebuild coordination and overlap-based Live admission. | [Processing lifecycle](../architecture/processing-lifecycle.md) |
