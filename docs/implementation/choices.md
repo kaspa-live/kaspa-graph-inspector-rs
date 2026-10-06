@@ -177,3 +177,90 @@ termination in a subprocess so the test runner itself cannot exit.
 
 The public adapter shape and callback behavior remain owned by the
 [process termination contract](../architecture/overview.md#process-termination-signal-adapter--settled).
+
+## 6 October 2026: NodeService implementation foundation
+
+### Crate and module boundaries
+
+Start `kgi-node` with these public modules:
+
+- `consensus`: `KgiConsensusParams`, its typed validation errors, and the
+  startup-time local parameter resolver;
+- `error`: NodeService, validated-RPC, rejection, and operation error values;
+- `rpc`: `ValidatedRpcClient`, `ValidatedNodeInfo`, normalized response values,
+  and the public operations on one validated generation; and
+- `service`: `NodeService`, its state and ordered events, status observation,
+  construction, and lifecycle methods.
+
+Keep the upstream client adapter, raw-response normalization,
+`NotificationRouter`, service-loop commands, and timing utilities in private
+`client`, `normalization`, `notification`, `runtime`, and `timing` modules.
+Tests remain beside their owning module, with integration tests added only for
+cross-module generation and routing order. `lib.rs` exposes the public modules
+without wildcard re-exports, so consumers retain paths such as
+`kgi_node::rpc::ValidatedRpcClient` and `kgi_node::service::NodeService`.
+
+These are Rust placement choices only. The focused
+[NodeService architecture](../architecture/node-service.md) remains the owner
+of connection, generation, normalization, and notification behavior.
+
+### Upstream and support dependencies
+
+Use the `v2.1.0` `kaspa-grpc-client` in direct-notification mode as the physical
+client. Its production connector uses the constructor whose automatic
+reconnect argument is fixed to `false`; NodeService, rather than the upstream
+client, owns replacement generations. Use `kaspa-rpc-core` for RPC request,
+response, notification, and API compatibility values, `kaspa-notify` for the
+notification trait and scopes, `kaspa-consensus-core` for local parameter
+resolution, and `kaspa-core` for logging through the retained upstream logging
+facade. Raw upstream values do not leave `kgi-node`.
+
+Use `serde_json` only to decode the upstream `OverrideParams` representation,
+`url` for the already parsed endpoint, `thiserror` for typed errors,
+`async-trait` for private testable adapter traits, and `rand` for the production
+jitter source. Tokio supplies the worker, channels, status observation,
+completion barriers, timer implementation, and RPC permits. All rusty-kaspa
+crates use the same workspace tag and lockfile revision accepted by the
+[current PUAR](../architecture/verification.md#current-puar-result).
+
+### Lifecycle and generation primitives
+
+Run NodeService ownership in one Tokio task and serialize its state changes in
+that task. Use private unbounded Tokio MPSC channels for its low-rate reliable
+control queue and ordered `NodeServiceEvent` stream. Construction creates the
+event receiver before the task can start, preserving the installation boundary
+without exposing the command sender. Supervisor-facing async methods submit
+private commands and use Tokio one-shot completion barriers; callers never
+observe or depend on the mailbox representation.
+
+Publish `NodeServiceStatus` through a Tokio watch channel because status is a
+latest-value observation rather than a reliable lifecycle input. Keep the
+worker join handle under the service owner and make the completed shutdown
+result reusable by later callers.
+
+Each `ValidatedRpcClient` uses a private atomic admission flag and a Tokio
+semaphore for the focused-owner runtime RPC limit. An operation obtains its
+permit and then confirms generation admission before issuing an upstream call.
+Retirement closes admission before disconnecting the physical client. A
+private synchronous mutex protects the router and subscription state needed by
+rusty-kaspa's synchronous notification callback; no mutex guard crosses an
+await. Generation-ending reports travel to the owner loop with a one-shot
+barrier so ordered retirement is complete before the operation returns its
+typed result.
+
+### Deterministic test seams
+
+Define private object-safe `RpcConnector` and `RpcConnection` traits containing
+only the operations KGI consumes. The production adapters delegate to
+`kaspa-grpc-client` and `kaspa-rpc-core`; unit tests use scripted connections
+that return real upstream response value types. This avoids implementing the
+complete upstream RPC trait or duplicating a gRPC server while still testing
+KGI-owned request construction, normalization, retirement, and ordering.
+
+Inject a private object-safe clock and jitter source through NodeService's
+runtime dependencies. Production uses Tokio time and a mutex-protected
+`rand::rngs::SmallRng` seeded from system entropy. Tests use a manually
+advanced clock and a scripted jitter sequence, so reconnect slots, the Ready
+reset boundary, and shutdown cancellation contain no wall-clock sleeps or
+probabilistic assertions. Exact delays and reset behavior remain owned by the
+[NodeService lifecycle](../architecture/node-service.md#nodeservice--settled).

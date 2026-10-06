@@ -6,7 +6,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+kaspa-consensus-core.workspace = true
+kaspa-core.workspace = true
+kaspa-grpc-client.workspace = true
+kaspa-notify.workspace = true
+kaspa-rpc-core.workspace = true
 kgi-model = { path = "../kgi-model" }
+rand.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

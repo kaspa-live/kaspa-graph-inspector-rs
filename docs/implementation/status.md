@@ -54,5 +54,13 @@ third-signal forced exit. Process composition and dispatch remain pending, as
 does the Supervisor-owned installation that connects the signal adapter to the
 global shutdown lifecycle.
 
+The NodeService increment has completed its foundation point. The accepted
+rusty-kaspa `v2.1.0` PUAR and RPC API compatibility predicate are present, and
+the `kgi-node` module boundaries, direct dependencies, lifecycle primitives,
+and deterministic RPC, clock, and jitter test seams are recorded in
+[implementation choices](choices.md#6-october-2026-nodeservice-implementation-foundation).
+`kgi-node` remains behavior-free; consensus resolution, normalization, routing,
+and the validated-generation lifecycle have not started.
+
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.
