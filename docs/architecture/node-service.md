@@ -122,6 +122,38 @@ Validation requires:
 - node is not in IBD when the handle is published;
 - gRPC automatic reconnect is disabled.
 
+### RPC API compatibility
+
+NodeService derives its required RPC API pair from the same compiled
+`kaspa-rpc-core` dependency used by KGI:
+
+```rust
+use kaspa_rpc_core::api::ops::{RPC_API_REVISION, RPC_API_VERSION};
+
+fn is_rpc_api_compatible(remote_version: u16, remote_revision: u16) -> bool {
+    remote_version == RPC_API_VERSION && remote_revision >= RPC_API_REVISION
+}
+```
+
+The API version is an exact compatibility boundary: a lower or higher remote
+version is incompatible. Within that version, the revision is a
+backward-compatible capability floor. A node at KGI's compiled revision or a
+newer revision is compatible; an older revision may lack behavior required by
+KGI and is incompatible. This follows the upstream distinction between an API
+version change, which requires connection refusal, and a revision change,
+which denotes a backward-compatible extension. KGI does not duplicate either
+constant as a local literal.
+
+Both remote values are mandatory inputs from the completed server-information
+response. If either value is absent or cannot be represented, validation
+rejects the connection as an incompatible RPC API. A transport or generation
+failure before a complete response remains a transient validation-RPC failure
+and does not invent observed values. Every incompatible result enters the
+terminal `Rejected` state, publishes no `ValidatedRpcClient`, and records the
+required and observed pair in diagnostic context. Successful validation stores
+and exposes the observed remote values rather than substituting KGI's local
+constants.
+
 Legacy Go kaspad notification semantics are deliberately unsupported.
 
 `ValidatedNodeInfo` copies only KGI-relevant values rather than retaining the

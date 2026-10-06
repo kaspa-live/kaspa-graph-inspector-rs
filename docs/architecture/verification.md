@@ -239,6 +239,14 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
     GetBlocks, current-pruning-point, Catchup sink-sample, and individual
     GetBlock sources. A full block timestamp of `u64::MAX` passes normalization
     unchanged and produces no timestamp-specific fault.
+16. RPC API compatibility uses the `RPC_API_VERSION` and `RPC_API_REVISION`
+    constants from KGI's compiled `kaspa-rpc-core`. Accept an exact version
+    with an equal or greater remote revision. Reject lower and higher versions,
+    an exact version with a lower revision, and a completed response missing
+    either value. Every rejection is terminal, publishes no validated RPC
+    generation, and reports the required and observed pair. A transport or
+    generation failure before the complete response remains transient and does
+    not enter terminal rejection.
 
 Use injected clocks and deterministic jitter to verify the independent
 [NodeService](node-service.md#nodeservice--settled) and
