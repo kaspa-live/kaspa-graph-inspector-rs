@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 5 October 2026.
+Updated 6 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -27,9 +27,7 @@ requirements continue to block only their dependent work.
 The imported browser still uses the v1 graph data source, models, and update
 behavior, so it is not yet compatible with the v2 HTTP, SSE, publication, and
 graph contracts. Runtime Web configuration, concrete Docker and conventional
-installation files, and the file-log directory model remain unimplemented. The
-`kgi-core::signals` module exists, while its Supervisor-owned termination
-adapter remains unimplemented.
+installation files, and the file-log directory model remain unimplemented.
 
 The public [graph wire format](../architecture/api-protocol.md#common-transport-dto-rules--settled)
 and [mandatory gzip delivery path](../architecture/api-protocol.md#graph-http-compression--settled)
@@ -46,6 +44,15 @@ Workspace formatting, Cargo check, Nextest, doctests, and Clippy with warnings
 denied pass. The Web Vitest baseline passes with no test files present, and the
 Vite production build passes with its existing large-chunk warning. This
 increment is ready for review before worker or API consumers are added.
+
+The next infrastructure increment now implements the immutable `kgi-core`
+configuration values, protected database and token values, explicit TOML,
+environment, and CLI source resolution, static validation, and the top-crate
+command grammar. It also implements the `kgi-core::signals` adapter with its
+weak shutdown target, first- and second-signal graceful requests, and
+third-signal forced exit. Process composition and dispatch remain pending, as
+does the Supervisor-owned installation that connects the signal adapter to the
+global shutdown lifecycle.
 
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.

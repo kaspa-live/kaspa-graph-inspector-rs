@@ -1446,6 +1446,7 @@ dependencies = [
 name = "kgi-core"
 version = "0.1.0"
 dependencies = [
+ "ctrlc",
  "kaspa-consensus-core",
  "url",
 ]
