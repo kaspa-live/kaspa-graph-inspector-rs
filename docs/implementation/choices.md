@@ -112,3 +112,67 @@ tests, following rusty-kaspa's test-runner split. Run
 rustdoc tests. Targeted development runs may narrow the package or test filter
 while retaining Nextest. No custom Nextest profile is added until a concrete
 test needs repository-specific retry, timeout, or grouping behavior.
+
+## 5 October 2026: process configuration and signals
+
+### Configuration dependencies and value protection
+
+Use `clap` with its derive API for the top-crate command grammar, `serde` derive
+and `toml` for the explicitly selected configuration file, and `url` for parsed
+URL values. Keep these dependencies in the smallest owning crate: command,
+source-loading, and resolution dependencies belong to `kgi`, while
+`kgi-core` depends only on crates needed by its resolved value types and signal
+adapter. Direct dependency versions shared with rusty-kaspa follow its pinned
+`v2.0.1` workspace where applicable.
+
+Retain the logging system from rusty-kaspa's `core/src/log` when process
+logging is implemented. `LoggingConfig.level` therefore carries that logger's
+root-or-subsystem filter expression, and its optional directory maps directly
+to file logging being enabled or disabled. Logger initialization remains a
+later top-crate startup step; the current configuration increment defines only
+the resolved values it will consume.
+
+Do not use clap's environment-variable integration. Capture the supported
+environment variables once into an explicit input and pass that input, the
+parsed CLI layer, and any parsed TOML layer to the resolver. This makes source
+precedence and invalid-value behavior directly testable without mutating the
+process environment.
+
+Database URLs and reinitialization tokens use dedicated value wrappers with
+redacted `Debug` implementations and narrowly scoped secret accessors. Raw
+source structs containing either value do not derive unrestricted `Debug` or
+`Display`. Configuration errors retain a field and source classification but
+do not retain or format the rejected source value. TOML deserialization errors
+are mapped to a redacted top-level diagnostic because a parser-provided source
+snippet can contain the database URL.
+
+These choices implement the secret-handling and parsed-value requirements in
+the [process configuration contract](../architecture/overview.md#process-configuration-and-command-entry--settled).
+
+### Top-crate module boundaries
+
+Start the private top-crate implementation with these modules:
+
+- `cli`: clap argument and subcommand shapes plus parsing from an injected
+  argument iterator;
+- `config`: raw source layers, explicit file and environment loading,
+  resolution, static validation, and typed diagnostics; and
+- `command`: the validated service and administrative invocation values that
+  form the later dispatch boundary.
+
+Keep `main` as the composition entry. `kgi-core::config` contains the resolved
+configuration value structs and their protected value types only, preserving
+the ownership boundary in the focused architecture. Resolver tests stay next
+to the private top-crate modules until a public library boundary is needed by
+another crate.
+
+### Signal adapter dependency and tests
+
+Use `ctrlc` with termination-signal support for `kgi-core::signals`, matching
+the pinned rusty-kaspa implementation dependency. Keep callback counting and
+weak-target behavior in an internal method callable by unit tests; the
+installed handler calls that same method. Verify forced third-signal process
+termination in a subprocess so the test runner itself cannot exit.
+
+The public adapter shape and callback behavior remain owned by the
+[process termination contract](../architecture/overview.md#process-termination-signal-adapter--settled).

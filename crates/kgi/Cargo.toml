@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+clap.workspace = true
+kaspa-consensus-core.workspace = true
+kaspa-core.workspace = true
 kgi-api-core = { path = "../kgi-api-core" }
 kgi-api-ingress = { path = "../kgi-api-ingress" }
 kgi-core = { path = "../kgi-core" }
@@ -13,6 +16,10 @@ kgi-model = { path = "../kgi-model" }
 kgi-node = { path = "../kgi-node" }
 kgi-processing = { path = "../kgi-processing" }
 kgi-storage = { path = "../kgi-storage" }
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

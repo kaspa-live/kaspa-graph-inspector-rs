@@ -5,5 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+ctrlc.workspace = true
+kaspa-consensus-core.workspace = true
+url.workspace = true
+
 [lints]
 workspace = true
