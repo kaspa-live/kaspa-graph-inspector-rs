@@ -291,8 +291,9 @@ database range permits it. Never extend outside that range. The returned
 The seed contains every materialized block in the nominal extent as a complete
 `GraphBlock`. Resolve every actual direct-parent and merge-set ID to its hash,
 including references whose blocks are outside the extent. Direct parents use a
-local vector order chosen by the projection; that order has no separate
-semantic meaning.
+local vector order chosen by the projection and contain each stored relation
+once, satisfying the
+[graph value contract](api-graph.md#graph-values-views-revisions-and-history--settled).
 For a non-Genesis block, `selected_parent_index` is the index of the stored
 selected-parent hash in that local vector. No parent ordinal is persisted.
 Genesis has an empty vector and `selected_parent_index = None`; synthetic

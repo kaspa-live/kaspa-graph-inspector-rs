@@ -84,7 +84,10 @@ identity carried downstream. Only level-zero parents become `direct_parents`.
 For an ordinary non-Genesis block, `selected_parent` must occur in
 `direct_parents`; absence cannot produce KGI's later selected-parent index.
 Parent and merge-set vectors otherwise preserve node order without uniqueness,
-self-reference, or graph-validity checks.
+self-reference, or graph-validity checks. Repeated positions in the node-facing
+direct-parent vector are input observations, not distinct durable graph
+relations; [storage](storage.md#persistent-representation--settled) owns their
+canonical representation.
 
 The sole membership exception is the exact Genesis hash discovered for the
 validated RPC generation. KGI gives Genesis its domain-owned canonical

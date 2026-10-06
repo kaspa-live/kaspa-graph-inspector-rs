@@ -495,7 +495,11 @@ must occur in the level-zero direct-parent sequence.
 The cached header hash is authoritative block identity and is never
 recomputed. The normalizer does not require unique parents or merge-set
 members, reject self-reference, or compare redundant reported hashes. It
-preserves the node's parent and merge-set order.
+preserves the node's parent and merge-set order, including repeated positions.
+This node-facing sequence is not a promise that repeated direct-parent
+occurrences become distinct durable relations; the
+[storage representation](storage.md#persistent-representation--settled) owns
+that canonicalization.
 
 For the exact Genesis hash of the validated RPC generation, the normalizer
 does not require verbose data. It copies the header hash, timestamp, DAA score,

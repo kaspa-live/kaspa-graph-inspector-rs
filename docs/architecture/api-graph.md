@@ -210,6 +210,12 @@ impl GraphDelta {
 }
 ```
 
+`GraphBlock.direct_parents` is a non-repeating local sequence containing each
+actual child-parent relation once. Its order has no cross-view semantic
+meaning; `selected_parent_index` addresses the selected parent in that same
+local sequence. Consequently one `EdgeId` represents the complete occurrence
+of one child-parent relation.
+
 A `GraphView` has no clock origin,
 liveness, database, or publication status. A view constructed from a database
 starts at revision zero with revision timestamp zero. A subview extract
@@ -310,7 +316,8 @@ The operation then performs one atomic graph-state transition:
    `Level { size, daa_score }` value. It preserves an existing derived
    `usage_count`; a newly retained level starts with `usage_count = 0`.
 4. Each retained edge addition increments the referenced parent level's
-   `usage_count`. Multiple edges to one parent level contribute separately.
+   `usage_count`. Multiple distinct edges to one parent level contribute
+   separately.
 5. When `target_low` advances, remove every block below it. Removing a child
    removes each edge owned by that child and decrements the corresponding
    parent-level counters. A level that left the nominal extent is removed only

@@ -140,7 +140,8 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
    ordinary block requires verbose data and selected-parent membership, uses
    the trusted cached header hash and header blue score, preserves parent and
    merge-set order, and ignores every named unused RPC field. Accept duplicate
-   parents or merge-set members and direct or merge-set self-reference.
+   parents or merge-set members and direct or merge-set self-reference;
+   repeated positions remain present in `ValidatedNodeBlock`.
    Separately, cover exact-Genesis construction without verbose data: ORIGIN,
    empty parent and merge-set vectors, and blue score zero are synthesized
    while timestamp, representable DAA score, and blue work come from the
@@ -388,14 +389,18 @@ references and newly absent references succeed as boundary leaves and do not
 produce that strict-policy result.
 
 For an inserted block, verify that the returned `BlockCommitted` contains its
-committed ID and new coordinate plus every direct parent's coordinate from the
-same committed transaction, with the coordinate absent for an outside-boundary
-parent. Its non-repeating `level_snapshots` must contain the complete resulting
-block level and every distinct materialized parent level, preserve an existing
-level's DAA score while its size changes, translate the no-VSPC sentinel to
-`None`, and exclude outside-boundary parents. Cover the first matching
-selected-parent index, including a repeated matching parent, and committed
-initial color and VSPC membership. Inserted outcomes and their
+committed ID and new coordinate plus every canonical direct parent's coordinate
+from the same committed transaction, with the coordinate absent for an
+outside-boundary parent. Its non-repeating `level_snapshots` must contain the
+complete resulting block level and every distinct materialized parent level,
+preserve an existing level's DAA score while its size changes, translate the
+no-VSPC sentinel to `None`, and exclude outside-boundary parents. Supply a
+validated parent sequence in which the selected parent and another parent each
+repeat. Verify first-occurrence canonicalization, one row and one
+`ParentCommitted` per relation, the selected-parent index in the canonical
+sequence, and no repeated coordinate or level contribution. Rebuild applies
+the same canonicalization. Cover committed initial color and VSPC membership.
+Inserted outcomes and their
 BlockProcessor offers preserve increasing IDs while permitting allocation
 gaps; `AlreadyMaterialized` returns no graph-update payload.
 Verify BlockProcessor forwards the inserted payload before `PersistedBlock`;
@@ -1459,9 +1464,13 @@ come from one read-only stable snapshot.
 
 Projection cases cover complete nominal blocks; crossing edges with zero, one,
 and two endpoint blocks; all nominal and endpoint levels; exclusion of the
-outside-PP sentinel edge; complete direct-parent and merge-set hashes; local
-`selected_parent_index`; Genesis without ORIGIN; current color and VSPC state;
-and both construction-only alignment values. Verify that the ID cut is the
+outside-PP sentinel edge; complete canonical direct-parent and merge-set hashes;
+local `selected_parent_index`; Genesis without ORIGIN; current color and VSPC
+state; and both construction-only alignment values. Verify that live
+`BlockCommitted` projection and database reconstruction expose the same unique
+child-parent relation set despite their permitted local vector ordering, create
+one `GraphEdge` per relation, and count each retained edge once in
+`usage_count`. Verify that the ID cut is the
 maximum over the complete materialized block table, including an ID whose
 block is outside the projected window. Recompute derived level usage from
 edges. Exercise the separate capped API pool and prove its saturation or

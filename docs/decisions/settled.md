@@ -7,6 +7,7 @@ mechanics.
 | Concern | Settled outcome | Current owner |
 |---|---|---|
 | Identity and materiality | Separate persistent identity, materiality, PP-boundary, and ORIGIN semantics. | [Domain model](../architecture/domain-model.md), [storage](../architecture/storage.md) |
+| Direct-parent representation | Preserve the node-facing sequence and canonicalize durable child-parent relations by first occurrence. | [Domain model](../architecture/domain-model.md), [storage](../architecture/storage.md), [API graph model](../architecture/api-graph.md) |
 | Database lifecycle | Network-bound idempotent bootstrap and explicit database replacement. | [Storage](../architecture/storage.md) |
 | Node capability | Validated RPC generations and normalized node inputs. | [NodeService](../architecture/node-service.md) |
 | Node trust boundary | Treat the configured node as the Kaspa consensus authority and validate only the boundary conditions required by KGI-owned invariants. | [Overview](../architecture/overview.md#node-trust-boundary--settled) |
