@@ -13,6 +13,7 @@ kaspa-grpc-client.workspace = true
 kaspa-notify.workspace = true
 kaspa-rpc-core.workspace = true
 kgi-model = { path = "../kgi-model" }
+log.workspace = true
 rand.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

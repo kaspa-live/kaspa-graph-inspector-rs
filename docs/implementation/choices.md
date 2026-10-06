@@ -213,7 +213,9 @@ client, owns replacement generations. Use `kaspa-rpc-core` for RPC request,
 response, notification, and API compatibility values, `kaspa-notify` for the
 notification trait and scopes, `kaspa-consensus-core` for local parameter
 resolution, and `kaspa-core` for logging through the retained upstream logging
-facade. Raw upstream values do not leave `kgi-node`.
+facade. The direct `log` dependency exists only because the exported
+`kaspa-core` logging macros expand through that crate; production calls retain
+the `kaspa-core` facade. Raw upstream values do not leave `kgi-node`.
 
 Use `serde_json` only to decode the upstream `OverrideParams` representation,
 `url` for the already parsed endpoint, `thiserror` for typed errors,

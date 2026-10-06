@@ -2589,6 +2589,7 @@ dependencies = [
  "kaspa-notify",
  "kaspa-rpc-core",
  "kgi-model",
+ "log",
  "rand 0.8.8",
  "serde_json",
  "thiserror 2.0.21",
