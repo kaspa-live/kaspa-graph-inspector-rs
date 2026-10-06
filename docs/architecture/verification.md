@@ -23,7 +23,7 @@ source analysis of KGI's upstream correctness assumptions against one exact
 rusty-kaspa commit. The current pinned reference revision is:
 
 ```text
-c338d495bec29e4dc8b5149f99e8db6fa916ed4a
+01b532e8b553523216471682649693af92f0fd16
 ```
 
 This pin makes the architecture analysis reproducible. It identifies the
@@ -108,7 +108,7 @@ upstream change gives a concrete reason.
 ### Current PUAR result
 
 Architecture accepts the
-[24 September 2026 PUAR](../reviews/2026-09-24-rusty-kaspa-c338d495-assumptions.md)
+[6 October 2026 PUAR](../reviews/2026-10-06-rusty-kaspa-01b532e8-assumptions.md)
 against the full pinned revision above. All eight checklist items are
 `Confirmed`; none is `Not confirmed` or `Contradicted`. The focused contracts
 may therefore rely on those reviewed upstream behaviors for the pinned

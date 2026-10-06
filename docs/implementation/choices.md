@@ -63,8 +63,7 @@ commit. The upstream tag resolves to
 
 This tag is the implementation dependency selection for the initial model.
 PUAR acceptance and runtime node-compatibility scope remain owned by the
-[verification contract](../architecture/verification.md); a later PUAR run will
-handle the next upstream review.
+[verification contract](../architecture/verification.md).
 
 ### Tokio channel, gate, and gap primitives
 
