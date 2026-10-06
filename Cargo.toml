@@ -21,6 +21,7 @@ repository = "https://github.com/kaspa-live/kaspa-graph-inspector-rs"
 edition = "2024"
 
 [workspace.dependencies]
+clap = { version = "4.5.35", features = ["derive", "string", "cargo"] }
 kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
 kaspa-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
 kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }

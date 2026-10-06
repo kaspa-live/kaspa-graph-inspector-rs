@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+clap.workspace = true
 kaspa-consensus-core.workspace = true
 kaspa-core.workspace = true
 kgi-api-core = { path = "../kgi-api-core" }

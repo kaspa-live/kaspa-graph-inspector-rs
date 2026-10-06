@@ -1,6 +1,6 @@
 //! Top-level configuration source loading, resolution, and static validation.
 
-#![allow(dead_code, reason = "wired into process entry by the command parsing increment")]
+#![allow(dead_code, reason = "process entry is wired with component composition")]
 
 use std::{
     collections::BTreeMap,
@@ -44,6 +44,7 @@ const ENV_NO_LOG_FILES: &str = "KGI_NO_LOG_FILES";
 const ENV_WEB_ROOT: &str = "KGI_WEB_ROOT";
 const ENV_BLOCK_EXPLORER_TEMPLATE: &str = "KGI_BLOCK_EXPLORER_URL_TEMPLATE";
 
+#[allow(dead_code, reason = "used when process entry is wired to component composition")]
 const SUPPORTED_ENVIRONMENT_VARIABLES: [&str; 17] = [
     ENV_CONFIG_FILE,
     ENV_MAINNET,
@@ -145,6 +146,7 @@ pub(crate) struct Environment {
 
 impl Environment {
     /// Captures the supported process environment once.
+    #[allow(dead_code, reason = "used when process entry is wired to component composition")]
     pub(crate) fn capture() -> Self {
         let values =
             SUPPORTED_ENVIRONMENT_VARIABLES.into_iter().filter_map(|name| env::var_os(name).map(|value| (name, value))).collect();
@@ -152,7 +154,7 @@ impl Environment {
     }
 
     #[cfg(test)]
-    fn from_values(values: impl IntoIterator<Item = (&'static str, OsString)>) -> Self {
+    pub(crate) fn from_values(values: impl IntoIterator<Item = (&'static str, OsString)>) -> Self {
         Self { values: values.into_iter().collect() }
     }
 
