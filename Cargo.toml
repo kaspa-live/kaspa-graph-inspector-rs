@@ -22,10 +22,13 @@ edition = "2024"
 
 [workspace.dependencies]
 kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
+kaspa-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
 kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
 kaspa-math = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
+serde = { version = "1.0.190", features = ["derive"] }
 thiserror = "2.0.18"
 tokio = { version = "1.42.1", features = ["macros", "rt", "sync", "time"] }
+toml = "0.8.8"
 url = "2.5.8"
 
 [workspace.lints.rust]
