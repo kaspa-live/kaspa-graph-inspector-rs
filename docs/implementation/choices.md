@@ -44,9 +44,9 @@ adapter is implemented.
 Use the following workspace dependency declarations for Kaspa value crates:
 
 ```toml
-kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
-kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
-kaspa-math = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
+kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }
+kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }
+kaspa-math = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }
 ```
 
 The component status values use
@@ -56,8 +56,10 @@ The component status values use
 `kaspa_math::Uint192`. This keeps upstream representation and ordering while
 avoiding a dependency from `kgi-model` on consensus processing, RPC, or service
 crates.
-The committed Cargo lockfile records the resolved source commit. The upstream
-tag currently resolves to `cfafeb4c093fa37a303f1b9f19c58f986b870ce3`.
+The workspace dependency selection advanced from `v2.0.1` to `v2.1.0` on
+6 October 2026. The committed Cargo lockfile records the resolved source
+commit. The upstream tag resolves to
+`01b532e8b553523216471682649693af92f0fd16`.
 
 This tag is the implementation dependency selection for the initial model.
 PUAR acceptance and runtime node-compatibility scope remain owned by the
@@ -122,8 +124,8 @@ and `toml` for the explicitly selected configuration file, and `url` for parsed
 URL values. Keep these dependencies in the smallest owning crate: command,
 source-loading, and resolution dependencies belong to `kgi`, while
 `kgi-core` depends only on crates needed by its resolved value types and signal
-adapter. Direct dependency versions shared with rusty-kaspa follow its pinned
-`v2.0.1` workspace where applicable.
+adapter. Direct dependency versions shared with rusty-kaspa follow its selected
+`v2.1.0` workspace where applicable.
 
 Retain the logging system from rusty-kaspa's `core/src/log` when process
 logging is implemented. `LoggingConfig.level` therefore carries that logger's
