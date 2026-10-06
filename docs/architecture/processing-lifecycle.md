@@ -655,11 +655,12 @@ contents likewise request Rebuild but are not treated as Empty.
 
 ResyncEngine uses the run's exact `Arc<ValidatedRpcClient>` and the normalized
 [individual recovery GetBlock](node-service.md#individual-recovery-getblock)
-contract to obtain the sink header. It compares the returned DAA score with the
-stored sink DAA score, then constructs `MaterializedSyncAnchor` from the stored
-ID, hash, and selected-parent hash plus the header's blue work and blue score.
-A header-only node block is sufficient because no body or transactions are
-needed. KGI relies on successful GetBlock GhostDAG enrichment also
+contract to obtain `ValidatedRecoveryHeader`. It compares the normalized DAA
+score with the stored sink DAA score, then constructs `MaterializedSyncAnchor`
+from the stored ID and selected-parent hash plus the normalized hash, blue work,
+and blue score. ResyncEngine never reads the raw RPC header or applies a second
+Genesis branch. A header-only node block is sufficient because no body or
+transactions are needed. KGI relies on successful GetBlock enrichment also
 establishing the recognition required to use the sink as a GetBlocks
 `low_hash`; the
 [PUAR](verification.md#current-puar-result) checks that upstream assumption

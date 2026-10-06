@@ -36,6 +36,13 @@ struct ValidatedNodeBlock {
     blue_work: BlueWork,
 }
 
+struct ValidatedRecoveryHeader {
+    hash: BlockHash,
+    daa_score: u64,
+    blue_work: BlueWork,
+    blue_score: u64,
+}
+
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct ConsensusOrder {
     blue_work: BlueWork,
@@ -101,6 +108,12 @@ that an ordinary selected parent can be encoded by index. Under the
 [node trust boundary](overview.md#node-trust-boundary--settled), it does not
 prove consensus correctness, uniqueness or acyclicity, and it makes no claim
 that any referenced hash is materialized in the current database.
+
+`ValidatedRecoveryHeader` is the normalized header-only value used by Resync
+preparation. Its DAA score is representable, and its blue score is either a
+representable ordinary block value or the canonical zero for the exact Genesis
+of the validated RPC generation. It proves no database materiality; processing
+combines it with storage-owned identity and selected-parent state.
 
 `BlockHash` is the immutable block identity. Every accepted representation of
 one hash denotes the same block and the same deterministic consensus metadata,

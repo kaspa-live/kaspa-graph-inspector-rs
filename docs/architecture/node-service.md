@@ -516,12 +516,13 @@ transaction payload is not rejected merely because KGI requested
 
 The common normalizer checks every consumed DAA score and every consumed
 ordinary blue score against the domain-owned `MAX_DAA_SCORE` and
-`MAX_BLUE_SCORE`. Apply the same checks to header-only node responses before
-their scores enter a `MaterializedSyncAnchor`, Catchup calculation, or other
-processing input. Genesis blue score is the synthesized zero. An excessive
-score returns the typed `ScoreOutOfRange(DaaScore)` or
-`ScoreOutOfRange(BlueScore)` result. It is not a malformed RPC shape and is
-never remapped to a source-specific malformed-input kind.
+`MAX_BLUE_SCORE`. Header-only operations likewise check each score they
+consume before it enters a normalized processing value. An exact-Genesis
+branch synthesizes blue score zero before any blue-score range check and does
+not consume the raw Genesis blue score. An excessive consumed score returns the
+typed `ScoreOutOfRange(DaaScore)` or `ScoreOutOfRange(BlueScore)` result. It is
+not a malformed RPC shape and is never remapped to a source-specific
+malformed-input kind.
 
 The normalizer copies the domain-owned informational `Timestamp` unchanged and
 performs no timestamp range validation. Storage owns its lossless `BIGINT`
@@ -673,16 +674,33 @@ validation.
 
 #### Individual recovery GetBlock
 
-During Resync preparation, `GetBlock(sink_hash, false)` must return exactly the
-requested trusted header hash and the header DAA score, blue work, and blue
-score required to construct `MaterializedSyncAnchor`. Storage supplies the
-materialized hash, ID, selected parent, and stored DAA score. This operation
-does not require verbose data, direct parents, merge sets, timestamp, or
-transactions. A different hash or missing required header data is
-`RecoveryInputInvalid(MalformedGetBlock)`. A definitive not-found response and
-a returned DAA score that disagrees with committed storage remain
-reconciliation evidence under the processing-lifecycle contract rather than
-malformed transport shapes.
+```rust
+impl ValidatedRpcClient {
+    async fn recovery_header(
+        &self,
+        hash: BlockHash,
+    ) -> Result<ValidatedRecoveryHeader, NodeError>;
+}
+```
+
+During Resync preparation, this operation calls `GetBlock(hash, false)` and
+requires the trusted header hash to equal `hash`. Both normalization branches
+require and range-check the header DAA score and require blue work:
+
+- for an ordinary block, require and range-check the raw header blue score and
+  copy it into `ValidatedRecoveryHeader`;
+- when `hash` is the exact Genesis of this validated RPC generation, do not
+  require, read, or range-check the raw header blue score and set the normalized
+  `blue_score` to zero.
+
+The operation does not require verbose data, direct parents, merge sets,
+timestamp, or transactions. A different hash or data missing from the
+applicable branch is `RecoveryInputInvalid(MalformedGetBlock)`. A definitive
+not-found response and a normalized DAA score that disagrees with committed
+storage remain reconciliation evidence under the processing-lifecycle contract
+rather than malformed transport shapes. Storage supplies the materialized ID,
+selected parent, and stored DAA score; NodeService does not construct
+`MaterializedSyncAnchor`.
 
 #### Individual full-block GetBlock
 

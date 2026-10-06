@@ -41,9 +41,10 @@ The PUAR checklist is:
 2. For the NodeService
    [individual recovery GetBlock](node-service.md#individual-recovery-getblock)
    used by [Resync preparation](processing-lifecycle.md#resync-preparation),
-   header-only `GetBlock` supplies the required DAA score, blue work, and blue
-   score and establishes that the returned block is recognized as a GetBlocks
-   low hash.
+   header-only `GetBlock` supplies the required DAA score and blue work, supplies
+   the ordinary-block blue score, and establishes that the returned block is
+   recognized as a GetBlocks low hash. KGI does not depend on the raw Genesis
+   blue score.
 3. For the NodeService
    [GetBlocks normalization](node-service.md#getblocks-and-vspc-recovery-responses)
    used by the [Catchup trigger](processing-lifecycle.md#catchup-trigger), the
@@ -253,6 +254,10 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
     particular, exact Genesis ignores raw blue score and synthesizes zero. A
     full block timestamp of `u64::MAX` passes normalization unchanged and
     produces no timestamp-specific fault.
+    For `recovery_header`, cover an ordinary missing and out-of-range blue score
+    plus exact-Genesis absent, nonzero, and out-of-range raw blue scores. Every
+    exact-Genesis case returns `ValidatedRecoveryHeader.blue_score = 0` while
+    still requiring and range-checking DAA score and requiring blue work.
 16. RPC API compatibility uses the `RPC_API_VERSION` and `RPC_API_REVISION`
     constants from KGI's compiled `kaspa-rpc-core`. Accept an exact version
     with an equal or greater remote revision. Reject lower and higher versions,
@@ -444,8 +449,9 @@ Materialized result, stored sink ID/hash/selected-parent hash/DAA score, and an
 exact no-transactions GetBlock header. Cover:
 
 - exact current-node-PP discovery and successful Materialized result;
-- successful `MaterializedSyncAnchor` construction, including a header-only
-  node block and a coherent committed Materialized sink;
+- successful `MaterializedSyncAnchor` construction from
+  `ValidatedRecoveryHeader` and a coherent committed Materialized sink,
+  including exact Genesis with normalized blue score zero;
 - exact RPC and DB generation propagation into both processor Begin payloads,
   including VspcProcessor initialization of its committed sink and history
   seed;
@@ -455,9 +461,11 @@ exact no-transactions GetBlock header. Cover:
   retiring the valid RPC generation;
 - transport or session failure without inferring Rebuild; and
 - a response carrying the wrong trusted header hash or missing required header
-  DAA score, blue work, or blue score
-  as `MalformedGetBlock`, retiring the exact RPC generation without inferring
-  Rebuild.
+  DAA score or blue work, plus an ordinary response missing blue score, as
+  `MalformedGetBlock`, retiring the exact RPC generation without inferring
+  Rebuild; and
+- proof that ResyncEngine uses the normalized hash, DAA score, blue work, and
+  blue score without reading or reinterpreting the raw RPC header.
 
 Verify the common
 [boundary seal threshold construction](processing-lifecycle.md#boundary-seal-threshold-construction)
