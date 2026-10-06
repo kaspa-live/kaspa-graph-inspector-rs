@@ -257,13 +257,13 @@ pub(crate) fn resolve(request: ResolveRequest<'_>) -> Result<KgiConfig, ConfigEr
     let override_params_file = resolve_value(&layers, |layer| layer.network.override_params_file.clone()).map(|(_, value)| value);
 
     let rpc_url = match resolve_value(&layers, |layer| layer.node.rpc_url.clone()) {
-        Some((source, value)) => parse_url("node.rpc-url", source, &value)?,
+        Some((source, value)) => parse_node_rpc_url(source, &value)?,
         None => default_rpc_url(network_id),
     };
 
     let (database_source, database_url) =
         resolve_value(&layers, |layer| layer.database.url.clone()).ok_or(ConfigError::MissingDatabaseUrl)?;
-    let database_url = DatabaseUrl::new(parse_url("database.url", database_source, &database_url)?);
+    let database_url = DatabaseUrl::new(parse_database_url(database_source, &database_url)?);
     let initialize = resolve_value(&layers, |layer| layer.database.initialize).is_some_and(|(_, value)| value);
     let reinitialization_token = resolve_value(&layers, |layer| layer.database.reinitialization_token.clone())
         .map(|(_, value)| ReinitializationToken::new(value));
@@ -361,6 +361,22 @@ fn default_rpc_url(network_id: NetworkId) -> Url {
 
 fn parse_url(field: &'static str, origin: ConfigSource, value: &str) -> Result<Url, ConfigError> {
     Url::parse(value).map_err(|_| ConfigError::InvalidValue { field, origin })
+}
+
+fn parse_node_rpc_url(origin: ConfigSource, value: &str) -> Result<Url, ConfigError> {
+    let url = parse_url("node.rpc-url", origin, value)?;
+    if url.scheme() != "grpc" || url.host_str().is_none() {
+        return Err(ConfigError::InvalidValue { field: "node.rpc-url", origin });
+    }
+    Ok(url)
+}
+
+fn parse_database_url(origin: ConfigSource, value: &str) -> Result<Url, ConfigError> {
+    let url = parse_url("database.url", origin, value)?;
+    if !matches!(url.scheme(), "postgres" | "postgresql") {
+        return Err(ConfigError::InvalidValue { field: "database.url", origin });
+    }
+    Ok(url)
 }
 
 fn validate_log_filter(filter: &str) -> Result<(), ()> {
@@ -561,8 +577,8 @@ mod tests {
     use kaspa_consensus_core::network::{NetworkId, NetworkType};
 
     use super::{
-        ConfigError, ConfigLayer, ConfigSource, DatabaseLayer, Environment, LoggingLayer, NetworkLayer, ResolveRequest, WebLayer,
-        resolve,
+        ConfigError, ConfigLayer, ConfigSource, DatabaseLayer, Environment, LoggingLayer, NetworkLayer, NodeLayer, ResolveRequest,
+        WebLayer, resolve,
     };
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -837,16 +853,48 @@ mod tests {
     }
 
     #[test]
-    fn database_url_and_token_are_redacted_from_resolution_errors() {
-        let invalid_url = "postgresql://alice:hunter2@exa mple/kgi?secret=query";
-        let token = "rotate-me-secret";
-        let environment = environment(&[("KGI_DATABASE_URL", invalid_url), ("KGI_REINITIALIZE_DB_TOKEN", token)]);
-        let cli = ConfigLayer::default();
+    fn endpoint_urls_require_consumer_compatible_schemes() {
+        for rpc_url in ["https://node.example:16110", "mailto:node@example.com", "grpc:///missing-authority"] {
+            let cli = ConfigLayer { node: NodeLayer { rpc_url: Some(rpc_url.to_owned()) }, ..base_cli() };
+            assert!(matches!(
+                resolve_test(&cli, &Environment::default()),
+                Err(ConfigError::InvalidValue { field: "node.rpc-url", origin: ConfigSource::CommandLine })
+            ));
+        }
 
-        let error = resolve_test(&cli, &environment).expect_err("invalid database URL must fail");
-        let diagnostic = format!("{error} {error:?}");
-        for secret in [invalid_url, "alice", "hunter2", "secret=query", token] {
-            assert!(!diagnostic.contains(secret));
+        for database_url in ["https://db.example/kgi", "mailto:database@example.com"] {
+            let cli = ConfigLayer {
+                database: DatabaseLayer { url: Some(database_url.to_owned()), ..DatabaseLayer::default() },
+                ..ConfigLayer::default()
+            };
+            assert!(matches!(
+                resolve_test(&cli, &Environment::default()),
+                Err(ConfigError::InvalidValue { field: "database.url", origin: ConfigSource::CommandLine })
+            ));
+        }
+
+        for database_url in ["postgres://db.example/kgi", "postgresql://db.example/kgi"] {
+            let cli = ConfigLayer {
+                database: DatabaseLayer { url: Some(database_url.to_owned()), ..DatabaseLayer::default() },
+                ..ConfigLayer::default()
+            };
+            let config = resolve_test(&cli, &Environment::default()).expect("supported PostgreSQL scheme must resolve");
+            assert_eq!(config.database.url.expose_url().as_str(), database_url);
+        }
+    }
+
+    #[test]
+    fn database_url_and_token_are_redacted_from_resolution_errors() {
+        let token = "rotate-me-secret";
+        for invalid_url in
+            ["postgresql://alice:hunter2@exa mple/kgi?secret=query", "https://alice:hunter2@db.example/kgi?secret=query"]
+        {
+            let environment = environment(&[("KGI_DATABASE_URL", invalid_url), ("KGI_REINITIALIZE_DB_TOKEN", token)]);
+            let error = resolve_test(&ConfigLayer::default(), &environment).expect_err("invalid database URL must fail");
+            let diagnostic = format!("{error} {error:?}");
+            for secret in [invalid_url, "alice", "hunter2", "secret=query", token] {
+                assert!(!diagnostic.contains(secret));
+            }
         }
     }
 
