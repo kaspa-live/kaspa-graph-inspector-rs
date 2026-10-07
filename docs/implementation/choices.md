@@ -292,3 +292,65 @@ acknowledged during connect, validation, retry, and rejected phases as well as
 Ready, so a late report cannot disturb a replacement or remain blocked behind
 one. Tests use identity jitter when asserting nominal slots and the manual
 clock for both the Ready reset boundary and shutdown-cancellable waits.
+
+## 7 October 2026: StorageService implementation foundation
+
+### PostgreSQL client and migration stack
+
+Use SQLx `0.9.0` with its PostgreSQL driver, Tokio runtime, embedded migration
+support, and Rustls with WebPKI roots. Disable SQLx's default feature set so
+KGI does not compile unused database drivers or JSON support. The `macros`
+feature is enabled only for embedding the migration directory; production SQL
+uses runtime `query`, `query_as`, and `query_scalar` APIs. KGI therefore does
+not require a live database during an ordinary build, and checked-in SQLx
+offline query metadata remains deferred until a concrete benefit justifies
+the additional workflow.
+
+Migration files remain solely under `crates/kgi-storage/migrations/` and are
+embedded in the binary. Use SQLx's own migration-history table and checksum
+validation. Every migration remains forward-only and transaction-compatible;
+the administrative replacement path will run the embedded migration set
+inside its owning outer transaction rather than introduce a second schema
+definition.
+
+### Concrete SQL representations
+
+Implement the SQL representation owned by the
+[storage contract](../architecture/storage.md#persistent-representation--settled)
+with SQLx runtime binds and rows. For the concrete fields left open there, use
+PostgreSQL `SMALLINT` for `BlockColor`, the canonical `NetworkId` string as
+`TEXT`, and nullable `TEXT` for the optional administrative reinitialization
+token. Conversion helpers remain private to `kgi-storage`; they return typed
+errors rather than exposing driver conversion failures across the crate
+boundary.
+
+Use the fixed session advisory-lock key `0x4b47_4932_0000_0001` on one
+dedicated SQLx `PgConnection` outside both pools. PostgreSQL scopes advisory
+locks to the connected database, so the same application key independently
+protects each database. Start the processing pool at four connections. The
+separate API pool takes its size from the
+[ApiService resource owner](../architecture/api-service.md#resource-isolation-and-saturation--settled).
+The private processing-pool size does not become a public API value.
+
+### Crate and module boundaries
+
+Start `kgi-storage` with public `error`, `generation`, and `service` modules.
+They own the typed storage failures, `NodeMetadata` and validated generation
+capabilities, and the Supervisor-facing service lifecycle respectively. Keep
+SQLx adaptation, migration execution, schema inspection, service-loop
+commands, retirement plumbing, and deterministic timing in private
+`database`, `migration`, `schema`, `runtime`, and `timing` modules. Expose the
+public modules without crate-root wildcard re-exports.
+
+These boundaries do not expose SQLx pools, connections, transactions, raw
+queries, or schema-classification details. Add each module only with its first
+implemented behavior rather than creating placeholder APIs.
+
+### PostgreSQL integration tests
+
+Use `testcontainers-modules` with the official `postgres:17-alpine` image and
+SQLx itself as the test client. Each fixture receives an isolated temporary
+database and requires no ambient `DATABASE_URL`. Keep the image tag explicit
+so a routine dependency or image update cannot silently change database
+behavior. Tests use runtime SQL APIs, run through Nextest, and retain container
+handles until every database assertion and cleanup barrier has completed.
