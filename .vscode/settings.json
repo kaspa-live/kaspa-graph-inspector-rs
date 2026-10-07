@@ -1,8 +1,29 @@
 {
   "cSpell.words": [
-      "wakeup",
-      "vspc",
+      "backpressure",
+      "bodyless",
+      "CBOR",
+      "coalescible",
+      "cutover",
+      "gapless",
+      "multiword",
       "nonblocking",
-      "nonblockingly"
+      "nonblockingly",
+      "noncanonical",
+      "nondecreasing",
+      "prestate",
+      "PUAR",
+      "rederives",
+      "resumability",
+      "subvalue",
+      "subvalues",
+      "subview",
+      "unpadded",
+      "unsubscription",
+      "upsert",
+      "upserts",
+      "vspc",
+      "wakeup",
+      "wakeups",
   ]
 }
