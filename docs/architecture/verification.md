@@ -80,12 +80,13 @@ The PUAR checklist is:
 9. For NodeService
    [individual recovery GetBlock](node-service.md#individual-recovery-getblock),
    an unknown requested hash produces
-   `ConsensusError::BlockNotFound(requested_hash)`, places exactly that error's
-   display text in the gRPC `RPCError.message`, preserves that string through
-   wire conversion, and reconstructs it as `RpcError::General` in the selected
-   Rust client. The review also records that unrelated remote and client
-   failures can use the same `General` variant, so the variant itself is not a
-   semantic discriminator.
+   `ConsensusError::HeaderNotFound(requested_hash)`; that variant and
+   `ConsensusError::BlockNotFound(requested_hash)` have distinct exact display
+   forms; and the gRPC conversion preserves either error's display string in
+   `RPCError.message` before reconstructing it as `RpcError::General` in the
+   selected Rust client. The review also records that unrelated remote and
+   client failures can use the same `General` variant, so the variant itself is
+   not a semantic discriminator.
 
 For each item, inspect the committed source at the full SHA and report one of:
 
@@ -119,19 +120,12 @@ upstream change gives a concrete reason.
 
 ### Current PUAR result
 
-Architecture accepts the
-[6 October 2026 PUAR](../reviews/2026-10-06-rusty-kaspa-01b532e8-assumptions.md)
-against the full pinned revision above. That report confirms all eight
-checklist items; none is `Not confirmed` or `Contradicted`. The focused
-contracts may therefore rely on those reviewed upstream behaviors for the
-pinned revision, subject to their stated KGI validation and recovery rules.
-
-The expanded
+Architecture accepts the expanded
 [7 October 2026 PUAR](../reviews/2026-10-07-rusty-kaspa-01b532e8-assumptions.md)
-reconfirms those eight items but reports the ninth GetBlock error-string
-compatibility assumption as `Contradicted`. Architecture must resolve that
-conflict before NodeService implements definitive GetBlock absence
-classification. The expanded report is not an accepted complete PUAR result.
+against the full pinned revision above. All nine checklist items are
+`Confirmed`; none is `Not confirmed` or `Contradicted`. The focused contracts
+may therefore rely on those reviewed upstream behaviors for the pinned
+revision, subject to their stated KGI validation and recovery rules.
 
 This section is the sole normative owner of the PUAR acceptance status. The
 report remains non-normative source analysis evidence. The accepted result does
@@ -255,9 +249,10 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
     generation; definitive not-found and `RpcRequestFailed` retain their
     distinct classifications. Exercise the NodeService-owned
     [GetBlock compatibility classification](node-service.md#getblock-not-found-compatibility-classification):
-    the exact `RpcError::General` message produced for the requested hash yields
-    definitive not-found, while a different hash, changed case, leading or
-    trailing content, and unrelated general errors do not. Every nonmatch
+    the exact `HeaderNotFound` and `BlockNotFound` messages built for the
+    requested hash each yield the same definitive not-found result, while a
+    different hash, changed case, leading or trailing content, and unrelated
+    general errors do not. Every nonmatch
     becomes `RpcRequestFailed`, leaves the exact generation valid, and exposes
     its message only as diagnostics. After this adapter, only its typed result
     may select caller or lifecycle behavior.

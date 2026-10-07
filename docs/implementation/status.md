@@ -74,7 +74,7 @@ and the lifecycle-owned opaque RPC-failure disposition.
 Validated-generation RPC execution now binds every operation and composite
 request to one physical connection, applies the runtime concurrency bound,
 constructs the required requests, normalizes their responses, classifies the
-pinned exact-message GetBlock compatibility case, and linearizes completion
+pinned exact-message GetBlock compatibility forms, and linearizes completion
 against cancellation or retirement. Malformed recovery responses use an
 exact-generation retirement request and completion barrier; opaque RPC failures
 and range faults do not retire the generation. The private

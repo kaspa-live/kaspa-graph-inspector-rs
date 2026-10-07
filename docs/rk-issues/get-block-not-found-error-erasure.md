@@ -21,14 +21,17 @@ Verified against rusty-kaspa revision
 
 ## Summary
 
-The RPC service obtains a typed `ConsensusError::BlockNotFound(hash)`, and
-`RpcError` can retain it through its transparent `ConsensusError` variant.
-The gRPC boundary discards that identity: `RPCError` contains only a message,
-the server serializes `RpcError` with `to_string()`, and the client converts the
-message back into `RpcError::General(String)`.
+The RPC service obtains a typed consensus error, and `RpcError` can retain it
+through its transparent `ConsensusError` variant. An unknown hash on the
+production GetBlock path produces `ConsensusError::HeaderNotFound(hash)`;
+rusty-kaspa also defines `ConsensusError::BlockNotFound(hash)` for unavailable
+full blocks. The gRPC boundary discards either identity: `RPCError` contains
+only a message, the server serializes `RpcError` with `to_string()`, and the
+client converts the message back into `RpcError::General(String)`.
 
-Consequently, `ConsensusError::BlockNotFound` is indistinguishable by type from
-other remote server failures through `kaspa-grpc-client`.
+Consequently, `ConsensusError::HeaderNotFound` and
+`ConsensusError::BlockNotFound` are indistinguishable by type from other remote
+server failures through `kaspa-grpc-client`.
 
 ## Current implementation
 
@@ -41,9 +44,20 @@ let block = session
     .await?;
 ```
 
-The consensus error is typed and includes the requested hash:
+`get_block_even_if_header_only` returns the typed header absence for an unknown
+requested hash:
 
 ```rust
+return Err(ConsensusError::HeaderNotFound(hash));
+```
+
+The two relevant consensus errors have distinct exact display forms and both
+include the requested hash:
+
+```rust
+#[error("cannot find header {0}")]
+HeaderNotFound(Hash),
+
 #[error("cannot find full block {0}")]
 BlockNotFound(Hash),
 ```
@@ -70,8 +84,9 @@ failure from a local transport or client failure.
 
 The production RPC path should expose a structured GetBlock-not-found
 discriminator. It may be a backward-compatible error code or a GetBlock-owned
-result variant, provided the server sets it from the typed consensus error and
-the Rust client preserves it without interpreting diagnostic text.
+result variant, provided the server maps both missing-header and
+missing-full-block outcomes to it and the Rust client preserves it without
+interpreting diagnostic text.
 
 An older server that does not send the discriminator must remain an opaque RPC
 failure rather than being misclassified.
@@ -80,9 +95,10 @@ failure rather than being misclassified.
 
 KGI v2 uses a pinned, exact-message compatibility adapter owned by the
 normative NodeService contract. It compares the complete remote message with
-the display form of `ConsensusError::BlockNotFound(requested_hash)` and turns
-only an exact match into KGI's typed definitive-not-found outcome. All other
-messages become KGI's opaque typed `RpcRequestFailed` outcome.
+the display forms of `ConsensusError::HeaderNotFound(requested_hash)` and
+`ConsensusError::BlockNotFound(requested_hash)`. Either exact match becomes
+KGI's typed definitive-not-found outcome. All other messages become KGI's
+opaque typed `RpcRequestFailed` outcome.
 
 This workaround is intentionally narrow and must be removed after a structured
 upstream result is available and accepted by a new pinned-upstream review.

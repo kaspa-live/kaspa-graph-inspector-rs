@@ -32,10 +32,10 @@ by the verification contract and is outside this review.
 | 6. Local consensus-parameter resolution | **Confirmed** |
 | 7. VSPC V2 batching and cursor behavior | **Confirmed** |
 | 8. VSPC path/GetBlock selected-parent correlation | **Confirmed** |
-| 9. `GetBlock` not-found error-string compatibility | **Contradicted** |
+| 9. `GetBlock` not-found error-string compatibility | **Confirmed** |
 
-The first eight checklist items are `Confirmed`. Item 9 is `Contradicted` and
-requires Architecture resolution before dependent implementation proceeds.
+No checklist item is `Not confirmed` or `Contradicted`. No architecture
+escalation is required from this review.
 
 ## 1. Genesis discovery through `GetBlocks`
 
@@ -348,25 +348,24 @@ attribution still handles observable disagreement explicitly.
 
 ## 9. `GetBlock` not-found error-string compatibility
 
-**Result: Contradicted.**
+**Result: Confirmed.**
 
-`ConsensusError::BlockNotFound(hash)` has the exact display form
-`cannot find full block {hash}`. However, `RpcService::get_block_call` calls
+`RpcService::get_block_call` calls
 `get_block_even_if_header_only`, whose unknown-hash and missing-header paths
-return `ConsensusError::HeaderNotFound(hash)`. Its display form is
-`cannot find header {hash}`. The production GetBlock absence path therefore
-does not produce the `BlockNotFound` text required by the KGI compatibility
-classifier.
+return `ConsensusError::HeaderNotFound(hash)`. Its exact display form is
+`cannot find header {hash}`. `ConsensusError::BlockNotFound(hash)` has the
+distinct exact display form `cannot find full block {hash}`.
 
-The rest of the assumed transport chain is confirmed. `get_block_call`
-propagates its consensus result with `?`, and `RpcError::ConsensusError` is a
-transparent conversion. The gRPC response converter calls
+`get_block_call` propagates its consensus result with `?`, and
+`RpcError::ConsensusError` is a transparent conversion. The generic gRPC
+response converter calls
 `RpcError::to_string()` and stores the result in the sole string field
 `RPCError.message`. On the client path, response conversion examines the error
 field before payload fields and converts the message back through
 `RpcError::from(String)`, which constructs `RpcError::General` without changing
-the string. The preserved string is therefore the `HeaderNotFound` display
-text for an ordinary unknown GetBlock hash.
+the string. The production unknown-hash path therefore preserves the exact
+`HeaderNotFound` message. The same generic conversion preserves the exact
+`BlockNotFound` message when that consensus error is supplied.
 
 Evidence:
 
@@ -388,18 +387,16 @@ Evidence:
 - `rpc/grpc/client/src/error.rs`, conversion of client errors to
   `RpcError::General`, lines 44-47.
 
-KGI impact and limitation: the settled `BlockNotFound` exact-message classifier
-does not recognize the ordinary production GetBlock absence emitted at the
-reviewed revision. Such an absence becomes `RpcRequestFailed` rather than the
-required definitive not-found result. `RpcError::General` is also used for
-unrelated remote and client failures and supplies no structured discriminator.
-Changing the expected message to `HeaderNotFound` would be an architecture
-change and is not selected by this review.
+KGI impact and limitation: the two exact source-defined strings support the
+settled compatibility adapter for both missing-header and missing-full-block
+representations of the requested hash. `RpcError::General` is also used for
+unrelated remote and client failures and supplies no structured discriminator,
+so the variant alone cannot establish absence and every other message must
+remain opaque.
 
 ## Overall limitation
 
-This PUAR confirms the first eight assumptions and contradicts the ninth for
-rusty-kaspa tag `v2.1.0` at resolved revision
-`01b532e8b553523216471682649693af92f0fd16`. It does not establish parity for
-other revisions, custom builds, or a connected node's undisclosed effective
-overrides.
+This PUAR establishes the nine assumptions only for rusty-kaspa tag `v2.1.0`
+at resolved revision `01b532e8b553523216471682649693af92f0fd16`. It does not
+establish parity for other revisions, custom builds, or a connected node's
+undisclosed effective overrides.

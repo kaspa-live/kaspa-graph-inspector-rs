@@ -492,20 +492,29 @@ NodeService reports active and permit-waiting runtime RPC operations.
 
 #### GetBlock not-found compatibility classification
 
-The selected rusty-kaspa gRPC transport does not preserve the structured
-`ConsensusError::BlockNotFound` variant. Its wire `RPCError` contains only a
-message, and the client reconstructs every remote error as
-`RpcError::General(String)`. KGI nevertheless requires a definitive GetBlock
-not-found result to remain distinct from other RPC failures.
+The selected rusty-kaspa gRPC transport does not preserve structured
+`ConsensusError::HeaderNotFound` or `ConsensusError::BlockNotFound` variants.
+Its wire `RPCError` contains only a message, and the client reconstructs every
+remote error as `RpcError::General(String)`. KGI nevertheless requires a
+definitive GetBlock not-found result to remain distinct from other RPC
+failures.
 
 NodeService therefore owns one narrow compatibility exception to the rule that
 error strings do not select control flow. For a failed GetBlock request with
-requested hash `hash`, classify `RpcError::General(message)` as definitive
-not-found only when `message` is byte-for-byte equal to:
+requested hash `hash`, classify `RpcError::General(message)` as the KGI-owned
+typed `BlockNotFound` outcome only when `message` is byte-for-byte equal to
+either:
 
 ```rust
-ConsensusError::BlockNotFound(hash).to_string()
+message == ConsensusError::HeaderNotFound(hash).to_string()
+    || message == ConsensusError::BlockNotFound(hash).to_string()
 ```
+
+The first form is the reviewed production result when GetBlock cannot find the
+requested header. The second form covers the same requested-block absence when
+rusty-kaspa reports the missing full block instead. KGI does not preserve this
+upstream distinction: both mean that the requested block cannot be obtained
+from the node and produce the same typed `BlockNotFound` result.
 
 The comparison performs no trimming, case folding, prefix or suffix matching,
 substring search, or classification of another RPC operation. A message built
@@ -526,7 +535,7 @@ owns the recovery and Live dispositions of `RpcRequestFailed`.
 
 This exception is tied to the pinned rusty-kaspa client behavior. An upstream
 or server message change may conservatively stop recognizing absence, but must
-never broaden the match. Replacing this adapter requires an end-to-end
+never broaden either match. Replacing this adapter requires an end-to-end
 structured not-found discriminator in the selected production transport and a
 newly accepted pinned-upstream review.
 

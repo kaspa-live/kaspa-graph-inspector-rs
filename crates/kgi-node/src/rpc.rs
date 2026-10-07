@@ -553,8 +553,9 @@ fn classify_get_block_error(hash: BlockHash, error: RpcError) -> GetBlockCallErr
     }
     let diagnostic: Arc<str> = Arc::from(error.to_string());
     if let RpcError::General(message) = error {
-        let expected = ConsensusError::BlockNotFound(hash).to_string();
-        if message == expected {
+        let header_not_found = ConsensusError::HeaderNotFound(hash).to_string();
+        let block_not_found = ConsensusError::BlockNotFound(hash).to_string();
+        if message == header_not_found || message == block_not_found {
             return GetBlockCallError::NotFound;
         }
     }
@@ -840,16 +841,20 @@ mod tests {
     }
 
     #[test]
-    fn get_block_not_found_match_is_exact_and_hash_specific() {
+    fn get_block_not_found_matches_are_exact_and_hash_specific() {
         let requested = hash(1);
-        let exact = ConsensusError::BlockNotFound(requested).to_string();
-        assert_eq!(classify_get_block_error(requested, RpcError::General(exact.clone())), GetBlockCallError::NotFound);
+        let header_not_found = ConsensusError::HeaderNotFound(requested).to_string();
+        let block_not_found = ConsensusError::BlockNotFound(requested).to_string();
+        for message in [header_not_found.clone(), block_not_found.clone()] {
+            assert_eq!(classify_get_block_error(requested, RpcError::General(message)), GetBlockCallError::NotFound);
+        }
 
         for message in [
+            ConsensusError::HeaderNotFound(hash(2)).to_string(),
             ConsensusError::BlockNotFound(hash(2)).to_string(),
-            exact.to_uppercase(),
-            format!(" {exact}"),
-            format!("{exact} "),
+            header_not_found.to_uppercase(),
+            format!(" {header_not_found}"),
+            format!("{block_not_found} "),
             "unrelated RPC failure".to_string(),
         ] {
             assert!(matches!(
@@ -879,12 +884,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_get_block_not_found_remains_distinct_without_retirement() {
+    async fn exact_get_block_not_found_forms_remain_distinct_without_retirement() {
         let requested = hash(1);
-        let message = ConsensusError::BlockNotFound(requested).to_string();
-        let scripts = [Script::block(Err(RpcError::General(message)), None)];
+        let scripts = [
+            Script::block(Err(RpcError::General(ConsensusError::HeaderNotFound(requested).to_string())), None),
+            Script::block(Err(RpcError::General(ConsensusError::BlockNotFound(requested).to_string())), None),
+        ];
         let (client, connection, mut retirements) = client(scripts);
 
+        assert_eq!(client.full_block(requested).await, Err(NodeError::BlockNotFound { hash: requested }));
         assert_eq!(client.full_block(requested).await, Err(NodeError::BlockNotFound { hash: requested }));
         assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
         assert_eq!(connection.disconnects.load(Ordering::Relaxed), 0);
@@ -914,7 +922,7 @@ mod tests {
     #[tokio::test]
     async fn advertised_sink_not_found_uses_sink_malformed_classification() {
         let sink = hash(7);
-        let message = ConsensusError::BlockNotFound(sink).to_string();
+        let message = ConsensusError::HeaderNotFound(sink).to_string();
         let scripts = [Script::sink(Ok(GetSinkResponse::new(sink))), Script::block(Err(RpcError::General(message)), None)];
         let (client, _connection, mut retirements) = client(scripts);
         let operation = tokio::spawn({
