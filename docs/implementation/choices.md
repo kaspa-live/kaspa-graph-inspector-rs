@@ -267,3 +267,28 @@ advanced clock and a scripted jitter sequence, so reconnect slots, the Ready
 reset boundary, and shutdown cancellation contain no wall-clock sleeps or
 probabilistic assertions. Exact delays and reset behavior remain owned by the
 [NodeService lifecycle](../architecture/node-service.md#nodeservice--settled).
+
+### Validated-generation composition
+
+Keep RPC API compatibility checking inside NodeService's private connection
+validation path. It is not exposed as a public free function or utility type;
+the published result is the semantic `ValidatedNodeInfo` attached to the exact
+generation. The same path constructs the raw Genesis-discovery request and
+polls server information during IBD. The private clock supplies a one-second
+IBD polling interval so those waits and shutdown races remain deterministic in
+tests.
+
+Each `ValidatedRpcClient` owns one `Arc<ResponseNormalizer>` and passes a clone
+to one stable `Arc<NotificationRouter>`. Subscription activation installs fresh
+session destinations into that router before starting remote subscriptions;
+successful deactivation clears them for a later session, while generation
+retirement permanently retires the router. The public `NotificationChannels`
+value groups the two bounded processor senders and reliable fault sender
+without exposing router internals.
+
+The permanent service task keeps physical connection, validation, event, and
+retirement ownership serialized in one loop. Stale retirement barriers are
+acknowledged during connect, validation, retry, and rejected phases as well as
+Ready, so a late report cannot disturb a replacement or remain blocked behind
+one. Tests use identity jitter when asserting nominal slots and the manual
+clock for both the Ready reset boundary and shutdown-cancellable waits.

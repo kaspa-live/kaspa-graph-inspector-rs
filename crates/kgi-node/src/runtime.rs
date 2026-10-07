@@ -8,23 +8,29 @@ use crate::rpc::ValidatedRpcClient;
 pub(crate) type RetirementSender = mpsc::UnboundedSender<RetirementRequest>;
 pub(crate) type RetirementReceiver = mpsc::UnboundedReceiver<RetirementRequest>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetirementReason {
+    MalformedRecoveryInput(RecoveryInputKind),
+    SubscriptionControlFailure,
+}
+
 pub(crate) struct RetirementRequest {
     generation: Weak<ValidatedRpcClient>,
-    cause: RecoveryInputKind,
+    reason: RetirementReason,
     completion: oneshot::Sender<()>,
 }
 
 impl RetirementRequest {
-    pub(crate) fn new(generation: Weak<ValidatedRpcClient>, cause: RecoveryInputKind, completion: oneshot::Sender<()>) -> Self {
-        Self { generation, cause, completion }
+    pub(crate) fn new(generation: Weak<ValidatedRpcClient>, reason: RetirementReason, completion: oneshot::Sender<()>) -> Self {
+        Self { generation, reason, completion }
     }
 
     pub(crate) fn generation(&self) -> &Weak<ValidatedRpcClient> {
         &self.generation
     }
 
-    pub(crate) const fn cause(&self) -> RecoveryInputKind {
-        self.cause
+    pub(crate) const fn reason(&self) -> RetirementReason {
+        self.reason
     }
 
     pub(crate) fn complete(self) {

@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     sync::{
-        Arc, Weak,
+        Arc, Mutex, Weak,
         atomic::{AtomicU8, AtomicUsize, Ordering},
     },
 };
@@ -13,25 +13,34 @@ use kaspa_rpc_core::{
 };
 use kgi_model::{
     block::{BlockHash, ValidatedNodeBlock, ValidatedRecoveryHeader},
-    lifecycle::RecoveryInputKind,
+    lifecycle::{FaultKind, RecoveryInputKind},
     vspc::VspcChange,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use crate::{
     client::RpcConnection,
     consensus::KgiConsensusParams,
     error::NodeError,
     normalization::{ResponseNormalizationError, ResponseNormalizer},
-    runtime::{RetirementRequest, RetirementSender},
+    notification::NotificationRouter,
+    runtime::{RetirementReason, RetirementRequest, RetirementSender},
 };
 
-#[allow(dead_code, reason = "NodeService constructs validated generations in point 4")]
 const MAX_RPC_CONCURRENCY: usize = 32;
 
 const GENERATION_ACTIVE: u8 = 0;
 const GENERATION_LOST: u8 = 1;
 const GENERATION_CANCELLED: u8 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubscriptionState {
+    Disabled,
+    Activating,
+    Enabled,
+    Disabling,
+    Retired,
+}
 
 /// Identity and assumptions attached to one validated physical RPC connection.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,11 +67,70 @@ pub struct RpcOperationCounts {
     pub waiting: usize,
 }
 
+/// Typed notification-routing failure reported to the active processing session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NotificationFault {
+    kind: FaultKind,
+    diagnostic: Arc<str>,
+}
+
+impl NotificationFault {
+    pub(crate) fn new(kind: FaultKind, diagnostic: impl Into<Arc<str>>) -> Self {
+        Self { kind, diagnostic: diagnostic.into() }
+    }
+
+    /// Returns the semantic fault classification.
+    #[must_use]
+    pub const fn kind(&self) -> FaultKind {
+        self.kind
+    }
+
+    /// Returns non-semantic diagnostic context.
+    #[must_use]
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+}
+
+/// Bounded processor destinations and reliable fault path for one session.
+#[derive(Debug)]
+pub struct NotificationChannels {
+    blocks: mpsc::Sender<ValidatedNodeBlock>,
+    vspc: mpsc::Sender<VspcChange>,
+    faults: mpsc::UnboundedSender<NotificationFault>,
+}
+
+impl NotificationChannels {
+    /// Groups the session endpoints installed before remote subscription starts.
+    #[must_use]
+    pub fn new(
+        blocks: mpsc::Sender<ValidatedNodeBlock>,
+        vspc: mpsc::Sender<VspcChange>,
+        faults: mpsc::UnboundedSender<NotificationFault>,
+    ) -> Self {
+        Self { blocks, vspc, faults }
+    }
+
+    pub(crate) const fn blocks(&self) -> &mpsc::Sender<ValidatedNodeBlock> {
+        &self.blocks
+    }
+
+    pub(crate) const fn vspc(&self) -> &mpsc::Sender<VspcChange> {
+        &self.vspc
+    }
+
+    pub(crate) const fn faults(&self) -> &mpsc::UnboundedSender<NotificationFault> {
+        &self.faults
+    }
+}
+
 /// RPC capability bound permanently to one validated physical connection.
 pub struct ValidatedRpcClient {
     connection: Arc<dyn RpcConnection>,
     node_info: ValidatedNodeInfo,
     normalizer: Arc<ResponseNormalizer>,
+    notification_router: Arc<NotificationRouter>,
+    subscription_state: Mutex<SubscriptionState>,
     admission: AtomicU8,
     admission_tx: watch::Sender<u8>,
     permits: Arc<Semaphore>,
@@ -73,13 +141,16 @@ pub struct ValidatedRpcClient {
 }
 
 impl ValidatedRpcClient {
-    #[allow(dead_code, reason = "NodeService constructs validated generations in point 4")]
     pub(crate) fn new(connection: Arc<dyn RpcConnection>, node_info: ValidatedNodeInfo, retirement_tx: RetirementSender) -> Arc<Self> {
+        let normalizer = Arc::new(ResponseNormalizer::new(node_info.genesis_hash));
+        let notification_router = Arc::new(NotificationRouter::new(normalizer.clone()));
         Arc::new_cyclic(|self_weak| {
             let (admission_tx, _) = watch::channel(GENERATION_ACTIVE);
             Self {
                 connection,
-                normalizer: Arc::new(ResponseNormalizer::new(node_info.genesis_hash)),
+                normalizer,
+                notification_router,
+                subscription_state: Mutex::new(SubscriptionState::Disabled),
                 node_info,
                 admission: AtomicU8::new(GENERATION_ACTIVE),
                 admission_tx,
@@ -102,6 +173,100 @@ impl ValidatedRpcClient {
     #[must_use]
     pub fn operation_counts(&self) -> RpcOperationCounts {
         RpcOperationCounts { active: self.active.load(Ordering::Relaxed), waiting: self.waiting.load(Ordering::Relaxed) }
+    }
+
+    pub(crate) fn notification_router(&self) -> Arc<NotificationRouter> {
+        self.notification_router.clone()
+    }
+
+    /// Starts both remote notification subscriptions and then enables local routing.
+    pub async fn activate_notifications(&self, channels: NotificationChannels) -> Result<(), NodeError> {
+        self.require_active()?;
+        {
+            let mut state = self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *state != SubscriptionState::Disabled {
+                return Err(NodeError::InvalidSubscriptionState);
+            }
+            *state = SubscriptionState::Activating;
+        }
+        if !self.notification_router.install(channels) {
+            self.set_subscription_state_if_not_retired(SubscriptionState::Disabled);
+            return Err(NodeError::InvalidSubscriptionState);
+        }
+
+        if let Err(error) = self.subscription_call(self.connection.start_block_added()).await {
+            self.finish_failed_activation();
+            return Err(error);
+        }
+        if let Err(start_error) = self.subscription_call(self.connection.start_virtual_chain_changed()).await {
+            if is_inactive_error(&start_error) {
+                self.finish_failed_activation();
+                return Err(start_error);
+            }
+            let rollback = self.subscription_call(self.connection.stop_block_added()).await;
+            if let Err(rollback_error) = rollback {
+                if is_inactive_error(&rollback_error) {
+                    return Err(rollback_error);
+                }
+                let diagnostic = Arc::from(format!("{start_error}; BlockAdded rollback failed: {rollback_error}"));
+                self.request_retirement(RetirementReason::SubscriptionControlFailure).await?;
+                return Err(NodeError::SubscriptionControlFailed { diagnostic });
+            }
+            self.finish_failed_activation();
+            return Err(start_error);
+        }
+
+        self.require_active()?;
+        if !self.notification_router.enable() {
+            return Err(self.inactive_error());
+        }
+        let mut state = self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *state == SubscriptionState::Retired {
+            return Err(self.inactive_error());
+        }
+        *state = SubscriptionState::Enabled;
+        Ok(())
+    }
+
+    /// Disables local routing immediately and then stops both remote subscriptions.
+    pub async fn disable_notifications(&self) -> Result<(), NodeError> {
+        let already_disabled = {
+            let mut state = self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match *state {
+                SubscriptionState::Disabled => true,
+                SubscriptionState::Enabled => {
+                    *state = SubscriptionState::Disabling;
+                    false
+                }
+                SubscriptionState::Retired => return Err(self.inactive_error()),
+                SubscriptionState::Activating | SubscriptionState::Disabling => {
+                    return Err(NodeError::InvalidSubscriptionState);
+                }
+            }
+        };
+        if already_disabled {
+            self.notification_router.clear();
+            return Ok(());
+        }
+        self.notification_router.disable();
+
+        let block_result = self.subscription_call(self.connection.stop_block_added()).await;
+        let vspc_result = self.subscription_call(self.connection.stop_virtual_chain_changed()).await;
+        if let Some(error) = [&block_result, &vspc_result].into_iter().find_map(|result| match result {
+            Err(error) if is_inactive_error(error) => Some(error.clone()),
+            _ => None,
+        }) {
+            return Err(error);
+        }
+        if let Err(error) = block_result.and(vspc_result) {
+            self.request_retirement(RetirementReason::SubscriptionControlFailure).await?;
+            return Err(error);
+        }
+
+        self.require_active()?;
+        self.notification_router.clear();
+        self.set_subscription_state_if_not_retired(SubscriptionState::Disabled);
+        Ok(())
     }
 
     /// Obtains and normalizes the current pruning-point block.
@@ -241,6 +406,22 @@ impl ValidatedRpcClient {
         response.map_err(RawCallError::Rpc)
     }
 
+    async fn subscription_call(&self, future: impl Future<Output = RpcResult<()>>) -> Result<(), NodeError> {
+        let mut admission = self.admission_tx.subscribe();
+        self.require_active()?;
+        tokio::pin!(future);
+        let response = tokio::select! {
+            biased;
+            changed = wait_until_inactive(&mut admission) => {
+                changed?;
+                return Err(self.inactive_error());
+            }
+            response = &mut future => response,
+        };
+        self.require_active()?;
+        response.map_err(|error| NodeError::SubscriptionControlFailed { diagnostic: Arc::from(error.to_string()) })
+    }
+
     async fn finish_normalized<T>(
         &self,
         operation: &OperationGuard<'_>,
@@ -260,12 +441,31 @@ impl ValidatedRpcClient {
     }
 
     async fn return_malformed<T>(&self, _operation: &OperationGuard<'_>, kind: RecoveryInputKind) -> Result<T, NodeError> {
+        self.request_retirement(RetirementReason::MalformedRecoveryInput(kind)).await?;
+        Err(NodeError::RecoveryInputInvalid(kind))
+    }
+
+    async fn request_retirement(&self, reason: RetirementReason) -> Result<(), NodeError> {
+        self.require_active()?;
         let (completion_tx, completion_rx) = oneshot::channel();
         self.retirement_tx
-            .send(RetirementRequest::new(self.self_weak.clone(), kind, completion_tx))
+            .send(RetirementRequest::new(self.self_weak.clone(), reason, completion_tx))
             .map_err(|_| NodeError::RetirementControlUnavailable)?;
         completion_rx.await.map_err(|_| NodeError::RetirementControlUnavailable)?;
-        Err(NodeError::RecoveryInputInvalid(kind))
+        Ok(())
+    }
+
+    fn finish_failed_activation(&self) {
+        self.notification_router.disable();
+        self.notification_router.clear();
+        self.set_subscription_state_if_not_retired(SubscriptionState::Disabled);
+    }
+
+    fn set_subscription_state_if_not_retired(&self, next: SubscriptionState) {
+        let mut state = self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *state != SubscriptionState::Retired {
+            *state = next;
+        }
     }
 
     fn require_active(&self) -> Result<(), NodeError> {
@@ -281,12 +481,10 @@ impl ValidatedRpcClient {
         self.require_active().expect_err("generation is inactive")
     }
 
-    #[allow(dead_code, reason = "NodeService consumes this in point 4")]
     pub(crate) async fn retire(&self) -> bool {
         self.close(GENERATION_LOST).await
     }
 
-    #[allow(dead_code, reason = "NodeService consumes this in point 4")]
     pub(crate) async fn cancel(&self) -> bool {
         self.close(GENERATION_CANCELLED).await
     }
@@ -296,6 +494,8 @@ impl ValidatedRpcClient {
             return false;
         }
         self.admission_tx.send_replace(state);
+        self.notification_router.retire();
+        *self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = SubscriptionState::Retired;
         if let Err(error) = self.connection.disconnect().await {
             kaspa_core::warn!("failed to disconnect retired RPC generation: {error}");
         }
@@ -369,6 +569,10 @@ fn map_opaque_rpc_error(error: RawCallError) -> NodeError {
     }
 }
 
+fn is_inactive_error(error: &NodeError) -> bool {
+    matches!(error, NodeError::GenerationLost | NodeError::Cancelled)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -397,12 +601,13 @@ mod tests {
     };
     use tokio::sync::{Semaphore, mpsc};
 
-    use super::{GetBlockCallError, ValidatedNodeInfo, ValidatedRpcClient, classify_get_block_error};
+    use super::{GetBlockCallError, NotificationChannels, ValidatedNodeInfo, ValidatedRpcClient, classify_get_block_error};
     use crate::{
         client::RpcConnection,
         consensus::KgiConsensusParams,
         error::NodeError,
-        runtime::{RetirementReceiver, retirement_channel},
+        notification::NotificationRouterState,
+        runtime::{RetirementReason, RetirementReceiver, retirement_channel},
     };
 
     enum Script {
@@ -447,6 +652,9 @@ mod tests {
     struct ScriptedConnection {
         scripts: tokio::sync::Mutex<VecDeque<Script>>,
         requests: Mutex<Vec<RecordedRequest>>,
+        subscription_results: Mutex<VecDeque<RpcResult<()>>>,
+        subscription_calls: Mutex<Vec<&'static str>>,
+        virtual_start_gate: Option<Arc<Semaphore>>,
         disconnects: AtomicUsize,
     }
 
@@ -455,8 +663,21 @@ mod tests {
             Self {
                 scripts: tokio::sync::Mutex::new(scripts.into_iter().collect()),
                 requests: Mutex::new(Vec::new()),
+                subscription_results: Mutex::new(VecDeque::new()),
+                subscription_calls: Mutex::new(Vec::new()),
+                virtual_start_gate: None,
                 disconnects: AtomicUsize::new(0),
             }
+        }
+
+        fn with_subscription_results(self, results: impl IntoIterator<Item = RpcResult<()>>) -> Self {
+            *self.subscription_results.lock().expect("subscription results") = results.into_iter().collect();
+            self
+        }
+
+        fn with_virtual_start_gate(mut self, gate: Arc<Semaphore>) -> Self {
+            self.virtual_start_gate = Some(gate);
+            self
         }
 
         async fn next(&self) -> Script {
@@ -469,6 +690,15 @@ mod tests {
 
         fn requests(&self) -> Vec<RecordedRequest> {
             self.requests.lock().expect("request log").clone()
+        }
+
+        fn subscription_call(&self, operation: &'static str) -> RpcResult<()> {
+            self.subscription_calls.lock().expect("subscription log").push(operation);
+            self.subscription_result()
+        }
+
+        fn subscription_result(&self) -> RpcResult<()> {
+            self.subscription_results.lock().expect("subscription results").pop_front().unwrap_or(Ok(()))
         }
     }
 
@@ -528,6 +758,26 @@ mod tests {
                 Script::Vspc(result) => *result,
                 _ => panic!("expected VSPC V2 script"),
             }
+        }
+
+        async fn start_block_added(&self) -> RpcResult<()> {
+            self.subscription_call("start BlockAdded")
+        }
+
+        async fn start_virtual_chain_changed(&self) -> RpcResult<()> {
+            self.subscription_calls.lock().expect("subscription log").push("start VirtualChainChanged");
+            if let Some(gate) = &self.virtual_start_gate {
+                gate.acquire().await.expect("virtual-start gate").forget();
+            }
+            self.subscription_result()
+        }
+
+        async fn stop_block_added(&self) -> RpcResult<()> {
+            self.subscription_call("stop BlockAdded")
+        }
+
+        async fn stop_virtual_chain_changed(&self) -> RpcResult<()> {
+            self.subscription_call("stop VirtualChainChanged")
         }
 
         async fn disconnect(&self) -> Result<(), Arc<str>> {
@@ -652,7 +902,7 @@ mod tests {
         });
 
         let retirement = retirements.recv().await.expect("retirement request");
-        assert_eq!(retirement.cause(), RecoveryInputKind::MalformedGetBlock);
+        assert_eq!(retirement.reason(), RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedGetBlock));
         assert!(client.retire().await);
         retirement.complete();
         assert_eq!(
@@ -674,7 +924,7 @@ mod tests {
         });
 
         let retirement = retirements.recv().await.expect("retirement request");
-        assert_eq!(retirement.cause(), RecoveryInputKind::MalformedCatchupSinkResponse);
+        assert_eq!(retirement.reason(), RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedCatchupSinkResponse));
         assert!(client.retire().await);
         retirement.complete();
         assert_eq!(
@@ -694,7 +944,7 @@ mod tests {
         });
 
         let retirement = retirements.recv().await.expect("retirement request");
-        assert_eq!(retirement.cause(), RecoveryInputKind::MalformedGetBlocks);
+        assert_eq!(retirement.reason(), RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedGetBlocks));
         assert!(client.retire().await);
         retirement.complete();
         assert_eq!(
@@ -716,7 +966,7 @@ mod tests {
         let retirement = retirements.recv().await.expect("retirement request");
         let generation = retirement.generation().upgrade().expect("exact generation");
         assert!(Arc::ptr_eq(&generation, &client));
-        assert_eq!(retirement.cause(), RecoveryInputKind::MalformedGetBlock);
+        assert_eq!(retirement.reason(), RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedGetBlock));
         assert!(client.retire().await);
         tokio::task::yield_now().await;
         assert!(!operation.is_finished());
@@ -765,6 +1015,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notification_subscription_transitions_preserve_remote_order() {
+        let connection = Arc::new(ScriptedConnection::new([]));
+        let (retirement_tx, mut retirements) = retirement_channel();
+        let client = ValidatedRpcClient::new(connection.clone(), node_info(), retirement_tx);
+        let (channels, _receivers) = notification_channels();
+
+        client.activate_notifications(channels).await.expect("activate notifications");
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Enabled);
+        client.disable_notifications().await.expect("disable notifications");
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Disabled);
+        assert_eq!(
+            connection.subscription_calls.lock().expect("subscription log").as_slice(),
+            &["start BlockAdded", "start VirtualChainChanged", "stop BlockAdded", "stop VirtualChainChanged"]
+        );
+        assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn router_remains_disabled_until_both_remote_starts_complete() {
+        let gate = Arc::new(Semaphore::new(0));
+        let connection = Arc::new(ScriptedConnection::new([]).with_virtual_start_gate(gate.clone()));
+        let (retirement_tx, _retirements) = retirement_channel();
+        let client = ValidatedRpcClient::new(connection.clone(), node_info(), retirement_tx);
+        let (channels, _receivers) = notification_channels();
+        let activation = tokio::spawn({
+            let client = client.clone();
+            async move { client.activate_notifications(channels).await }
+        });
+
+        while connection.subscription_calls.lock().expect("subscription log").len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Disabled);
+        gate.add_permits(1);
+        activation.await.expect("activation task").expect("activation");
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Enabled);
+    }
+
+    #[tokio::test]
+    async fn second_subscription_failure_rolls_back_and_allows_a_fresh_activation() {
+        let connection = Arc::new(ScriptedConnection::new([]).with_subscription_results([
+            Ok(()),
+            Err(RpcError::General("VSPC start failed".to_string())),
+            Ok(()),
+        ]));
+        let (retirement_tx, mut retirements) = retirement_channel();
+        let client = ValidatedRpcClient::new(connection.clone(), node_info(), retirement_tx);
+        let (channels, _receivers) = notification_channels();
+
+        assert!(matches!(client.activate_notifications(channels).await, Err(NodeError::SubscriptionControlFailed { .. })));
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Disabled);
+        assert_eq!(
+            connection.subscription_calls.lock().expect("subscription log").as_slice(),
+            &["start BlockAdded", "start VirtualChainChanged", "stop BlockAdded"]
+        );
+        assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+
+        let (channels, _receivers) = notification_channels();
+        client.activate_notifications(channels).await.expect("fresh activation after rollback");
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Enabled);
+    }
+
+    #[tokio::test]
+    async fn failed_subscription_rollback_requests_exact_generation_retirement() {
+        let connection = Arc::new(ScriptedConnection::new([]).with_subscription_results([
+            Ok(()),
+            Err(RpcError::General("VSPC start failed".to_string())),
+            Err(RpcError::General("BlockAdded rollback failed".to_string())),
+        ]));
+        let (retirement_tx, mut retirements) = retirement_channel();
+        let client = ValidatedRpcClient::new(connection, node_info(), retirement_tx);
+        let (channels, _receivers) = notification_channels();
+        let activation = tokio::spawn({
+            let client = client.clone();
+            async move { client.activate_notifications(channels).await }
+        });
+
+        let retirement = retirements.recv().await.expect("retirement request");
+        assert_eq!(retirement.reason(), RetirementReason::SubscriptionControlFailure);
+        assert!(retirement.generation().upgrade().is_some_and(|generation| Arc::ptr_eq(&generation, &client)));
+        assert!(client.retire().await);
+        retirement.complete();
+        assert!(matches!(activation.await.expect("activation task"), Err(NodeError::SubscriptionControlFailed { .. })));
+    }
+
+    #[tokio::test]
+    async fn partial_unsubscription_failure_retires_after_attempting_both_stops() {
+        let connection = Arc::new(ScriptedConnection::new([]).with_subscription_results([
+            Ok(()),
+            Ok(()),
+            Err(RpcError::General("BlockAdded stop failed".to_string())),
+            Ok(()),
+        ]));
+        let (retirement_tx, mut retirements) = retirement_channel();
+        let client = ValidatedRpcClient::new(connection.clone(), node_info(), retirement_tx);
+        let (channels, _receivers) = notification_channels();
+        client.activate_notifications(channels).await.expect("activation");
+        let deactivation = tokio::spawn({
+            let client = client.clone();
+            async move { client.disable_notifications().await }
+        });
+
+        let retirement = retirements.recv().await.expect("retirement request");
+        assert_eq!(retirement.reason(), RetirementReason::SubscriptionControlFailure);
+        assert!(client.retire().await);
+        retirement.complete();
+        assert!(matches!(deactivation.await.expect("deactivation task"), Err(NodeError::SubscriptionControlFailed { .. })));
+        assert_eq!(
+            connection.subscription_calls.lock().expect("subscription log").as_slice(),
+            &["start BlockAdded", "start VirtualChainChanged", "stop BlockAdded", "stop VirtualChainChanged"]
+        );
+    }
+
+    #[tokio::test]
     async fn runtime_concurrency_is_bounded_to_thirty_two() {
         let gate = Arc::new(Semaphore::new(0));
         let requested = hash(1);
@@ -791,6 +1155,19 @@ mod tests {
         let (retirement_tx, retirement_rx) = retirement_channel();
         let client = ValidatedRpcClient::new(connection.clone(), node_info(), retirement_tx);
         (client, connection, retirement_rx)
+    }
+
+    type NotificationReceivers = (
+        mpsc::Receiver<kgi_model::block::ValidatedNodeBlock>,
+        mpsc::Receiver<kgi_model::vspc::VspcChange>,
+        mpsc::UnboundedReceiver<super::NotificationFault>,
+    );
+
+    fn notification_channels() -> (NotificationChannels, NotificationReceivers) {
+        let (block_tx, block_rx) = mpsc::channel(1);
+        let (vspc_tx, vspc_rx) = mpsc::channel(1);
+        let (fault_tx, fault_rx) = mpsc::unbounded_channel();
+        (NotificationChannels::new(block_tx, vspc_tx, fault_tx), (block_rx, vspc_rx, fault_rx))
     }
 
     fn node_info() -> ValidatedNodeInfo {

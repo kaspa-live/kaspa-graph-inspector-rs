@@ -6,35 +6,21 @@ use kaspa_notify::{
 };
 use kaspa_rpc_core::{Notification, VirtualChainChangedNotification};
 use kgi_model::{
-    block::ValidatedNodeBlock,
     lifecycle::{FaultKind, MalformedVspcNotificationReason, NotificationInputKind, OwnershipFault},
     vspc::VspcChange,
 };
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::mpsc::error::TrySendError;
 
-use crate::normalization::{BlockNormalizationError, ResponseNormalizer};
+use crate::{
+    normalization::{BlockNormalizationError, ResponseNormalizer},
+    rpc::{NotificationChannels, NotificationFault},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NotificationRouterState {
     Disabled,
     Enabled,
     Retired,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NotificationRouterFault {
-    kind: FaultKind,
-    diagnostic: Arc<str>,
-}
-
-impl NotificationRouterFault {
-    pub(crate) fn kind(&self) -> FaultKind {
-        self.kind
-    }
-
-    pub(crate) fn diagnostic(&self) -> &str {
-        &self.diagnostic
-    }
 }
 
 #[derive(Debug)]
@@ -46,31 +32,34 @@ pub(crate) struct NotificationRouter {
 #[derive(Debug)]
 struct NotificationRouterInner {
     state: NotificationRouterState,
-    blocks: mpsc::Sender<ValidatedNodeBlock>,
-    vspc: mpsc::Sender<VspcChange>,
-    faults: mpsc::UnboundedSender<NotificationRouterFault>,
+    destinations: Option<NotificationChannels>,
 }
 
 impl NotificationRouter {
-    pub(crate) fn new(
-        normalizer: Arc<ResponseNormalizer>,
-        blocks: mpsc::Sender<ValidatedNodeBlock>,
-        vspc: mpsc::Sender<VspcChange>,
-        faults: mpsc::UnboundedSender<NotificationRouterFault>,
-    ) -> Self {
+    pub(crate) fn new(normalizer: Arc<ResponseNormalizer>) -> Self {
         Self {
             normalizer,
-            inner: Mutex::new(NotificationRouterInner { state: NotificationRouterState::Disabled, blocks, vspc, faults }),
+            inner: Mutex::new(NotificationRouterInner { state: NotificationRouterState::Disabled, destinations: None }),
         }
     }
 
+    pub(crate) fn install(&self, channels: NotificationChannels) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.state != NotificationRouterState::Disabled {
+            return false;
+        }
+        inner.destinations = Some(channels);
+        true
+    }
+
+    #[cfg(test)]
     pub(crate) fn state(&self) -> NotificationRouterState {
         self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).state
     }
 
     pub(crate) fn enable(&self) -> bool {
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if inner.state == NotificationRouterState::Retired {
+        if inner.state != NotificationRouterState::Disabled || inner.destinations.is_none() {
             false
         } else {
             inner.state = NotificationRouterState::Enabled;
@@ -85,8 +74,17 @@ impl NotificationRouter {
         }
     }
 
+    pub(crate) fn clear(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.state == NotificationRouterState::Disabled {
+            inner.destinations = None;
+        }
+    }
+
     pub(crate) fn retire(&self) {
-        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).state = NotificationRouterState::Retired;
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.state = NotificationRouterState::Retired;
+        inner.destinations = None;
     }
 
     fn route_block(
@@ -112,7 +110,10 @@ impl NotificationRouter {
             }
         };
 
-        match inner.blocks.try_send(block) {
+        let Some(destinations) = inner.destinations.as_ref() else {
+            return Err(NotifyError::ChannelSendError);
+        };
+        match destinations.blocks().try_send(block) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 disable_and_report(inner, FaultKind::SessionContinuityLost, "BlockAdded destination is full")
@@ -142,7 +143,10 @@ impl NotificationRouter {
         }
 
         let change = VspcChange { removed: Arc::from(removed.as_slice()), added: Arc::from(added.as_slice()) };
-        match inner.vspc.try_send(change) {
+        let Some(destinations) = inner.destinations.as_ref() else {
+            return Err(NotifyError::ChannelSendError);
+        };
+        match destinations.vspc().try_send(change) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 disable_and_report(inner, FaultKind::SessionContinuityLost, "VirtualChainChanged destination is full")
@@ -173,7 +177,13 @@ impl Notify<Notification> for NotificationRouter {
 
 fn disable_and_report(inner: &mut NotificationRouterInner, kind: FaultKind, diagnostic: impl Into<Arc<str>>) -> NotifyResult<()> {
     inner.state = NotificationRouterState::Disabled;
-    inner.faults.send(NotificationRouterFault { kind, diagnostic: diagnostic.into() }).map_err(|_| NotifyError::ChannelSendError)
+    inner
+        .destinations
+        .as_ref()
+        .ok_or(NotifyError::ChannelSendError)?
+        .faults()
+        .send(NotificationFault::new(kind, diagnostic))
+        .map_err(|_| NotifyError::ChannelSendError)
 }
 
 #[cfg(test)]
@@ -192,9 +202,12 @@ mod tests {
     };
     use tokio::sync::mpsc;
 
-    use crate::normalization::ResponseNormalizer;
+    use crate::{
+        normalization::ResponseNormalizer,
+        rpc::{NotificationChannels, NotificationFault},
+    };
 
-    use super::{NotificationRouter, NotificationRouterFault, NotificationRouterState};
+    use super::{NotificationRouter, NotificationRouterState};
 
     #[test]
     fn disabled_and_retired_router_drop_without_consuming_capacity() {
@@ -302,7 +315,7 @@ mod tests {
         let (block_router, mut blocks, mut block_vspc, mut block_faults) = router(1);
         blocks.try_recv().expect_err("empty channel");
         block_router.enable();
-        let block_sender = block_router.inner.lock().expect("router").blocks.clone();
+        let block_sender = block_router.inner.lock().expect("router").destinations.as_ref().expect("destinations").blocks().clone();
         block_sender.try_send(validated_block(hash(9))).expect("fill block channel");
         block_router.notify(block_added(rpc_block(hash(1), vec![hash(2)]))).expect("full channel is classified");
         block_router.notify(vspc_changed(vec![], vec![hash(3)])).expect("disabled VSPC callback");
@@ -311,7 +324,7 @@ mod tests {
 
         let (vspc_router, mut later_blocks, mut filled_vspc, mut vspc_faults) = router(1);
         vspc_router.enable();
-        let vspc_sender = vspc_router.inner.lock().expect("router").vspc.clone();
+        let vspc_sender = vspc_router.inner.lock().expect("router").destinations.as_ref().expect("destinations").vspc().clone();
         vspc_sender.try_send(VspcChange { removed: Arc::from([]), added: Arc::from([hash(8)]) }).expect("fill VSPC channel");
         vspc_router.notify(vspc_changed(vec![], vec![hash(3)])).expect("full channel is classified");
         vspc_router.notify(block_added(rpc_block(hash(4), vec![hash(5)]))).expect("disabled block callback");
@@ -336,16 +349,14 @@ mod tests {
 
     fn router(
         capacity: usize,
-    ) -> (
-        NotificationRouter,
-        mpsc::Receiver<ValidatedNodeBlock>,
-        mpsc::Receiver<VspcChange>,
-        mpsc::UnboundedReceiver<NotificationRouterFault>,
-    ) {
+    ) -> (NotificationRouter, mpsc::Receiver<ValidatedNodeBlock>, mpsc::Receiver<VspcChange>, mpsc::UnboundedReceiver<NotificationFault>)
+    {
         let (block_tx, block_rx) = mpsc::channel(capacity);
         let (vspc_tx, vspc_rx) = mpsc::channel(capacity);
         let (fault_tx, fault_rx) = mpsc::unbounded_channel();
-        (NotificationRouter::new(Arc::new(ResponseNormalizer::new(hash(0))), block_tx, vspc_tx, fault_tx), block_rx, vspc_rx, fault_rx)
+        let router = NotificationRouter::new(Arc::new(ResponseNormalizer::new(hash(0))));
+        assert!(router.install(NotificationChannels::new(block_tx, vspc_tx, fault_tx)));
+        (router, block_rx, vspc_rx, fault_rx)
     }
 
     fn block_added(block: RpcBlock) -> Notification {

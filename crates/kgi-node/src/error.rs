@@ -71,6 +71,52 @@ pub enum ConsensusResolutionError {
     InvalidParameters(#[from] InvalidConsensusParameters),
 }
 
+/// Permanent reason a physical node connection cannot be published.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum NodeRejection {
+    #[error("node network mismatch: expected {expected}, observed {observed}")]
+    NetworkMismatch { expected: NetworkId, observed: NetworkId },
+
+    #[error(
+        "incompatible RPC API: required {required_version}.{minimum_revision}+, observed {observed_version:?}.{observed_revision:?}"
+    )]
+    IncompatibleRpcApi { required_version: u16, minimum_revision: u16, observed_version: Option<u16>, observed_revision: Option<u16> },
+
+    #[error(
+        "required notification capabilities are unavailable: handle_stop_notify={handle_stop_notify}, handle_message_id={handle_message_id}"
+    )]
+    MissingNotificationCapabilities { handle_stop_notify: bool, handle_message_id: bool },
+}
+
+/// Transient reason NodeService currently has no validated RPC generation.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum NodeUnavailableReason {
+    #[error("node connection failed: {diagnostic}")]
+    ConnectionFailed { diagnostic: Arc<str> },
+
+    #[error("node validation failed: {diagnostic}")]
+    ValidationFailed { diagnostic: Arc<str> },
+
+    #[error("node is performing initial block download")]
+    InitialBlockDownload,
+
+    #[error("validated node connection was lost: {diagnostic}")]
+    ConnectionLost { diagnostic: Arc<str> },
+}
+
+/// Failure of the permanent NodeService control lifecycle.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum NodeServiceError {
+    #[error("NodeService control path is unavailable")]
+    ControlUnavailable,
+
+    #[error("NodeService event path closed while the service was running")]
+    EventPathClosed,
+
+    #[error("NodeService worker failed: {diagnostic}")]
+    WorkerFailed { diagnostic: Arc<str> },
+}
+
 /// Failure returned by one operation on a validated RPC generation.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum NodeError {
@@ -85,6 +131,12 @@ pub enum NodeError {
 
     #[error("RPC request failed: {diagnostic}")]
     RpcRequestFailed { diagnostic: Arc<str> },
+
+    #[error("notification subscription control failed: {diagnostic}")]
+    SubscriptionControlFailed { diagnostic: Arc<str> },
+
+    #[error("notification subscription state does not permit this operation")]
+    InvalidSubscriptionState,
 
     #[error("recovery input is invalid: {0:?}")]
     RecoveryInputInvalid(RecoveryInputKind),
