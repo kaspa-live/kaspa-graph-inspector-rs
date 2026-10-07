@@ -77,6 +77,15 @@ The PUAR checklist is:
 8. For [VSPC path attribution](vspc-processing.md#readiness-and-materiality--settled),
    a valid retained-range VSPC query emits adjacent chain-path members using
    the same GhostDAG selected-parent relation that enriched GetBlock exposes.
+9. For NodeService
+   [individual recovery GetBlock](node-service.md#individual-recovery-getblock),
+   an unknown requested hash produces
+   `ConsensusError::BlockNotFound(requested_hash)`, places exactly that error's
+   display text in the gRPC `RPCError.message`, preserves that string through
+   wire conversion, and reconstructs it as `RpcError::General` in the selected
+   Rust client. The review also records that unrelated remote and client
+   failures can use the same `General` variant, so the variant itself is not a
+   semantic discriminator.
 
 For each item, inspect the committed source at the full SHA and report one of:
 
@@ -112,10 +121,17 @@ upstream change gives a concrete reason.
 
 Architecture accepts the
 [6 October 2026 PUAR](../reviews/2026-10-06-rusty-kaspa-01b532e8-assumptions.md)
-against the full pinned revision above. All eight checklist items are
-`Confirmed`; none is `Not confirmed` or `Contradicted`. The focused contracts
-may therefore rely on those reviewed upstream behaviors for the pinned
-revision, subject to their stated KGI validation and recovery rules.
+against the full pinned revision above. That report confirms all eight
+checklist items; none is `Not confirmed` or `Contradicted`. The focused
+contracts may therefore rely on those reviewed upstream behaviors for the
+pinned revision, subject to their stated KGI validation and recovery rules.
+
+The expanded
+[7 October 2026 PUAR](../reviews/2026-10-07-rusty-kaspa-01b532e8-assumptions.md)
+reconfirms those eight items but reports the ninth GetBlock error-string
+compatibility assumption as `Contradicted`. Architecture must resolve that
+conflict before NodeService implements definitive GetBlock absence
+classification. The expanded report is not an accepted complete PUAR result.
 
 This section is the sole normative owner of the PUAR acceptance status. The
 report remains non-normative source analysis evidence. The accepted result does
