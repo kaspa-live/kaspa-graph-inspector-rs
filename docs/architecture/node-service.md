@@ -428,14 +428,29 @@ disable router immediately
 stop both remote subscriptions
 ```
 
-Subscription changes are all-or-nothing. If either remote start fails, stop
-any subscription already started; retire the validated handle when rollback
-cannot be proven. A partial subscription or unsubscription failure likewise
-retires the handle. Callbacks received while the router remains Disabled
-during remote activation are intentionally dropped; they receive no Catchup
-overlap credit and do not themselves request recovery. NodeService does not
-replay dropped callbacks. The consequences for Live admission and a block that
-later becomes required belong to the
+Subscription changes are all-or-nothing. `SubscriptionControlFailed` is the
+generation-preserving activation result: the first remote start failed before
+anything became active, or a later start failed and every earlier start was
+successfully rolled back. Before returning it, NodeService leaves the router
+and subscription state Disabled, clears the installed notification channels,
+keeps the exact validated handle admitted, and emits no `RpcRetired` event.
+
+When activation rollback cannot be proven, or either remote unsubscription
+fails, NodeService disables the router, retires the exact validated handle,
+enqueues `RpcRetired` before completing the operation, and returns
+`GenerationLost`. Disable attempts still issue both remote stops before this
+retirement decision. Cancellation or an independently observed retirement
+retains its existing typed outcome rather than being reclassified as a
+subscription-control failure. The
+[processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
+owns the cross-worker fault and disposition of the generation-preserving
+result and the coalescing of a generation-ending result with `RpcRetired`.
+
+Callbacks received while the router remains Disabled during remote activation
+are intentionally dropped; they receive no Catchup overlap credit and do not
+themselves request recovery. NodeService does not replay dropped callbacks.
+The consequences for Live admission and a block that later becomes required
+belong to the
 [processing lifecycle](processing-lifecycle.md#recovery-scope-and-omitted-body-tips).
 Disabling is an immediate local cutoff, not a quiescence or transport fence.
 An item whose bounded enqueue linearized before retirement may remain in the

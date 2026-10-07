@@ -205,7 +205,13 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
    sends both processor Catchup commands before invoking NodeService activation;
    NodeService sends no processor command; routing remains Disabled until both
    remote starts succeed; and callbacks received during that interval are
-   dropped without overlap credit or immediate recovery.
+   dropped without overlap credit or immediate recovery. Cover a failed first
+   start and a failed second start with successful rollback: both return
+   `SubscriptionControlFailed`, retain the exact generation, emit no
+   `RpcRetired`, and permit a fresh activation. A failed rollback and a failure
+   of either remote stop disable routing, retire the exact generation, enqueue
+   `RpcRetired` before returning `GenerationLost`, and never expose a partial
+   subscription. Verify that both remote stops are attempted.
 9. Verify the
    [current pruning-point block contract](node-service.md#current-pruning-point-block)
    with success, canonical Genesis construction, non-Genesis selected-parent
@@ -565,6 +571,12 @@ with injected clocks and deterministic jitter:
   binding and requests at most one deactivation when an operation fault reports
   the same loss concurrently; a later `RpcPublished(R2)` is retained until the
   engine is Idle;
+- a generation-preserving `SubscriptionControlFailed` aborts active recovery
+  with `Retry`, retains its recovery obligation and RPC generation, uses the
+  general backoff, and consumes no malformed-input budget; a rollback or
+  unsubscription failure instead races its returned `GenerationLost` against
+  the already-enqueued exact `RpcRetired`, and either observation order
+  requests at most one deactivation and cannot reuse the retired generation;
 - when a malformed-response retirement arrives before its owner-directed
   fault, deactivation begins but preserves delivery of the already-produced
   result; the later fault is accepted before `Deactivated`, consumes the shared

@@ -208,9 +208,8 @@ impl ValidatedRpcClient {
                 if is_inactive_error(&rollback_error) {
                     return Err(rollback_error);
                 }
-                let diagnostic = Arc::from(format!("{start_error}; BlockAdded rollback failed: {rollback_error}"));
                 self.request_retirement(RetirementReason::SubscriptionControlFailure).await?;
-                return Err(NodeError::SubscriptionControlFailed { diagnostic });
+                return Err(NodeError::GenerationLost);
             }
             self.finish_failed_activation();
             return Err(start_error);
@@ -258,9 +257,9 @@ impl ValidatedRpcClient {
         }) {
             return Err(error);
         }
-        if let Err(error) = block_result.and(vspc_result) {
+        if block_result.and(vspc_result).is_err() {
             self.request_retirement(RetirementReason::SubscriptionControlFailure).await?;
-            return Err(error);
+            return Err(NodeError::GenerationLost);
         }
 
         self.require_active()?;
@@ -1054,6 +1053,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_subscription_failure_preserves_the_generation_and_allows_a_fresh_activation() {
+        let connection = Arc::new(ScriptedConnection::new([]).with_subscription_results([
+            Err(RpcError::General("BlockAdded start failed".to_string())),
+            Ok(()),
+            Ok(()),
+        ]));
+        let (retirement_tx, mut retirements) = retirement_channel();
+        let client = ValidatedRpcClient::new(connection.clone(), node_info(), retirement_tx);
+        let (channels, _receivers) = notification_channels();
+
+        assert!(matches!(client.activate_notifications(channels).await, Err(NodeError::SubscriptionControlFailed { .. })));
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Disabled);
+        assert_eq!(connection.subscription_calls.lock().expect("subscription log").as_slice(), &["start BlockAdded"]);
+        assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+
+        let (channels, _receivers) = notification_channels();
+        client.activate_notifications(channels).await.expect("fresh activation after failed first start");
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Enabled);
+    }
+
+    #[tokio::test]
     async fn second_subscription_failure_rolls_back_and_allows_a_fresh_activation() {
         let connection = Arc::new(ScriptedConnection::new([]).with_subscription_results([
             Ok(()),
@@ -1097,7 +1117,8 @@ mod tests {
         assert!(retirement.generation().upgrade().is_some_and(|generation| Arc::ptr_eq(&generation, &client)));
         assert!(client.retire().await);
         retirement.complete();
-        assert!(matches!(activation.await.expect("activation task"), Err(NodeError::SubscriptionControlFailed { .. })));
+        assert_eq!(activation.await.expect("activation task"), Err(NodeError::GenerationLost));
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Retired);
     }
 
     #[tokio::test]
@@ -1121,7 +1142,37 @@ mod tests {
         assert_eq!(retirement.reason(), RetirementReason::SubscriptionControlFailure);
         assert!(client.retire().await);
         retirement.complete();
-        assert!(matches!(deactivation.await.expect("deactivation task"), Err(NodeError::SubscriptionControlFailed { .. })));
+        assert_eq!(deactivation.await.expect("deactivation task"), Err(NodeError::GenerationLost));
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Retired);
+        assert_eq!(
+            connection.subscription_calls.lock().expect("subscription log").as_slice(),
+            &["start BlockAdded", "start VirtualChainChanged", "stop BlockAdded", "stop VirtualChainChanged"]
+        );
+    }
+
+    #[tokio::test]
+    async fn second_unsubscription_failure_also_retires_after_attempting_both_stops() {
+        let connection = Arc::new(ScriptedConnection::new([]).with_subscription_results([
+            Ok(()),
+            Ok(()),
+            Ok(()),
+            Err(RpcError::General("VirtualChainChanged stop failed".to_string())),
+        ]));
+        let (retirement_tx, mut retirements) = retirement_channel();
+        let client = ValidatedRpcClient::new(connection.clone(), node_info(), retirement_tx);
+        let (channels, _receivers) = notification_channels();
+        client.activate_notifications(channels).await.expect("activation");
+        let deactivation = tokio::spawn({
+            let client = client.clone();
+            async move { client.disable_notifications().await }
+        });
+
+        let retirement = retirements.recv().await.expect("retirement request");
+        assert_eq!(retirement.reason(), RetirementReason::SubscriptionControlFailure);
+        assert!(client.retire().await);
+        retirement.complete();
+        assert_eq!(deactivation.await.expect("deactivation task"), Err(NodeError::GenerationLost));
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Retired);
         assert_eq!(
             connection.subscription_calls.lock().expect("subscription log").as_slice(),
             &["start BlockAdded", "start VirtualChainChanged", "stop BlockAdded", "stop VirtualChainChanged"]

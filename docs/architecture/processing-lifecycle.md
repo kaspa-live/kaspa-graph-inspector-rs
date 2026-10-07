@@ -215,6 +215,7 @@ enum OwnershipFault {
 enum FaultKind {
     ServiceGenerationLost(ServiceKind),
     RpcRequestFailed,
+    SubscriptionControlFailed,
     SessionContinuityLost,
     NotificationInputInvalid(NotificationInputKind),
     RecoveryInputInvalid(RecoveryInputKind),
@@ -299,6 +300,13 @@ compatibility classification before constructing this envelope.
   replacement generation. An independently observed generation retirement
   instead produces `ServiceGenerationLost(Node)` and follows that existing
   replacement wait.
+- The NodeService-owned generation-preserving
+  [`SubscriptionControlFailed`](node-service.md#notificationrouter) result
+  aborts an active recovery attempt with `Retry`, retains the current recovery
+  obligation, uses the general recovery backoff, does not consume the
+  malformed-input budget, and does not wait for a replacement generation. In
+  Live it requires Resync. A generation-ending subscription-control result
+  enters this lifecycle as `ServiceGenerationLost(Node)`.
 - A nonmaterialized hash directly named in VSPC `added`/`removed` and a
   resolver-confirmed unavailable dependency each require Rebuild directly:
   the DB can no longer be trusted against node state. RPC connection failure
@@ -877,6 +885,11 @@ Begin needs no acknowledgement. Before Catchup:
 3. after both starts succeed, enable the router and publish the client's
    subscription state Enabled.
 
+If activation returns the generation-preserving `SubscriptionControlFailed`,
+ResyncEngine reports that fault with `Retry` and dispatches no Catchup
+notification input. A generation-ending activation result follows the existing
+generation-loss path.
+
 Processor-local notification gates are authoritative for immediate dropping.
 Callbacks arriving while the router remains Disabled during activation are
 intentionally dropped without overlap credit or a recovery request. Synthetic
@@ -1090,6 +1103,13 @@ On Deactivate, ResyncEngine performs this barrier in order:
 6. release every processing-session clone of the validated RPC and DB handles;
 7. drop `ProcessingSession`; and
 8. emit `Deactivated` and enter Idle.
+
+If step 1 returns `GenerationLost` under the NodeService-owned
+[subscription contract](node-service.md#notificationrouter), the local
+notification cutoff is complete, so ResyncEngine continues the remaining
+barrier. During ordinary operation the resulting fault and `RpcRetired` event
+coalesce under the exact-generation rule; during terminal shutdown the event
+is drained and discarded and no recovery starts.
 
 The owning services may retain their validated generations after Deactivate.
 For global shutdown, Supervisor first enters terminal shutdown and starts no
