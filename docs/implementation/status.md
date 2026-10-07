@@ -54,22 +54,29 @@ third-signal forced exit. Process composition and dispatch remain pending, as
 does the Supervisor-owned installation that connects the signal adapter to the
 global shutdown lifecycle.
 
-The NodeService increment has completed its foundation and pure-normalization
-points. The accepted rusty-kaspa `v2.1.0` PUAR and RPC API compatibility
-predicate are present, and the `kgi-node` module boundaries, direct
-dependencies, lifecycle primitives, and deterministic RPC, clock, and jitter
-test seams are recorded in
+The NodeService increment has completed its foundation and runtime-response
+normalization points. The accepted rusty-kaspa `v2.1.0` PUAR is present, and
+the `kgi-node` module boundaries, direct dependencies, lifecycle primitives,
+and deterministic RPC, clock, and jitter test seams are recorded in
 [implementation choices](choices.md#6-october-2026-nodeservice-implementation-foundation).
 `kgi-node` now resolves and validates local consensus assumptions and contains
-the private raw-response normalizers for Genesis discovery, full blocks,
-recovery headers, pruning-point and Catchup samples, GetBlocks pages, and VSPC
-V2 responses. The normalizers preserve the minimized trusted-node boundary.
+the generation-bound raw-response normalizer for full blocks, recovery headers,
+pruning-point and Catchup samples, GetBlocks pages, and VSPC V2 responses. It
+preserves the minimized trusted-node boundary. RPC API compatibility and
+Genesis discovery remain part of the pending NodeService connection-validation
+flow rather than standalone helpers.
 The architecture-level GetBlock not-found representation blocker is resolved
 by the NodeService-owned
 [compatibility contract](../architecture/node-service.md#getblock-not-found-compatibility-classification)
 and the lifecycle-owned opaque RPC-failure disposition.
-Validated-generation RPC execution, notification routing, and the permanent
-NodeService lifecycle have not started.
+Validated-generation RPC execution now binds every operation and composite
+request to one physical connection, applies the runtime concurrency bound,
+constructs the required requests, normalizes their responses, classifies the
+pinned exact-message GetBlock compatibility case, and linearizes completion
+against cancellation or retirement. Malformed recovery responses use an
+exact-generation retirement request and completion barrier; opaque RPC failures
+and range faults do not retire the generation. Notification routing and the
+permanent NodeService lifecycle have not started.
 
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.

@@ -23,158 +23,159 @@ enum BlockNormalizationError {
     SelectedParentNotDirect,
 }
 
-pub(crate) fn discover_genesis(response: &GetBlocksResponse) -> Result<BlockHash, GenesisDiscoveryError> {
-    response.block_hashes.first().copied().ok_or(GenesisDiscoveryError::EmptyHashVector)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GenesisDiscoveryError {
-    EmptyHashVector,
-}
-
-pub(crate) fn normalize_pruning_point_block(
-    advertised_hash: BlockHash,
-    block: RpcBlock,
+pub(crate) struct ResponseNormalizer {
     genesis_hash: BlockHash,
-) -> Result<ValidatedNodeBlock, ResponseNormalizationError> {
-    if advertised_hash == ORIGIN || block.header.hash != advertised_hash {
-        return Err(malformed(RecoveryInputKind::MalformedPruningPointResponse));
-    }
-    normalize_full_block(block, genesis_hash)
-        .map_err(|error| classify_block_error(error, RecoveryInputKind::MalformedPruningPointResponse))
 }
 
-pub(crate) fn normalize_catchup_sink_sample(
-    advertised_hash: BlockHash,
-    block: &RpcBlock,
-) -> Result<CatchupSinkSample, ResponseNormalizationError> {
-    if advertised_hash == ORIGIN || block.header.hash != advertised_hash {
-        return Err(malformed(RecoveryInputKind::MalformedCatchupSinkResponse));
-    }
-    check_score(block.header.daa_score, MAX_DAA_SCORE, ScoreRangeFault::DaaScore)?;
-    Ok(CatchupSinkSample { hash: block.header.hash, daa_score: block.header.daa_score })
-}
-
-pub(crate) fn normalize_get_blocks(
-    low_hash: BlockHash,
-    response: GetBlocksResponse,
-    genesis_hash: BlockHash,
-) -> Result<Vec<ValidatedNodeBlock>, ResponseNormalizationError> {
-    let mut blocks = response.blocks.into_iter();
-    let Some(anchor) = blocks.next() else {
-        return Err(malformed(RecoveryInputKind::MalformedGetBlocks));
-    };
-    if anchor.header.hash != low_hash {
-        return Err(malformed(RecoveryInputKind::MalformedGetBlocks));
+impl ResponseNormalizer {
+    pub(crate) const fn new(genesis_hash: BlockHash) -> Self {
+        Self { genesis_hash }
     }
 
-    let normalized = blocks
-        .map(|block| {
-            normalize_full_block(block, genesis_hash)
-                .map_err(|error| classify_block_error(error, RecoveryInputKind::MalformedGetBlocks))
+    pub(crate) fn pruning_point_block(
+        &self,
+        advertised_hash: BlockHash,
+        block: RpcBlock,
+    ) -> Result<ValidatedNodeBlock, ResponseNormalizationError> {
+        if advertised_hash == ORIGIN || block.header.hash != advertised_hash {
+            return Err(malformed(RecoveryInputKind::MalformedPruningPointResponse));
+        }
+        self.validated_block(block).map_err(|error| classify_block_error(error, RecoveryInputKind::MalformedPruningPointResponse))
+    }
+
+    pub(crate) fn catchup_sink_sample(
+        &self,
+        advertised_hash: BlockHash,
+        block: &RpcBlock,
+    ) -> Result<CatchupSinkSample, ResponseNormalizationError> {
+        if advertised_hash == ORIGIN || block.header.hash != advertised_hash {
+            return Err(malformed(RecoveryInputKind::MalformedCatchupSinkResponse));
+        }
+        check_score(block.header.daa_score, MAX_DAA_SCORE, ScoreRangeFault::DaaScore)?;
+        Ok(CatchupSinkSample { hash: block.header.hash, daa_score: block.header.daa_score })
+    }
+
+    pub(crate) fn get_blocks(
+        &self,
+        low_hash: BlockHash,
+        response: GetBlocksResponse,
+    ) -> Result<Vec<ValidatedNodeBlock>, ResponseNormalizationError> {
+        let mut blocks = response.blocks.into_iter();
+        let Some(anchor) = blocks.next() else {
+            return Err(malformed(RecoveryInputKind::MalformedGetBlocks));
+        };
+        if anchor.header.hash != low_hash {
+            return Err(malformed(RecoveryInputKind::MalformedGetBlocks));
+        }
+
+        let normalized = blocks
+            .map(|block| {
+                self.validated_block(block).map_err(|error| classify_block_error(error, RecoveryInputKind::MalformedGetBlocks))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if normalized.last().is_some_and(|block| block.hash == low_hash) {
+            return Err(malformed(RecoveryInputKind::MalformedGetBlocks));
+        }
+        Ok(normalized)
+    }
+
+    pub(crate) fn virtual_chain(
+        &self,
+        low_hash: BlockHash,
+        response: &GetVirtualChainFromBlockV2Response,
+    ) -> Result<VspcChange, ResponseNormalizationError> {
+        let removed = response.removed_chain_block_hashes.as_slice();
+        let added = response.added_chain_block_hashes.as_slice();
+        let reason = if !removed.is_empty() && added.is_empty() {
+            Some(MalformedVspcResponseReason::RemovedChainWithoutAddedPath)
+        } else if removed.first().is_some_and(|hash| *hash != low_hash) {
+            Some(MalformedVspcResponseReason::RemovedSourceMismatch)
+        } else if added.last() == Some(&low_hash) {
+            Some(MalformedVspcResponseReason::NonAdvancingAddedCursor)
+        } else {
+            None
+        };
+
+        if let Some(reason) = reason {
+            return Err(malformed(RecoveryInputKind::MalformedVspcResponse(reason)));
+        }
+
+        Ok(VspcChange { removed: Arc::from(removed), added: Arc::from(added) })
+    }
+
+    pub(crate) fn recovery_header(
+        &self,
+        requested_hash: BlockHash,
+        block: &RpcBlock,
+    ) -> Result<ValidatedRecoveryHeader, ResponseNormalizationError> {
+        if block.header.hash != requested_hash {
+            return Err(malformed(RecoveryInputKind::MalformedGetBlock));
+        }
+        check_score(block.header.daa_score, MAX_DAA_SCORE, ScoreRangeFault::DaaScore)?;
+        let blue_score = if requested_hash == self.genesis_hash {
+            0
+        } else {
+            check_score(block.header.blue_score, MAX_BLUE_SCORE, ScoreRangeFault::BlueScore)?;
+            block.header.blue_score
+        };
+
+        Ok(ValidatedRecoveryHeader {
+            hash: block.header.hash,
+            daa_score: block.header.daa_score,
+            blue_work: block.header.blue_work,
+            blue_score,
         })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if normalized.last().is_some_and(|block| block.hash == low_hash) {
-        return Err(malformed(RecoveryInputKind::MalformedGetBlocks));
-    }
-    Ok(normalized)
-}
-
-pub(crate) fn normalize_vspc_response(
-    low_hash: BlockHash,
-    response: &GetVirtualChainFromBlockV2Response,
-) -> Result<VspcChange, ResponseNormalizationError> {
-    let removed = response.removed_chain_block_hashes.as_slice();
-    let added = response.added_chain_block_hashes.as_slice();
-    let reason = if !removed.is_empty() && added.is_empty() {
-        Some(MalformedVspcResponseReason::RemovedChainWithoutAddedPath)
-    } else if removed.first().is_some_and(|hash| *hash != low_hash) {
-        Some(MalformedVspcResponseReason::RemovedSourceMismatch)
-    } else if added.last() == Some(&low_hash) {
-        Some(MalformedVspcResponseReason::NonAdvancingAddedCursor)
-    } else {
-        None
-    };
-
-    if let Some(reason) = reason {
-        return Err(malformed(RecoveryInputKind::MalformedVspcResponse(reason)));
     }
 
-    Ok(VspcChange { removed: Arc::from(removed), added: Arc::from(added) })
-}
-
-pub(crate) fn normalize_recovery_header(
-    requested_hash: BlockHash,
-    block: &RpcBlock,
-    genesis_hash: BlockHash,
-) -> Result<ValidatedRecoveryHeader, ResponseNormalizationError> {
-    if block.header.hash != requested_hash {
-        return Err(malformed(RecoveryInputKind::MalformedGetBlock));
+    pub(crate) fn full_block(
+        &self,
+        requested_hash: BlockHash,
+        block: RpcBlock,
+    ) -> Result<ValidatedNodeBlock, ResponseNormalizationError> {
+        if block.header.hash != requested_hash {
+            return Err(malformed(RecoveryInputKind::MalformedGetBlock));
+        }
+        self.validated_block(block).map_err(|error| classify_block_error(error, RecoveryInputKind::MalformedGetBlock))
     }
-    check_score(block.header.daa_score, MAX_DAA_SCORE, ScoreRangeFault::DaaScore)?;
-    let blue_score = if requested_hash == genesis_hash {
-        0
-    } else {
-        check_score(block.header.blue_score, MAX_BLUE_SCORE, ScoreRangeFault::BlueScore)?;
-        block.header.blue_score
-    };
 
-    Ok(ValidatedRecoveryHeader {
-        hash: block.header.hash,
-        daa_score: block.header.daa_score,
-        blue_work: block.header.blue_work,
-        blue_score,
-    })
-}
+    fn validated_block(&self, block: RpcBlock) -> Result<ValidatedNodeBlock, BlockNormalizationError> {
+        let header = block.header;
+        check_score(header.daa_score, MAX_DAA_SCORE, ScoreRangeFault::DaaScore).map_err(response_to_block_error)?;
 
-pub(crate) fn normalize_requested_full_block(
-    requested_hash: BlockHash,
-    block: RpcBlock,
-    genesis_hash: BlockHash,
-) -> Result<ValidatedNodeBlock, ResponseNormalizationError> {
-    if block.header.hash != requested_hash {
-        return Err(malformed(RecoveryInputKind::MalformedGetBlock));
-    }
-    normalize_full_block(block, genesis_hash).map_err(|error| classify_block_error(error, RecoveryInputKind::MalformedGetBlock))
-}
+        if header.hash == self.genesis_hash {
+            return Ok(ValidatedNodeBlock {
+                hash: header.hash,
+                selected_parent: ORIGIN,
+                direct_parents: Vec::new(),
+                blue_merge_set: Vec::new(),
+                red_merge_set: Vec::new(),
+                timestamp: header.timestamp,
+                daa_score: header.daa_score,
+                blue_score: 0,
+                blue_work: header.blue_work,
+            });
+        }
 
-fn normalize_full_block(block: RpcBlock, genesis_hash: BlockHash) -> Result<ValidatedNodeBlock, BlockNormalizationError> {
-    let header = block.header;
-    check_score(header.daa_score, MAX_DAA_SCORE, ScoreRangeFault::DaaScore).map_err(response_to_block_error)?;
+        check_score(header.blue_score, MAX_BLUE_SCORE, ScoreRangeFault::BlueScore).map_err(response_to_block_error)?;
+        let verbose = block.verbose_data.ok_or(BlockNormalizationError::MissingVerboseData)?;
+        let direct_parents = header.parents_by_level.into_iter().next().unwrap_or_default();
+        if !direct_parents.contains(&verbose.selected_parent_hash) {
+            return Err(BlockNormalizationError::SelectedParentNotDirect);
+        }
 
-    if header.hash == genesis_hash {
-        return Ok(ValidatedNodeBlock {
+        Ok(ValidatedNodeBlock {
             hash: header.hash,
-            selected_parent: ORIGIN,
-            direct_parents: Vec::new(),
-            blue_merge_set: Vec::new(),
-            red_merge_set: Vec::new(),
+            selected_parent: verbose.selected_parent_hash,
+            direct_parents,
+            blue_merge_set: verbose.merge_set_blues_hashes,
+            red_merge_set: verbose.merge_set_reds_hashes,
             timestamp: header.timestamp,
             daa_score: header.daa_score,
-            blue_score: 0,
+            blue_score: header.blue_score,
             blue_work: header.blue_work,
-        });
+        })
     }
-
-    check_score(header.blue_score, MAX_BLUE_SCORE, ScoreRangeFault::BlueScore).map_err(response_to_block_error)?;
-    let verbose = block.verbose_data.ok_or(BlockNormalizationError::MissingVerboseData)?;
-    let direct_parents = header.parents_by_level.into_iter().next().unwrap_or_default();
-    if !direct_parents.contains(&verbose.selected_parent_hash) {
-        return Err(BlockNormalizationError::SelectedParentNotDirect);
-    }
-
-    Ok(ValidatedNodeBlock {
-        hash: header.hash,
-        selected_parent: verbose.selected_parent_hash,
-        direct_parents,
-        blue_merge_set: verbose.merge_set_blues_hashes,
-        red_merge_set: verbose.merge_set_reds_hashes,
-        timestamp: header.timestamp,
-        daa_score: header.daa_score,
-        blue_score: header.blue_score,
-        blue_work: header.blue_work,
-    })
 }
 
 fn check_score(value: u64, maximum: u64, fault: ScoreRangeFault) -> Result<(), ResponseNormalizationError> {
@@ -212,11 +213,7 @@ mod tests {
         lifecycle::{MalformedVspcResponseReason, RecoveryInputKind, ScoreRangeFault},
     };
 
-    use super::{
-        GenesisDiscoveryError, ResponseNormalizationError, discover_genesis, normalize_catchup_sink_sample, normalize_full_block,
-        normalize_get_blocks, normalize_pruning_point_block, normalize_recovery_header, normalize_requested_full_block,
-        normalize_vspc_response,
-    };
+    use super::{ResponseNormalizationError, ResponseNormalizer};
 
     #[test]
     fn ordinary_full_block_preserves_consumed_sequences_and_ignores_redundancy() {
@@ -230,7 +227,7 @@ mod tests {
         verbose.merge_set_blues_hashes = vec![own, hash(4), hash(4)];
         verbose.merge_set_reds_hashes = vec![hash(5), selected_parent, hash(5)];
 
-        let normalized = normalize_full_block(block, hash(0)).expect("valid ordinary block");
+        let normalized = normalizer(hash(0)).validated_block(block).expect("valid ordinary block");
 
         assert_eq!(normalized.hash, own);
         assert_eq!(normalized.selected_parent, selected_parent);
@@ -244,11 +241,11 @@ mod tests {
     fn ordinary_full_block_requires_verbose_and_selected_parent_membership() {
         let mut missing_verbose = rpc_block(hash(1), vec![hash(2)]);
         missing_verbose.verbose_data = None;
-        assert!(normalize_full_block(missing_verbose, hash(0)).is_err());
+        assert!(normalizer(hash(0)).validated_block(missing_verbose).is_err());
 
         let mut missing_parent = rpc_block(hash(1), vec![hash(2)]);
         missing_parent.verbose_data.as_mut().expect("verbose").selected_parent_hash = hash(3);
-        assert!(normalize_full_block(missing_parent, hash(0)).is_err());
+        assert!(normalizer(hash(0)).validated_block(missing_parent).is_err());
     }
 
     #[test]
@@ -259,7 +256,7 @@ mod tests {
         block.header.timestamp = u64::MAX;
         block.verbose_data = None;
 
-        let normalized = normalize_full_block(block, genesis).expect("canonical Genesis");
+        let normalized = normalizer(genesis).validated_block(block).expect("canonical Genesis");
 
         assert_eq!(normalized.hash, genesis);
         assert_eq!(normalized.selected_parent, ORIGIN);
@@ -275,35 +272,25 @@ mod tests {
         let mut daa = rpc_block(hash(1), vec![hash(2)]);
         daa.header.daa_score = MAX_DAA_SCORE + 1;
         assert_eq!(
-            normalize_requested_full_block(hash(1), daa, hash(0)),
+            normalizer(hash(0)).full_block(hash(1), daa),
             Err(ResponseNormalizationError::ScoreOutOfRange(ScoreRangeFault::DaaScore))
         );
 
         let mut blue = rpc_block(hash(1), vec![hash(2)]);
         blue.header.blue_score = MAX_BLUE_SCORE + 1;
         assert_eq!(
-            normalize_requested_full_block(hash(1), blue, hash(0)),
+            normalizer(hash(0)).full_block(hash(1), blue),
             Err(ResponseNormalizationError::ScoreOutOfRange(ScoreRangeFault::BlueScore))
         );
 
         let mut genesis = rpc_block(hash(9), vec![]);
         genesis.header.blue_score = u64::MAX;
-        assert!(normalize_requested_full_block(hash(9), genesis, hash(9)).is_ok());
+        assert!(normalizer(hash(9)).full_block(hash(9), genesis).is_ok());
 
         let mut maxima = rpc_block(hash(7), vec![hash(2)]);
         maxima.header.daa_score = MAX_DAA_SCORE;
         maxima.header.blue_score = MAX_BLUE_SCORE;
-        assert!(normalize_requested_full_block(hash(7), maxima, hash(0)).is_ok());
-    }
-
-    #[test]
-    fn genesis_discovery_uses_first_hash_and_ignores_blocks() {
-        let response = GetBlocksResponse::new(vec![hash(1), hash(2)], vec![rpc_block(hash(9), vec![hash(8)])]);
-        assert_eq!(discover_genesis(&response), Ok(hash(1)));
-        assert_eq!(
-            discover_genesis(&GetBlocksResponse::new(vec![], vec![rpc_block(hash(9), vec![])])),
-            Err(GenesisDiscoveryError::EmptyHashVector)
-        );
+        assert!(normalizer(hash(0)).full_block(hash(7), maxima).is_ok());
     }
 
     #[test]
@@ -318,7 +305,7 @@ mod tests {
                 rpc_block(hash(2), vec![hash(8)]),
             ],
         );
-        let page = normalize_get_blocks(low, response, hash(0)).expect("valid page");
+        let page = normalizer(hash(0)).get_blocks(low, response).expect("valid page");
         assert_eq!(page.iter().map(|block| block.hash).collect::<Vec<_>>(), vec![hash(2), hash(3), hash(2)]);
     }
 
@@ -326,7 +313,8 @@ mod tests {
     fn get_blocks_accepts_anchor_only_and_rejects_framing_errors() {
         let low = hash(1);
         assert!(
-            normalize_get_blocks(low, GetBlocksResponse::new(vec![], vec![rpc_block(low, vec![])]), hash(0))
+            normalizer(hash(0))
+                .get_blocks(low, GetBlocksResponse::new(vec![], vec![rpc_block(low, vec![])]))
                 .expect("anchor only")
                 .is_empty()
         );
@@ -337,7 +325,7 @@ mod tests {
             GetBlocksResponse::new(vec![], vec![rpc_block(low, vec![]), rpc_block(low, vec![hash(8)])]),
         ] {
             assert_eq!(
-                normalize_get_blocks(low, response, hash(0)),
+                normalizer(hash(0)).get_blocks(low, response),
                 Err(ResponseNormalizationError::Malformed(RecoveryInputKind::MalformedGetBlocks))
             );
         }
@@ -349,14 +337,14 @@ mod tests {
         let mut malformed = rpc_block(hash(2), vec![hash(8)]);
         malformed.verbose_data = None;
         assert_eq!(
-            normalize_get_blocks(low, GetBlocksResponse::new(vec![], vec![rpc_block(low, vec![]), malformed]), hash(0),),
+            normalizer(hash(0)).get_blocks(low, GetBlocksResponse::new(vec![], vec![rpc_block(low, vec![]), malformed])),
             Err(ResponseNormalizationError::Malformed(RecoveryInputKind::MalformedGetBlocks))
         );
 
         let mut excessive = rpc_block(hash(2), vec![hash(8)]);
         excessive.header.daa_score = MAX_DAA_SCORE + 1;
         assert_eq!(
-            normalize_get_blocks(low, GetBlocksResponse::new(vec![], vec![rpc_block(low, vec![]), excessive]), hash(0),),
+            normalizer(hash(0)).get_blocks(low, GetBlocksResponse::new(vec![], vec![rpc_block(low, vec![]), excessive])),
             Err(ResponseNormalizationError::ScoreOutOfRange(ScoreRangeFault::DaaScore))
         );
     }
@@ -371,7 +359,7 @@ mod tests {
         ];
         for (response, reason) in cases {
             assert_eq!(
-                normalize_vspc_response(low, &response),
+                normalizer(hash(0)).virtual_chain(low, &response),
                 Err(ResponseNormalizationError::Malformed(RecoveryInputKind::MalformedVspcResponse(reason)))
             );
         }
@@ -381,7 +369,7 @@ mod tests {
     fn vspc_preserves_duplicates_intersections_and_nonfinal_low_hash() {
         let low = hash(1);
         let response = vspc(vec![low, hash(2), hash(2)], vec![hash(2), low, hash(3), hash(3)]);
-        let normalized = normalize_vspc_response(low, &response).expect("trusted path properties");
+        let normalized = normalizer(hash(0)).virtual_chain(low, &response).expect("trusted path properties");
         assert_eq!(normalized.removed.as_ref(), &[low, hash(2), hash(2)]);
         assert_eq!(normalized.added.as_ref(), &[hash(2), low, hash(3), hash(3)]);
     }
@@ -393,7 +381,7 @@ mod tests {
             let mut block = rpc_block(genesis, vec![]);
             block.header.blue_score = raw_blue_score;
             block.verbose_data = None;
-            let normalized = normalize_recovery_header(genesis, &block, genesis).expect("Genesis recovery header");
+            let normalized = normalizer(genesis).recovery_header(genesis, &block).expect("Genesis recovery header");
             assert_eq!(normalized.blue_score, 0);
         }
     }
@@ -403,20 +391,21 @@ mod tests {
         let requested = hash(1);
         let block = rpc_block(hash(2), vec![]);
         assert_eq!(
-            normalize_recovery_header(requested, &block, hash(0)),
+            normalizer(hash(0)).recovery_header(requested, &block),
             Err(ResponseNormalizationError::Malformed(RecoveryInputKind::MalformedGetBlock))
         );
 
         let mut excessive = rpc_block(requested, vec![]);
         excessive.header.blue_score = MAX_BLUE_SCORE + 1;
         assert_eq!(
-            normalize_recovery_header(requested, &excessive, hash(0)),
+            normalizer(hash(0)).recovery_header(requested, &excessive),
             Err(ResponseNormalizationError::ScoreOutOfRange(ScoreRangeFault::BlueScore))
         );
 
         let mut ordinary = rpc_block(requested, vec![]);
         ordinary.verbose_data = None;
-        let normalized = normalize_recovery_header(requested, &ordinary, hash(0)).expect("ordinary header does not need verbose data");
+        let normalized =
+            normalizer(hash(0)).recovery_header(requested, &ordinary).expect("ordinary header does not need verbose data");
         assert_eq!(normalized.blue_score, ordinary.header.blue_score);
     }
 
@@ -424,21 +413,25 @@ mod tests {
     fn pruning_point_and_sink_apply_source_specific_attribution() {
         let block = rpc_block(hash(2), vec![hash(8)]);
         assert_eq!(
-            normalize_pruning_point_block(hash(3), block.clone(), hash(0)),
+            normalizer(hash(0)).pruning_point_block(hash(3), block.clone()),
             Err(ResponseNormalizationError::Malformed(RecoveryInputKind::MalformedPruningPointResponse))
         );
         assert_eq!(
-            normalize_catchup_sink_sample(hash(3), &block),
+            normalizer(hash(0)).catchup_sink_sample(hash(3), &block),
             Err(ResponseNormalizationError::Malformed(RecoveryInputKind::MalformedCatchupSinkResponse))
         );
         assert_eq!(
-            normalize_catchup_sink_sample(ORIGIN, &block),
+            normalizer(hash(0)).catchup_sink_sample(ORIGIN, &block),
             Err(ResponseNormalizationError::Malformed(RecoveryInputKind::MalformedCatchupSinkResponse))
         );
     }
 
     fn hash(byte: u8) -> Hash {
         Hash::from_bytes([byte; 32])
+    }
+
+    const fn normalizer(genesis_hash: Hash) -> ResponseNormalizer {
+        ResponseNormalizer::new(genesis_hash)
     }
 
     fn rpc_block(hash_value: Hash, direct_parents: Vec<Hash>) -> RpcBlock {

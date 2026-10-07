@@ -1,6 +1,10 @@
 use std::{io, path::PathBuf, sync::Arc};
 
 use kaspa_consensus_core::network::NetworkId;
+use kgi_model::{
+    block::BlockHash,
+    lifecycle::{RecoveryInputKind, ScoreRangeFault},
+};
 use thiserror::Error;
 
 /// Consensus parameter whose configured or derived value is invalid.
@@ -65,4 +69,29 @@ pub enum ConsensusResolutionError {
 
     #[error(transparent)]
     InvalidParameters(#[from] InvalidConsensusParameters),
+}
+
+/// Failure returned by one operation on a validated RPC generation.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum NodeError {
+    #[error("validated RPC generation was lost")]
+    GenerationLost,
+
+    #[error("RPC operation was cancelled")]
+    Cancelled,
+
+    #[error("block {hash} was definitively not found")]
+    BlockNotFound { hash: BlockHash },
+
+    #[error("RPC request failed: {diagnostic}")]
+    RpcRequestFailed { diagnostic: Arc<str> },
+
+    #[error("recovery input is invalid: {0:?}")]
+    RecoveryInputInvalid(RecoveryInputKind),
+
+    #[error("node score is outside KGI's range: {0:?}")]
+    ScoreOutOfRange(ScoreRangeFault),
+
+    #[error("NodeService retirement control path is unavailable")]
+    RetirementControlUnavailable,
 }
