@@ -10,6 +10,9 @@ pub mod rpc;
 #[allow(dead_code)]
 mod client;
 mod normalization;
+// Point 4 installs the router into validated-generation subscription control.
+#[allow(dead_code)]
+mod notification;
 // Point 4 consumes retirement requests in the permanent service loop.
 #[allow(dead_code)]
 mod runtime;

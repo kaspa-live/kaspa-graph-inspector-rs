@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 6 October 2026.
+Updated 7 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -75,8 +75,13 @@ constructs the required requests, normalizes their responses, classifies the
 pinned exact-message GetBlock compatibility case, and linearizes completion
 against cancellation or retirement. Malformed recovery responses use an
 exact-generation retirement request and completion barrier; opaque RPC failures
-and range faults do not retire the generation. Notification routing and the
-permanent NodeService lifecycle have not started.
+and range faults do not retire the generation. The private
+`NotificationRouter` core now implements the synchronous rusty-kaspa callback,
+generation-context BlockAdded normalization, empty and malformed virtual-chain
+filtering, bounded nonblocking delivery, and shared disablement after malformed
+input, saturation, or unexpected endpoint loss. Validated-generation
+subscription activation and rollback, notification fault integration, and the
+permanent NodeService lifecycle remain pending.
 
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.

@@ -62,7 +62,7 @@ pub struct RpcOperationCounts {
 pub struct ValidatedRpcClient {
     connection: Arc<dyn RpcConnection>,
     node_info: ValidatedNodeInfo,
-    normalizer: ResponseNormalizer,
+    normalizer: Arc<ResponseNormalizer>,
     admission: AtomicU8,
     admission_tx: watch::Sender<u8>,
     permits: Arc<Semaphore>,
@@ -79,7 +79,7 @@ impl ValidatedRpcClient {
             let (admission_tx, _) = watch::channel(GENERATION_ACTIVE);
             Self {
                 connection,
-                normalizer: ResponseNormalizer::new(node_info.genesis_hash),
+                normalizer: Arc::new(ResponseNormalizer::new(node_info.genesis_hash)),
                 node_info,
                 admission: AtomicU8::new(GENERATION_ACTIVE),
                 admission_tx,

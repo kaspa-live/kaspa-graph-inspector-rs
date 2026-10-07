@@ -17,12 +17,13 @@ pub(crate) enum ResponseNormalizationError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BlockNormalizationError {
+pub(crate) enum BlockNormalizationError {
     ScoreOutOfRange(ScoreRangeFault),
     MissingVerboseData,
     SelectedParentNotDirect,
 }
 
+#[derive(Debug)]
 pub(crate) struct ResponseNormalizer {
     genesis_hash: BlockHash,
 }
@@ -30,6 +31,10 @@ pub(crate) struct ResponseNormalizer {
 impl ResponseNormalizer {
     pub(crate) const fn new(genesis_hash: BlockHash) -> Self {
         Self { genesis_hash }
+    }
+
+    pub(crate) fn block_added(&self, block: RpcBlock) -> Result<ValidatedNodeBlock, BlockNormalizationError> {
+        self.validated_block(block)
     }
 
     pub(crate) fn pruning_point_block(
