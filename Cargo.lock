@@ -2985,10 +2985,12 @@ dependencies = [
 name = "kgi-storage"
 version = "0.1.0"
 dependencies = [
+ "kaspa-consensus-core",
  "kgi-api-model",
  "kgi-model",
  "sqlx",
  "testcontainers-modules",
+ "thiserror 2.0.21",
  "tokio",
 ]
 

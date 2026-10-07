@@ -6,9 +6,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+kaspa-consensus-core.workspace = true
 kgi-api-model = { path = "../kgi-api-model" }
 kgi-model = { path = "../kgi-model" }
 sqlx.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 testcontainers-modules.workspace = true

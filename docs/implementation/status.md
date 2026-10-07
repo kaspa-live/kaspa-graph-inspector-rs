@@ -20,9 +20,14 @@ fault, status, VSPC, and committed graph-update values are implemented against
 the selected rusty-kaspa `v2.1.0` value crates. The session-scoped graph-update
 ingress implements the shared pre-seal gate, nonblocking ordinary offers,
 lossless lifecycle markers, coalescing gap observation, and ingress metrics.
-Storage, processing, and API service crates remain behavior-free scaffolds;
-database migrations have not started. Open architecture requirements continue
-to block only their dependent work.
+Processing and API service crates remain behavior-free scaffolds. The first
+StorageService implementation slice selects SQLx with PostgreSQL and Rustls,
+embeds the forward-only metadata and processing-schema migrations, acquires the
+dedicated advisory ownership lock, classifies database bootstrap states, and
+performs the atomic idempotent `Uninitialized -> Empty` network binding.
+Validated processing/API generations and the permanent autonomous service
+lifecycle remain pending. Open architecture requirements continue to block
+only their dependent work.
 
 The imported browser still uses the v1 graph data source, models, and update
 behavior, so it is not yet compatible with the v2 HTTP, SSE, publication, and
