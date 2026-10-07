@@ -23,7 +23,7 @@ source analysis of KGI's upstream correctness assumptions against one exact
 rusty-kaspa commit. The current pinned reference revision is:
 
 ```text
-c338d495bec29e4dc8b5149f99e8db6fa916ed4a
+01b532e8b553523216471682649693af92f0fd16
 ```
 
 This pin makes the architecture analysis reproducible. It identifies the
@@ -36,12 +36,15 @@ The PUAR checklist is:
 
 1. For [Genesis discovery](node-service.md#genesis-discovery),
    `GetBlocks(None, false, false)` returns the configured Genesis hash first and
-   returns no blocks.
+   makes that first hash usable as the generation's Genesis identity. KGI does
+   not rely on the accompanying block vector.
 2. For the NodeService
    [individual recovery GetBlock](node-service.md#individual-recovery-getblock)
    used by [Resync preparation](processing-lifecycle.md#resync-preparation),
-   header-only `GetBlock` supplies the required GhostDAG data and establishes
-   that the returned block is recognized as a GetBlocks low hash.
+   header-only `GetBlock` supplies the required DAA score and blue work, supplies
+   the ordinary-block blue score, and establishes that the returned block is
+   recognized as a GetBlocks low hash. KGI does not depend on the raw Genesis
+   blue score.
 3. For the NodeService
    [GetBlocks normalization](node-service.md#getblocks-and-vspc-recovery-responses)
    used by the [Catchup trigger](processing-lifecycle.md#catchup-trigger), the
@@ -74,6 +77,16 @@ The PUAR checklist is:
 8. For [VSPC path attribution](vspc-processing.md#readiness-and-materiality--settled),
    a valid retained-range VSPC query emits adjacent chain-path members using
    the same GhostDAG selected-parent relation that enriched GetBlock exposes.
+9. For NodeService
+   [individual recovery GetBlock](node-service.md#individual-recovery-getblock),
+   an unknown requested hash produces
+   `ConsensusError::HeaderNotFound(requested_hash)`; that variant and
+   `ConsensusError::BlockNotFound(requested_hash)` have distinct exact display
+   forms; and the gRPC conversion preserves either error's display string in
+   `RPCError.message` before reconstructing it as `RpcError::General` in the
+   selected Rust client. The review also records that unrelated remote and
+   client failures can use the same `General` variant, so the variant itself is
+   not a semantic discriminator.
 
 For each item, inspect the committed source at the full SHA and report one of:
 
@@ -107,9 +120,9 @@ upstream change gives a concrete reason.
 
 ### Current PUAR result
 
-Architecture accepts the
-[24 September 2026 PUAR](../reviews/2026-09-24-rusty-kaspa-c338d495-assumptions.md)
-against the full pinned revision above. All eight checklist items are
+Architecture accepts the expanded
+[7 October 2026 PUAR](../reviews/2026-10-07-rusty-kaspa-01b532e8-assumptions.md)
+against the full pinned revision above. All nine checklist items are
 `Confirmed`; none is `Not confirmed` or `Contradicted`. The focused contracts
 may therefore rely on those reviewed upstream behaviors for the pinned
 revision, subject to their stated KGI validation and recovery rules.
@@ -134,22 +147,29 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
 [RPC normalization](node-service.md#rpc-normalization) with:
 
 1. Common full-block normalization produces the flattened
-   `ValidatedNodeBlock` and rejects missing header or verbose data, inconsistent
-   hashes, duplicate direct parents, contradictory self-reference, and an
-   ordinary selected parent absent from the direct parents. Cover the exact
-   validated-Genesis ORIGIN exception and its mandatory zero blue score
-   separately.
-2. GetBlocks fixtures cover the inclusive low hash, unequal hash/block vector
-   lengths, hash/block disagreement, duplicates, a valid response that
-   normalizes to zero blocks, and a page with one invalid full-block member.
-   For every malformed recovery shape, assert typed whole-page rejection, no
-   cursor or processor advancement, and retirement of the exact RPC
-   generation.
+   `ValidatedNodeBlock` from the exact consumed header and verbose fields. An
+   ordinary block requires verbose data and selected-parent membership, uses
+   the trusted cached header hash and header blue score, preserves parent and
+   merge-set order, and ignores every named unused RPC field. Accept duplicate
+   parents or merge-set members and direct or merge-set self-reference;
+   repeated positions remain present in `ValidatedNodeBlock`.
+   Separately, cover exact-Genesis construction without verbose data: ORIGIN,
+   empty parent and merge-set vectors, and blue score zero are synthesized
+   while timestamp, representable DAA score, and blue work come from the
+   header.
+2. GetBlocks fixtures cover an empty block vector, the inclusive trusted header
+   hash, a valid anchor-only response, a nonempty result whose final hash equals
+   `low_hash`, and a page with one invalid retained full-block member. Assert
+   that mismatched or unequal parallel hash vectors and duplicate block hashes
+   are ignored, node block order is preserved, and the final retained header
+   hash is the next cursor. For every malformed recovery shape, assert typed
+   whole-page rejection, no cursor or processor advancement, and retirement of
+   the exact RPC generation.
 3. Genesis discovery request construction with `low_hash = None`, blocks and
-   transactions disabled, plus response validation for a nonempty hash vector,
-   empty block vector, transport failure, and malformed output. Given a valid
-   response, NodeService uses its first hash without substituting a local
-   Genesis constant.
+   transactions disabled, plus response handling for a nonempty hash vector,
+   either empty or nonempty ignored block vectors, opaque RPC-call failure,
+   and an empty hash vector. Given a valid response, NodeService uses its first
+   hash without substituting a local Genesis constant.
 4. Consensus parameter resolution uses exact `NetworkId` parameters when
    supported. Mainnet emits no divergence warning. Every non-mainnet profile,
    including supported testnet and simnet, warns with the exact network,
@@ -174,11 +194,12 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
 6. VSPC V2 request construction uses `min_confirmation_count = None` and
    `data_verbosity_level = Some(RpcDataVerbosityLevel::None)`. Mocked valid
    complete-prefix and advancing-cursor responses exercise KGI's pump behavior.
-   Reject a removed chain without an added path, duplicate members,
-   removed/added intersection, a nonadvancing nonempty added cursor, a nonempty
-   removed path whose first hash differs from `low_hash`, and any occurrence of
-   `low_hash` in `added` as the corresponding `MalformedVspcResponse` reason,
-   with generation retirement and no cursor advancement.
+   Reject a removed chain without an added path, a nonadvancing nonempty added
+   cursor, and a nonempty removed path whose first hash differs from `low_hash`
+   as the corresponding `MalformedVspcResponse` reason, with generation
+   retirement and no cursor advancement. Accept and preserve duplicate members,
+   removed/added intersections, and a nonfinal occurrence of `low_hash` in
+   `added` when the retained framing conditions hold.
 7. Mocked notification and VSPC V2 responses with a nonempty removed chain and
    an empty added path. Assert the source-specific dispositions: a notification
    reports
@@ -194,51 +215,81 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
    sends both processor Catchup commands before invoking NodeService activation;
    NodeService sends no processor command; routing remains Disabled until both
    remote starts succeed; and callbacks received during that interval are
-   dropped without overlap credit or immediate recovery.
+   dropped without overlap credit or immediate recovery. Cover a failed first
+   start and a failed second start with successful rollback: both return
+   `SubscriptionControlFailed`, retain the exact generation, emit no
+   `RpcRetired`, and permit a fresh activation. A failed rollback and a failure
+   of either remote stop disable routing, retire the exact generation, enqueue
+   `RpcRetired` before returning `GenerationLost`, and never expose a partial
+   subscription. Verify that both remote stops are attempted.
 9. Verify the
    [current pruning-point block contract](node-service.md#current-pruning-point-block)
-   with success, the Genesis exception, non-Genesis parent validation, every
-   listed malformed response condition, exact-generation retirement, and
-   transport or generation loss without inferring a database mismatch. An
-   exact-Genesis response with blue score one is
-   `RecoveryInputInvalid(MalformedPruningPointResponse)`, retires the producing
-   RPC generation, consumes the shared malformed-input budget, and produces no
-   boundary threshold, `PreparedSync`, or storage mutation. Supervisor may
-   already have completed that attempt's `reset` call; the next attempt
-   supersedes it with a fresh ingress.
+   with success, canonical Genesis construction, non-Genesis selected-parent
+   membership, every listed malformed response condition, exact-generation
+   retirement, and `RpcRequestFailed` or generation loss without inferring a
+   database mismatch. A repeated response-network value is ignored. An
+   exact-Genesis response with a nonzero or out-of-range raw blue score still
+   normalizes to the domain-owned zero and may produce the zero boundary
+   threshold. Supervisor may already have completed a failed attempt's `reset`
+   call; the next attempt supersedes it with a fresh ingress.
 10. Verify the
     [Catchup sink-sample contract](node-service.md#catchup-sink-sample) with
     ordinary and exact-Genesis success, ORIGIN, an advertised sink that is
-    definitively not found, missing or malformed header data, wrong computed or
-    reported hashes. Exact-Genesis success includes a representable nonzero DAA
-    score. Every malformed case returns `MalformedCatchupSinkResponse`, retires
-    the exact RPC generation, and consumes the shared malformed-input budget.
+    definitively not found, missing or malformed header data, and a trusted
+    header hash different from the advertised sink. Ignore verbose data and
+    redundant reported hashes. Exact-Genesis success includes a representable
+    nonzero DAA score. Every malformed case returns
+    `MalformedCatchupSinkResponse`, retires the exact RPC generation, and
+    consumes the shared malformed-input budget.
     Cover an out-of-range DAA score without generation retirement or budget
-    consumption, transport and generation loss as session faults, and a
-    distinct cancellation outcome.
+    consumption, `RpcRequestFailed` and generation loss as session faults, and
+    a distinct cancellation outcome.
 11. Individual full-block GetBlock validates the requested hash and every
     `ValidatedNodeBlock` invariant. Malformed output retires the exact RPC
-    generation; definitive not-found and transport failure retain their
-    distinct classifications.
+    generation; definitive not-found and `RpcRequestFailed` retain their
+    distinct classifications. Exercise the NodeService-owned
+    [GetBlock compatibility classification](node-service.md#getblock-not-found-compatibility-classification):
+    the exact `HeaderNotFound` and `BlockNotFound` messages built for the
+    requested hash each yield the same definitive not-found result, while a
+    different hash, changed case, leading or trailing content, and unrelated
+    general errors do not. Every nonmatch
+    becomes `RpcRequestFailed`, leaves the exact generation valid, and exposes
+    its message only as diagnostics. After this adapter, only its typed result
+    may select caller or lifecycle behavior.
 12. BlockAdded normalization failure disables routing, enqueues no block, and
     reports `NotificationInputInvalid(MalformedBlockAdded)` without retiring
     the RPC generation.
-13. NotificationRouter applies the VSPC structural checks in their specified
-    order. Exercise the valid empty no-op and each typed nonempty-removed,
-    duplicate-member, and removed/added-intersection result; malformed input
-    is not enqueued and disables routing without retiring the RPC generation.
+13. NotificationRouter drops the valid empty VSPC no-op and rejects a nonempty
+    removed path with an empty added path without enqueueing it, disabling
+    routing without retiring the RPC generation. Duplicate members and
+    removed/added intersections are preserved and delivered normally.
 14. Saturate each NotificationRouter destination independently. The triggering
     notification is not enqueued, both streams are disabled, and the router
     reports `SessionContinuityLost`; the particular destination remains
     diagnostic context and does not create a notification-specific fault.
 15. Exercise `MAX_DAA_SCORE` and `MAX_BLUE_SCORE` successfully, then exceed
-    each by one in full-block and header-only responses. Every excessive node
-    value reports the corresponding `ScoreOutOfRange` fault, returns no
-    normalized value, is Fatal without retiring the RPC generation, and does
-    not consume the malformed recovery-response budget. Include BlockAdded,
-    GetBlocks, current-pruning-point, Catchup sink-sample, and individual
-    GetBlock sources. A full block timestamp of `u64::MAX` passes normalization
-    unchanged and produces no timestamp-specific fault.
+    each consumed score by one in the full-block and header-only operations
+    that use it. Every excessive consumed value reports the corresponding
+    `ScoreOutOfRange` fault, returns no normalized value, is Fatal without
+    retiring the RPC generation, and does not consume the malformed
+    recovery-response budget. Include BlockAdded, retained GetBlocks members,
+    current-pruning-point, Catchup sink-sample DAA, and both individual GetBlock
+    forms as applicable. An ignored score does not create a fault. In
+    particular, exact Genesis ignores raw blue score and synthesizes zero. A
+    full block timestamp of `u64::MAX` passes normalization unchanged and
+    produces no timestamp-specific fault.
+    For `recovery_header`, cover an ordinary missing and out-of-range blue score
+    plus exact-Genesis absent, nonzero, and out-of-range raw blue scores. Every
+    exact-Genesis case returns `ValidatedRecoveryHeader.blue_score = 0` while
+    still requiring and range-checking DAA score and requiring blue work.
+16. RPC API compatibility uses the `RPC_API_VERSION` and `RPC_API_REVISION`
+    constants from KGI's compiled `kaspa-rpc-core`. Accept an exact version
+    with an equal or greater remote revision. Reject lower and higher versions,
+    an exact version with a lower revision, and a completed response missing
+    either value. Every rejection is terminal, publishes no validated RPC
+    generation, and reports the required and observed pair. A transport or
+    generation failure before the complete response remains transient and does
+    not enter terminal rejection.
 
 Use injected clocks and deterministic jitter to verify the independent
 [NodeService](node-service.md#nodeservice--settled) and
@@ -250,7 +301,13 @@ Install the reliable ordered `NodeServiceEvent` path before initial RPC
 publication or rejection. Verify initial and replacement `RpcPublished`, exact
 `RpcRetired`, suppression of repeated retirement, retirement before an
 operation returns its generation-ending error, terminal `Rejected`, and Fatal
-unexpected event-path closure while Supervisor is Running.
+unexpected event-path closure while Supervisor is Running. Race an in-flight
+operation with retirement and require one linearized old-generation success or
+generation-loss result, never completion through the replacement. Verify that
+a stale retirement or operation report cannot affect the replacement, that an
+existing processing session never adopts it, and that the retired router
+enqueues no later callbacks while already-enqueued work remains confined to
+old-session teardown.
 Install the reliable ordered `StorageServiceEvent` path before either initial
 DB generation can be published. Verify initial and replacement processing and
 API publications, exact-`Arc` retirements, suppression of repeated retirement,
@@ -361,13 +418,18 @@ references and newly absent references succeed as boundary leaves and do not
 produce that strict-policy result.
 
 For an inserted block, verify that the returned `BlockCommitted` contains its
-committed ID and new coordinate plus every direct parent's coordinate from the
-same committed transaction, with the coordinate absent for an outside-boundary
-parent. Its non-repeating `level_snapshots` must contain the complete resulting
-block level and every distinct materialized parent level, preserve an existing
-level's DAA score while its size changes, translate the no-VSPC sentinel to
-`None`, and exclude outside-boundary parents. Cover the selected-parent index
-and committed initial color and VSPC membership. Inserted outcomes and their
+committed ID and new coordinate plus every canonical direct parent's coordinate
+from the same committed transaction, with the coordinate absent for an
+outside-boundary parent. Its non-repeating `level_snapshots` must contain the
+complete resulting block level and every distinct materialized parent level,
+preserve an existing level's DAA score while its size changes, translate the
+no-VSPC sentinel to `None`, and exclude outside-boundary parents. Supply a
+validated parent sequence in which the selected parent and another parent each
+repeat. Verify first-occurrence canonicalization, one row and one
+`ParentCommitted` per relation, the selected-parent index in the canonical
+sequence, and no repeated coordinate or level contribution. Rebuild applies
+the same canonicalization. Cover committed initial color and VSPC membership.
+Inserted outcomes and their
 BlockProcessor offers preserve increasing IDs while permitting allocation
 gaps; `AlreadyMaterialized` returns no graph-update payload.
 Verify BlockProcessor forwards the inserted payload before `PersistedBlock`;
@@ -376,16 +438,18 @@ later `PersistedBlock` delivery or request processing recovery.
 
 Verify the [atomic VSPC transaction](storage.md#atomic-vspc-transaction--settled)
 for source continuity, every removed and added selected-parent relationship,
-the removed/added pivot, direct-chain materiality, duplicate/intersection
-rejection through typed pre-mutation `VspcMemberSetViolation`, source-specific
-lifecycle mapping of that defensive error, typed pre-mutation
+the removed/added pivot, direct-chain materiality, distinct identity resolution
+with original repeated positions preserved, typed pre-mutation
 `VspcSourceDiscontinuity`, and structured
 `VspcPathDiscontinuity(VspcPathConflict)` evidence, atomic membership and
 coloring changes, merge-set members represented only by boundary identity, and
-final level-score publication. Its definite outcome contains one complete
-post-commit snapshot for every distinct affected level, including a level whose
-remove/add sequence restores its original score, and requires no post-commit
-projection read.
+final level-score publication. Cover duplicate members and a removed/added
+intersection without a member-set rejection: ordinary source, materiality, and
+path validation still applies, and any admitted change follows the existing
+ordered removal, addition, and coloring steps. Its definite outcome contains
+one complete post-commit snapshot for every distinct affected level, including
+a level whose remove/add sequence restores its original score, and requires no
+post-commit projection read.
 
 Verify [transaction retries](storage.md#transaction-retries) with PostgreSQL
 integration fixtures. Only SQLSTATE `40001` and `40P01` retry the complete
@@ -409,8 +473,9 @@ Materialized result, stored sink ID/hash/selected-parent hash/DAA score, and an
 exact no-transactions GetBlock header. Cover:
 
 - exact current-node-PP discovery and successful Materialized result;
-- successful `MaterializedSyncAnchor` construction, including a header-only
-  node block and a coherent committed Materialized sink;
+- successful `MaterializedSyncAnchor` construction from
+  `ValidatedRecoveryHeader` and a coherent committed Materialized sink,
+  including exact Genesis with normalized blue score zero;
 - exact RPC and DB generation propagation into both processor Begin payloads,
   including VspcProcessor initialization of its committed sink and history
   seed;
@@ -418,10 +483,13 @@ exact no-transactions GetBlock header. Cover:
   requiring Rebuild;
 - an absent or identity-only current node PP requiring Rebuild without
   retiring the valid RPC generation;
-- transport or session failure without inferring Rebuild; and
-- a response carrying the wrong hash or missing required GhostDAG header data
-  as `MalformedGetBlock`, retiring the exact RPC generation without inferring
-  Rebuild.
+- `RpcRequestFailed` or another session failure without inferring Rebuild; and
+- a response carrying the wrong trusted header hash or missing required header
+  DAA score or blue work, plus an ordinary response missing blue score, as
+  `MalformedGetBlock`, retiring the exact RPC generation without inferring
+  Rebuild; and
+- proof that ResyncEngine uses the normalized hash, DAA score, blue work, and
+  blue score without reading or reinterpreting the raw RPC header.
 
 Verify the common
 [boundary seal threshold construction](processing-lifecycle.md#boundary-seal-threshold-construction)
@@ -431,17 +499,18 @@ representable sum above that maximum. Both failures report
 `ScoreOutOfRange(BoundarySealThreshold)` without wrapping or saturation and
 produce no `PreparedSync` or processor Begin. Resync uses the reconciled DB PP
 hash and score. Rebuild uses the normalized node PP hash and score and performs
-this check before database replacement. The Genesis branch returns
-the constant zero from an input whose owning source has already established the
-shared Genesis invariant.
+this check before database replacement. The Genesis branch returns the
+constant zero from NodeService's canonical Genesis representation or
+StorageService's processing-valid Genesis state without inspecting a redundant
+raw node blue score.
 
 Verify Rebuild obtains one normalized current pruning-point block, completes
 StorageService's API-read replacement gate, and passes that same
 `ValidatedNodeBlock` to `rebuild_from_pruning_point` rather than rediscovering
 it or mixing RPC generations. Its successful threshold and returned anchor populate the same
 `PreparedSync` and exact BlockProcessor Begin payload. Malformed pruning-point
-responses use the shared malformed-input budget; transport and generation loss
-retain their session-fault disposition.
+responses use the shared malformed-input budget; `RpcRequestFailed` and
+generation loss retain their session-fault disposition.
 
 Also cover a coherent Genesis-anchored database below anticone finalization
 depth, Empty-versus-Genesis discrimination, exact node/database
@@ -513,6 +582,12 @@ with injected clocks and deterministic jitter:
   binding and requests at most one deactivation when an operation fault reports
   the same loss concurrently; a later `RpcPublished(R2)` is retained until the
   engine is Idle;
+- a generation-preserving `SubscriptionControlFailed` aborts active recovery
+  with `Retry`, retains its recovery obligation and RPC generation, uses the
+  general backoff, and consumes no malformed-input budget; a rollback or
+  unsubscription failure instead races its returned `GenerationLost` against
+  the already-enqueued exact `RpcRetired`, and either observation order
+  requests at most one deactivation and cannot reuse the retired generation;
 - when a malformed-response retirement arrives before its owner-directed
   fault, deactivation begins but preserves delivery of the already-produced
   result; the later fault is accepted before `Deactivated`, consumes the shared
@@ -538,7 +613,7 @@ with injected clocks and deterministic jitter:
 - recovery requirements do not consume Retry backoff;
 - one shared counter across malformed pruning-point, Catchup sink-sample,
   GetBlock, GetBlocks, and VSPC response kinds and all VSPC reasons, including
-  `RemovedChainWithoutAddedPath`, `LowHashPathMismatch`,
+  `RemovedChainWithoutAddedPath`, `RemovedSourceMismatch`,
   `ResolvedSourceDiscontinuity`, and the later attributed
   `SelectedParentPathDiscontinuity`: each malformed synthetic
   occurrence retires its producing generation, the first three permit another
@@ -555,13 +630,15 @@ with injected clocks and deterministic jitter:
   source policy; a synthetic conflict on both sides records Rebuild, retires and
   counts the generation, while the notification form records Rebuild without
   retirement or malformed-budget consumption;
-- malformed, definitively absent, transport-failed, cancelled, and
+- malformed, definitively absent, `RpcRequestFailed`, cancelled, and
   generation-lost attribution probes retain their distinct dispositions; and
 - both `BoundedStateExhausted` variants atomically reject the triggering input,
   disable both notification streams, require Resync without weakening Rebuild,
   retire no RPC generation, consume no malformed-input budget, and proceed
   through complete session teardown; and
-- typed fault kinds, never diagnostics, drive policy and counters.
+- after the NodeService-owned GetBlock compatibility adapter has produced its
+  typed result, typed fault kinds rather than diagnostics drive policy and
+  counters.
 
 Exercise every row of the lifecycle-owned
 [ownership and session-channel disposition table](processing-lifecycle.md#supervisor-and-recovery-intent--settled),
@@ -1427,9 +1504,13 @@ come from one read-only stable snapshot.
 
 Projection cases cover complete nominal blocks; crossing edges with zero, one,
 and two endpoint blocks; all nominal and endpoint levels; exclusion of the
-outside-PP sentinel edge; complete direct-parent and merge-set hashes; local
-`selected_parent_index`; Genesis without ORIGIN; current color and VSPC state;
-and both construction-only alignment values. Verify that the ID cut is the
+outside-PP sentinel edge; complete canonical direct-parent and merge-set hashes;
+local `selected_parent_index`; Genesis without ORIGIN; current color and VSPC
+state; and both construction-only alignment values. Verify that live
+`BlockCommitted` projection and database reconstruction expose the same unique
+child-parent relation set despite their permitted local vector ordering, create
+one `GraphEdge` per relation, and count each retained edge once in
+`usage_count`. Verify that the ID cut is the
 maximum over the complete materialized block table, including an ID whose
 block is outside the projected window. Recompute derived level usage from
 edges. Exercise the separate capped API pool and prove its saturation or

@@ -10,6 +10,14 @@ are accepted; do not introduce them implicitly during implementation.
 ## KGI v2.1 candidate list
 
 - low-frequency Live VSPC consistency probe;
+- replace the pinned exact-message GetBlock not-found compatibility adapter
+  with a structured rusty-kaspa gRPC discriminator, then remove the exception
+  only after the selected client and server path and a new PUAR prove
+  end-to-end preservation; the current NodeService behavior remains owned by
+  the
+  [GetBlock compatibility contract](architecture/node-service.md#getblock-not-found-compatibility-classification),
+  and the upstream deficiency is recorded in
+  [the local issue](rk-issues/get-block-not-found-error-erasure.md);
 - administrative/API-triggered recovery through Supervisor;
 - investigate deterministic per-level slot ordering derived from block data,
   aiming for stable coordinates where instances share the same retained DAG;

@@ -167,8 +167,6 @@ enum Component {
 enum ServiceKind { Node, Storage }
 enum MalformedVspcNotificationReason {
     RemovedChainWithoutAddedPath,
-    DuplicateChainMember,
-    RemovedAddedIntersection,
     ResolvedSourceDiscontinuity,
     SelectedParentPathDiscontinuity,
     DuplicatePendingTransition,
@@ -182,9 +180,7 @@ enum NotificationInputKind {
 enum MalformedVspcResponseReason {
     RemovedChainWithoutAddedPath,
     NonAdvancingAddedCursor,
-    DuplicateChainMember,
-    RemovedAddedIntersection,
-    LowHashPathMismatch,
+    RemovedSourceMismatch,
     ResolvedSourceDiscontinuity,
     SelectedParentPathDiscontinuity,
 }
@@ -218,6 +214,8 @@ enum OwnershipFault {
 }
 enum FaultKind {
     ServiceGenerationLost(ServiceKind),
+    RpcRequestFailed,
+    SubscriptionControlFailed,
     SessionContinuityLost,
     NotificationInputInvalid(NotificationInputKind),
     RecoveryInputInvalid(RecoveryInputKind),
@@ -280,17 +278,35 @@ watch primitives remain deferred.
 `ComponentFault` is the cross-worker control envelope. Component-local errors
 may retain richer library-specific sources, but must be classified before
 crossing an ownership boundary. The enum sketch fixes the required semantic
-discriminants, not exact module placement or error-library syntax. Only typed
-fields drive control, retry counters, and metrics; diagnostic strings never
-do.
+discriminants, not exact module placement or error-library syntax. At this
+boundary, only typed fields drive control, retry counters, and metrics; raw
+diagnostic strings never do. NodeService performs its upstream GetBlock
+compatibility classification before constructing this envelope.
 
 - `Retry` is meaningful only while a recovery is active. It aborts and fully
   deactivates the current attempt; after Idle and backoff, Supervisor reruns
   fresh preparation for the strongest unsatisfied recovery obligation. It
   never retries one RPC or page in place.
 - A recoverable fault in Live must require at least `Resync`.
-- Fault strings are diagnostics and must never drive control flow; retry
+- After NodeService performs its sole
+  [GetBlock compatibility classification](node-service.md#getblock-not-found-compatibility-classification),
+  fault strings are diagnostics and never drive lifecycle control flow; retry
   causes used by policy are typed.
+- The NodeService-owned
+  [`RpcRequestFailed`](node-service.md#getblock-not-found-compatibility-classification)
+  result aborts an active recovery attempt with `Retry`, retains the current
+  recovery obligation, and uses the general recovery backoff. In Live it
+  requires Resync. It does not consume the malformed-input budget or wait for a
+  replacement generation. An independently observed generation retirement
+  instead produces `ServiceGenerationLost(Node)` and follows that existing
+  replacement wait.
+- The NodeService-owned generation-preserving
+  [`SubscriptionControlFailed`](node-service.md#notificationrouter) result
+  aborts an active recovery attempt with `Retry`, retains the current recovery
+  obligation, uses the general recovery backoff, does not consume the
+  malformed-input budget, and does not wait for a replacement generation. In
+  Live it requires Resync. A generation-ending subscription-control result
+  enters this lifecycle as `ServiceGenerationLost(Node)`.
 - A nonmaterialized hash directly named in VSPC `added`/`removed` and a
   resolver-confirmed unavailable dependency each require Rebuild directly:
   the DB can no longer be trusted against node state. RPC connection failure
@@ -352,16 +368,9 @@ recovery-response budget. A malformed individual full-block GetBlock, whether
 issued by DependencyResolver or VspcProcessor attribution, retires the exact
 RPC generation: during active recovery it consumes the shared malformed-input
 budget, while in Live it requires Resync without consuming that recovery-only
-budget. Attribution transport, cancellation, or generation loss is a session
-fault and establishes neither candidate nor database blame.
-
-A defensive storage `VspcMemberSetViolation` maps by candidate source. For a
-synthetic candidate it becomes
-`RecoveryInputInvalid(MalformedVspcResponse(reason))`; for a notification it
-becomes `NotificationInputInvalid(MalformedVspcChange(reason))`. The reason is
-the corresponding `DuplicateChainMember` or `RemovedAddedIntersection`
-variant. Apply the same recovery-response or notification-source disposition
-defined above; storage does not decide it.
+budget. Attribution `RpcRequestFailed`, cancellation, or generation loss
+establishes neither candidate nor database blame; its typed lifecycle
+disposition remains unchanged.
 
 When Supervisor still holds the same published RPC and processing DB
 generations, whole-attempt recovery retries use nominal
@@ -627,11 +636,10 @@ otherwise:
     checked(boundary_blue_score + anticone_finalization_depth)
 ```
 
-The Genesis branch consumes the zero-blue-score invariant already established
-by either NodeService's normalized block or StorageService's processing-valid
-database snapshot; it does not accept an arbitrary Genesis score. A malformed
-node Genesis is rejected before this function and therefore before database
-replacement.
+The Genesis branch consumes the domain-owned zero produced by NodeService's
+canonical Genesis normalization or held by StorageService's processing-valid
+database snapshot. It does not inspect a redundant node-reported Genesis blue
+score.
 
 The result must be at most the shared `MAX_BLUE_SCORE`. `Overflow` or
 `AboveMaximum` reports `ScoreOutOfRange(BoundarySealThreshold)` with Fatal
@@ -668,11 +676,12 @@ contents likewise request Rebuild but are not treated as Empty.
 
 ResyncEngine uses the run's exact `Arc<ValidatedRpcClient>` and the normalized
 [individual recovery GetBlock](node-service.md#individual-recovery-getblock)
-contract to obtain the sink header. It compares the returned DAA score with the
-stored sink DAA score, then constructs `MaterializedSyncAnchor` from the stored
-ID, hash, and selected-parent hash plus the header's blue work and blue score.
-A header-only node block is sufficient because no body or transactions are
-needed. KGI relies on successful GetBlock GhostDAG enrichment also
+contract to obtain `ValidatedRecoveryHeader`. It compares the normalized DAA
+score with the stored sink DAA score, then constructs `MaterializedSyncAnchor`
+from the stored ID and selected-parent hash plus the normalized hash, blue work,
+and blue score. ResyncEngine never reads the raw RPC header or applies a second
+Genesis branch. A header-only node block is sufficient because no body or
+transactions are needed. KGI relies on successful GetBlock enrichment also
 establishing the recognition required to use the sink as a GetBlocks
 `low_hash`; the
 [PUAR](verification.md#current-puar-result) checks that upstream assumption
@@ -696,7 +705,7 @@ sink despite also storing `db_pp_blue_score = 0`.
 
 A missing or inconsistent stored sink, a definitive absent response from the
 node, a stored/returned DAA-score mismatch, or another failed reconciliation
-check reports `Require(Rebuild)` to Supervisor. A transport failure,
+check reports `Require(Rebuild)` to Supervisor. An opaque `RpcRequestFailed`,
 cancellation, connection loss, or validated-client loss is instead a session
 fault/retry and does not prove that Rebuild is required. NodeService owns
 classification of a malformed GetBlock response as
@@ -875,6 +884,11 @@ Begin needs no acknowledgement. Before Catchup:
 2. start both remote subscriptions with NotificationRouter still Disabled;
 3. after both starts succeed, enable the router and publish the client's
    subscription state Enabled.
+
+If activation returns the generation-preserving `SubscriptionControlFailed`,
+ResyncEngine reports that fault with `Retry` and dispatches no Catchup
+notification input. A generation-ending activation result follows the existing
+generation-loss path.
 
 Processor-local notification gates are authoritative for immediate dropping.
 Callbacks arriving while the router remains Disabled during activation are
@@ -1089,6 +1103,13 @@ On Deactivate, ResyncEngine performs this barrier in order:
 6. release every processing-session clone of the validated RPC and DB handles;
 7. drop `ProcessingSession`; and
 8. emit `Deactivated` and enter Idle.
+
+If step 1 returns `GenerationLost` under the NodeService-owned
+[subscription contract](node-service.md#notificationrouter), the local
+notification cutoff is complete, so ResyncEngine continues the remaining
+barrier. During ordinary operation the resulting fault and `RpcRetired` event
+coalesce under the exact-generation rule; during terminal shutdown the event
+is drained and discarded and no recovery starts.
 
 The owning services may retain their validated generations after Deactivate.
 For global shutdown, Supervisor first enters terminal shutdown and starts no

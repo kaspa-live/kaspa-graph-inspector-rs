@@ -83,6 +83,15 @@ pub struct ValidatedNodeBlock {
     pub blue_work: BlueWork,
 }
 
+/// Normalized header-only block data used during recovery preparation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedRecoveryHeader {
+    pub hash: BlockHash,
+    pub daa_score: u64,
+    pub blue_work: BlueWork,
+    pub blue_score: u64,
+}
+
 /// Deterministic order by `(blue_work, hash)`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConsensusOrder {

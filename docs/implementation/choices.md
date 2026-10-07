@@ -44,9 +44,9 @@ adapter is implemented.
 Use the following workspace dependency declarations for Kaspa value crates:
 
 ```toml
-kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
-kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
-kaspa-math = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.0.1" }
+kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }
+kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }
+kaspa-math = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }
 ```
 
 The component status values use
@@ -56,13 +56,14 @@ The component status values use
 `kaspa_math::Uint192`. This keeps upstream representation and ordering while
 avoiding a dependency from `kgi-model` on consensus processing, RPC, or service
 crates.
-The committed Cargo lockfile records the resolved source commit. The upstream
-tag currently resolves to `cfafeb4c093fa37a303f1b9f19c58f986b870ce3`.
+The workspace dependency selection advanced from `v2.0.1` to `v2.1.0` on
+6 October 2026. The committed Cargo lockfile records the resolved source
+commit. The upstream tag resolves to
+`01b532e8b553523216471682649693af92f0fd16`.
 
 This tag is the implementation dependency selection for the initial model.
 PUAR acceptance and runtime node-compatibility scope remain owned by the
-[verification contract](../architecture/verification.md); a later PUAR run will
-handle the next upstream review.
+[verification contract](../architecture/verification.md).
 
 ### Tokio channel, gate, and gap primitives
 
@@ -92,10 +93,11 @@ public API.
 
 Library crates use explicit typed error enums derived with `thiserror::Error`.
 They do not return `anyhow::Error`, boxed dynamic errors, or select control flow
-from error strings. Component-local errors may retain concrete upstream
-sources; before an error crosses an ownership boundary it is classified into
-the shared typed fault vocabulary, with `Arc<str>` used only for diagnostic
-context.
+from error strings except for the single NodeService-owned
+[GetBlock compatibility adapter](../architecture/node-service.md#getblock-not-found-compatibility-classification).
+Component-local errors may retain concrete upstream sources; before an error
+crosses an ownership boundary it is classified into the shared typed fault
+vocabulary, with `Arc<str>` used only for diagnostic context.
 
 The top binary and `xtask` may use `anyhow` for command-boundary context where
 no caller branches on the error. They must still preserve typed component
@@ -122,8 +124,8 @@ and `toml` for the explicitly selected configuration file, and `url` for parsed
 URL values. Keep these dependencies in the smallest owning crate: command,
 source-loading, and resolution dependencies belong to `kgi`, while
 `kgi-core` depends only on crates needed by its resolved value types and signal
-adapter. Direct dependency versions shared with rusty-kaspa follow its pinned
-`v2.0.1` workspace where applicable.
+adapter. Direct dependency versions shared with rusty-kaspa follow its selected
+`v2.1.0` workspace where applicable.
 
 Retain the logging system from rusty-kaspa's `core/src/log` when process
 logging is implemented. `LoggingConfig.level` therefore carries that logger's
@@ -176,3 +178,117 @@ termination in a subprocess so the test runner itself cannot exit.
 
 The public adapter shape and callback behavior remain owned by the
 [process termination contract](../architecture/overview.md#process-termination-signal-adapter--settled).
+
+## 6 October 2026: NodeService implementation foundation
+
+### Crate and module boundaries
+
+Start `kgi-node` with these public modules:
+
+- `consensus`: `KgiConsensusParams`, its typed validation errors, and the
+  startup-time local parameter resolver;
+- `error`: NodeService, validated-RPC, rejection, and operation error values;
+- `rpc`: `ValidatedRpcClient`, `ValidatedNodeInfo`, normalized response values,
+  and the public operations on one validated generation; and
+- `service`: `NodeService`, its state and ordered events, status observation,
+  construction, and lifecycle methods.
+
+Keep the upstream client adapter, raw-response normalization,
+`NotificationRouter`, service-loop commands, and timing utilities in private
+`client`, `normalization`, `notification`, `runtime`, and `timing` modules.
+Tests remain beside their owning module, with integration tests added only for
+cross-module generation and routing order. `lib.rs` exposes the public modules
+without wildcard re-exports, so consumers retain paths such as
+`kgi_node::rpc::ValidatedRpcClient` and `kgi_node::service::NodeService`.
+
+These are Rust placement choices only. The focused
+[NodeService architecture](../architecture/node-service.md) remains the owner
+of connection, generation, normalization, and notification behavior.
+
+### Upstream and support dependencies
+
+Use the `v2.1.0` `kaspa-grpc-client` in direct-notification mode as the physical
+client. Its production connector uses the constructor whose automatic
+reconnect argument is fixed to `false`; NodeService, rather than the upstream
+client, owns replacement generations. Use `kaspa-rpc-core` for RPC request,
+response, notification, and API compatibility values, `kaspa-notify` for the
+notification trait and scopes, `kaspa-consensus-core` for local parameter
+resolution, and `kaspa-core` for logging through the retained upstream logging
+facade. The direct `log` dependency exists only because the exported
+`kaspa-core` logging macros expand through that crate; production calls retain
+the `kaspa-core` facade. Raw upstream values do not leave `kgi-node`.
+
+Use `serde_json` only to decode the upstream `OverrideParams` representation,
+`url` for the already parsed endpoint, `thiserror` for typed errors,
+`async-trait` for private testable adapter traits, and `rand` for the production
+jitter source. Tokio supplies the worker, channels, status observation,
+completion barriers, timer implementation, and RPC permits. All rusty-kaspa
+crates use the same workspace tag and lockfile revision accepted by the
+[current PUAR](../architecture/verification.md#current-puar-result).
+
+### Lifecycle and generation primitives
+
+Run NodeService ownership in one Tokio task and serialize its state changes in
+that task. Use private unbounded Tokio MPSC channels for its low-rate reliable
+control queue and ordered `NodeServiceEvent` stream. Construction creates the
+event receiver before the task can start, preserving the installation boundary
+without exposing the command sender. Supervisor-facing async methods submit
+private commands and use Tokio one-shot completion barriers; callers never
+observe or depend on the mailbox representation.
+
+Publish `NodeServiceStatus` through a Tokio watch channel because status is a
+latest-value observation rather than a reliable lifecycle input. Keep the
+worker join handle under the service owner and make the completed shutdown
+result reusable by later callers.
+
+Each `ValidatedRpcClient` uses a private atomic admission flag and a Tokio
+semaphore for the focused-owner runtime RPC limit. An operation obtains its
+permit and then confirms generation admission before issuing an upstream call.
+Retirement closes admission before disconnecting the physical client. A
+private synchronous mutex protects the router and subscription state needed by
+rusty-kaspa's synchronous notification callback; no mutex guard crosses an
+await. Generation-ending reports travel to the owner loop with a one-shot
+barrier so ordered retirement is complete before the operation returns its
+typed result.
+
+### Deterministic test seams
+
+Define private object-safe `RpcConnector` and `RpcConnection` traits containing
+only the operations KGI consumes. The production adapters delegate to
+`kaspa-grpc-client` and `kaspa-rpc-core`; unit tests use scripted connections
+that return real upstream response value types. This avoids implementing the
+complete upstream RPC trait or duplicating a gRPC server while still testing
+KGI-owned request construction, normalization, retirement, and ordering.
+
+Inject a private object-safe clock and jitter source through NodeService's
+runtime dependencies. Production uses Tokio time and a mutex-protected
+`rand::rngs::SmallRng` seeded from system entropy. Tests use a manually
+advanced clock and a scripted jitter sequence, so reconnect slots, the Ready
+reset boundary, and shutdown cancellation contain no wall-clock sleeps or
+probabilistic assertions. Exact delays and reset behavior remain owned by the
+[NodeService lifecycle](../architecture/node-service.md#nodeservice--settled).
+
+### Validated-generation composition
+
+Keep RPC API compatibility checking inside NodeService's private connection
+validation path. It is not exposed as a public free function or utility type;
+the published result is the semantic `ValidatedNodeInfo` attached to the exact
+generation. The same path constructs the raw Genesis-discovery request and
+polls server information during IBD. The private clock supplies a one-second
+IBD polling interval so those waits and shutdown races remain deterministic in
+tests.
+
+Each `ValidatedRpcClient` owns one `Arc<ResponseNormalizer>` and passes a clone
+to one stable `Arc<NotificationRouter>`. Subscription activation installs fresh
+session destinations into that router before starting remote subscriptions;
+successful deactivation clears them for a later session, while generation
+retirement permanently retires the router. The public `NotificationChannels`
+value groups the two bounded processor senders and reliable fault sender
+without exposing router internals.
+
+The permanent service task keeps physical connection, validation, event, and
+retirement ownership serialized in one loop. Stale retirement barriers are
+acknowledged during connect, validation, retry, and rejected phases as well as
+Ready, so a late report cannot disturb a replacement or remain blocked behind
+one. Tests use identity jitter when asserting nominal slots and the manual
+clock for both the Ready reset boundary and shutdown-cancellable waits.

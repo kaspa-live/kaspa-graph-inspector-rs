@@ -7,8 +7,13 @@ mechanics.
 | Concern | Settled outcome | Current owner |
 |---|---|---|
 | Identity and materiality | Separate persistent identity, materiality, PP-boundary, and ORIGIN semantics. | [Domain model](../architecture/domain-model.md), [storage](../architecture/storage.md) |
+| Direct-parent representation | Preserve the node-facing sequence and canonicalize durable child-parent relations by first occurrence. | [Domain model](../architecture/domain-model.md), [storage](../architecture/storage.md), [API graph model](../architecture/api-graph.md) |
 | Database lifecycle | Network-bound idempotent bootstrap and explicit database replacement. | [Storage](../architecture/storage.md) |
 | Node capability | Validated RPC generations and normalized node inputs. | [NodeService](../architecture/node-service.md) |
+| Node trust boundary | Treat the configured node as the Kaspa consensus authority and validate only the boundary conditions required by KGI-owned invariants. | [Overview](../architecture/overview.md#node-trust-boundary--settled) |
+| gRPC error compatibility | Preserve definitive GetBlock absence through the pinned erased-error representation and classify every other flattened runtime RPC error opaquely. | [NodeService](../architecture/node-service.md#getblock-not-found-compatibility-classification) |
+| Notification subscription control | Retry a failed activation on the same RPC generation only after NodeService proves complete rollback; otherwise retire that generation. | [NodeService](../architecture/node-service.md#notificationrouter), [processing lifecycle](../architecture/processing-lifecycle.md#supervisor-and-recovery-intent--settled) |
+| Genesis recovery header | Normalize an exact-Genesis recovery blue score to zero inside NodeService before Resync consumes it. | [NodeService](../architecture/node-service.md#individual-recovery-getblock) |
 | Block processing | Phase-aware block admission, materialization, and dependency recovery. | [Block processing](../architecture/block-processing.md), [storage](../architecture/storage.md) |
 | VSPC processing | Ordered readiness-gated VSPC processing and publication. | [VSPC processing](../architecture/vspc-processing.md) |
 | Recovery lifecycle | Explicit Resync/Rebuild coordination and overlap-based Live admission. | [Processing lifecycle](../architecture/processing-lifecycle.md) |
