@@ -1,5 +1,6 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use kaspa_consensus_core::network::NetworkId;
 use kgi_core::timing::{Clock, EqualJitter, Jitter, TokioClock};
 use kgi_model::{
@@ -78,6 +79,16 @@ impl StorageService {
         clock: Arc<dyn Clock>,
         jitter: Arc<dyn Jitter>,
     ) -> (Arc<Self>, StorageServiceEventReceiver) {
+        Self::start_with_generation_opener(database_url, connector, clock, jitter, Arc::new(SqlxGenerationOpener))
+    }
+
+    fn start_with_generation_opener(
+        database_url: Url,
+        connector: Arc<dyn DatabaseConnector>,
+        clock: Arc<dyn Clock>,
+        jitter: Arc<dyn Jitter>,
+        generation_opener: Arc<dyn GenerationOpener>,
+    ) -> (Arc<Self>, StorageServiceEventReceiver) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (retirement_tx, retirement_rx) = retirement_channel();
@@ -93,6 +104,7 @@ impl StorageService {
             retirements: retirement_rx,
             retirement_tx,
             status: status_tx,
+            generation_opener,
         };
         let join = tokio::spawn(async move {
             let result = worker.run().await;
@@ -173,6 +185,41 @@ struct ActiveGenerations {
     api_required: bool,
 }
 
+#[async_trait]
+trait GenerationOpener: Send + Sync {
+    async fn open_processing(
+        &self,
+        database_url: String,
+        binding: DatabaseBinding,
+        retirement_tx: RetirementSender,
+    ) -> Result<Arc<ValidatedDbClient>, StorageError>;
+
+    async fn open_api(&self, database_url: String, retirement_tx: RetirementSender)
+    -> Result<Arc<ValidatedApiDbClient>, StorageError>;
+}
+
+struct SqlxGenerationOpener;
+
+#[async_trait]
+impl GenerationOpener for SqlxGenerationOpener {
+    async fn open_processing(
+        &self,
+        database_url: String,
+        binding: DatabaseBinding,
+        retirement_tx: RetirementSender,
+    ) -> Result<Arc<ValidatedDbClient>, StorageError> {
+        open_processing_generation(database_url, binding, retirement_tx).await
+    }
+
+    async fn open_api(
+        &self,
+        database_url: String,
+        retirement_tx: RetirementSender,
+    ) -> Result<Arc<ValidatedApiDbClient>, StorageError> {
+        open_api_generation(database_url, retirement_tx).await
+    }
+}
+
 struct StorageServiceWorker {
     database_url: Url,
     connector: Arc<dyn DatabaseConnector>,
@@ -183,6 +230,7 @@ struct StorageServiceWorker {
     retirements: RetirementReceiver,
     retirement_tx: RetirementSender,
     status: watch::Sender<StorageServiceStatus>,
+    generation_opener: Arc<dyn GenerationOpener>,
 }
 
 impl StorageServiceWorker {
@@ -326,12 +374,24 @@ impl StorageServiceWorker {
             if active.processing.is_none() {
                 self.publish_status(StorageServiceStatusState::Unavailable);
                 let database_url = self.database_url.as_str().to_owned();
-                let opening = open_processing_generation(database_url, active.binding, self.retirement_tx.clone());
+                let generation_opener = self.generation_opener.clone();
+                let retirement_tx = self.retirement_tx.clone();
+                let binding = active.binding;
+                let opening = async move { generation_opener.open_processing(database_url, binding, retirement_tx).await };
                 tokio::pin!(opening);
                 loop {
+                    let health_clock = self.clock.clone();
+                    let health = async move { health_clock.sleep(LOCK_HEALTH_INTERVAL).await };
+                    tokio::pin!(health);
                     tokio::select! {
                         result = &mut opening => match result {
                             Ok(client) => {
+                                if database.ping().await.is_err() {
+                                    client.retire();
+                                    client.close().await;
+                                    self.handle_lock_loss(active).await?;
+                                    return Ok(ActiveExit::Reconnect);
+                                }
                                 self.send_event(StorageServiceEvent::ProcessingDbPublished(client.clone()))?;
                                 active.processing = Some(client);
                                 break;
@@ -341,6 +401,12 @@ impl StorageServiceWorker {
                                     ActiveRetryExit::Retry => break,
                                     ActiveRetryExit::Exit(exit) => return Ok(exit),
                                 }
+                            }
+                        },
+                        () = &mut health => {
+                            if database.ping().await.is_err() {
+                                self.handle_lock_loss(active).await?;
+                                return Ok(ActiveExit::Reconnect);
                             }
                         },
                         command = self.commands.recv() => if let Some(exit) = self.handle_active_command(command, database, active).await? {
@@ -355,12 +421,23 @@ impl StorageServiceWorker {
             if active.api_required && active.api.is_none() {
                 self.publish_status(StorageServiceStatusState::Unavailable);
                 let database_url = self.database_url.as_str().to_owned();
-                let opening = open_api_generation(database_url, self.retirement_tx.clone());
+                let generation_opener = self.generation_opener.clone();
+                let retirement_tx = self.retirement_tx.clone();
+                let opening = async move { generation_opener.open_api(database_url, retirement_tx).await };
                 tokio::pin!(opening);
                 loop {
+                    let health_clock = self.clock.clone();
+                    let health = async move { health_clock.sleep(LOCK_HEALTH_INTERVAL).await };
+                    tokio::pin!(health);
                     tokio::select! {
                         result = &mut opening => match result {
                             Ok(client) => {
+                                if database.ping().await.is_err() {
+                                    client.retire();
+                                    client.close().await;
+                                    self.handle_lock_loss(active).await?;
+                                    return Ok(ActiveExit::Reconnect);
+                                }
                                 self.send_event(StorageServiceEvent::ApiDbPublished(client.clone()))?;
                                 active.api = Some(client);
                                 break;
@@ -370,6 +447,12 @@ impl StorageServiceWorker {
                                     ActiveRetryExit::Retry => break,
                                     ActiveRetryExit::Exit(exit) => return Ok(exit),
                                 }
+                            }
+                        },
+                        () = &mut health => {
+                            if database.ping().await.is_err() {
+                                self.handle_lock_loss(active).await?;
+                                return Ok(ActiveExit::Reconnect);
                             }
                         },
                         command = self.commands.recv() => if let Some(exit) = self.handle_active_command(command, database, active).await? {
@@ -397,8 +480,7 @@ impl StorageServiceWorker {
                     }
                     () = &mut health => {
                         if database.ping().await.is_err() {
-                            self.retire_all(active).await?;
-                            self.publish_status(StorageServiceStatusState::Unavailable);
+                            self.handle_lock_loss(active).await?;
                             return Ok(ActiveExit::Reconnect);
                         }
                     }
@@ -505,8 +587,17 @@ impl StorageServiceWorker {
         let sleep = async move { clock.sleep(delay).await };
         tokio::pin!(sleep);
         loop {
+            let health_clock = self.clock.clone();
+            let health = async move { health_clock.sleep(LOCK_HEALTH_INTERVAL).await };
+            tokio::pin!(health);
             tokio::select! {
                 () = &mut sleep => return Ok(ActiveRetryExit::Retry),
+                () = &mut health => {
+                    if database.ping().await.is_err() {
+                        self.handle_lock_loss(active).await?;
+                        return Ok(ActiveRetryExit::Exit(ActiveExit::Reconnect));
+                    }
+                },
                 command = self.commands.recv() => {
                     if let Some(exit) = self.handle_active_command(command, database, active).await? {
                         return Ok(ActiveRetryExit::Exit(exit));
@@ -515,6 +606,12 @@ impl StorageServiceWorker {
                 request = self.retirements.recv() => self.handle_retirement(request, active).await?,
             }
         }
+    }
+
+    async fn handle_lock_loss(&self, active: &mut ActiveGenerations) -> Result<(), StorageError> {
+        self.retire_all(active).await?;
+        self.publish_status(StorageServiceStatusState::Unavailable);
+        Ok(())
     }
 
     async fn wait_retry(
@@ -709,14 +806,20 @@ mod tests {
         postgres::Postgres,
         testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner},
     };
-    use tokio::{sync::mpsc, time::timeout};
+    use tokio::{
+        sync::{Semaphore, mpsc},
+        time::timeout,
+    };
     use url::Url;
 
-    use super::{LOCK_HEALTH_INTERVAL, READY_BACKOFF_RESET, StorageService, StorageServiceEvent, StorageServiceEventReceiver};
+    use super::{
+        GenerationOpener, LOCK_HEALTH_INTERVAL, READY_BACKOFF_RESET, StorageService, StorageServiceEvent, StorageServiceEventReceiver,
+    };
     use crate::{
-        database::{DatabaseConnector, LockedDatabase},
+        database::{DatabaseConnector, LockedDatabase, open_api_generation, open_processing_generation},
         error::{StorageError, StorageRejection},
-        generation::{ValidatedApiDbClient, ValidatedDbClient},
+        generation::{DatabaseBinding, ValidatedApiDbClient, ValidatedDbClient},
+        runtime::RetirementSender,
         state::DatabaseState,
     };
 
@@ -948,6 +1051,101 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum ReplacementLockLossTrigger {
+        HealthPoll,
+        PrePublicationRecheck,
+    }
+
+    async fn exercise_api_replacement_lock_loss(trigger: ReplacementLockLossTrigger) {
+        let (_container, database_url) = fixture().await;
+        let (reconnect_tx, mut reconnect_rx) = mpsc::unbounded_channel();
+        let connector = Arc::new(ReconnectGateConnector {
+            attempts: AtomicUsize::new(0),
+            reconnect_started: reconnect_tx,
+            reconnect_permit: Semaphore::new(0),
+        });
+        let (api_open_tx, mut api_open_rx) = mpsc::unbounded_channel();
+        let generation_opener =
+            Arc::new(GatedApiGenerationOpener { api_open_started: api_open_tx, api_open_permit: Semaphore::new(0) });
+        let (sleep_tx, mut sleeps) = mpsc::unbounded_channel();
+        let clock = Arc::new(ManualClock { sleeps: sleep_tx });
+        let (service, mut events) = StorageService::start_with_generation_opener(
+            database_url.clone(),
+            connector.clone(),
+            clock,
+            Arc::new(IdentityJitter),
+            generation_opener.clone(),
+        );
+        wait_for_status(&service, StorageServiceStatusState::AwaitingInitialization).await;
+        let genesis = match trigger {
+            ReplacementLockLossTrigger::HealthPoll => hash(4),
+            ReplacementLockLossTrigger::PrePublicationRecheck => hash(5),
+        };
+        service.initialize_if_uninitialized(mainnet(), genesis).await.expect("database initialization");
+        let processing = match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbPublished(client) => client,
+            event => panic!("expected initial processing publication, got {event:?}"),
+        };
+        let api = match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbPublished(client) => client,
+            event => panic!("expected initial API publication, got {event:?}"),
+        };
+        wait_for_status(&service, StorageServiceStatusState::Ready).await;
+        let (ready_health, ready_reset) = ready_timers(&mut sleeps).await;
+
+        api.request_retirement().await.expect("API retirement barrier");
+        match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &api)),
+            event => panic!("expected API retirement, got {event:?}"),
+        }
+        drop(ready_health);
+        drop(ready_reset);
+        timeout(TEST_TIMEOUT, api_open_rx.recv()).await.expect("API replacement must start").expect("API-open observer");
+        let replacement_health = timeout(TEST_TIMEOUT, sleeps.recv()).await.expect("replacement health timer").expect("clock path");
+        assert_eq!(replacement_health.duration, LOCK_HEALTH_INTERVAL);
+
+        let mut observer = PgConnection::connect(database_url.as_str()).await.expect("lock observer");
+        terminate_lock_owner(&mut observer).await;
+        match trigger {
+            ReplacementLockLossTrigger::HealthPoll => {
+                replacement_health.completion.send(()).expect("run replacement health check");
+            }
+            ReplacementLockLossTrigger::PrePublicationRecheck => {
+                drop(replacement_health);
+                generation_opener.api_open_permit.add_permits(1);
+            }
+        }
+
+        match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &processing)),
+            event => panic!("expected processing retirement before any replacement publication, got {event:?}"),
+        }
+        timeout(TEST_TIMEOUT, reconnect_rx.recv()).await.expect("reconnect attempt").expect("reconnect observer");
+        assert!(timeout(Duration::from_millis(100), events.recv()).await.is_err());
+
+        connector.reconnect_permit.add_permits(1);
+        match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbPublished(_) => {}
+            event => panic!("expected processing publication after reacquisition, got {event:?}"),
+        }
+        match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbPublished(_) => {}
+            event => panic!("expected API publication after reacquisition, got {event:?}"),
+        }
+        service.shutdown().await.expect("service shutdown");
+    }
+
+    #[tokio::test]
+    async fn advisory_lock_loss_is_observed_while_api_replacement_is_blocked() {
+        exercise_api_replacement_lock_loss(ReplacementLockLossTrigger::HealthPoll).await;
+    }
+
+    #[tokio::test]
+    async fn completed_api_replacement_rechecks_lock_before_publication() {
+        exercise_api_replacement_lock_loss(ReplacementLockLossTrigger::PrePublicationRecheck).await;
+    }
+
     #[tokio::test]
     async fn closed_event_path_is_fatal_and_releases_database_ownership() {
         let (_container, database_url) = fixture().await;
@@ -969,6 +1167,50 @@ mod tests {
         async fn connect(&self, _database_url: &str) -> Result<LockedDatabase, StorageError> {
             self.attempts.fetch_add(1, Ordering::Relaxed);
             Err(StorageError::Database { operation: "scripted connection", diagnostic: Arc::from("unavailable") })
+        }
+    }
+
+    struct ReconnectGateConnector {
+        attempts: AtomicUsize,
+        reconnect_started: mpsc::UnboundedSender<()>,
+        reconnect_permit: Semaphore,
+    }
+
+    #[async_trait]
+    impl DatabaseConnector for ReconnectGateConnector {
+        async fn connect(&self, database_url: &str) -> Result<LockedDatabase, StorageError> {
+            if self.attempts.fetch_add(1, Ordering::Relaxed) > 0 {
+                self.reconnect_started.send(()).expect("reconnect observer");
+                self.reconnect_permit.acquire().await.expect("reconnect gate").forget();
+            }
+            LockedDatabase::connect(database_url).await
+        }
+    }
+
+    struct GatedApiGenerationOpener {
+        api_open_started: mpsc::UnboundedSender<()>,
+        api_open_permit: Semaphore,
+    }
+
+    #[async_trait]
+    impl GenerationOpener for GatedApiGenerationOpener {
+        async fn open_processing(
+            &self,
+            database_url: String,
+            binding: DatabaseBinding,
+            retirement_tx: RetirementSender,
+        ) -> Result<Arc<ValidatedDbClient>, StorageError> {
+            open_processing_generation(database_url, binding, retirement_tx).await
+        }
+
+        async fn open_api(
+            &self,
+            database_url: String,
+            retirement_tx: RetirementSender,
+        ) -> Result<Arc<ValidatedApiDbClient>, StorageError> {
+            self.api_open_started.send(()).expect("API-open observer");
+            self.api_open_permit.acquire().await.expect("API-open gate").forget();
+            open_api_generation(database_url, retirement_tx).await
         }
     }
 

@@ -50,7 +50,8 @@ so the ordered retirement event is enqueued before `GenerationLost` returns.
 Deterministic lifecycle tests cover the nominal retry sequence and reset
 boundary; PostgreSQL integration tests cover publication order, exact and
 independent replacement, advisory-lock contention, lock loss with both
-two-generation and processing-only states, and fatal event-path closure.
+two-generation and processing-only states, lock loss during blocked replacement
+opening, the pre-publication ownership recheck, and fatal event-path closure.
 The gated Rebuild-start API publication, replacement exclusion, and bounded
 drain/cancellation remain for the database-replacement-safety increment
 together with their dependent storage operations. No open architecture

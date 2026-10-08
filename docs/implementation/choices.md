@@ -403,17 +403,21 @@ owns the exact conditional event contract.
 
 Retain the parsed database URL privately in StorageService and create fresh
 SQLx pools for every replacement generation. Poll the dedicated advisory-lock
-connection once per second while Ready. This interval is a private health-check
-implementation choice; the reconnect delays, equal-jitter range, and 60-second
-Ready reset remain defined by the
+connection once per second throughout the active lifecycle, including while a
+missing pool generation is opening or waiting for retry, and recheck it after
+replacement validation immediately before publication. This interval is a
+private health-check implementation choice; the reconnect delays, equal-jitter
+range, and 60-second Ready reset remain defined by the
 [storage lifecycle](../architecture/storage.md#storageservice-lifecycle--settled).
 
-Inject the private connector and shared `kgi-core::timing` clock and jitter
-interfaces into the worker. Production uses SQLx plus the shared Tokio clock
-and entropy-seeded equal-jitter source; tests use scripted connection results,
-individually controlled sleeps, and identity jitter. PostgreSQL container tests
-terminate the actual advisory-lock backend to verify exact dual-generation
-retirement and autonomous republication. The
+Inject the private lock connector, replacement-generation opener, and shared
+`kgi-core::timing` clock and jitter interfaces into the worker. Production uses
+SQLx plus the shared Tokio clock and entropy-seeded equal-jitter source; tests
+use scripted connection results, gated replacement opening, individually
+controlled sleeps, and identity jitter. PostgreSQL container tests terminate
+the actual advisory-lock backend to verify exact retirement, suppression of
+replacement publication until ownership is reacquired, and autonomous
+republication. The
 Rebuild replacement gate and API database-phase drain remain part of the later
 database-replacement-safety implementation rather than this general connection
 lifecycle slice.
