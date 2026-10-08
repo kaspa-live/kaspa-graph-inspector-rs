@@ -619,6 +619,11 @@ with injected clocks and deterministic jitter:
   `DefiniteFailure`, retained Resync and Rebuild obligations, DB-generation
   retention versus retirement, complete session teardown, and the prohibition
   on reissuing an ambiguous transaction;
+- both storage-owned `RebuildSetupFault` reasons aborting a Rebuild attempt
+  with `Retry`, retaining its Rebuild obligation and processing generation,
+  using the general backoff, and waiting for no replacement processing
+  generation; reject either fault outside Rebuild as an invalid lifecycle
+  condition;
 - a recoverable failure after `reset` sends no API invalidation control; only
   the next processing attempt's `reset` call supersedes the installed
   ApiService session;
@@ -1678,9 +1683,15 @@ is still running, construction waiting at the storage gate, and
 `PublishPostSeal` arriving before that event with construction remaining
 pending. A final definite replacement failure retires the gated generation
 without making it readable; an ambiguous outcome retires both API and
-processing generations. Cover fresh-pool validation failure and bounded
-old-generation drain failure without starting the replacement transaction or
-publishing an unvalidated client. No in-flight request
+processing generations. Cover fresh-pool validation failure as
+`RebuildSetupFailed(ApiGenerationPreparation)` without publishing an
+unvalidated client, and bounded old-generation drain failure as
+`RebuildSetupFailed(ApiReadExclusion)` with retirement of the still-gated fresh
+API generation. Neither starts the replacement transaction, mutates processing
+contents or caches, or retires the processing generation. Cover setup
+cancellation as ordinary cancellation without a fault, and distinguish a
+proven processing-generation loss and an internal replacement-control failure
+through their existing typed paths. No in-flight request
 rebinds to a newly published storage generation,
 and no request observes a partial or mixed generation, including with
 PostgreSQL `TRUNCATE`. Verify ordinary sender teardown may close the installed

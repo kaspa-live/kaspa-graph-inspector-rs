@@ -225,6 +225,7 @@ enum FaultKind {
     ServiceGenerationLost(ServiceKind),
     RpcRequestFailed,
     SubscriptionControlFailed,
+    RebuildSetupFailed(RebuildSetupFault),
     SessionContinuityLost,
     NotificationInputInvalid(NotificationInputKind),
     RecoveryInputInvalid(RecoveryInputKind),
@@ -421,6 +422,17 @@ recovery-response budget.
 
 A definitive not-found dependency remains `DependencyUnavailable` and requires
 Rebuild instead of being classified as malformed.
+
+The storage-owned
+[`RebuildSetupFault`](storage.md#api-read-exclusion-during-database-replacement--settled)
+may be reported only while a Rebuild attempt is preparing database replacement
+and before its transaction starts. `RebuildSetupFailed` aborts that complete
+session with `Retry`, retains the `Rebuild` obligation and current processing
+generation, and uses the general recovery backoff. It does not wait for
+`ProcessingDbPublished`, because storage did not retire that generation. The
+next attempt performs fresh Rebuild preparation and never reissues only the
+failed setup phase. Observing this fault in another recovery mode or in Live is
+an invalid lifecycle condition and is Fatal.
 
 Storage owns local transaction retries, operation-outcome classification, and
 database-generation retirement; see

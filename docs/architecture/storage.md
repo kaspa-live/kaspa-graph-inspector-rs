@@ -200,6 +200,24 @@ operation-completion barrier is required.
 
 ### API read exclusion during database replacement — settled
 
+```rust
+enum RebuildSetupFault {
+    ApiGenerationPreparation,
+    ApiReadExclusion,
+}
+```
+
+`ApiGenerationPreparation` means that StorageService could not create and
+validate the fresh read-only API generation required by this Rebuild attempt.
+It does not include a failure that proves the current processing generation was
+lost or a terminal database rejection; those retain their existing generation
+loss or service-rejection classifications.
+
+`ApiReadExclusion` means that the bounded cancellation and drain procedure
+could not establish exclusive replacement access. An unexpectedly closed or
+broken replacement-control primitive is instead an internal StorageService
+failure, not a recoverable setup fault.
+
 Every database phase performed through `ValidatedApiDbClient` holds a shared
 database-replacement permit from before its read-only transaction begins until
 the complete bounded projection has been detached into memory and the
@@ -221,11 +239,20 @@ request reports database-backed read unavailability; the
 [API protocol](api-protocol.md#anchored-graph-windows--settled) owns its HTTP
 mapping. An API read cannot delay replacement without bound.
 
-Failure or cancellation before the fresh pool is validated or the exclusive
-permit is acquired starts no replacement transaction. If the fresh generation
-was already published, StorageService retires it while its gate is still
-closed. A transient pool-creation failure follows StorageService's bounded
-retry policy without exposing an unvalidated client.
+A non-cancellation setup failure starts no replacement transaction and returns
+`StorageError::RebuildSetupFailed(reason)`. For
+`ApiGenerationPreparation`, no unvalidated API client is published. For
+`ApiReadExclusion`, StorageService retires the already published fresh API
+generation while its gate is still closed. Both outcomes leave the database,
+processing caches, and current `ValidatedDbClient` generation unchanged. They
+do not start an independent storage retry loop; the processing lifecycle owns
+the complete-attempt retry.
+
+Session or service cancellation during setup performs the same applicable API
+generation cleanup and follows the ordinary cancellation path rather than
+returning `StorageError::RebuildSetupFailed`. If connection loss proves the
+processing generation unusable, StorageService instead retires it and returns
+`ServiceGenerationLost(Storage)` under the existing generation-loss contract.
 
 The exclusive permit remains held through the atomic replacement outcome and
 cache publication or generation retirement. A database phase started through
