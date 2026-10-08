@@ -27,7 +27,9 @@ dedicated advisory ownership lock, classifies database bootstrap states, and
 performs the atomic idempotent `Uninitialized -> Empty` network binding. Its
 post-migration physical-layout fingerprint validates column defaults and
 identity mode, constraints, constraint-backed indexes, and required query-path
-indexes before any database generation can be published.
+indexes before any database generation can be published. Malformed immutable
+network bindings produce terminal unsupported-schema rejection rather than
+transient connection retry.
 The validated-generation storage slice adds processing and read-only API pool
 generations without exposing SQLx resources across the crate boundary. The
 processing pool is independently capped at four connections, the API pool at

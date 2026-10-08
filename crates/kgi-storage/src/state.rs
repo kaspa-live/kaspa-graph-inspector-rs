@@ -143,17 +143,19 @@ impl<'connection> ProcessingStateInspection<'connection> {
         match rows.as_slice() {
             [] => Ok(None),
             [row] => {
-                let network_text: String =
-                    row.try_get("network_id").map_err(|error| StorageError::invalid_metadata(error.to_string()))?;
+                let network_text: String = row
+                    .try_get("network_id")
+                    .map_err(|error| invalid_network_binding(format!("network ID decode failed: {error}")))?;
                 let network_id = NetworkId::from_str(&network_text)
-                    .map_err(|error| StorageError::invalid_metadata(format!("invalid network ID {network_text:?}: {error}")))?;
-                let genesis_bytes: Vec<u8> =
-                    row.try_get("genesis_hash").map_err(|error| StorageError::invalid_metadata(error.to_string()))?;
+                    .map_err(|error| invalid_network_binding(format!("invalid network ID {network_text:?}: {error}")))?;
+                let genesis_bytes: Vec<u8> = row
+                    .try_get("genesis_hash")
+                    .map_err(|error| invalid_network_binding(format!("Genesis hash decode failed: {error}")))?;
                 let genesis_hash = BlockHash::try_from(genesis_bytes.as_slice())
-                    .map_err(|error| StorageError::invalid_metadata(format!("invalid Genesis hash: {error}")))?;
+                    .map_err(|error| invalid_network_binding(format!("invalid Genesis hash: {error}")))?;
                 Ok(Some(DatabaseBinding::new(network_id, genesis_hash)))
             }
-            _ => Err(StorageError::invalid_metadata("multiple network-metadata rows")),
+            _ => Err(invalid_network_binding("multiple network-metadata rows")),
         }
     }
 
@@ -274,4 +276,8 @@ impl<'connection> ProcessingStateInspection<'connection> {
             .map(|(((id, hash), selected_parent), daa_score)| StoredVspcSink { hash, id, selected_parent, daa_score });
         Ok(sink)
     }
+}
+
+fn invalid_network_binding(diagnostic: impl std::fmt::Display) -> StorageError {
+    StorageRejection::UnsupportedSchema { diagnostic: Arc::from(format!("invalid immutable network binding: {diagnostic}")) }.into()
 }

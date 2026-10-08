@@ -371,7 +371,9 @@ classification.
 The adapter implements the storage-owned
 [bounded processing-state classification](../architecture/storage.md#bounded-processing-state-classification--settled)
 contract. Query shape and indexes remain implementation details only within
-that settled complexity boundary.
+that settled complexity boundary. It converts immutable network-binding decode,
+construction, and cardinality defects directly to `UnsupportedSchema`; those
+defects never enter the mutable processing-state `Inconsistent` path.
 
 ### PostgreSQL integration tests
 

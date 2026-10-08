@@ -1224,6 +1224,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_immutable_network_identifier_is_terminal_rejection() {
+        let (_container, database_url) = fixture().await;
+        let (mut database, state) =
+            LockedDatabase::connect(database_url.as_str()).await.expect("database lock").prepare().await.expect("schema preparation");
+        assert_eq!(state, DatabaseState::Uninitialized);
+        sqlx::query(
+            "INSERT INTO network_metadata (singleton, network_id, genesis_hash)
+             VALUES (TRUE, $1, $2)",
+        )
+        .bind("not-a-kaspa-network")
+        .bind(hash(4).as_bytes().as_slice())
+        .execute(database.connection_mut())
+        .await
+        .expect("malformed immutable binding fixture");
+        drop(database);
+
+        let (service, mut events) = StorageService::start(database_url);
+        match next_event(&mut events).await {
+            StorageServiceEvent::Rejected(StorageRejection::UnsupportedSchema { diagnostic }) => {
+                assert!(diagnostic.contains("invalid immutable network binding"));
+                assert!(diagnostic.contains("invalid network ID"));
+            }
+            event => panic!("expected terminal malformed-binding rejection, got {event:?}"),
+        }
+        assert_eq!(service.status().state, StorageServiceStatusState::Rejected);
+        service.shutdown().await.expect("rejected service shutdown");
+    }
+
+    #[tokio::test]
     async fn operation_retirement_reports_event_path_failure_instead_of_generation_loss() {
         let (_container, database_url) = fixture().await;
         let (service, events, processing, _api) = initialize_service(database_url).await;
