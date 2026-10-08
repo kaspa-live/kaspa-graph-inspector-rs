@@ -301,7 +301,7 @@ impl StorageServiceWorker {
             }
             self.publish_status(StorageServiceStatusState::Ready);
 
-            let active_exit = match self.maintain(&mut database, &mut active, &mut retry_index).await {
+            let active_exit = match self.run_active(&mut database, &mut active, &mut retry_index).await {
                 Ok(exit) => exit,
                 Err(error) => {
                     let _ = self.retire_all(&mut active).await;
@@ -316,7 +316,7 @@ impl StorageServiceWorker {
         }
     }
 
-    async fn maintain(
+    async fn run_active(
         &mut self,
         database: &mut PreparedDatabase,
         active: &mut ActiveGenerations,
