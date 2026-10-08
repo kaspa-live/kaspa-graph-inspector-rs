@@ -15,8 +15,8 @@ use url::Url;
 
 use crate::{
     database::{
-        DatabaseConnector, PreparedDatabase, SqlxDatabaseConnector, open_api_generation, open_processing_generation,
-        open_validated_generations,
+        DatabaseConnector, PreparedDatabase, SqlxDatabaseConnector, ValidatedGenerations, open_api_generation,
+        open_processing_generation, open_validated_generations,
     },
     error::{StorageError, StorageRejection},
     generation::{DatabaseBinding, ValidatedApiDbClient, ValidatedDbClient},
@@ -188,21 +188,15 @@ struct ActiveGenerations {
 
 #[async_trait]
 trait GenerationOpener: Send + Sync {
-    async fn open_processing(
+    async fn open_initial(
         &self,
         database_url: String,
-        binding: DatabaseBinding,
+        state: DatabaseState,
         retirement_tx: RetirementSender,
-    ) -> Result<Arc<ValidatedDbClient>, StorageError>;
+    ) -> Result<Option<ValidatedGenerations>, StorageError> {
+        open_validated_generations(database_url, state, retirement_tx).await
+    }
 
-    async fn open_api(&self, database_url: String, retirement_tx: RetirementSender)
-    -> Result<Arc<ValidatedApiDbClient>, StorageError>;
-}
-
-struct SqlxGenerationOpener;
-
-#[async_trait]
-impl GenerationOpener for SqlxGenerationOpener {
     async fn open_processing(
         &self,
         database_url: String,
@@ -220,6 +214,11 @@ impl GenerationOpener for SqlxGenerationOpener {
         open_api_generation(database_url, retirement_tx).await
     }
 }
+
+struct SqlxGenerationOpener;
+
+#[async_trait]
+impl GenerationOpener for SqlxGenerationOpener {}
 
 struct StorageServiceWorker {
     database_url: Url,
@@ -333,22 +332,30 @@ impl StorageServiceWorker {
                 }
             }
 
-            let generations =
-                match open_validated_generations(self.database_url.as_str().to_owned(), state, self.retirement_tx.clone()).await {
-                    Ok(Some(generations)) => generations,
-                    Ok(None) => continue,
-                    Err(StorageError::Rejected(rejection)) => {
-                        return self.reject_without_generations(rejection, &mut pending_initialization).await;
+            let generations = match self
+                .generation_opener
+                .open_initial(self.database_url.as_str().to_owned(), state, self.retirement_tx.clone())
+                .await
+            {
+                Ok(Some(generations)) => generations,
+                Ok(None) => continue,
+                Err(StorageError::Rejected(rejection)) => {
+                    return self.reject_without_generations(rejection, &mut pending_initialization).await;
+                }
+                Err(_error) => {
+                    self.publish_status(StorageServiceStatusState::Unavailable);
+                    if self.wait_retry(&mut retry_index, &mut pending_initialization).await? {
+                        continue;
                     }
-                    Err(_error) => {
-                        self.publish_status(StorageServiceStatusState::Unavailable);
-                        if self.wait_retry(&mut retry_index, &mut pending_initialization).await? {
-                            continue;
-                        }
-                        return Ok(());
-                    }
-                };
+                    return Ok(());
+                }
+            };
             let (processing, api) = generations.into_parts();
+            if database.ping().await.is_err() {
+                self.discard_unpublished(processing, api);
+                self.publish_status(StorageServiceStatusState::Unavailable);
+                continue;
+            }
             let mut active =
                 ActiveGenerations { binding: processing.binding(), api_required: api.is_some(), processing: Some(processing), api };
             if let Err(error) = self.publish_initial(&active).await {
@@ -714,6 +721,15 @@ impl StorageServiceWorker {
         self.cleanup.spawn(async move { client.close().await });
     }
 
+    fn discard_unpublished(&mut self, processing: Arc<ValidatedDbClient>, api: Option<Arc<ValidatedApiDbClient>>) {
+        processing.retire();
+        self.track_processing_cleanup(processing);
+        if let Some(api) = api {
+            api.retire();
+            self.track_api_cleanup(api);
+        }
+    }
+
     async fn join_cleanup(&mut self) -> Result<(), StorageError> {
         while let Some(result) = self.cleanup.join_next().await {
             result.map_err(|error| StorageError::WorkerFailed { diagnostic: Arc::from(error.to_string()) })?;
@@ -842,9 +858,9 @@ mod tests {
         GenerationOpener, LOCK_HEALTH_INTERVAL, READY_BACKOFF_RESET, StorageService, StorageServiceEvent, StorageServiceEventReceiver,
     };
     use crate::{
-        database::{DatabaseConnector, LockedDatabase, open_api_generation, open_processing_generation},
+        database::{DatabaseConnector, LockedDatabase, ValidatedGenerations, open_api_generation, open_validated_generations},
         error::{StorageError, StorageRejection},
-        generation::{DatabaseBinding, ValidatedApiDbClient, ValidatedDbClient},
+        generation::{ValidatedApiDbClient, ValidatedDbClient},
         runtime::RetirementSender,
         state::DatabaseState,
     };
@@ -1116,6 +1132,49 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn initial_publication_rechecks_lock_after_generation_opening() {
+        let (_container, database_url) = fixture().await;
+        let (mut database, state) =
+            LockedDatabase::connect(database_url.as_str()).await.expect("database lock").prepare().await.expect("schema preparation");
+        assert_eq!(state, DatabaseState::Uninitialized);
+        database.initialize_if_uninitialized(mainnet(), hash(6), None).await.expect("database initialization");
+        drop(database);
+
+        let (reconnect_tx, mut reconnect_rx) = mpsc::unbounded_channel();
+        let connector = Arc::new(ReconnectGateConnector {
+            attempts: AtomicUsize::new(0),
+            reconnect_started: reconnect_tx,
+            reconnect_permit: Semaphore::new(0),
+        });
+        let (initial_open_tx, mut initial_open_rx) = mpsc::unbounded_channel();
+        let generation_opener = Arc::new(GatedInitialGenerationOpener {
+            attempts: AtomicUsize::new(0),
+            initial_open_started: initial_open_tx,
+            initial_open_permit: Semaphore::new(0),
+        });
+        let (service, mut events) = StorageService::start_with_generation_opener(
+            database_url.clone(),
+            connector.clone(),
+            Arc::new(kgi_core::timing::TokioClock),
+            Arc::new(IdentityJitter),
+            generation_opener.clone(),
+        );
+
+        timeout(TEST_TIMEOUT, initial_open_rx.recv()).await.expect("initial generation opening must start").expect("open observer");
+        let mut observer = PgConnection::connect(database_url.as_str()).await.expect("lock observer");
+        terminate_lock_owner(&mut observer).await;
+        generation_opener.initial_open_permit.add_permits(1);
+
+        timeout(TEST_TIMEOUT, reconnect_rx.recv()).await.expect("reconnect attempt").expect("reconnect observer");
+        assert!(timeout(Duration::from_millis(100), events.recv()).await.is_err());
+
+        connector.reconnect_permit.add_permits(1);
+        assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ProcessingDbPublished(_)));
+        assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbPublished(_)));
+        service.shutdown().await.expect("service shutdown");
+    }
+
     #[derive(Clone, Copy)]
     enum ReplacementLockLossTrigger {
         HealthPoll,
@@ -1298,17 +1357,30 @@ mod tests {
         api_open_permit: Semaphore,
     }
 
+    struct GatedInitialGenerationOpener {
+        attempts: AtomicUsize,
+        initial_open_started: mpsc::UnboundedSender<()>,
+        initial_open_permit: Semaphore,
+    }
+
     #[async_trait]
-    impl GenerationOpener for GatedApiGenerationOpener {
-        async fn open_processing(
+    impl GenerationOpener for GatedInitialGenerationOpener {
+        async fn open_initial(
             &self,
             database_url: String,
-            binding: DatabaseBinding,
+            state: DatabaseState,
             retirement_tx: RetirementSender,
-        ) -> Result<Arc<ValidatedDbClient>, StorageError> {
-            open_processing_generation(database_url, binding, retirement_tx).await
+        ) -> Result<Option<ValidatedGenerations>, StorageError> {
+            if self.attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                self.initial_open_started.send(()).expect("initial-open observer");
+                self.initial_open_permit.acquire().await.expect("initial-open gate").forget();
+            }
+            open_validated_generations(database_url, state, retirement_tx).await
         }
+    }
 
+    #[async_trait]
+    impl GenerationOpener for GatedApiGenerationOpener {
         async fn open_api(
             &self,
             database_url: String,
