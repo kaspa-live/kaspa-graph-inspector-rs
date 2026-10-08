@@ -433,3 +433,11 @@ republication. The
 Rebuild replacement gate and API database-phase drain remain part of the later
 database-replacement-safety implementation rather than this general connection
 lifecycle slice.
+
+Map connection-class failures specifically at a persistent-mutation COMMIT
+boundary to the shared `Persistence(AmbiguousCommit)` value; ordinary SQLx
+operations retain the generic connection-loss mapping. The initialization
+integration fixture can inject acknowledgement loss after PostgreSQL has
+accepted COMMIT, then drops the uncertain connection and runs normal database
+preparation again. This verifies the storage owner's transaction-outcome
+contract without teaching the service to replay an uncertain mutation.

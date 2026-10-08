@@ -6,7 +6,7 @@ use kgi_model::{
     block::{BlockHash, MAX_BLUE_SCORE, MAX_DAA_SCORE, Timestamp},
     lifecycle::ScoreRangeFault,
 };
-use sqlx::{Connection, PgConnection, postgres::PgPoolOptions};
+use sqlx::{Connection, PgConnection, Postgres, Transaction, postgres::PgPoolOptions};
 
 use crate::{
     error::{StorageError, StorageRejection},
@@ -65,6 +65,13 @@ pub(crate) struct PreparedDatabase {
     connection: PgConnection,
 }
 
+#[derive(Clone, Copy)]
+enum InitializationCommitFault {
+    None,
+    #[cfg(test)]
+    LoseAcknowledgementAfterCommit,
+}
+
 impl LockedDatabase {
     pub(crate) async fn connect(database_url: &str) -> Result<Self, StorageError> {
         let mut connection = PgConnection::connect(database_url).await.map_err(|error| StorageError::database("connection", error))?;
@@ -107,6 +114,22 @@ impl PreparedDatabase {
         genesis_hash: BlockHash,
         reinitialization_token: Option<String>,
     ) -> Result<DatabaseState, StorageError> {
+        self.initialize_if_uninitialized_with_commit_fault(
+            network_id,
+            genesis_hash,
+            reinitialization_token,
+            InitializationCommitFault::None,
+        )
+        .await
+    }
+
+    async fn initialize_if_uninitialized_with_commit_fault(
+        &mut self,
+        network_id: NetworkId,
+        genesis_hash: BlockHash,
+        reinitialization_token: Option<String>,
+        commit_fault: InitializationCommitFault,
+    ) -> Result<DatabaseState, StorageError> {
         let state = self.classify().await?;
         if let Some(observed) = state.binding() {
             ensure_binding(observed, network_id, genesis_hash)?;
@@ -131,7 +154,9 @@ impl PreparedDatabase {
                 .await
                 .map_err(|error| StorageError::database("administrative-metadata initialization", error))?;
         }
-        transaction.commit().await.map_err(|error| StorageError::database("initialization transaction commit", error))?;
+        commit_initialization(transaction, commit_fault)
+            .await
+            .map_err(|error| StorageError::mutation_commit("initialization transaction commit", error))?;
 
         let initialized = self.classify().await?;
         if !matches!(initialized, DatabaseState::Empty(_)) {
@@ -152,6 +177,22 @@ impl PreparedDatabase {
     pub(crate) fn connection_mut(&mut self) -> &mut PgConnection {
         &mut self.connection
     }
+}
+
+async fn commit_initialization(
+    transaction: Transaction<'_, Postgres>,
+    commit_fault: InitializationCommitFault,
+) -> Result<(), sqlx::Error> {
+    transaction.commit().await?;
+    #[cfg(test)]
+    if matches!(commit_fault, InitializationCommitFault::LoseAcknowledgementAfterCommit) {
+        return Err(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "injected initialization COMMIT acknowledgement loss",
+        )));
+    }
+    let _ = commit_fault;
+    Ok(())
 }
 
 pub(crate) async fn open_validated_generations(
@@ -267,7 +308,7 @@ mod tests {
     use std::sync::Arc;
 
     use kaspa_consensus_core::network::{NetworkId, NetworkType};
-    use kgi_model::block::BlockHash;
+    use kgi_model::{block::BlockHash, lifecycle::PersistenceFault};
     use sqlx::{Connection, PgConnection};
     use testcontainers_modules::{
         postgres::Postgres,
@@ -275,8 +316,8 @@ mod tests {
     };
 
     use super::{
-        API_POOL_SIZE, LockedDatabase, PROCESSING_POOL_SIZE, PreparedDatabase, blue_score_to_sql, daa_score_to_sql,
-        open_validated_generations, timestamp_from_sql, timestamp_to_sql,
+        API_POOL_SIZE, InitializationCommitFault, LockedDatabase, PROCESSING_POOL_SIZE, PreparedDatabase, blue_score_to_sql,
+        daa_score_to_sql, open_validated_generations, timestamp_from_sql, timestamp_to_sql,
     };
     use crate::{
         error::{StorageError, StorageRejection},
@@ -362,6 +403,37 @@ mod tests {
                 && observed_network_id == mainnet()
                 && observed_genesis_hash == hash(1)
         ));
+    }
+
+    #[tokio::test]
+    async fn initialization_commit_acknowledgement_loss_is_ambiguous_and_reconciled_from_database_truth() {
+        let (_container, database_url) = fixture().await;
+        let (mut database, state) = prepared_database(&database_url).await;
+        assert_eq!(state, DatabaseState::Uninitialized);
+
+        let error = database
+            .initialize_if_uninitialized_with_commit_fault(
+                mainnet(),
+                hash(3),
+                Some("ambiguous-deployment".to_owned()),
+                InitializationCommitFault::LoseAcknowledgementAfterCommit,
+            )
+            .await
+            .expect_err("lost COMMIT acknowledgement must not report a definite outcome");
+        assert_eq!(error, StorageError::Persistence(PersistenceFault::AmbiguousCommit));
+
+        drop(database);
+        let (mut reconnected, observed) = prepared_database(&database_url).await;
+        let DatabaseState::Empty(binding) = observed else {
+            panic!("reconnection must classify the committed database truth as Empty");
+        };
+        assert_eq!(binding.network_id(), mainnet());
+        assert_eq!(binding.genesis_hash(), hash(3));
+        let token: Option<String> = sqlx::query_scalar("SELECT last_reinitialization_token FROM administrative_metadata")
+            .fetch_one(reconnected.connection_mut())
+            .await
+            .expect("administrative token after reconnect");
+        assert_eq!(token.as_deref(), Some("ambiguous-deployment"));
     }
 
     #[tokio::test]

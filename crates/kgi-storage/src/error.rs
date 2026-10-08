@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use kaspa_consensus_core::network::NetworkId;
-use kgi_model::{block::BlockHash, lifecycle::ScoreRangeFault};
+use kgi_model::{
+    block::BlockHash,
+    lifecycle::{PersistenceFault, ScoreRangeFault},
+};
 use thiserror::Error;
 
 /// Permanent reason a PostgreSQL database cannot be used by KGI.
@@ -46,6 +49,10 @@ pub enum StorageError {
     #[error("PostgreSQL {operation} lost its connection: {diagnostic}")]
     ConnectionLost { operation: &'static str, diagnostic: Arc<str> },
 
+    /// A persistent mutation did not produce a definite outcome.
+    #[error("database persistence fault: {0:?}")]
+    Persistence(PersistenceFault),
+
     /// An embedded migration could not be applied or validated.
     #[error("database migration failed: {diagnostic}")]
     Migration { diagnostic: Arc<str> },
@@ -81,6 +88,14 @@ impl StorageError {
         let connection_lost = sqlx_connection_lost(&error);
         let diagnostic = Arc::from(error.to_string());
         if connection_lost { Self::ConnectionLost { operation, diagnostic } } else { Self::Database { operation, diagnostic } }
+    }
+
+    pub(crate) fn mutation_commit(operation: &'static str, error: sqlx::Error) -> Self {
+        if sqlx_connection_lost(&error) {
+            Self::Persistence(PersistenceFault::AmbiguousCommit)
+        } else {
+            Self::database(operation, error)
+        }
     }
 
     #[allow(dead_code, reason = "used by the private bootstrap lifecycle")]
