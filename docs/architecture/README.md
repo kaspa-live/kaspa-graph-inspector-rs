@@ -44,7 +44,7 @@ Legacy handoffs and earlier planning material may use these names:
 | `Cycle 1` | `PreSeal` |
 | `Quiesce` | `Deactivate` |
 | `check_block_materiality()` | `ValidatedDbClient::block_presence()` |
-| `load_reconciliation_state()` | `ValidatedDbClient::reconciliation_snapshot()` |
+| `load_reconciliation_state()` | `ValidatedDbClient::load_session_state()` |
 
 Behavioral replacements are recorded in
 [superseded.md](../decisions/superseded.md) and rejected proposals in

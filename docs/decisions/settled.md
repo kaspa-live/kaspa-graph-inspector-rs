@@ -8,7 +8,7 @@ mechanics.
 |---|---|---|
 | Identity and materiality | Separate persistent identity, materiality, PP-boundary, and ORIGIN semantics. | [Domain model](../architecture/domain-model.md), [storage](../architecture/storage.md) |
 | Direct-parent representation | Preserve the node-facing sequence and canonicalize durable child-parent relations by first occurrence. | [Domain model](../architecture/domain-model.md), [storage](../architecture/storage.md), [API graph model](../architecture/api-graph.md) |
-| Database lifecycle | Network-bound idempotent bootstrap and explicit database replacement. | [Storage](../architecture/storage.md) |
+| Database lifecycle | Network-bound idempotent bootstrap, fixed-cost processing-state classification, and explicit database replacement. | [Storage](../architecture/storage.md#bounded-processing-state-classification--settled) |
 | Node capability | Validated RPC generations and normalized node inputs. | [NodeService](../architecture/node-service.md) |
 | Node trust boundary | Treat the configured node as the Kaspa consensus authority and validate only the boundary conditions required by KGI-owned invariants. | [Overview](../architecture/overview.md#node-trust-boundary--settled) |
 | gRPC error compatibility | Preserve definitive GetBlock absence through the pinned erased-error representation and classify every other flattened runtime RPC error opaquely. | [NodeService](../architecture/node-service.md#getblock-not-found-compatibility-classification) |

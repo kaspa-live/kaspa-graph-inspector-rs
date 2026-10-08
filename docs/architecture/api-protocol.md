@@ -206,7 +206,7 @@ The public block projection preserves its **actual direct-parent list** even
 when some parents are outside the response or PP boundary and have no
 drawable edge. A materialized Genesis is recognized from its empty actual
 direct-parent list. The public projection and Web client do not need to expose
-or consult the persisted `NodeMetadata.genesis_hash`, and no dedicated
+or consult the persisted `DatabaseBinding.genesis_hash`, and no dedicated
 Genesis-hash API endpoint is required.
 
 ## Serialized graph values and hash dictionary — settled
