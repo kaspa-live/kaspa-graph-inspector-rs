@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use kaspa_consensus_core::network::NetworkId;
 use kgi_core::timing::{Clock, EqualJitter, Jitter, TokioClock};
@@ -570,37 +570,32 @@ impl StorageServiceWorker {
         Ok(())
     }
 
-    fn retire_all<'a>(
-        &'a self,
-        active: &'a mut ActiveGenerations,
-    ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut result = Ok(());
-            let processing = active.processing.take();
-            let api = active.api.take();
-            if let Some(processing) = &processing
-                && processing.retire()
-                && let Err(error) = self.send_event(StorageServiceEvent::ProcessingDbRetired(processing.clone()))
-            {
-                result = Err(error);
+    async fn retire_all(&self, active: &mut ActiveGenerations) -> Result<(), StorageError> {
+        let mut result = Ok(());
+        let processing = active.processing.take();
+        let api = active.api.take();
+        if let Some(processing) = &processing
+            && processing.retire()
+            && let Err(error) = self.send_event(StorageServiceEvent::ProcessingDbRetired(processing.clone()))
+        {
+            result = Err(error);
+        }
+        if let Some(api) = &api
+            && api.retire()
+            && let Err(error) = self.send_event(StorageServiceEvent::ApiDbRetired(api.clone()))
+            && result.is_ok()
+        {
+            result = Err(error);
+        }
+        match (processing, api) {
+            (Some(processing), Some(api)) => {
+                tokio::join!(processing.close(), api.close());
             }
-            if let Some(api) = &api
-                && api.retire()
-                && let Err(error) = self.send_event(StorageServiceEvent::ApiDbRetired(api.clone()))
-                && result.is_ok()
-            {
-                result = Err(error);
-            }
-            match (processing, api) {
-                (Some(processing), Some(api)) => {
-                    tokio::join!(processing.close(), api.close());
-                }
-                (Some(processing), None) => processing.close().await,
-                (None, Some(api)) => api.close().await,
-                (None, None) => {}
-            }
-            result
-        })
+            (Some(processing), None) => processing.close().await,
+            (None, Some(api)) => api.close().await,
+            (None, None) => {}
+        }
+        result
     }
 
     async fn reject_active(&mut self, active: &mut ActiveGenerations, rejection: StorageRejection) -> Result<(), StorageError> {

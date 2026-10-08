@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use kaspa_consensus_core::network::NetworkId;
@@ -79,13 +79,10 @@ impl LockedDatabase {
         Ok(Self { connection })
     }
 
-    pub(crate) fn prepare(self) -> impl Future<Output = Result<(PreparedDatabase, DatabaseState), StorageError>> + Send + 'static {
-        let mut connection = self.connection;
-        async move {
-            schema::prepare(&mut connection).await?;
-            let state = ProcessingStateInspection::classify(&mut connection).await?;
-            Ok((PreparedDatabase { connection }, state))
-        }
+    pub(crate) async fn prepare(mut self) -> Result<(PreparedDatabase, DatabaseState), StorageError> {
+        schema::prepare(&mut self.connection).await?;
+        let state = ProcessingStateInspection::classify(&mut self.connection).await?;
+        Ok((PreparedDatabase { connection: self.connection }, state))
     }
 }
 
@@ -104,55 +101,51 @@ impl DatabaseConnector for SqlxDatabaseConnector {
 }
 
 impl PreparedDatabase {
-    pub(crate) fn initialize_if_uninitialized(
+    pub(crate) async fn initialize_if_uninitialized(
         &mut self,
         network_id: NetworkId,
         genesis_hash: BlockHash,
         reinitialization_token: Option<String>,
-    ) -> Pin<Box<dyn Future<Output = Result<DatabaseState, StorageError>> + Send + '_>> {
-        Box::pin(async move {
-            let state = self.classify().await?;
-            if let Some(observed) = state.binding() {
-                ensure_binding(observed, network_id, genesis_hash)?;
-                return Ok(state);
-            }
+    ) -> Result<DatabaseState, StorageError> {
+        let state = self.classify().await?;
+        if let Some(observed) = state.binding() {
+            ensure_binding(observed, network_id, genesis_hash)?;
+            return Ok(state);
+        }
 
-            let mut transaction =
-                self.connection.begin().await.map_err(|error| StorageError::database("initialization transaction start", error))?;
-            sqlx::query(
-                "INSERT INTO network_metadata (singleton, network_id, genesis_hash)
+        let mut transaction =
+            self.connection.begin().await.map_err(|error| StorageError::database("initialization transaction start", error))?;
+        sqlx::query(
+            "INSERT INTO network_metadata (singleton, network_id, genesis_hash)
                  VALUES (TRUE, $1, $2)",
-            )
-            .bind(network_id.to_string())
-            .bind(genesis_hash.as_bytes().as_slice())
-            .execute(&mut *transaction)
-            .await
-            .map_err(|error| StorageError::database("network-metadata initialization", error))?;
-            if let Some(token) = reinitialization_token {
-                sqlx::query("UPDATE administrative_metadata SET last_reinitialization_token = $1 WHERE singleton")
-                    .bind(token)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(|error| StorageError::database("administrative-metadata initialization", error))?;
-            }
-            transaction.commit().await.map_err(|error| StorageError::database("initialization transaction commit", error))?;
-
-            let initialized = self.classify().await?;
-            if !matches!(initialized, DatabaseState::Empty(_)) {
-                return Err(StorageError::invalid_metadata("initialization did not produce an Empty database"));
-            }
-            Ok(initialized)
-        })
-    }
-
-    pub(crate) fn classify(&mut self) -> Pin<Box<dyn Future<Output = Result<DatabaseState, StorageError>> + Send + '_>> {
-        ProcessingStateInspection::classify(&mut self.connection)
-    }
-
-    pub(crate) fn ping(&mut self) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>> {
-        Box::pin(
-            async move { self.connection.ping().await.map_err(|error| StorageError::database("advisory-lock health check", error)) },
         )
+        .bind(network_id.to_string())
+        .bind(genesis_hash.as_bytes().as_slice())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| StorageError::database("network-metadata initialization", error))?;
+        if let Some(token) = reinitialization_token {
+            sqlx::query("UPDATE administrative_metadata SET last_reinitialization_token = $1 WHERE singleton")
+                .bind(token)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| StorageError::database("administrative-metadata initialization", error))?;
+        }
+        transaction.commit().await.map_err(|error| StorageError::database("initialization transaction commit", error))?;
+
+        let initialized = self.classify().await?;
+        if !matches!(initialized, DatabaseState::Empty(_)) {
+            return Err(StorageError::invalid_metadata("initialization did not produce an Empty database"));
+        }
+        Ok(initialized)
+    }
+
+    pub(crate) async fn classify(&mut self) -> Result<DatabaseState, StorageError> {
+        ProcessingStateInspection::classify(&mut self.connection).await
+    }
+
+    pub(crate) async fn ping(&mut self) -> Result<(), StorageError> {
+        self.connection.ping().await.map_err(|error| StorageError::database("advisory-lock health check", error))
     }
 
     #[cfg(test)]

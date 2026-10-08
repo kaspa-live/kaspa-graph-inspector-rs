@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin, str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc};
 
 use kaspa_consensus_core::network::NetworkId;
 use kgi_model::block::{BlockHash, CompactId, MAX_DAA_SCORE};
@@ -62,25 +62,15 @@ pub(crate) struct ProcessingStateInspection<'connection> {
 }
 
 impl ProcessingStateInspection<'_> {
-    pub(crate) fn classify(
-        connection: &mut PgConnection,
-    ) -> Pin<Box<dyn Future<Output = Result<DatabaseState, StorageError>> + Send + '_>> {
-        Box::pin(async move {
-            let transaction =
-                connection.begin().await.map_err(|error| StorageError::database("classification transaction start", error))?;
-            ProcessingStateInspection::begin(transaction).await?.finish_database_classification().await
-        })
+    pub(crate) async fn classify(connection: &mut PgConnection) -> Result<DatabaseState, StorageError> {
+        let transaction =
+            connection.begin().await.map_err(|error| StorageError::database("classification transaction start", error))?;
+        ProcessingStateInspection::begin(transaction).await?.finish_database_classification().await
     }
 
-    pub(crate) fn load(
-        pool: &PgPool,
-        binding: DatabaseBinding,
-    ) -> impl Future<Output = Result<StoredSessionState, StorageError>> + Send + 'static {
-        let pool = pool.clone();
-        async move {
-            let transaction = pool.begin().await.map_err(|error| StorageError::database("session-state transaction start", error))?;
-            ProcessingStateInspection::begin(transaction).await?.finish_session_state(binding).await
-        }
+    pub(crate) async fn load(pool: &PgPool, binding: DatabaseBinding) -> Result<StoredSessionState, StorageError> {
+        let transaction = pool.begin().await.map_err(|error| StorageError::database("session-state transaction start", error))?;
+        ProcessingStateInspection::begin(transaction).await?.finish_session_state(binding).await
     }
 }
 

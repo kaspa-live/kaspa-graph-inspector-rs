@@ -93,9 +93,8 @@ impl<T: GenerationKind> GenerationRuntime<T> {
         self.valid.swap(false, Ordering::AcqRel)
     }
 
-    fn close(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
-        let pool = self.pool.clone();
-        async move { pool.close().await }
+    async fn close(&self) {
+        self.pool.close().await;
     }
 
     async fn request_retirement(&self) -> Result<(), StorageError> {
@@ -166,8 +165,8 @@ impl ValidatedDbClient {
         self.runtime.retire()
     }
 
-    pub(crate) fn close(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
-        self.runtime.close()
+    pub(crate) async fn close(&self) {
+        self.runtime.close().await;
     }
 
     pub(crate) async fn request_retirement(&self) -> Result<(), StorageError> {
@@ -217,8 +216,8 @@ impl ValidatedApiDbClient {
         self.runtime.retire()
     }
 
-    pub(crate) fn close(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
-        self.runtime.close()
+    pub(crate) async fn close(&self) {
+        self.runtime.close().await;
     }
 
     #[allow(dead_code, reason = "used by API projection operations in the persistence increment")]

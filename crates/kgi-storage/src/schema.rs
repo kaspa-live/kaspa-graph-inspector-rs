@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc};
 
 use sqlx::{PgConnection, Row};
 
@@ -41,13 +41,11 @@ const KGI_COLUMNS: [&str; 28] = [
     "processing_metadata.db_pp_blue_score:bigint:int8:NO:NO",
 ];
 
-pub(crate) fn prepare(connection: &mut PgConnection) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>> {
-    Box::pin(async move {
-        validate_migratable_layout(connection).await?;
-        reject_newer_schema(connection).await?;
-        migration::migrate(connection).await?;
-        validate_current_layout(connection).await
-    })
+pub(crate) async fn prepare(connection: &mut PgConnection) -> Result<(), StorageError> {
+    validate_migratable_layout(connection).await?;
+    reject_newer_schema(connection).await?;
+    migration::migrate(connection).await?;
+    validate_current_layout(connection).await
 }
 
 async fn validate_migratable_layout(connection: &mut PgConnection) -> Result<(), StorageError> {
