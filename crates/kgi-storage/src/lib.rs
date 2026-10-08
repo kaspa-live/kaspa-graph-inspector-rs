@@ -11,3 +11,5 @@ mod database;
 mod migration;
 #[allow(dead_code, reason = "used through the database bootstrap lifecycle")]
 mod schema;
+#[allow(dead_code, reason = "used through database bootstrap and recovery-session preparation")]
+mod state;

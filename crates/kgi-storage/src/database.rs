@@ -1,16 +1,33 @@
+use std::sync::Arc;
+
 use kaspa_consensus_core::network::NetworkId;
 use kgi_model::{
     block::{BlockHash, MAX_BLUE_SCORE, MAX_DAA_SCORE, Timestamp},
     lifecycle::ScoreRangeFault,
 };
-use sqlx::{Connection, PgConnection};
+use sqlx::{Connection, PgConnection, postgres::PgPoolOptions};
 
 use crate::{
     error::{StorageError, StorageRejection},
-    schema::{self, DatabaseState},
+    generation::{DatabaseBinding, ValidatedApiDbClient, ValidatedDbClient},
+    schema,
+    state::{DatabaseState, ProcessingStateInspection},
 };
 
 const ADVISORY_LOCK_KEY: i64 = 0x4b47_4932_0000_0001;
+const PROCESSING_POOL_SIZE: u32 = 4;
+const API_POOL_SIZE: u32 = 8;
+
+pub(crate) struct ValidatedGenerations {
+    processing: Arc<ValidatedDbClient>,
+    api: Option<Arc<ValidatedApiDbClient>>,
+}
+
+impl ValidatedGenerations {
+    pub(crate) fn into_parts(self) -> (Arc<ValidatedDbClient>, Option<Arc<ValidatedApiDbClient>>) {
+        (self.processing, self.api)
+    }
+}
 
 pub(crate) const fn timestamp_to_sql(timestamp: Timestamp) -> i64 {
     i64::from_ne_bytes(timestamp.to_ne_bytes())
@@ -38,6 +55,10 @@ pub(crate) struct LockedDatabase {
     connection: PgConnection,
 }
 
+pub(crate) struct PreparedDatabase {
+    connection: PgConnection,
+}
+
 impl LockedDatabase {
     pub(crate) async fn connect(database_url: &str) -> Result<Self, StorageError> {
         let mut connection = PgConnection::connect(database_url).await.map_err(|error| StorageError::database("connection", error))?;
@@ -52,17 +73,21 @@ impl LockedDatabase {
         Ok(Self { connection })
     }
 
-    pub(crate) async fn prepare(&mut self) -> Result<DatabaseState, StorageError> {
-        schema::prepare(&mut self.connection).await
+    pub(crate) async fn prepare(mut self) -> Result<(PreparedDatabase, DatabaseState), StorageError> {
+        schema::prepare(&mut self.connection).await?;
+        let state = ProcessingStateInspection::classify(&mut self.connection).await?;
+        Ok((PreparedDatabase { connection: self.connection }, state))
     }
+}
 
+impl PreparedDatabase {
     pub(crate) async fn initialize_if_uninitialized(
         &mut self,
         network_id: NetworkId,
         genesis_hash: BlockHash,
         reinitialization_token: Option<&str>,
     ) -> Result<DatabaseState, StorageError> {
-        let state = schema::classify(&mut self.connection).await?;
+        let state = self.classify().await?;
         if let Some(observed) = state.binding() {
             ensure_binding(observed, network_id, genesis_hash)?;
             return Ok(state);
@@ -71,14 +96,14 @@ impl LockedDatabase {
         let mut transaction =
             self.connection.begin().await.map_err(|error| StorageError::database("initialization transaction start", error))?;
         sqlx::query(
-            "INSERT INTO node_metadata (singleton, network_id, genesis_hash, db_pp_blue_score)
-             VALUES (TRUE, $1, $2, 0)",
+            "INSERT INTO network_metadata (singleton, network_id, genesis_hash)
+             VALUES (TRUE, $1, $2)",
         )
         .bind(network_id.to_string())
         .bind(genesis_hash.as_bytes().as_slice())
         .execute(&mut *transaction)
         .await
-        .map_err(|error| StorageError::database("node-metadata initialization", error))?;
+        .map_err(|error| StorageError::database("network-metadata initialization", error))?;
         if let Some(token) = reinitialization_token {
             sqlx::query("UPDATE administrative_metadata SET last_reinitialization_token = $1 WHERE singleton")
                 .bind(token)
@@ -88,11 +113,15 @@ impl LockedDatabase {
         }
         transaction.commit().await.map_err(|error| StorageError::database("initialization transaction commit", error))?;
 
-        let initialized = schema::classify(&mut self.connection).await?;
+        let initialized = self.classify().await?;
         if !matches!(initialized, DatabaseState::Empty(_)) {
             return Err(StorageError::invalid_metadata("initialization did not produce an Empty database"));
         }
         Ok(initialized)
+    }
+
+    pub(crate) async fn classify(&mut self) -> Result<DatabaseState, StorageError> {
+        ProcessingStateInspection::classify(&mut self.connection).await
     }
 
     #[cfg(test)]
@@ -101,25 +130,86 @@ impl LockedDatabase {
     }
 }
 
+pub(crate) async fn open_validated_generations(
+    database_url: &str,
+    state: DatabaseState,
+) -> Result<Option<ValidatedGenerations>, StorageError> {
+    let (binding, coherent) = match state {
+        DatabaseState::Uninitialized => return Ok(None),
+        DatabaseState::Empty(binding) | DatabaseState::Initialized(binding) => (binding, true),
+        DatabaseState::Inconsistent { binding } => (binding, false),
+    };
+
+    let processing_pool = PgPoolOptions::new()
+        .max_connections(PROCESSING_POOL_SIZE)
+        .connect(database_url)
+        .await
+        .map_err(|error| StorageError::database("processing-pool connection", error))?;
+    validate_processing_pool(&processing_pool).await?;
+    let processing = Arc::new(ValidatedDbClient::new(processing_pool, binding));
+
+    let api = if coherent {
+        let api_pool = PgPoolOptions::new()
+            .max_connections(API_POOL_SIZE)
+            .after_connect(|connection, _metadata| {
+                Box::pin(async move {
+                    sqlx::query("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY").execute(connection).await?;
+                    Ok(())
+                })
+            })
+            .connect(database_url)
+            .await
+            .map_err(|error| StorageError::database("API-pool connection", error))?;
+        validate_api_pool(&api_pool).await?;
+        Some(Arc::new(ValidatedApiDbClient::new(api_pool)))
+    } else {
+        None
+    };
+
+    Ok(Some(ValidatedGenerations { processing, api }))
+}
+
+async fn validate_processing_pool(pool: &sqlx::PgPool) -> Result<(), StorageError> {
+    validate_pool_access(pool, "processing-pool validation", "off").await
+}
+
+async fn validate_api_pool(pool: &sqlx::PgPool) -> Result<(), StorageError> {
+    validate_pool_access(pool, "API-pool validation", "on").await
+}
+
+async fn validate_pool_access(pool: &sqlx::PgPool, operation: &'static str, expected: &str) -> Result<(), StorageError> {
+    let read_only: String = sqlx::query_scalar("SHOW default_transaction_read_only")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| StorageError::database(operation, error))?;
+    if read_only == expected {
+        Ok(())
+    } else {
+        Err(StorageError::database(operation, format!("expected default_transaction_read_only={expected}, observed {read_only}")))
+    }
+}
+
 fn ensure_binding(
-    observed: crate::schema::DatabaseBinding,
+    observed: DatabaseBinding,
     expected_network_id: NetworkId,
     expected_genesis_hash: BlockHash,
 ) -> Result<(), StorageError> {
-    if observed.network_id == expected_network_id && observed.genesis_hash == expected_genesis_hash {
+    if observed.network_id() == expected_network_id && observed.genesis_hash() == expected_genesis_hash {
         return Ok(());
     }
     Err(StorageRejection::NetworkMismatch {
         expected_network_id,
         expected_genesis_hash,
-        observed_network_id: observed.network_id,
-        observed_genesis_hash: observed.genesis_hash,
+        observed_network_id: observed.network_id(),
+        observed_genesis_hash: observed.genesis_hash(),
     }
     .into())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use kaspa_consensus_core::network::{NetworkId, NetworkType};
     use kgi_model::block::BlockHash;
     use sqlx::{Connection, PgConnection};
@@ -128,11 +218,15 @@ mod tests {
         testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner},
     };
 
-    use super::{LockedDatabase, blue_score_to_sql, daa_score_to_sql, timestamp_from_sql, timestamp_to_sql};
+    use super::{
+        API_POOL_SIZE, LockedDatabase, PROCESSING_POOL_SIZE, PreparedDatabase, blue_score_to_sql, daa_score_to_sql,
+        open_validated_generations, timestamp_from_sql, timestamp_to_sql,
+    };
     use crate::{
         error::{StorageError, StorageRejection},
+        generation::StoredSessionState,
         migration,
-        schema::{self, DatabaseState},
+        state::DatabaseState,
     };
 
     const POSTGRES_PORT: u16 = 5432;
@@ -143,6 +237,10 @@ mod tests {
         let port = container.get_host_port_ipv4(POSTGRES_PORT).await.expect("fixture PostgreSQL port must resolve");
         let database_url = format!("postgresql://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
         (container, database_url)
+    }
+
+    async fn prepared_database(database_url: &str) -> (PreparedDatabase, DatabaseState) {
+        LockedDatabase::connect(database_url).await.expect("database lock").prepare().await.expect("schema preparation")
     }
 
     fn mainnet() -> NetworkId {
@@ -156,17 +254,21 @@ mod tests {
     #[tokio::test]
     async fn initialization_is_atomic_idempotent_and_immutably_bound() {
         let (_container, database_url) = fixture().await;
-        let mut database = LockedDatabase::connect(&database_url).await.expect("database lock");
-        assert_eq!(database.prepare().await.expect("schema preparation"), DatabaseState::Uninitialized);
+        let (mut database, state) = prepared_database(&database_url).await;
+        assert_eq!(state, DatabaseState::Uninitialized);
 
         let initialized =
             database.initialize_if_uninitialized(mainnet(), hash(1), Some("deployment-a")).await.expect("first initialization");
-        let DatabaseState::Empty(metadata) = initialized else {
+        let DatabaseState::Empty(binding) = initialized else {
             panic!("first initialization must produce Empty");
         };
-        assert_eq!(metadata.network_id(), mainnet());
-        assert_eq!(metadata.genesis_hash(), hash(1));
-        assert_eq!(metadata.db_pp_blue_score(), 0);
+        assert_eq!(binding.network_id(), mainnet());
+        assert_eq!(binding.genesis_hash(), hash(1));
+        let processing_metadata_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM processing_metadata")
+            .fetch_one(database.connection_mut())
+            .await
+            .expect("processing-metadata count");
+        assert_eq!(processing_metadata_rows, 0);
 
         let repeated = database
             .initialize_if_uninitialized(mainnet(), hash(1), Some("ignored-after-initialization"))
@@ -206,15 +308,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coherent_state_opens_independent_capped_pool_generations() {
+        let (_container, database_url) = fixture().await;
+        let (mut database, uninitialized) = prepared_database(&database_url).await;
+        assert!(
+            open_validated_generations(&database_url, uninitialized).await.expect("uninitialized capability classification").is_none()
+        );
+        let state = database.initialize_if_uninitialized(mainnet(), hash(6), None).await.expect("initialization");
+
+        let generations = open_validated_generations(&database_url, state)
+            .await
+            .expect("validated generation creation")
+            .expect("initialized database must publish generations");
+        let (processing, api) = generations.into_parts();
+        let api = api.expect("coherent database must publish an API generation");
+
+        assert_eq!(processing.binding().network_id(), mainnet());
+        assert_eq!(processing.binding().genesis_hash(), hash(6));
+        assert_eq!(processing.load_session_state().await.expect("empty session state"), StoredSessionState::Empty);
+        assert_eq!(processing.pool().options().get_max_connections(), PROCESSING_POOL_SIZE);
+        assert_eq!(api.pool().options().get_max_connections(), API_POOL_SIZE);
+        assert!(api.is_valid());
+
+        let mut processing_connection = processing.pool().acquire().await.expect("processing connection");
+        let mut api_connection = api.pool().acquire().await.expect("API connection");
+        let processing_pid: i32 =
+            sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *processing_connection).await.expect("processing PID");
+        let api_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *api_connection).await.expect("API PID");
+        assert_ne!(processing_pid, api_pid);
+
+        let processing_read_only: String = sqlx::query_scalar("SHOW default_transaction_read_only")
+            .fetch_one(&mut *processing_connection)
+            .await
+            .expect("processing access mode");
+        let api_read_only: String =
+            sqlx::query_scalar("SHOW default_transaction_read_only").fetch_one(&mut *api_connection).await.expect("API access mode");
+        assert_eq!(processing_read_only, "off");
+        assert_eq!(api_read_only, "on");
+        assert!(
+            sqlx::query("UPDATE administrative_metadata SET last_reinitialization_token = 'forbidden'")
+                .execute(&mut *api_connection)
+                .await
+                .is_err()
+        );
+
+        let api_clone = Arc::clone(&api);
+        assert!(api.retire());
+        assert!(!api.is_valid());
+        assert!(!api_clone.is_valid());
+        assert!(!api.retire());
+        assert!(processing.is_valid());
+        assert!(processing.retire());
+        assert!(!processing.is_valid());
+    }
+
+    #[tokio::test]
+    async fn inconsistent_state_opens_only_a_rebuild_usable_processing_generation() {
+        let (_container, database_url) = fixture().await;
+        let (mut database, _) = prepared_database(&database_url).await;
+        database.initialize_if_uninitialized(mainnet(), hash(7), None).await.expect("initialization");
+        sqlx::query("ALTER TABLE processing_metadata DROP CONSTRAINT processing_metadata_db_pp_blue_score_check")
+            .execute(database.connection_mut())
+            .await
+            .expect("permit corrupted score fixture");
+        sqlx::query("INSERT INTO processing_metadata (singleton, db_pp_blue_score) VALUES (TRUE, -1)")
+            .execute(database.connection_mut())
+            .await
+            .expect("corrupt pruning-point score");
+        let state = database.classify().await.expect("inconsistent classification");
+
+        let generations = open_validated_generations(&database_url, state)
+            .await
+            .expect("validated generation creation")
+            .expect("bound inconsistent database must publish processing generation");
+        let (processing, api) = generations.into_parts();
+
+        assert_eq!(processing.binding().network_id(), mainnet());
+        assert_eq!(processing.binding().genesis_hash(), hash(7));
+        assert!(api.is_none());
+    }
+
+    #[tokio::test]
     async fn preparatory_schema_and_rolled_back_binding_remain_uninitialized() {
         let (_container, database_url) = fixture().await;
-        let mut database = LockedDatabase::connect(&database_url).await.expect("database lock");
-        assert_eq!(database.prepare().await.expect("schema preparation"), DatabaseState::Uninitialized);
+        let (mut database, state) = prepared_database(&database_url).await;
+        assert_eq!(state, DatabaseState::Uninitialized);
 
         let mut transaction = database.connection_mut().begin().await.expect("transaction");
         sqlx::query(
-            "INSERT INTO node_metadata (singleton, network_id, genesis_hash, db_pp_blue_score)
-             VALUES (TRUE, $1, $2, 0)",
+            "INSERT INTO network_metadata (singleton, network_id, genesis_hash)
+             VALUES (TRUE, $1, $2)",
         )
         .bind(mainnet().to_string())
         .bind(hash(3).as_bytes().as_slice())
@@ -223,7 +406,7 @@ mod tests {
         .expect("provisional binding");
         transaction.rollback().await.expect("rollback");
 
-        assert_eq!(schema::classify(database.connection_mut()).await.expect("classification"), DatabaseState::Uninitialized);
+        assert_eq!(database.classify().await.expect("classification"), DatabaseState::Uninitialized);
     }
 
     #[tokio::test]
@@ -231,10 +414,28 @@ mod tests {
         let (_container, database_url) = fixture().await;
         let mut connection = PgConnection::connect(&database_url).await.expect("fixture connection");
         migration::MIGRATOR.run_to(1, &mut connection).await.expect("first migration only");
+        sqlx::query(
+            "INSERT INTO network_metadata (singleton, network_id, genesis_hash)
+             VALUES (TRUE, $1, $2)",
+        )
+        .bind(mainnet().to_string())
+        .bind(hash(10).as_bytes().as_slice())
+        .execute(&mut connection)
+        .await
+        .expect("version-one empty binding");
         connection.close().await.expect("close migration connection");
 
-        let mut database = LockedDatabase::connect(&database_url).await.expect("database lock");
-        assert_eq!(database.prepare().await.expect("remaining migrations"), DatabaseState::Uninitialized);
+        let (mut database, state) = prepared_database(&database_url).await;
+        let DatabaseState::Empty(binding) = state else {
+            panic!("version-one empty binding must migrate to Empty");
+        };
+        assert_eq!(binding.network_id(), mainnet());
+        assert_eq!(binding.genesis_hash(), hash(10));
+        let processing_metadata_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM processing_metadata")
+            .fetch_one(database.connection_mut())
+            .await
+            .expect("migrated processing-metadata count");
+        assert_eq!(processing_metadata_rows, 0);
         let processing_table_exists: bool = sqlx::query_scalar("SELECT to_regclass('public.blocks') IS NOT NULL")
             .fetch_one(database.connection_mut())
             .await
@@ -260,7 +461,7 @@ mod tests {
             .await
             .expect("dirty migration marker");
         connection.close().await.expect("close migration connection");
-        let mut dirty = LockedDatabase::connect(&dirty_url).await.expect("database lock");
+        let dirty = LockedDatabase::connect(&dirty_url).await.expect("database lock");
         assert!(matches!(dirty.prepare().await, Err(StorageError::Migration { .. })));
     }
 
@@ -270,31 +471,31 @@ mod tests {
         let mut connection = PgConnection::connect(&unknown_url).await.expect("fixture connection");
         sqlx::query("CREATE TABLE unrelated_user_data (id BIGINT PRIMARY KEY)").execute(&mut connection).await.expect("unknown table");
         connection.close().await.expect("close fixture connection");
-        let mut unknown = LockedDatabase::connect(&unknown_url).await.expect("database lock");
+        let unknown = LockedDatabase::connect(&unknown_url).await.expect("database lock");
         assert!(matches!(unknown.prepare().await, Err(StorageError::Rejected(StorageRejection::UnsupportedSchema { .. }))));
 
         let (_partial_container, partial_url) = fixture().await;
         let mut connection = PgConnection::connect(&partial_url).await.expect("fixture connection");
-        sqlx::query("CREATE TABLE node_metadata (singleton BOOLEAN PRIMARY KEY)")
+        sqlx::query("CREATE TABLE network_metadata (singleton BOOLEAN PRIMARY KEY)")
             .execute(&mut connection)
             .await
             .expect("partial table");
         connection.close().await.expect("close fixture connection");
-        let mut partial = LockedDatabase::connect(&partial_url).await.expect("database lock");
+        let partial = LockedDatabase::connect(&partial_url).await.expect("database lock");
         assert!(matches!(partial.prepare().await, Err(StorageError::Rejected(StorageRejection::UnsupportedSchema { .. }))));
 
         let (_tampered_container, tampered_url) = fixture().await;
-        let mut tampered = LockedDatabase::connect(&tampered_url).await.expect("database lock");
-        tampered.prepare().await.expect("current schema");
+        let (mut tampered, _) = prepared_database(&tampered_url).await;
         sqlx::query("ALTER TABLE administrative_metadata DROP COLUMN last_reinitialization_token")
             .execute(tampered.connection_mut())
             .await
             .expect("tamper with current schema");
+        drop(tampered);
+        let tampered = LockedDatabase::connect(&tampered_url).await.expect("database lock");
         assert!(matches!(tampered.prepare().await, Err(StorageError::Rejected(StorageRejection::UnsupportedSchema { .. }))));
 
         let (_newer_container, newer_url) = fixture().await;
-        let mut newer = LockedDatabase::connect(&newer_url).await.expect("database lock");
-        newer.prepare().await.expect("current schema");
+        let (mut newer, _) = prepared_database(&newer_url).await;
         let future_version = migration::current_version() + 1;
         sqlx::query(
             "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
@@ -304,8 +505,14 @@ mod tests {
         .execute(newer.connection_mut())
         .await
         .expect("future migration marker");
+        drop(newer);
+        let newer = LockedDatabase::connect(&newer_url).await.expect("database lock");
+        let error = match newer.prepare().await {
+            Ok(_) => panic!("newer schema must be rejected"),
+            Err(error) => error,
+        };
         assert_eq!(
-            newer.prepare().await.expect_err("newer schema must be rejected"),
+            error,
             StorageError::Rejected(StorageRejection::SchemaTooNew {
                 observed: future_version,
                 supported: migration::current_version(),
@@ -314,11 +521,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn processing_contents_distinguish_initialized_and_inconsistent() {
+    async fn bounded_session_state_distinguishes_initialized_and_inconsistent() {
         let (_container, database_url) = fixture().await;
-        let mut database = LockedDatabase::connect(&database_url).await.expect("database lock");
-        database.prepare().await.expect("schema preparation");
+        let (mut database, _) = prepared_database(&database_url).await;
         database.initialize_if_uninitialized(mainnet(), hash(9), None).await.expect("initialization");
+
+        sqlx::query("INSERT INTO processing_metadata (singleton, db_pp_blue_score) VALUES (TRUE, 0)")
+            .execute(database.connection_mut())
+            .await
+            .expect("Genesis processing metadata");
 
         sqlx::query("INSERT INTO block_identifiers (id, hash) VALUES (1, $1), (2, $2)")
             .bind(hash(8).as_bytes().as_slice())
@@ -339,44 +550,58 @@ mod tests {
         .execute(database.connection_mut())
         .await
         .expect("Genesis block");
-        assert!(matches!(
-            schema::classify(database.connection_mut()).await.expect("Genesis classification"),
-            DatabaseState::Initialized(_)
-        ));
+        let initialized = database.classify().await.expect("Genesis classification");
+        assert!(matches!(initialized, DatabaseState::Initialized(_)));
+
+        let generations = open_validated_generations(&database_url, initialized)
+            .await
+            .expect("validated generation creation")
+            .expect("initialized database must publish generations");
+        let (processing, _api) = generations.into_parts();
+        let StoredSessionState::Initialized(snapshot) = processing.load_session_state().await.expect("initialized session state")
+        else {
+            panic!("Genesis contents must produce an initialized session snapshot");
+        };
+        assert_eq!(snapshot.db_pp_hash, hash(9));
+        assert_eq!(snapshot.db_pp_blue_score, 0);
+        assert_eq!(snapshot.committed_vspc_sink.hash, hash(9));
+        assert_eq!(snapshot.committed_vspc_sink.id.get(), 2);
+        assert_eq!(snapshot.committed_vspc_sink.selected_parent, hash(8));
+        assert_eq!(snapshot.committed_vspc_sink.daa_score, 0);
 
         sqlx::query("INSERT INTO block_identifiers (id, hash) VALUES (3, $1)")
             .bind(hash(7).as_bytes().as_slice())
             .execute(database.connection_mut())
             .await
             .expect("extra boundary identity");
+        // Session loading deliberately does not rescan every retained identity.
+        assert!(matches!(database.classify().await.expect("bounded classification"), DatabaseState::Initialized(_)));
         assert!(matches!(
-            schema::classify(database.connection_mut()).await.expect("inconsistent classification"),
-            DatabaseState::Inconsistent { .. }
+            processing.load_session_state().await.expect("fresh bounded session state"),
+            StoredSessionState::Initialized(_)
         ));
 
-        sqlx::query("ALTER TABLE node_metadata DROP CONSTRAINT node_metadata_db_pp_blue_score_check")
+        sqlx::query("ALTER TABLE processing_metadata DROP CONSTRAINT processing_metadata_db_pp_blue_score_check")
             .execute(database.connection_mut())
             .await
             .expect("permit corrupted score fixture");
-        sqlx::query("UPDATE node_metadata SET db_pp_blue_score = -1")
+        sqlx::query("UPDATE processing_metadata SET db_pp_blue_score = -1")
             .execute(database.connection_mut())
             .await
             .expect("corrupt pruning-point score");
-        let negative = schema::classify(database.connection_mut()).await.expect("negative score classification");
+        let negative = database.classify().await.expect("negative score classification");
         assert!(matches!(
             negative,
-            DatabaseState::Inconsistent {
-                binding,
-                metadata: None,
-            } if binding.network_id == mainnet() && binding.genesis_hash == hash(9)
+            DatabaseState::Inconsistent { binding }
+                if binding.network_id() == mainnet() && binding.genesis_hash() == hash(9)
         ));
+        assert_eq!(processing.load_session_state().await.expect("negative metadata session state"), StoredSessionState::Inconsistent);
     }
 
     #[tokio::test]
     async fn score_constraints_and_timestamp_bit_patterns_are_exact() {
         let (_container, database_url) = fixture().await;
-        let mut database = LockedDatabase::connect(&database_url).await.expect("database lock");
-        database.prepare().await.expect("schema preparation");
+        let (mut database, _) = prepared_database(&database_url).await;
         database.initialize_if_uninitialized(mainnet(), hash(5), None).await.expect("initialization");
         sqlx::query("INSERT INTO block_identifiers (id, hash) VALUES (1, $1), (2, $2)")
             .bind(hash(4).as_bytes().as_slice())

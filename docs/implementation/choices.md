@@ -335,16 +335,33 @@ The private processing-pool size does not become a public API value.
 ### Crate and module boundaries
 
 Start `kgi-storage` with public `error`, `generation`, and `service` modules.
-They own the typed storage failures, `NodeMetadata` and validated generation
+They own the typed storage failures, `DatabaseBinding` and validated generation
 capabilities, and the Supervisor-facing service lifecycle respectively. Keep
-SQLx adaptation, migration execution, schema inspection, service-loop
-commands, retirement plumbing, and deterministic timing in private
-`database`, `migration`, `schema`, `runtime`, and `timing` modules. Expose the
-public modules without crate-root wildcard re-exports.
+SQLx adaptation, migration execution, schema inspection, processing-state
+inspection, service-loop commands, retirement plumbing, and deterministic
+timing in private `database`, `migration`, `schema`, `state`, `runtime`, and
+`timing` modules. Expose the public modules without crate-root wildcard
+re-exports.
 
 These boundaries do not expose SQLx pools, connections, transactions, raw
 queries, or schema-classification details. Add each module only with its first
 implemented behavior rather than creating placeholder APIs.
+
+### Validated generations and stored session state
+
+Keep `DatabaseBinding`, `ValidatedDbClient`, `ValidatedApiDbClient`, and the
+storage-owned session-state result values together in the public `generation`
+module. `LockedDatabase::prepare` consumes the advisory-lock capability and
+returns `PreparedDatabase` only after migration and physical-layout validation.
+`ValidatedDbClient::load_session_state` delegates to the private state adapter
+and exposes no SQLx value. `ProcessingStateInspection` owns the repeatable-read,
+read-only transaction used by both session loading and initial generation
+classification.
+
+The adapter implements the storage-owned
+[bounded processing-state classification](../architecture/storage.md#bounded-processing-state-classification--settled)
+contract. Query shape and indexes remain implementation details only within
+that settled complexity boundary.
 
 ### PostgreSQL integration tests
 

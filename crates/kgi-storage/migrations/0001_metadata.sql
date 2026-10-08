@@ -1,7 +1,11 @@
-CREATE TABLE node_metadata (
+CREATE TABLE network_metadata (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
     network_id TEXT NOT NULL,
-    genesis_hash BYTEA NOT NULL CHECK (octet_length(genesis_hash) = 32),
+    genesis_hash BYTEA NOT NULL CHECK (octet_length(genesis_hash) = 32)
+);
+
+CREATE TABLE processing_metadata (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
     db_pp_blue_score BIGINT NOT NULL CHECK (db_pp_blue_score >= 0)
 );
 

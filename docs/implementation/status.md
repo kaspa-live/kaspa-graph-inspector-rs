@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 7 October 2026.
+Updated 8 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -25,9 +25,25 @@ StorageService implementation slice selects SQLx with PostgreSQL and Rustls,
 embeds the forward-only metadata and processing-schema migrations, acquires the
 dedicated advisory ownership lock, classifies database bootstrap states, and
 performs the atomic idempotent `Uninitialized -> Empty` network binding.
-Validated processing/API generations and the permanent autonomous service
-lifecycle remain pending. Open architecture requirements continue to block
-only their dependent work.
+The validated-generation storage slice adds processing and read-only API pool
+generations without exposing SQLx resources across the crate boundary. The
+processing pool is independently capped at four connections, the API pool at
+eight, and API sessions default to read-only. One `ValidatedDbClient` type is
+used for compatible Empty, Initialized, and Inconsistent contents; it proves
+generation ownership, compatible schema, and immutable `DatabaseBinding`.
+Immutable network metadata and mutable `ProcessingMetadata` use separate
+singleton tables; Empty has no processing-metadata row, and invalid processing
+metadata produces semantic Inconsistent without invalidating the client. Only
+coherent Empty and Initialized contents initially produce an API capability.
+API validity is shared and terminal, while retirement authority remains private
+to storage. The processing client also loads a fresh storage-owned session
+state in one repeatable-read transaction. Initial publication and session
+loading share a bounded classifier based on existence checks, indexed PP and
+VSPC-sink lookup, and primary-key identity resolution; they perform no retained
+graph audit. The permanent autonomous service lifecycle, ordered events,
+reconnection, gated Rebuild-start API publication, and operation-level
+retirement barriers remain pending. No open architecture requirement currently
+blocks the remaining storage lifecycle work.
 
 The imported browser still uses the v1 graph data source, models, and update
 behavior, so it is not yet compatible with the v2 HTTP, SSE, publication, and

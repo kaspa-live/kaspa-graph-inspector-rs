@@ -43,7 +43,7 @@ pub enum StorageError {
     Migration { diagnostic: Arc<str> },
 
     /// Persisted metadata cannot be represented by the KGI domain model.
-    #[error("invalid persisted node metadata: {diagnostic}")]
+    #[error("invalid persisted database metadata: {diagnostic}")]
     InvalidMetadata { diagnostic: Arc<str> },
 
     /// A caller supplied a score outside KGI's persistent range.
