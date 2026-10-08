@@ -226,14 +226,22 @@ compression, and response delivery occur outside this permit and cannot issue
 follow-up database reads.
 
 Before `rebuild_from_pruning_point` clears or replaces processing data,
-StorageService atomically closes new API DB admission, retires the current
-`ValidatedApiDbClient` generation, creates and validates a fresh read-only API
-pool generation, and emits the ordered `StorageServiceEvent::ApiDbRetired` and
-`StorageServiceEvent::ApiDbPublished` events. The fresh generation is therefore
-available for API construction as soon as replacement starts, while remaining
-behind the closed gate. StorageService then boundedly drains or cancels all old
-database phases that still hold shared permits and acquires the exclusive
-replacement permit. A request that detached its projection before closure may
+StorageService atomically closes new API DB admission. If a current
+`ValidatedApiDbClient` generation exists, it retires that exact generation and
+emits `StorageServiceEvent::ApiDbRetired(old)`. If none exists, including the
+initial `Inconsistent -> Rebuild` path, it emits no retirement event and
+creates no placeholder client. StorageService then creates and validates a
+fresh read-only API pool generation and emits
+`StorageServiceEvent::ApiDbPublished(fresh)`. The complete event sequence is
+therefore `Retired(old), Published(fresh)` when an old generation exists and
+only `Published(fresh)` when it does not.
+
+The fresh generation is available for API construction as soon as it is
+published, while remaining behind the closed gate. When an old generation
+existed, StorageService boundedly drains or cancels its database phases that
+still hold shared permits before acquiring the exclusive replacement permit.
+With no old API generation, that drain is vacuous and cannot produce
+`ApiReadExclusion`. A request that detached its projection before closure may
 finish returning that old coherent image. Every other affected old-generation
 request reports database-backed read unavailability; the
 [API protocol](api-protocol.md#anchored-graph-windows--settled) owns its HTTP
@@ -374,8 +382,9 @@ StorageService acquires a dedicated PostgreSQL session advisory lock before
 initialization, migration, or validation and holds it throughout the
 validated-client lifetime. It rechecks state under that lock before first
 initialization. Losing the lock connection retires the current processing
-and API generations and emits both exact retirement events; the processing
-lifecycle alone owns termination of a session using the processing generation.
+generation and, if one exists, the current API generation, then emits the
+corresponding exact retirement event for each; the processing lifecycle alone
+owns termination of a session using the processing generation.
 No replacement generation is published until StorageService reconnects and
 reacquires the lock. Failure to acquire the lock enters terminal
 `Rejected(DatabaseAlreadyInUse)` and emits the corresponding `Rejected` event.

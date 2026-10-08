@@ -343,8 +343,10 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
    the database. Unknown tables are never claimed or destroyed, and neither
    form can expose a partially recreated schema.
 6. Advisory-lock contention rejects with `DatabaseAlreadyInUse`, and lock loss
-   retires both DB generations and emits their exact retirement events without
-   directly changing processing-session or API publication state. Compatible
+   retires every currently published DB generation and emits its exact
+   retirement event without directly changing processing-session or API
+   publication state. Cover lock loss both with and without a current API
+   generation. Compatible
    v2 migrations are ordered,
    transactional, revalidated, and finish before client publication. Cover
    newer-schema and v1/unsupported rejection, failed migration without client
@@ -395,8 +397,8 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
     it constructs no `ProcessingMetadata`, stores no processing metadata in the
     client, and never invents or converts a score. Rebuild keeps that exact
     processing client, publishes a fresh API generation behind the closed
-    replacement gate before mutation, and opens that same generation only
-    after definite commit.
+    replacement gate before mutation without emitting `ApiDbRetired`, and opens
+    that same generation only after definite commit.
     A defensive out-of-range storage input is rejected before mutation with
     the typed DAA or blue
     `StorageError::ScoreOutOfRange` reason. Round-trip timestamps `0`,
@@ -1672,8 +1674,12 @@ cannot install its publication or reopen the gate.
 Resync preserves public database-backed reads, and failed reconciliation followed by
 Rebuild calls `reset` again with a fresh ingress. Rebuild reset locally unbinds
 the old API client and disables public request admission; StorageService owns
-closing database admission, retiring the old generation, boundedly draining or
-cancelling active database phases, and publishing the fresh gated generation.
+closing database admission, conditionally retiring and draining an existing
+old generation, and publishing the fresh gated generation. Verify the ordered
+`ApiDbRetired(old), ApiDbPublished(fresh)` sequence when an old generation
+exists and the sole `ApiDbPublished(fresh)` event when none exists. Supervisor
+must forward exactly the emitted sequence without synthesizing the absent
+retirement event.
 Verify a detached old projection may complete delivery while
 an undetached request returns 503, public reads reopen only after the
 replacement completes `Prewarming` and becomes `Active`, and

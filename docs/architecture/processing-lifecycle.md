@@ -768,7 +768,8 @@ During Rebuild, the storage-owned
 can emit retirement and publication events while
 `rebuild_from_pruning_point` is still running. Supervisor forwards each event
 immediately in stream order rather than deferring it until the call returns. It
-does not synthesize another publication event when the call completes.
+does not synthesize a retirement event when storage had no current API
+generation, or another publication event when the call completes.
 
 Supervisor does not start, coalesce, cancel, or classify API-generation
 acquisition tasks. Forwarding a generation event changes neither processing
