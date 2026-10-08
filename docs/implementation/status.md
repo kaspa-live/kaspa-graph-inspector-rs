@@ -24,7 +24,10 @@ Processing and API service crates remain behavior-free scaffolds. The first
 StorageService implementation slice selects SQLx with PostgreSQL and Rustls,
 embeds the forward-only metadata and processing-schema migrations, acquires the
 dedicated advisory ownership lock, classifies database bootstrap states, and
-performs the atomic idempotent `Uninitialized -> Empty` network binding.
+performs the atomic idempotent `Uninitialized -> Empty` network binding. Its
+post-migration physical-layout fingerprint validates column defaults and
+identity mode, constraints, constraint-backed indexes, and required query-path
+indexes before any database generation can be published.
 The validated-generation storage slice adds processing and read-only API pool
 generations without exposing SQLx resources across the crate boundary. The
 processing pool is independently capped at four connections, the API pool at
@@ -53,7 +56,8 @@ independent replacement, advisory-lock contention, lock loss with both
 two-generation and processing-only states, lock loss during blocked replacement
 opening, the pre-publication ownership recheck, nonblocking replacement while a
 retired pool still has a checked-out connection, terminal joining of that pool
-drain, and fatal event-path closure.
+drain, missing required index and constraint rejection, and fatal event-path
+closure.
 The gated Rebuild-start API publication, replacement exclusion, and bounded
 drain/cancellation remain for the database-replacement-safety increment
 together with their dependent storage operations. No open architecture

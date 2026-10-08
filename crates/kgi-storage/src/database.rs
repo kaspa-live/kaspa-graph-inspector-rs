@@ -300,6 +300,15 @@ mod tests {
         LockedDatabase::connect(database_url).await.expect("database lock").prepare().await.expect("schema preparation")
     }
 
+    async fn assert_schema_tamper_rejected(database_url: &str, statement: &'static str) {
+        let (mut database, _) = prepared_database(database_url).await;
+        sqlx::query(statement).execute(database.connection_mut()).await.expect("schema tamper");
+        drop(database);
+
+        let locked = LockedDatabase::connect(database_url).await.expect("database lock after tamper");
+        assert!(matches!(locked.prepare().await, Err(StorageError::Rejected(StorageRejection::UnsupportedSchema { .. }))));
+    }
+
     fn mainnet() -> NetworkId {
         NetworkId::new(NetworkType::Mainnet)
     }
@@ -582,6 +591,26 @@ mod tests {
                 supported: migration::current_version(),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn missing_required_indexes_and_constraints_are_rejected() {
+        {
+            let (_container, database_url) = fixture().await;
+            assert_schema_tamper_rejected(&database_url, "DROP INDEX blocks_vspc_sink_idx").await;
+        }
+        {
+            let (_container, database_url) = fixture().await;
+            assert_schema_tamper_rejected(&database_url, "ALTER TABLE blocks DROP CONSTRAINT blocks_level_slot_key").await;
+        }
+        {
+            let (_container, database_url) = fixture().await;
+            assert_schema_tamper_rejected(&database_url, "ALTER TABLE blocks DROP CONSTRAINT blocks_daa_score_check").await;
+        }
+        {
+            let (_container, database_url) = fixture().await;
+            assert_schema_tamper_rejected(&database_url, "ALTER TABLE blocks DROP CONSTRAINT blocks_selected_parent_id_fkey").await;
+        }
     }
 
     #[tokio::test]

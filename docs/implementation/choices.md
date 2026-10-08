@@ -314,6 +314,14 @@ the administrative replacement path will run the embedded migration set
 inside its owning outer transaction rather than introduce a second schema
 definition.
 
+After migration, construct a physical-layout fingerprint from
+`information_schema` and `pg_catalog`. Match the exact KGI table, column,
+default, identity, and constraint signatures, and require the complete set of
+constraint-backed and query-path index signatures, including index validity,
+readiness, access method, key order, sort options, and partial predicate. Extra
+operator-created indexes do not alter KGI semantics and are permitted; an
+altered or missing required object is `UnsupportedSchema`.
+
 ### Concrete SQL representations
 
 Implement the SQL representation owned by the
