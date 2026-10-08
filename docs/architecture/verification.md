@@ -349,8 +349,16 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
    generation. Compatible
    v2 migrations are ordered,
    transactional, revalidated, and finish before client publication. Cover
-   newer-schema and v1/unsupported rejection, failed migration without client
-   publication, and the prohibition on automatic down or online migration.
+   newer-schema and v1/unsupported rejection and the prohibition on automatic
+   down or online migration. At the StorageService boundary, exercise both a
+   dirty migration marker and a checksum mismatch. Each publishes no validated
+   generation, emits exactly one terminal `Rejected(MigrationFailed)` event,
+   completes pending initialization with that rejection, performs no reconnect
+   or migration retry, and makes Supervisor enter Fatal. A later successful
+   service shutdown proves cleanup and does not substitute for the rejection.
+   Separately inject migration execution connection loss and verify transient
+   `Unavailable`, shutdown-cancellable service-backoff retry of the complete
+   startup attempt, and no terminal rejection.
 7. Storage may open, lock, and inspect Uninitialized contents before node
    validation, but only atomic publication of complete `DatabaseBinding` crosses
    `Uninitialized -> Empty`. Inject a crash around this transaction and prove

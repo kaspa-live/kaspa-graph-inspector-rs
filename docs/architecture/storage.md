@@ -176,9 +176,9 @@ indefinitely with nominal delays:
 Each actual delay uses equal jitter from 50% through 100% of the nominal
 delay. Every wait is shutdown-cancellable. Reset the sequence only after
 StorageService has remained continuously Ready for 60 seconds. Network
-binding mismatch and unsupported, newer, v1, partial, or unknown schema
-states enter terminal `Rejected` and do not retry under unchanged
-configuration.
+binding mismatch, a permanent migration failure, and unsupported, newer, v1,
+partial, or unknown schema states enter terminal `Rejected` and do not retry
+under the unchanged database and binary.
 
 A connection-level storage failure retires the validated generation, but does
 not retroactively revoke independent operations already in flight. The
@@ -365,6 +365,7 @@ Inconsistent
 
 Rejected
     network identity mismatch or unsupported, newer, v1, partial, or unknown
+    schema, or a permanent migration failure prevents completion of a usable
     schema
 ```
 
@@ -432,10 +433,34 @@ validated client:
 - a v1 or otherwise unsupported schema is `Rejected(UnsupportedSchema)`.
 
 Every ordinary migration is transactional. A failed migration publishes no
-validated client. Automatic down migration, migration during a processing
-session, online migration, and in-place v1-to-v2 migration are forbidden. A
-migration that cannot complete transactionally is rejected by ordinary
-startup.
+validated client. The migration adapter classifies an execution error caused
+by connection loss, SQLSTATE `40001`, or SQLSTATE `40P01` as transient. The
+complete startup and migration attempt enters `Unavailable` and retries under
+the StorageService connection backoff; it does not use the local transaction
+retry slots.
+
+Every other migration-framework failure is permanent under the current
+database and binary. This includes a dirty migration marker, a checksum or
+version mismatch, a missing or invalid migration, migration-source failure,
+and a nonretryable SQL execution failure. It is classified directly as:
+
+```rust
+StorageError::Rejected(StorageRejection::MigrationFailed {
+    diagnostic: Arc<str>,
+})
+```
+
+StorageService enters terminal `Rejected`, emits the typed `Rejected` event,
+completes every pending initialization request with the same rejection, and
+does not retry. No generic migration error may pass through `Unavailable`.
+Successful later `shutdown()` reports completion of terminal cleanup; it does
+not replace or erase the already emitted rejection. The
+[processing lifecycle](processing-lifecycle.md#processing-session-and-resource-acquisition--settled)
+owns the event's Fatal disposition.
+
+Automatic down migration, migration during a processing session, online
+migration, and in-place v1-to-v2 migration are forbidden. A migration that
+cannot complete transactionally is rejected by ordinary startup.
 
 The immutable network binding and mutable processing metadata are separate
 semantic values with separate persisted rows:
@@ -582,7 +607,8 @@ disposition.
 | Immutable `(network_id, genesis_hash)` mismatch | `Rejected(NetworkMismatch)` |
 | Schema newer than the binary | `Rejected(SchemaTooNew)` |
 | Unsupported, v1, partial, or unknown schema | `Rejected(UnsupportedSchema)` |
-| Compatible migration fails | Publish no validated client; report the typed startup storage failure |
+| Migration execution loses its connection or reports SQLSTATE `40001` or `40P01` | Publish no validated client; enter `Unavailable` and retry the complete startup attempt under the service backoff |
+| Migration has a dirty marker, checksum/version mismatch, missing or invalid migration, source failure, or other nonretryable failure | `Rejected(MigrationFailed { diagnostic })`; publish no validated client and do not retry |
 | Processing contents are `Inconsistent` | Keep the compatible database usable for Rebuild; never permit Resync |
 | Rebuild commit outcome is ambiguous | `Persistence(AmbiguousCommit)` under the transaction-outcome contract above |
 | Domain invariant violation inside an operation | Typed operation/session failure for the owning caller |
