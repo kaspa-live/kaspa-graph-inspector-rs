@@ -4,11 +4,12 @@
 
 pub mod error;
 pub mod generation;
+pub mod service;
 
-#[allow(dead_code, reason = "wired into the permanent service in the next lifecycle point")]
 mod database;
 #[allow(dead_code, reason = "used through the database bootstrap lifecycle")]
 mod migration;
+mod runtime;
 #[allow(dead_code, reason = "used through the database bootstrap lifecycle")]
 mod schema;
 #[allow(dead_code, reason = "used through database bootstrap and recovery-session preparation")]

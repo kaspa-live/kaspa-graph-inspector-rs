@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
+use async_trait::async_trait;
 use kaspa_consensus_core::network::NetworkId;
 use kgi_model::{
     block::{BlockHash, MAX_BLUE_SCORE, MAX_DAA_SCORE, Timestamp},
@@ -10,6 +11,7 @@ use sqlx::{Connection, PgConnection, postgres::PgPoolOptions};
 use crate::{
     error::{StorageError, StorageRejection},
     generation::{DatabaseBinding, ValidatedApiDbClient, ValidatedDbClient},
+    runtime::RetirementSender,
     schema,
     state::{DatabaseState, ProcessingStateInspection},
 };
@@ -29,14 +31,17 @@ impl ValidatedGenerations {
     }
 }
 
+#[allow(dead_code, reason = "used by persistence transactions in the next increment")]
 pub(crate) const fn timestamp_to_sql(timestamp: Timestamp) -> i64 {
     i64::from_ne_bytes(timestamp.to_ne_bytes())
 }
 
+#[allow(dead_code, reason = "used by persistence transactions in the next increment")]
 pub(crate) const fn timestamp_from_sql(timestamp: i64) -> Timestamp {
     u64::from_ne_bytes(timestamp.to_ne_bytes())
 }
 
+#[allow(dead_code, reason = "used by persistence transactions in the next increment")]
 pub(crate) fn daa_score_to_sql(score: u64) -> Result<i64, StorageError> {
     if score > MAX_DAA_SCORE {
         return Err(StorageError::ScoreOutOfRange(ScoreRangeFault::DaaScore));
@@ -44,6 +49,7 @@ pub(crate) fn daa_score_to_sql(score: u64) -> Result<i64, StorageError> {
     i64::try_from(score).map_err(|_| StorageError::ScoreOutOfRange(ScoreRangeFault::DaaScore))
 }
 
+#[allow(dead_code, reason = "used by persistence transactions in the next increment")]
 pub(crate) fn blue_score_to_sql(score: u64) -> Result<i64, StorageError> {
     if score > MAX_BLUE_SCORE {
         return Err(StorageError::ScoreOutOfRange(ScoreRangeFault::BlueScore));
@@ -73,55 +79,80 @@ impl LockedDatabase {
         Ok(Self { connection })
     }
 
-    pub(crate) async fn prepare(mut self) -> Result<(PreparedDatabase, DatabaseState), StorageError> {
-        schema::prepare(&mut self.connection).await?;
-        let state = ProcessingStateInspection::classify(&mut self.connection).await?;
-        Ok((PreparedDatabase { connection: self.connection }, state))
+    pub(crate) fn prepare(self) -> impl Future<Output = Result<(PreparedDatabase, DatabaseState), StorageError>> + Send + 'static {
+        let mut connection = self.connection;
+        async move {
+            schema::prepare(&mut connection).await?;
+            let state = ProcessingStateInspection::classify(&mut connection).await?;
+            Ok((PreparedDatabase { connection }, state))
+        }
+    }
+}
+
+#[async_trait]
+pub(crate) trait DatabaseConnector: Send + Sync {
+    async fn connect(&self, database_url: &str) -> Result<LockedDatabase, StorageError>;
+}
+
+pub(crate) struct SqlxDatabaseConnector;
+
+#[async_trait]
+impl DatabaseConnector for SqlxDatabaseConnector {
+    async fn connect(&self, database_url: &str) -> Result<LockedDatabase, StorageError> {
+        LockedDatabase::connect(database_url).await
     }
 }
 
 impl PreparedDatabase {
-    pub(crate) async fn initialize_if_uninitialized(
+    pub(crate) fn initialize_if_uninitialized(
         &mut self,
         network_id: NetworkId,
         genesis_hash: BlockHash,
-        reinitialization_token: Option<&str>,
-    ) -> Result<DatabaseState, StorageError> {
-        let state = self.classify().await?;
-        if let Some(observed) = state.binding() {
-            ensure_binding(observed, network_id, genesis_hash)?;
-            return Ok(state);
-        }
+        reinitialization_token: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<DatabaseState, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            let state = self.classify().await?;
+            if let Some(observed) = state.binding() {
+                ensure_binding(observed, network_id, genesis_hash)?;
+                return Ok(state);
+            }
 
-        let mut transaction =
-            self.connection.begin().await.map_err(|error| StorageError::database("initialization transaction start", error))?;
-        sqlx::query(
-            "INSERT INTO network_metadata (singleton, network_id, genesis_hash)
-             VALUES (TRUE, $1, $2)",
-        )
-        .bind(network_id.to_string())
-        .bind(genesis_hash.as_bytes().as_slice())
-        .execute(&mut *transaction)
-        .await
-        .map_err(|error| StorageError::database("network-metadata initialization", error))?;
-        if let Some(token) = reinitialization_token {
-            sqlx::query("UPDATE administrative_metadata SET last_reinitialization_token = $1 WHERE singleton")
-                .bind(token)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|error| StorageError::database("administrative-metadata initialization", error))?;
-        }
-        transaction.commit().await.map_err(|error| StorageError::database("initialization transaction commit", error))?;
+            let mut transaction =
+                self.connection.begin().await.map_err(|error| StorageError::database("initialization transaction start", error))?;
+            sqlx::query(
+                "INSERT INTO network_metadata (singleton, network_id, genesis_hash)
+                 VALUES (TRUE, $1, $2)",
+            )
+            .bind(network_id.to_string())
+            .bind(genesis_hash.as_bytes().as_slice())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| StorageError::database("network-metadata initialization", error))?;
+            if let Some(token) = reinitialization_token {
+                sqlx::query("UPDATE administrative_metadata SET last_reinitialization_token = $1 WHERE singleton")
+                    .bind(token)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| StorageError::database("administrative-metadata initialization", error))?;
+            }
+            transaction.commit().await.map_err(|error| StorageError::database("initialization transaction commit", error))?;
 
-        let initialized = self.classify().await?;
-        if !matches!(initialized, DatabaseState::Empty(_)) {
-            return Err(StorageError::invalid_metadata("initialization did not produce an Empty database"));
-        }
-        Ok(initialized)
+            let initialized = self.classify().await?;
+            if !matches!(initialized, DatabaseState::Empty(_)) {
+                return Err(StorageError::invalid_metadata("initialization did not produce an Empty database"));
+            }
+            Ok(initialized)
+        })
     }
 
-    pub(crate) async fn classify(&mut self) -> Result<DatabaseState, StorageError> {
-        ProcessingStateInspection::classify(&mut self.connection).await
+    pub(crate) fn classify(&mut self) -> Pin<Box<dyn Future<Output = Result<DatabaseState, StorageError>> + Send + '_>> {
+        ProcessingStateInspection::classify(&mut self.connection)
+    }
+
+    pub(crate) fn ping(&mut self) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>> {
+        Box::pin(
+            async move { self.connection.ping().await.map_err(|error| StorageError::database("advisory-lock health check", error)) },
+        )
     }
 
     #[cfg(test)]
@@ -131,8 +162,9 @@ impl PreparedDatabase {
 }
 
 pub(crate) async fn open_validated_generations(
-    database_url: &str,
+    database_url: String,
     state: DatabaseState,
+    retirement_tx: RetirementSender,
 ) -> Result<Option<ValidatedGenerations>, StorageError> {
     let (binding, coherent) = match state {
         DatabaseState::Uninitialized => return Ok(None),
@@ -140,33 +172,61 @@ pub(crate) async fn open_validated_generations(
         DatabaseState::Inconsistent { binding } => (binding, false),
     };
 
-    let processing_pool = PgPoolOptions::new()
-        .max_connections(PROCESSING_POOL_SIZE)
-        .connect(database_url)
-        .await
-        .map_err(|error| StorageError::database("processing-pool connection", error))?;
-    validate_processing_pool(&processing_pool).await?;
-    let processing = Arc::new(ValidatedDbClient::new(processing_pool, binding));
+    let processing = open_processing_generation(database_url.clone(), binding, retirement_tx.clone()).await?;
 
     let api = if coherent {
-        let api_pool = PgPoolOptions::new()
-            .max_connections(API_POOL_SIZE)
-            .after_connect(|connection, _metadata| {
-                Box::pin(async move {
-                    sqlx::query("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY").execute(connection).await?;
-                    Ok(())
-                })
-            })
-            .connect(database_url)
-            .await
-            .map_err(|error| StorageError::database("API-pool connection", error))?;
-        validate_api_pool(&api_pool).await?;
-        Some(Arc::new(ValidatedApiDbClient::new(api_pool)))
+        match open_api_generation(database_url, retirement_tx).await {
+            Ok(api) => Some(api),
+            Err(error) => {
+                processing.retire();
+                processing.close().await;
+                return Err(error);
+            }
+        }
     } else {
         None
     };
 
     Ok(Some(ValidatedGenerations { processing, api }))
+}
+
+pub(crate) async fn open_processing_generation(
+    database_url: String,
+    binding: DatabaseBinding,
+    retirement_tx: RetirementSender,
+) -> Result<Arc<ValidatedDbClient>, StorageError> {
+    let pool = PgPoolOptions::new()
+        .max_connections(PROCESSING_POOL_SIZE)
+        .connect(&database_url)
+        .await
+        .map_err(|error| StorageError::database("processing-pool connection", error))?;
+    if let Err(error) = validate_processing_pool(&pool).await {
+        pool.close().await;
+        return Err(error);
+    }
+    Ok(ValidatedDbClient::new(pool, binding, retirement_tx))
+}
+
+pub(crate) async fn open_api_generation(
+    database_url: String,
+    retirement_tx: RetirementSender,
+) -> Result<Arc<ValidatedApiDbClient>, StorageError> {
+    let pool = PgPoolOptions::new()
+        .max_connections(API_POOL_SIZE)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY").execute(connection).await?;
+                Ok(())
+            })
+        })
+        .connect(&database_url)
+        .await
+        .map_err(|error| StorageError::database("API-pool connection", error))?;
+    if let Err(error) = validate_api_pool(&pool).await {
+        pool.close().await;
+        return Err(error);
+    }
+    Ok(ValidatedApiDbClient::new(pool, retirement_tx))
 }
 
 async fn validate_processing_pool(pool: &sqlx::PgPool) -> Result<(), StorageError> {
@@ -185,7 +245,10 @@ async fn validate_pool_access(pool: &sqlx::PgPool, operation: &'static str, expe
     if read_only == expected {
         Ok(())
     } else {
-        Err(StorageError::database(operation, format!("expected default_transaction_read_only={expected}, observed {read_only}")))
+        Err(StorageError::Database {
+            operation,
+            diagnostic: Arc::from(format!("expected default_transaction_read_only={expected}, observed {read_only}")),
+        })
     }
 }
 
@@ -226,6 +289,7 @@ mod tests {
         error::{StorageError, StorageRejection},
         generation::StoredSessionState,
         migration,
+        runtime::retirement_channel,
         state::DatabaseState,
     };
 
@@ -257,8 +321,10 @@ mod tests {
         let (mut database, state) = prepared_database(&database_url).await;
         assert_eq!(state, DatabaseState::Uninitialized);
 
-        let initialized =
-            database.initialize_if_uninitialized(mainnet(), hash(1), Some("deployment-a")).await.expect("first initialization");
+        let initialized = database
+            .initialize_if_uninitialized(mainnet(), hash(1), Some("deployment-a".to_owned()))
+            .await
+            .expect("first initialization");
         let DatabaseState::Empty(binding) = initialized else {
             panic!("first initialization must produce Empty");
         };
@@ -271,7 +337,7 @@ mod tests {
         assert_eq!(processing_metadata_rows, 0);
 
         let repeated = database
-            .initialize_if_uninitialized(mainnet(), hash(1), Some("ignored-after-initialization"))
+            .initialize_if_uninitialized(mainnet(), hash(1), Some("ignored-after-initialization".to_owned()))
             .await
             .expect("idempotent initialization");
         assert!(matches!(repeated, DatabaseState::Empty(_)));
@@ -311,12 +377,16 @@ mod tests {
     async fn coherent_state_opens_independent_capped_pool_generations() {
         let (_container, database_url) = fixture().await;
         let (mut database, uninitialized) = prepared_database(&database_url).await;
+        let (retirement_tx, _retirement_rx) = retirement_channel();
         assert!(
-            open_validated_generations(&database_url, uninitialized).await.expect("uninitialized capability classification").is_none()
+            open_validated_generations(database_url.clone(), uninitialized, retirement_tx.clone())
+                .await
+                .expect("uninitialized capability classification")
+                .is_none()
         );
         let state = database.initialize_if_uninitialized(mainnet(), hash(6), None).await.expect("initialization");
 
-        let generations = open_validated_generations(&database_url, state)
+        let generations = open_validated_generations(database_url.clone(), state, retirement_tx)
             .await
             .expect("validated generation creation")
             .expect("initialized database must publish generations");
@@ -376,8 +446,9 @@ mod tests {
             .await
             .expect("corrupt pruning-point score");
         let state = database.classify().await.expect("inconsistent classification");
+        let (retirement_tx, _retirement_rx) = retirement_channel();
 
-        let generations = open_validated_generations(&database_url, state)
+        let generations = open_validated_generations(database_url.clone(), state, retirement_tx)
             .await
             .expect("validated generation creation")
             .expect("bound inconsistent database must publish processing generation");
@@ -553,7 +624,8 @@ mod tests {
         let initialized = database.classify().await.expect("Genesis classification");
         assert!(matches!(initialized, DatabaseState::Initialized(_)));
 
-        let generations = open_validated_generations(&database_url, initialized)
+        let (retirement_tx, _retirement_rx) = retirement_channel();
+        let generations = open_validated_generations(database_url.clone(), initialized, retirement_tx)
             .await
             .expect("validated generation creation")
             .expect("initialized database must publish generations");

@@ -339,10 +339,10 @@ Start `kgi-storage` with public `error`, `generation`, and `service` modules.
 They own the typed storage failures, `DatabaseBinding` and validated generation
 capabilities, and the Supervisor-facing service lifecycle respectively. Keep
 SQLx adaptation, migration execution, schema inspection, processing-state
-inspection, service-loop commands, retirement plumbing, and deterministic
-timing in private `database`, `migration`, `schema`, `state`, `runtime`, and
-`timing` modules. Expose the public modules without crate-root wildcard
-re-exports.
+inspection, service-loop commands, and retirement plumbing in private
+`database`, `migration`, `schema`, `state`, and `runtime` modules. Consume the
+generic clock and jitter mechanism from `kgi-core::timing`. Expose the public
+modules without crate-root wildcard re-exports.
 
 These boundaries do not expose SQLx pools, connections, transactions, raw
 queries, or schema-classification details. Add each module only with its first
@@ -372,3 +372,47 @@ database and requires no ambient `DATABASE_URL`. Keep the image tag explicit
 so a routine dependency or image update cannot silently change database
 behavior. Tests use runtime SQL APIs, run through Nextest, and retain container
 handles until every database assertion and cleanup barrier has completed.
+
+## 8 October 2026: Permanent StorageService lifecycle
+
+### Worker, observation, and retirement plumbing
+
+Run StorageService ownership in one Tokio task. Use private unbounded Tokio
+MPSC channels for its low-rate control queue, reliable ordered lifecycle-event
+stream, and exact-generation retirement reports. The public service handle
+retains the task join handle and exposes latest-value status through a Tokio
+watch channel. Initialization, shutdown, and operation-detected retirement use
+one-shot completion barriers; initialization requests received while the
+database is unavailable remain in FIFO order.
+
+Both validated client types compose one private generic generation runtime that
+owns their pool, terminal atomic admission flag, retirement sender, and weak
+self-reference. A private generation-kind trait maps each concrete client type
+to its storage-local processing-or-API retirement target. Reports use the
+generic `kgi-core` retirement request envelope with that target and no reason
+payload. The service task compares the weak target with the currently owned
+exact `Arc`, suppresses stale and repeated reports, changes validity before
+event publication, and completes an operation barrier only after the retirement
+event has been enqueued. Processing and API pool generations remain
+independently replaceable. Losing the dedicated advisory-lock connection
+retires both in processing-then-API event order before the service reacquires
+database ownership.
+
+### Connection lifecycle and deterministic timing
+
+Retain the parsed database URL privately in StorageService and create fresh
+SQLx pools for every replacement generation. Poll the dedicated advisory-lock
+connection once per second while Ready. This interval is a private health-check
+implementation choice; the reconnect delays, equal-jitter range, and 60-second
+Ready reset remain defined by the
+[storage lifecycle](../architecture/storage.md#storageservice-lifecycle--settled).
+
+Inject the private connector and shared `kgi-core::timing` clock and jitter
+interfaces into the worker. Production uses SQLx plus the shared Tokio clock
+and entropy-seeded equal-jitter source; tests use scripted connection results,
+individually controlled sleeps, and identity jitter. PostgreSQL container tests
+terminate the actual advisory-lock backend to verify exact dual-generation
+retirement and autonomous republication. The
+Rebuild replacement gate and API database-phase drain remain part of the later
+database-replacement-safety implementation rather than this general connection
+lifecycle slice.

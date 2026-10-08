@@ -6,15 +6,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 kaspa-consensus-core.workspace = true
 kgi-api-model = { path = "../kgi-api-model" }
+kgi-core = { path = "../kgi-core" }
 kgi-model = { path = "../kgi-model" }
 sqlx.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 testcontainers-modules.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true

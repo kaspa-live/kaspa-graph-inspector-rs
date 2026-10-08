@@ -40,10 +40,21 @@ to storage. The processing client also loads a fresh storage-owned session
 state in one repeatable-read transaction. Initial publication and session
 loading share a bounded classifier based on existence checks, indexed PP and
 VSPC-sink lookup, and primary-key identity resolution; they perform no retained
-graph audit. The permanent autonomous service lifecycle, ordered events,
-reconnection, gated Rebuild-start API publication, and operation-level
-retirement barriers remain pending. No open architecture requirement currently
-blocks the remaining storage lifecycle work.
+graph audit. The permanent autonomous StorageService lifecycle now owns
+connection, advisory-lock health, initialization authorization, exact
+processing and API generation publication and retirement, independent pool
+replacement, terminal rejection, retry with equal jitter and its Ready reset,
+and terminal idempotent shutdown. The implemented session-state operation
+reports connection loss through a private exact-generation retirement barrier,
+so the ordered retirement event is enqueued before `GenerationLost` returns.
+Deterministic lifecycle tests cover the nominal retry sequence and reset
+boundary; PostgreSQL integration tests cover publication order, exact and
+independent replacement, advisory-lock contention and loss, and fatal
+event-path closure.
+The gated Rebuild-start API publication, replacement exclusion, and bounded
+drain/cancellation remain for the database-replacement-safety increment
+together with their dependent storage operations. No open architecture
+requirement currently blocks that work.
 
 The imported browser still uses the v1 graph data source, models, and update
 behavior, so it is not yet compatible with the v2 HTTP, SSE, publication, and

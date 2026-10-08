@@ -34,9 +34,17 @@ pub enum StorageRejection {
 /// Failure while preparing or inspecting KGI storage.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum StorageError {
+    /// The exact validated database generation was retired.
+    #[error("validated database generation was lost")]
+    GenerationLost,
+
     /// PostgreSQL could not complete the requested operation.
     #[error("PostgreSQL {operation} failed: {diagnostic}")]
     Database { operation: &'static str, diagnostic: Arc<str> },
+
+    /// Communication with the current PostgreSQL generation was lost.
+    #[error("PostgreSQL {operation} lost its connection: {diagnostic}")]
+    ConnectionLost { operation: &'static str, diagnostic: Arc<str> },
 
     /// An embedded migration could not be applied or validated.
     #[error("database migration failed: {diagnostic}")]
@@ -53,12 +61,26 @@ pub enum StorageError {
     /// The database is permanently incompatible with this process.
     #[error(transparent)]
     Rejected(#[from] StorageRejection),
+
+    /// The reliable lifecycle-event receiver was dropped.
+    #[error("storage lifecycle event path closed")]
+    EventPathClosed,
+
+    /// The permanent service control path is unavailable.
+    #[error("storage service control path is unavailable")]
+    ControlUnavailable,
+
+    /// The permanent service worker terminated unexpectedly.
+    #[error("storage service worker failed: {diagnostic}")]
+    WorkerFailed { diagnostic: Arc<str> },
 }
 
 impl StorageError {
     #[allow(dead_code, reason = "used by the private bootstrap lifecycle")]
-    pub(crate) fn database(operation: &'static str, error: impl std::fmt::Display) -> Self {
-        Self::Database { operation, diagnostic: Arc::from(error.to_string()) }
+    pub(crate) fn database(operation: &'static str, error: sqlx::Error) -> Self {
+        let connection_lost = sqlx_connection_lost(&error);
+        let diagnostic = Arc::from(error.to_string());
+        if connection_lost { Self::ConnectionLost { operation, diagnostic } } else { Self::Database { operation, diagnostic } }
     }
 
     #[allow(dead_code, reason = "used by the private bootstrap lifecycle")]
@@ -70,4 +92,20 @@ impl StorageError {
     pub(crate) fn invalid_metadata(diagnostic: impl Into<Arc<str>>) -> Self {
         Self::InvalidMetadata { diagnostic: diagnostic.into() }
     }
+
+    pub(crate) const fn is_connection_lost(&self) -> bool {
+        matches!(self, Self::ConnectionLost { .. })
+    }
+}
+
+fn sqlx_connection_lost(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::Protocol(_)
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::WorkerCrashed
+            | sqlx::Error::BeginFailed
+    )
 }
