@@ -313,7 +313,10 @@ embedded in the binary. Use SQLx's own migration-history table and checksum
 validation. Every migration remains forward-only and transaction-compatible;
 the administrative replacement path will run the embedded migration set
 inside its owning outer transaction rather than introduce a second schema
-definition.
+definition. When SQLx migration history exists, inspect its maximum version
+before comparing the database's table set with the current binary's known
+layout, so ordinary future migrations that add tables retain the specific
+`SchemaTooNew` classification.
 
 After migration, construct a physical-layout fingerprint from
 `information_schema` and `pg_catalog`. Match the exact KGI table, column,

@@ -650,6 +650,10 @@ mod tests {
         .execute(newer.connection_mut())
         .await
         .expect("future migration marker");
+        sqlx::query("CREATE TABLE future_projection_state (id BIGINT PRIMARY KEY)")
+            .execute(newer.connection_mut())
+            .await
+            .expect("future migration table");
         drop(newer);
         let newer = LockedDatabase::connect(&newer_url).await.expect("database lock");
         let error = match newer.prepare().await {

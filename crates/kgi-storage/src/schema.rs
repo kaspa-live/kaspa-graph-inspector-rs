@@ -88,8 +88,8 @@ const KGI_INDEXES: [&str; 13] = [
 ];
 
 pub(crate) async fn prepare(connection: &mut PgConnection) -> Result<(), StorageError> {
-    validate_migratable_layout(connection).await?;
     reject_newer_schema(connection).await?;
+    validate_migratable_layout(connection).await?;
     migration::migrate(connection).await?;
     validate_current_layout(connection).await
 }
