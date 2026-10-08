@@ -448,7 +448,7 @@ impl ValidatedRpcClient {
         self.require_active()?;
         let (completion_tx, completion_rx) = oneshot::channel();
         self.retirement_tx
-            .send(RetirementRequest::new(self.self_weak.clone(), reason, completion_tx))
+            .send(RetirementRequest::with_reason(self.self_weak.clone(), reason, completion_tx))
             .map_err(|_| NodeError::RetirementControlUnavailable)?;
         completion_rx.await.map_err(|_| NodeError::RetirementControlUnavailable)?;
         Ok(())
@@ -909,7 +909,7 @@ mod tests {
         });
 
         let retirement = retirements.recv().await.expect("retirement request");
-        assert_eq!(retirement.reason(), RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedGetBlock));
+        assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedGetBlock));
         assert!(client.retire().await);
         retirement.complete();
         assert_eq!(
@@ -931,7 +931,7 @@ mod tests {
         });
 
         let retirement = retirements.recv().await.expect("retirement request");
-        assert_eq!(retirement.reason(), RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedCatchupSinkResponse));
+        assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedCatchupSinkResponse));
         assert!(client.retire().await);
         retirement.complete();
         assert_eq!(
@@ -951,7 +951,7 @@ mod tests {
         });
 
         let retirement = retirements.recv().await.expect("retirement request");
-        assert_eq!(retirement.reason(), RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedGetBlocks));
+        assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedGetBlocks));
         assert!(client.retire().await);
         retirement.complete();
         assert_eq!(
@@ -971,9 +971,9 @@ mod tests {
         });
 
         let retirement = retirements.recv().await.expect("retirement request");
-        let generation = retirement.generation().upgrade().expect("exact generation");
+        let generation = retirement.target().upgrade().expect("exact generation");
         assert!(Arc::ptr_eq(&generation, &client));
-        assert_eq!(retirement.reason(), RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedGetBlock));
+        assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedGetBlock));
         assert!(client.retire().await);
         tokio::task::yield_now().await;
         assert!(!operation.is_finished());
@@ -1121,8 +1121,8 @@ mod tests {
         });
 
         let retirement = retirements.recv().await.expect("retirement request");
-        assert_eq!(retirement.reason(), RetirementReason::SubscriptionControlFailure);
-        assert!(retirement.generation().upgrade().is_some_and(|generation| Arc::ptr_eq(&generation, &client)));
+        assert_eq!(retirement.reason(), &RetirementReason::SubscriptionControlFailure);
+        assert!(retirement.target().upgrade().is_some_and(|generation| Arc::ptr_eq(&generation, &client)));
         assert!(client.retire().await);
         retirement.complete();
         assert_eq!(activation.await.expect("activation task"), Err(NodeError::GenerationLost));
@@ -1147,7 +1147,7 @@ mod tests {
         });
 
         let retirement = retirements.recv().await.expect("retirement request");
-        assert_eq!(retirement.reason(), RetirementReason::SubscriptionControlFailure);
+        assert_eq!(retirement.reason(), &RetirementReason::SubscriptionControlFailure);
         assert!(client.retire().await);
         retirement.complete();
         assert_eq!(deactivation.await.expect("deactivation task"), Err(NodeError::GenerationLost));
@@ -1176,7 +1176,7 @@ mod tests {
         });
 
         let retirement = retirements.recv().await.expect("retirement request");
-        assert_eq!(retirement.reason(), RetirementReason::SubscriptionControlFailure);
+        assert_eq!(retirement.reason(), &RetirementReason::SubscriptionControlFailure);
         assert!(client.retire().await);
         retirement.complete();
         assert_eq!(deactivation.await.expect("deactivation task"), Err(NodeError::GenerationLost));

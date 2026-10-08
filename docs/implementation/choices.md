@@ -247,9 +247,10 @@ permit and then confirms generation admission before issuing an upstream call.
 Retirement closes admission before disconnecting the physical client. A
 private synchronous mutex protects the router and subscription state needed by
 rusty-kaspa's synchronous notification callback; no mutex guard crosses an
-await. Generation-ending reports travel to the owner loop with a one-shot
-barrier so ordered retirement is complete before the operation returns its
-typed result.
+await. Generation-ending reports use the generic `kgi-core` retirement request
+envelope with a node-local weak generation target and reason. Its one-shot
+barrier ensures ordered retirement is complete before the operation returns
+its typed result.
 
 ### Deterministic test seams
 

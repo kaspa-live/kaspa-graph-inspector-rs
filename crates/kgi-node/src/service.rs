@@ -365,7 +365,7 @@ impl NodeServiceWorker {
                         return Err(NodeServiceError::ControlUnavailable);
                     };
                     if request_targets(&request, &client) {
-                        let reason = request.reason();
+                        let reason = *request.reason();
                         let event_result = self.stop_generation(&client, false).await;
                         request.complete();
                         event_result?;
@@ -477,7 +477,7 @@ fn status_from_info(info: &ValidatedNodeInfo) -> ValidatedNodeStatus {
 }
 
 fn request_targets(request: &RetirementRequest, client: &Arc<ValidatedRpcClient>) -> bool {
-    request.generation().upgrade().is_some_and(|reported| Arc::ptr_eq(&reported, client))
+    request.target().upgrade().is_some_and(|reported| Arc::ptr_eq(&reported, client))
 }
 
 fn complete_stale_retirement(request: Option<RetirementRequest>) -> Result<(), NodeServiceError> {
