@@ -395,8 +395,9 @@ exact `Arc`, suppresses stale and repeated reports, changes validity before
 event publication, and completes an operation barrier only after the retirement
 event has been enqueued. Processing and API pool generations remain
 independently replaceable. Losing the dedicated advisory-lock connection
-retires both in processing-then-API event order before the service reacquires
-database ownership.
+uses the same owned-generation retirement path before the service reacquires
+database ownership; the [storage lifecycle](../architecture/storage.md#storageservice-lifecycle--settled)
+owns the exact conditional event contract.
 
 ### Connection lifecycle and deterministic timing
 

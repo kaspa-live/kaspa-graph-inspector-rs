@@ -717,6 +717,7 @@ mod tests {
         database::{DatabaseConnector, LockedDatabase},
         error::{StorageError, StorageRejection},
         generation::{ValidatedApiDbClient, ValidatedDbClient},
+        state::DatabaseState,
     };
 
     const POSTGRES_PORT: u16 = 5432;
@@ -905,6 +906,46 @@ mod tests {
         assert!(!Arc::ptr_eq(&replacement_api, &api));
 
         service.shutdown().await.expect("service shutdown");
+    }
+
+    #[tokio::test]
+    async fn advisory_lock_loss_without_api_generation_retires_only_processing() {
+        let (_container, database_url) = fixture().await;
+        let (mut database, state) =
+            LockedDatabase::connect(database_url.as_str()).await.expect("database lock").prepare().await.expect("schema preparation");
+        assert!(matches!(state, DatabaseState::Uninitialized));
+        database.initialize_if_uninitialized(mainnet(), hash(1), None).await.expect("database initialization");
+        sqlx::query("INSERT INTO processing_metadata (singleton, db_pp_blue_score) VALUES (TRUE, 0)")
+            .execute(database.connection_mut())
+            .await
+            .expect("inconsistent processing metadata");
+        drop(database);
+
+        let (service, mut events) = StorageService::start(database_url.clone());
+        let processing = match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbPublished(client) => client,
+            event => panic!("expected processing-only publication, got {event:?}"),
+        };
+        wait_for_status(&service, StorageServiceStatusState::Ready).await;
+
+        let mut observer = PgConnection::connect(database_url.as_str()).await.expect("lock observer");
+        terminate_lock_owner(&mut observer).await;
+
+        match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &processing)),
+            event => panic!("expected processing retirement after lock loss, got {event:?}"),
+        }
+        let replacement = match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbPublished(client) => client,
+            event => panic!("expected processing-only republication, got {event:?}"),
+        };
+        assert!(!Arc::ptr_eq(&replacement, &processing));
+
+        service.shutdown().await.expect("service shutdown");
+        match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &replacement)),
+            event => panic!("expected only replacement processing retirement, got {event:?}"),
+        }
     }
 
     #[tokio::test]
