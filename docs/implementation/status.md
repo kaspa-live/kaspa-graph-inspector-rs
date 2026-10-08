@@ -49,7 +49,8 @@ processing and API generation publication and retirement, independent pool
 replacement, terminal rejection, retry with equal jitter and its Ready reset,
 and terminal idempotent shutdown. The implemented session-state operation
 reports connection loss through a private exact-generation retirement barrier,
-so the ordered retirement event is enqueued before `GenerationLost` returns.
+so the ordered retirement event is enqueued before `GenerationLost` returns;
+event-enqueue failure is instead returned through that result-bearing barrier.
 Deterministic lifecycle tests cover the nominal retry sequence and reset
 boundary; PostgreSQL integration tests cover publication order, exact and
 independent replacement, advisory-lock contention, lock loss with both

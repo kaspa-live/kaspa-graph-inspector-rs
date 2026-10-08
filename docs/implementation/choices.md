@@ -248,9 +248,10 @@ Retirement closes admission before disconnecting the physical client. A
 private synchronous mutex protects the router and subscription state needed by
 rusty-kaspa's synchronous notification callback; no mutex guard crosses an
 await. Generation-ending reports use the generic `kgi-core` retirement request
-envelope with a node-local weak generation target and reason. Its one-shot
-barrier ensures ordered retirement is complete before the operation returns
-its typed result.
+envelope with a node-local weak generation target and reason. The envelope's
+one-shot barrier carries the service-side `Result`; NodeService acknowledges
+success only after event enqueue and maps a failed barrier to the existing
+operation-level retirement-control error.
 
 ### Deterministic test seams
 
@@ -390,8 +391,10 @@ MPSC channels for its low-rate control queue, reliable ordered lifecycle-event
 stream, and exact-generation retirement reports. The public service handle
 retains the task join handle and exposes latest-value status through a Tokio
 watch channel. Initialization, shutdown, and operation-detected retirement use
-one-shot completion barriers; initialization requests received while the
-database is unavailable remain in FIFO order.
+one-shot completion barriers; the retirement barrier carries
+`Result<(), StorageError>` so an event-path failure reaches the reporting
+operation rather than being mistaken for completed retirement. Initialization
+requests received while the database is unavailable remain in FIFO order.
 
 Both validated client types compose one private generic generation runtime that
 owns their pool, terminal atomic admission flag, retirement sender, and weak

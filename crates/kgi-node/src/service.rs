@@ -367,13 +367,13 @@ impl NodeServiceWorker {
                     if request_targets(&request, &client) {
                         let reason = *request.reason();
                         let event_result = self.stop_generation(&client, false).await;
-                        request.complete();
+                        request.complete(event_result.clone());
                         event_result?;
                         return Ok(ReadyExit::Reconnect(NodeUnavailableReason::ConnectionLost {
                             diagnostic: Arc::from(format!("generation retired after {reason:?}")),
                         }));
                     }
-                    request.complete();
+                    request.complete(Ok(()));
                 }
                 result = connection.wait_for_disconnect() => {
                     self.stop_generation(&client, false).await?;
@@ -482,7 +482,7 @@ fn request_targets(request: &RetirementRequest, client: &Arc<ValidatedRpcClient>
 
 fn complete_stale_retirement(request: Option<RetirementRequest>) -> Result<(), NodeServiceError> {
     let request = request.ok_or(NodeServiceError::ControlUnavailable)?;
-    request.complete();
+    request.complete(Ok(()));
     Ok(())
 }
 
@@ -955,6 +955,22 @@ mod tests {
         );
         assert_eq!(service.status().state, NodeServiceStatusState::Unavailable);
         service.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn malformed_runtime_response_reports_retirement_event_path_failure() {
+        let network_id = mainnet();
+        let connection = Arc::new(ScriptedConnection::new([server_info(network_id, true)], hash(1)).with_malformed_blocks());
+        let connector = connector([Ok(connection as Arc<dyn RpcConnection>)]);
+        let (service, mut events) = start_service(network_id, connector, Arc::new(TokioClock));
+        let published = match recv_event(&mut events).await {
+            NodeServiceEvent::RpcPublished(client) => client,
+            _ => panic!("expected published generation"),
+        };
+        drop(events);
+
+        assert_eq!(published.full_block(hash(9)).await, Err(NodeError::RetirementControlUnavailable));
+        assert_eq!(service.shutdown().await, Err(super::NodeServiceError::EventPathClosed));
     }
 
     fn start_service(

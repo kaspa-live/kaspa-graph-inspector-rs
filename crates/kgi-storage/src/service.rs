@@ -561,7 +561,7 @@ impl StorageServiceWorker {
                     if client.retire() {
                         self.track_processing_cleanup(client.clone());
                         let event_result = self.send_event(StorageServiceEvent::ProcessingDbRetired(client.clone()));
-                        request.complete();
+                        request.complete(event_result.clone());
                         return event_result;
                     }
                 }
@@ -576,13 +576,13 @@ impl StorageServiceWorker {
                     if client.retire() {
                         self.track_api_cleanup(client.clone());
                         let event_result = self.send_event(StorageServiceEvent::ApiDbRetired(client.clone()));
-                        request.complete();
+                        request.complete(event_result.clone());
                         return event_result;
                     }
                 }
             }
         }
-        request.complete();
+        request.complete(Ok(()));
         Ok(())
     }
 
@@ -809,7 +809,7 @@ fn queue_or_shutdown(command: Option<ServiceCommand>, pending: &mut VecDeque<Ini
 
 fn complete_stale_retirement(request: Option<RetirementRequest>) -> Result<(), StorageError> {
     let request = request.ok_or(StorageError::ControlUnavailable)?;
-    request.complete();
+    request.complete(Ok(()));
     Ok(())
 }
 
@@ -1221,6 +1221,18 @@ mod tests {
 
         assert_eq!(service.shutdown().await, Err(StorageError::EventPathClosed));
         let _new_owner = LockedDatabase::connect(database_url.as_str()).await.expect("released lock must be reacquirable");
+    }
+
+    #[tokio::test]
+    async fn operation_retirement_reports_event_path_failure_instead_of_generation_loss() {
+        let (_container, database_url) = fixture().await;
+        let (service, events, processing, _api) = initialize_service(database_url).await;
+        drop(events);
+
+        processing.close().await;
+        let result = timeout(TEST_TIMEOUT, processing.load_session_state()).await.expect("operation retirement barrier must complete");
+        assert_eq!(result, Err(StorageError::EventPathClosed));
+        assert_eq!(service.shutdown().await, Err(StorageError::EventPathClosed));
     }
 
     struct FailingConnector {

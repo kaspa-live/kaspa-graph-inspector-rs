@@ -4,7 +4,7 @@ use kgi_core::retirement::RetirementRequest as CoreRetirementRequest;
 use kgi_model::lifecycle::RecoveryInputKind;
 use tokio::sync::mpsc;
 
-use crate::rpc::ValidatedRpcClient;
+use crate::{error::NodeServiceError, rpc::ValidatedRpcClient};
 
 pub(crate) type RetirementSender = mpsc::UnboundedSender<RetirementRequest>;
 pub(crate) type RetirementReceiver = mpsc::UnboundedReceiver<RetirementRequest>;
@@ -15,7 +15,7 @@ pub(crate) enum RetirementReason {
     SubscriptionControlFailure,
 }
 
-pub(crate) type RetirementRequest = CoreRetirementRequest<Weak<ValidatedRpcClient>, RetirementReason>;
+pub(crate) type RetirementRequest = CoreRetirementRequest<Weak<ValidatedRpcClient>, RetirementReason, NodeServiceError>;
 
 pub(crate) fn retirement_channel() -> (RetirementSender, RetirementReceiver) {
     mpsc::unbounded_channel()

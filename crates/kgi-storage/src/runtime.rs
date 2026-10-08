@@ -3,7 +3,10 @@ use std::sync::Weak;
 use kgi_core::retirement::RetirementRequest as CoreRetirementRequest;
 use tokio::sync::mpsc;
 
-use crate::generation::{ValidatedApiDbClient, ValidatedDbClient};
+use crate::{
+    error::StorageError,
+    generation::{ValidatedApiDbClient, ValidatedDbClient},
+};
 
 pub(crate) type RetirementSender = mpsc::UnboundedSender<RetirementRequest>;
 pub(crate) type RetirementReceiver = mpsc::UnboundedReceiver<RetirementRequest>;
@@ -14,7 +17,7 @@ pub(crate) enum RetirementTarget {
     Api(Weak<ValidatedApiDbClient>),
 }
 
-pub(crate) type RetirementRequest = CoreRetirementRequest<RetirementTarget>;
+pub(crate) type RetirementRequest = CoreRetirementRequest<RetirementTarget, (), StorageError>;
 
 pub(crate) fn retirement_channel() -> (RetirementSender, RetirementReceiver) {
     mpsc::unbounded_channel()

@@ -108,14 +108,8 @@ impl<T: GenerationKind> GenerationRuntime<T> {
         }
         let (completion, acknowledgement) = oneshot::channel();
         let target = T::retirement_target(self.self_weak.clone());
-        if self.retirement_tx.send(RetirementRequest::new(target, completion)).is_err() {
-            return if self.is_valid() { Err(StorageError::ControlUnavailable) } else { Ok(()) };
-        }
-        match acknowledgement.await {
-            Ok(()) => Ok(()),
-            Err(_) if !self.is_valid() => Ok(()),
-            Err(_) => Err(StorageError::ControlUnavailable),
-        }
+        self.retirement_tx.send(RetirementRequest::new(target, completion)).map_err(|_| StorageError::ControlUnavailable)?;
+        acknowledgement.await.map_err(|_| StorageError::ControlUnavailable)?
     }
 }
 

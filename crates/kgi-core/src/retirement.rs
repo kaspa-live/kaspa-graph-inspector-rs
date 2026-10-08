@@ -3,22 +3,22 @@
 use tokio::sync::oneshot;
 
 /// A service-owned retirement target paired with a completion barrier.
-pub struct RetirementRequest<T, R = ()> {
+pub struct RetirementRequest<T, R = (), E = ()> {
     target: T,
     reason: R,
-    completion: oneshot::Sender<()>,
+    completion: oneshot::Sender<Result<(), E>>,
 }
 
-impl<T> RetirementRequest<T> {
+impl<T, E> RetirementRequest<T, (), E> {
     /// Creates a retirement request without a reason payload.
-    pub fn new(target: T, completion: oneshot::Sender<()>) -> Self {
+    pub fn new(target: T, completion: oneshot::Sender<Result<(), E>>) -> Self {
         Self { target, reason: (), completion }
     }
 }
 
-impl<T, R> RetirementRequest<T, R> {
+impl<T, R, E> RetirementRequest<T, R, E> {
     /// Creates a retirement request with a service-specific reason.
-    pub fn with_reason(target: T, reason: R, completion: oneshot::Sender<()>) -> Self {
+    pub fn with_reason(target: T, reason: R, completion: oneshot::Sender<Result<(), E>>) -> Self {
         Self { target, reason, completion }
     }
 
@@ -34,9 +34,9 @@ impl<T, R> RetirementRequest<T, R> {
         &self.reason
     }
 
-    /// Completes the request's acknowledgement barrier.
-    pub fn complete(self) {
-        let _ = self.completion.send(());
+    /// Completes the request's acknowledgement barrier with the service result.
+    pub fn complete(self, result: Result<(), E>) {
+        let _ = self.completion.send(result);
     }
 }
 
@@ -47,19 +47,19 @@ mod tests {
     use super::RetirementRequest;
 
     #[test]
-    fn reasonless_request_preserves_target_and_completes_barrier() {
+    fn reasonless_request_preserves_target_and_completes_result_barrier() {
         let (completion, mut acknowledgement) = oneshot::channel();
         let request = RetirementRequest::new(7_u8, completion);
 
         assert_eq!(*request.target(), 7);
         assert_eq!(*request.reason(), ());
-        request.complete();
-        assert_eq!(acknowledgement.try_recv(), Ok(()));
+        request.complete(Err("event path closed"));
+        assert_eq!(acknowledgement.try_recv(), Ok(Err("event path closed")));
     }
 
     #[test]
     fn reasoned_request_preserves_target_and_reason() {
-        let (completion, _acknowledgement) = oneshot::channel();
+        let (completion, _acknowledgement) = oneshot::channel::<Result<(), ()>>();
         let request = RetirementRequest::with_reason("generation", "malformed response", completion);
 
         assert_eq!(*request.target(), "generation");
