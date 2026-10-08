@@ -1703,9 +1703,17 @@ unvalidated client, and bounded old-generation drain failure as
 `RebuildSetupFailed(ApiReadExclusion)` with retirement of the still-gated fresh
 API generation. Neither starts the replacement transaction, mutates processing
 contents or caches, or retires the processing generation. Cover setup
-cancellation as ordinary cancellation without a fault, and distinguish a
-proven processing-generation loss and an internal replacement-control failure
-through their existing typed paths. No in-flight request
+cancellation as ordinary cancellation without a fault. Break replacement
+control before fresh API publication, after gated fresh API publication, and
+while a phase admitted by a retired generation still holds a lease. Each
+unexpected case returns
+`StorageError::ReplacementControlUnavailable`, starts no replacement
+transaction, retires the current API generation if one exists, leaves the
+processing generation and persistent state unchanged, and reports
+`Ownership(ManagedComponentUnavailable)` from StorageService with Fatal
+disposition. Verify active database-phase cancellation is best effort and does
+not delay the fault indefinitely, while the resulting global shutdown performs
+ordinary bounded resource cleanup. No in-flight request
 rebinds to a newly published storage generation,
 and no request observes a partial or mixed generation, including with
 PostgreSQL `TRUNCATE`. Verify ordinary sender teardown may close the installed

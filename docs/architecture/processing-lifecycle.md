@@ -434,6 +434,18 @@ next attempt performs fresh Rebuild preparation and never reissues only the
 failed setup phase. Observing this fault in another recovery mode or in Live is
 an invalid lifecycle condition and is Fatal.
 
+StorageService's typed
+[`StorageError::ReplacementControlUnavailable`](storage.md#api-read-exclusion-during-database-replacement--settled)
+maps to
+`Ownership(ManagedComponentUnavailable)` with `source: StorageService` and a
+Fatal disposition. The service-owned replacement infrastructure cannot be
+recreated by retrying a Rebuild or starting another processing session.
+Supervisor therefore enters Fatal and begins ordinary global shutdown without
+changing the retained recovery obligation. This fault is neither
+`Ownership(InternalControlPathLost)`, which is reserved for worker command
+paths, nor a persistence fault. Expected cancellation after session or service
+shutdown has begun remains ordinary cancellation and reports no fault.
+
 Storage owns local transaction retries, operation-outcome classification, and
 database-generation retirement; see
 [storage.md](storage.md#transaction-retries). Using those classifications, the

@@ -215,8 +215,10 @@ loss or service-rejection classifications.
 
 `ApiReadExclusion` means that the bounded cancellation and drain procedure
 could not establish exclusive replacement access. An unexpectedly closed or
-broken replacement-control primitive is instead an internal StorageService
-failure, not a recoverable setup fault.
+broken replacement-control primitive returns
+`StorageError::ReplacementControlUnavailable { diagnostic }`. This is an
+internal StorageService failure, not a recoverable setup fault and not a
+persistence failure.
 
 Every database phase performed through `ValidatedApiDbClient` holds a shared
 database-replacement permit from before its read-only transaction begins until
@@ -273,6 +275,21 @@ generation cleanup and follows the ordinary cancellation path rather than
 returning `StorageError::RebuildSetupFailed`. If connection loss proves the
 processing generation unusable, StorageService instead retires it and returns
 `ServiceGenerationLost(Storage)` under the existing generation-loss contract.
+
+If replacement control becomes unavailable unexpectedly while StorageService
+is required to operate, no replacement transaction starts. StorageService
+keeps API database admission closed wherever the remaining control path permits,
+retires the currently published API generation if one exists, and emits its
+exact `ApiDbRetired` event before returning
+`StorageError::ReplacementControlUnavailable`. It requests cancellation of
+active API database phases on a best-effort basis but does not delay fault
+reporting indefinitely through the broken control path. Database contents,
+processing caches, and the current processing generation remain unchanged:
+loss of API replacement control does not prove processing-generation loss.
+The [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
+owns the resulting terminal component disposition.
+If session or service cancellation has already been selected, the ordinary
+cancellation path takes precedence over this fault.
 
 The exclusive permit remains held through the atomic replacement outcome and
 cache publication or generation retirement. A database phase started through
