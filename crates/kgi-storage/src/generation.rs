@@ -93,6 +93,11 @@ impl<T: GenerationKind> GenerationRuntime<T> {
         self.valid.swap(false, Ordering::AcqRel)
     }
 
+    fn begin_close(&self) {
+        // SQLx marks the pool closed before returning the future that drains it.
+        drop(self.pool.close());
+    }
+
     async fn close(&self) {
         self.pool.close().await;
     }
@@ -165,6 +170,10 @@ impl ValidatedDbClient {
         self.runtime.retire()
     }
 
+    pub(crate) fn begin_close(&self) {
+        self.runtime.begin_close();
+    }
+
     pub(crate) async fn close(&self) {
         self.runtime.close().await;
     }
@@ -214,6 +223,10 @@ impl ValidatedApiDbClient {
     #[allow(dead_code, reason = "used by the permanent service lifecycle")]
     pub(crate) fn retire(&self) -> bool {
         self.runtime.retire()
+    }
+
+    pub(crate) fn begin_close(&self) {
+        self.runtime.begin_close();
     }
 
     pub(crate) async fn close(&self) {

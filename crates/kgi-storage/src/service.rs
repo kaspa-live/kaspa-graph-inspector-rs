@@ -9,7 +9,7 @@ use kgi_model::{
 };
 use tokio::{
     sync::{Mutex, mpsc, oneshot, watch},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 use url::Url;
 
@@ -105,6 +105,7 @@ impl StorageService {
             retirement_tx,
             status: status_tx,
             generation_opener,
+            cleanup: JoinSet::new(),
         };
         let join = tokio::spawn(async move {
             let result = worker.run().await;
@@ -231,10 +232,17 @@ struct StorageServiceWorker {
     retirement_tx: RetirementSender,
     status: watch::Sender<StorageServiceStatus>,
     generation_opener: Arc<dyn GenerationOpener>,
+    cleanup: JoinSet<()>,
 }
 
 impl StorageServiceWorker {
     async fn run(mut self) -> Result<(), StorageError> {
+        let lifecycle_result = self.run_lifecycle().await;
+        let cleanup_result = self.join_cleanup().await;
+        lifecycle_result.and(cleanup_result)
+    }
+
+    async fn run_lifecycle(&mut self) -> Result<(), StorageError> {
         let mut retry_index = 0;
         let mut pending_initialization = VecDeque::new();
         'lifecycle: loop {
@@ -388,7 +396,7 @@ impl StorageServiceWorker {
                             Ok(client) => {
                                 if database.ping().await.is_err() {
                                     client.retire();
-                                    client.close().await;
+                                    self.track_processing_cleanup(client);
                                     self.handle_lock_loss(active).await?;
                                     return Ok(ActiveExit::Reconnect);
                                 }
@@ -434,7 +442,7 @@ impl StorageServiceWorker {
                             Ok(client) => {
                                 if database.ping().await.is_err() {
                                     client.retire();
-                                    client.close().await;
+                                    self.track_api_cleanup(client);
                                     self.handle_lock_loss(active).await?;
                                     return Ok(ActiveExit::Reconnect);
                                 }
@@ -536,7 +544,11 @@ impl StorageServiceWorker {
         }
     }
 
-    async fn handle_retirement(&self, request: Option<RetirementRequest>, active: &mut ActiveGenerations) -> Result<(), StorageError> {
+    async fn handle_retirement(
+        &mut self,
+        request: Option<RetirementRequest>,
+        active: &mut ActiveGenerations,
+    ) -> Result<(), StorageError> {
         let request = request.ok_or(StorageError::ControlUnavailable)?;
         match request.target() {
             RetirementTarget::Processing(reported) => {
@@ -547,9 +559,9 @@ impl StorageServiceWorker {
                 if targeted {
                     let client = active.processing.take().expect("targeted processing generation exists");
                     if client.retire() {
+                        self.track_processing_cleanup(client.clone());
                         let event_result = self.send_event(StorageServiceEvent::ProcessingDbRetired(client.clone()));
                         request.complete();
-                        client.close().await;
                         return event_result;
                     }
                 }
@@ -562,9 +574,9 @@ impl StorageServiceWorker {
                 if targeted {
                     let client = active.api.take().expect("targeted API generation exists");
                     if client.retire() {
+                        self.track_api_cleanup(client.clone());
                         let event_result = self.send_event(StorageServiceEvent::ApiDbRetired(client.clone()));
                         request.complete();
-                        client.close().await;
                         return event_result;
                     }
                 }
@@ -608,7 +620,7 @@ impl StorageServiceWorker {
         }
     }
 
-    async fn handle_lock_loss(&self, active: &mut ActiveGenerations) -> Result<(), StorageError> {
+    async fn handle_lock_loss(&mut self, active: &mut ActiveGenerations) -> Result<(), StorageError> {
         self.retire_all(active).await?;
         self.publish_status(StorageServiceStatusState::Unavailable);
         Ok(())
@@ -667,32 +679,46 @@ impl StorageServiceWorker {
         Ok(())
     }
 
-    async fn retire_all(&self, active: &mut ActiveGenerations) -> Result<(), StorageError> {
+    async fn retire_all(&mut self, active: &mut ActiveGenerations) -> Result<(), StorageError> {
         let mut result = Ok(());
         let processing = active.processing.take();
         let api = active.api.take();
         if let Some(processing) = &processing
             && processing.retire()
-            && let Err(error) = self.send_event(StorageServiceEvent::ProcessingDbRetired(processing.clone()))
         {
-            result = Err(error);
+            self.track_processing_cleanup(processing.clone());
+            if let Err(error) = self.send_event(StorageServiceEvent::ProcessingDbRetired(processing.clone())) {
+                result = Err(error);
+            }
         }
         if let Some(api) = &api
             && api.retire()
-            && let Err(error) = self.send_event(StorageServiceEvent::ApiDbRetired(api.clone()))
-            && result.is_ok()
         {
-            result = Err(error);
-        }
-        match (processing, api) {
-            (Some(processing), Some(api)) => {
-                tokio::join!(processing.close(), api.close());
+            self.track_api_cleanup(api.clone());
+            if let Err(error) = self.send_event(StorageServiceEvent::ApiDbRetired(api.clone()))
+                && result.is_ok()
+            {
+                result = Err(error);
             }
-            (Some(processing), None) => processing.close().await,
-            (None, Some(api)) => api.close().await,
-            (None, None) => {}
         }
         result
+    }
+
+    fn track_processing_cleanup(&mut self, client: Arc<ValidatedDbClient>) {
+        client.begin_close();
+        self.cleanup.spawn(async move { client.close().await });
+    }
+
+    fn track_api_cleanup(&mut self, client: Arc<ValidatedApiDbClient>) {
+        client.begin_close();
+        self.cleanup.spawn(async move { client.close().await });
+    }
+
+    async fn join_cleanup(&mut self) -> Result<(), StorageError> {
+        while let Some(result) = self.cleanup.join_next().await {
+            result.map_err(|error| StorageError::WorkerFailed { diagnostic: Arc::from(error.to_string()) })?;
+        }
+        Ok(())
     }
 
     async fn reject_active(&mut self, active: &mut ActiveGenerations, rejection: StorageRejection) -> Result<(), StorageError> {
@@ -961,6 +987,45 @@ mod tests {
             event => panic!("expected rejection after exact retirements, got {event:?}"),
         }
         service.shutdown().await.expect("rejected service shutdown");
+    }
+
+    #[tokio::test]
+    async fn api_retirement_replaces_before_checked_out_connection_returns() {
+        let (_container, database_url) = fixture().await;
+        let (service, mut events, processing, api) = initialize_service(database_url).await;
+        let held_connection = api.pool().acquire().await.expect("checked-out API connection");
+
+        timeout(TEST_TIMEOUT, api.request_retirement())
+            .await
+            .expect("retirement must not wait for the checked-out connection")
+            .expect("API retirement barrier");
+        assert!(api.pool().is_closed());
+        match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &api)),
+            event => panic!("expected API retirement, got {event:?}"),
+        }
+        let replacement_api = match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbPublished(client) => client,
+            event => panic!("expected API replacement before releasing the old connection, got {event:?}"),
+        };
+
+        let shutdown = service.shutdown();
+        tokio::pin!(shutdown);
+        assert!(timeout(Duration::from_millis(100), &mut shutdown).await.is_err());
+        match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &processing)),
+            event => panic!("expected processing retirement during shutdown, got {event:?}"),
+        }
+        match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &replacement_api)),
+            event => panic!("expected replacement API retirement during shutdown, got {event:?}"),
+        }
+
+        drop(held_connection);
+        timeout(TEST_TIMEOUT, shutdown)
+            .await
+            .expect("shutdown must finish after the old connection returns")
+            .expect("service shutdown");
     }
 
     #[tokio::test]

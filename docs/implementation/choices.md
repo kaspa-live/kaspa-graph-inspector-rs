@@ -393,10 +393,14 @@ generic `kgi-core` retirement request envelope with that target and no reason
 payload. The service task compares the weak target with the currently owned
 exact `Arc`, suppresses stale and repeated reports, changes validity before
 event publication, and completes an operation barrier only after the retirement
-event has been enqueued. Processing and API pool generations remain
-independently replaceable. Losing the dedicated advisory-lock connection
-uses the same owned-generation retirement path before the service reacquires
-database ownership; the [storage lifecycle](../architecture/storage.md#storageservice-lifecycle--settled)
+event has been enqueued. Retirement synchronously marks the SQLx pool closed,
+then moves its potentially blocking drain into a tracked Tokio task so the
+serialized lifecycle worker can publish and validate the replacement without
+waiting for checked-out connections. Terminal worker completion joins every
+tracked drain. Processing and API pool generations remain independently
+replaceable. Losing the dedicated advisory-lock connection uses the same
+owned-generation retirement path before the service reacquires database
+ownership; the [storage lifecycle](../architecture/storage.md#storageservice-lifecycle--settled)
 owns the exact conditional event contract.
 
 ### Connection lifecycle and deterministic timing
