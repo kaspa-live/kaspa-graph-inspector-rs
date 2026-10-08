@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{collections::VecDeque, future::Future, sync::Arc, time::Duration};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use kaspa_consensus_core::network::NetworkId;
@@ -59,6 +62,10 @@ pub struct StorageService {
     status: watch::Receiver<StorageServiceStatus>,
     completion: watch::Receiver<Option<Result<(), StorageError>>>,
     join: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    retained_cleanup_tasks: Arc<AtomicUsize>,
+    #[cfg(test)]
+    panic_next_cleanup: Arc<AtomicBool>,
 }
 
 impl StorageService {
@@ -94,6 +101,10 @@ impl StorageService {
         let (retirement_tx, retirement_rx) = retirement_channel();
         let (status_tx, status_rx) = watch::channel(StorageServiceStatus { state: StorageServiceStatusState::Connecting });
         let (completion_tx, completion_rx) = watch::channel(None);
+        #[cfg(test)]
+        let retained_cleanup_tasks = Arc::new(AtomicUsize::new(0));
+        #[cfg(test)]
+        let panic_next_cleanup = Arc::new(AtomicBool::new(false));
         let worker = StorageServiceWorker {
             database_url,
             connector,
@@ -106,13 +117,25 @@ impl StorageService {
             status: status_tx,
             generation_opener,
             cleanup: JoinSet::new(),
+            #[cfg(test)]
+            retained_cleanup_tasks: retained_cleanup_tasks.clone(),
+            #[cfg(test)]
+            panic_next_cleanup: panic_next_cleanup.clone(),
         };
         let join = tokio::spawn(async move {
             let result = worker.run().await;
             completion_tx.send_replace(Some(result));
         });
-        let service =
-            Arc::new(Self { commands: command_tx, status: status_rx, completion: completion_rx, join: Mutex::new(Some(join)) });
+        let service = Arc::new(Self {
+            commands: command_tx,
+            status: status_rx,
+            completion: completion_rx,
+            join: Mutex::new(Some(join)),
+            #[cfg(test)]
+            retained_cleanup_tasks,
+            #[cfg(test)]
+            panic_next_cleanup,
+        });
         (service, event_rx)
     }
 
@@ -165,6 +188,16 @@ impl StorageService {
             return Ok(());
         };
         join.await.map_err(|error| StorageError::WorkerFailed { diagnostic: Arc::from(error.to_string()) })
+    }
+
+    #[cfg(test)]
+    fn retained_cleanup_tasks(&self) -> usize {
+        self.retained_cleanup_tasks.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn panic_next_cleanup(&self) {
+        self.panic_next_cleanup.store(true, Ordering::Release);
     }
 }
 
@@ -232,6 +265,10 @@ struct StorageServiceWorker {
     status: watch::Sender<StorageServiceStatus>,
     generation_opener: Arc<dyn GenerationOpener>,
     cleanup: JoinSet<()>,
+    #[cfg(test)]
+    retained_cleanup_tasks: Arc<AtomicUsize>,
+    #[cfg(test)]
+    panic_next_cleanup: Arc<AtomicBool>,
 }
 
 impl StorageServiceWorker {
@@ -245,6 +282,7 @@ impl StorageServiceWorker {
         let mut retry_index = 0;
         let mut pending_initialization = VecDeque::new();
         'lifecycle: loop {
+            self.reap_completed_cleanup()?;
             self.publish_status(StorageServiceStatusState::Connecting);
             let connector = self.connector.clone();
             let database_url = self.database_url.as_str().to_owned();
@@ -255,6 +293,7 @@ impl StorageServiceWorker {
             tokio::pin!(opening);
             let (mut database, mut state) = loop {
                 tokio::select! {
+                    cleanup = self.cleanup.join_next(), if !self.cleanup.is_empty() => self.complete_cleanup(cleanup)?,
                     command = self.commands.recv() => match queue_or_shutdown(command, &mut pending_initialization) {
                         CommandDisposition::Continue => {}
                         CommandDisposition::Shutdown => return self.finish_without_generations().await,
@@ -283,6 +322,7 @@ impl StorageServiceWorker {
                         break request;
                     }
                     tokio::select! {
+                        cleanup = self.cleanup.join_next(), if !self.cleanup.is_empty() => self.complete_cleanup(cleanup)?,
                         command = self.commands.recv() => match command {
                             Some(ServiceCommand::Initialize { network_id, genesis_hash, completion }) => {
                                 break InitializationRequest { network_id, genesis_hash, completion };
@@ -394,11 +434,11 @@ impl StorageServiceWorker {
                 let binding = active.binding;
                 let opening = async move { generation_opener.open_processing(database_url, binding, retirement_tx).await };
                 tokio::pin!(opening);
+                let health = wait_for_lock_health(self.clock.clone());
+                tokio::pin!(health);
                 loop {
-                    let health_clock = self.clock.clone();
-                    let health = async move { health_clock.sleep(LOCK_HEALTH_INTERVAL).await };
-                    tokio::pin!(health);
                     tokio::select! {
+                        cleanup = self.cleanup.join_next(), if !self.cleanup.is_empty() => self.complete_cleanup(cleanup)?,
                         result = &mut opening => match result {
                             Ok(client) => {
                                 if database.ping().await.is_err() {
@@ -423,11 +463,18 @@ impl StorageServiceWorker {
                                 self.handle_lock_loss(active).await?;
                                 return Ok(ActiveExit::Reconnect);
                             }
+                            health.set(wait_for_lock_health(self.clock.clone()));
                         },
-                        command = self.commands.recv() => if let Some(exit) = self.handle_active_command(command, database, active).await? {
-                            return Ok(exit);
+                        command = self.commands.recv() => {
+                            if let Some(exit) = self.handle_active_command(command, database, active).await? {
+                                return Ok(exit);
+                            }
+                            health.set(wait_for_lock_health(self.clock.clone()));
                         },
-                        request = self.retirements.recv() => self.handle_retirement(request, active).await?,
+                        request = self.retirements.recv() => {
+                            self.handle_retirement(request, active).await?;
+                            health.set(wait_for_lock_health(self.clock.clone()));
+                        },
                     }
                 }
                 continue;
@@ -440,11 +487,11 @@ impl StorageServiceWorker {
                 let retirement_tx = self.retirement_tx.clone();
                 let opening = async move { generation_opener.open_api(database_url, retirement_tx).await };
                 tokio::pin!(opening);
+                let health = wait_for_lock_health(self.clock.clone());
+                tokio::pin!(health);
                 loop {
-                    let health_clock = self.clock.clone();
-                    let health = async move { health_clock.sleep(LOCK_HEALTH_INTERVAL).await };
-                    tokio::pin!(health);
                     tokio::select! {
+                        cleanup = self.cleanup.join_next(), if !self.cleanup.is_empty() => self.complete_cleanup(cleanup)?,
                         result = &mut opening => match result {
                             Ok(client) => {
                                 if database.ping().await.is_err() {
@@ -469,11 +516,18 @@ impl StorageServiceWorker {
                                 self.handle_lock_loss(active).await?;
                                 return Ok(ActiveExit::Reconnect);
                             }
+                            health.set(wait_for_lock_health(self.clock.clone()));
                         },
-                        command = self.commands.recv() => if let Some(exit) = self.handle_active_command(command, database, active).await? {
-                            return Ok(exit);
+                        command = self.commands.recv() => {
+                            if let Some(exit) = self.handle_active_command(command, database, active).await? {
+                                return Ok(exit);
+                            }
+                            health.set(wait_for_lock_health(self.clock.clone()));
                         },
-                        request = self.retirements.recv() => self.handle_retirement(request, active).await?,
+                        request = self.retirements.recv() => {
+                            self.handle_retirement(request, active).await?;
+                            health.set(wait_for_lock_health(self.clock.clone()));
+                        },
                     }
                 }
                 continue;
@@ -483,30 +537,36 @@ impl StorageServiceWorker {
             let ready_clock = self.clock.clone();
             let ready_reset = async move { ready_clock.sleep(READY_BACKOFF_RESET).await };
             tokio::pin!(ready_reset);
+            let health = wait_for_lock_health(self.clock.clone());
+            tokio::pin!(health);
             let mut reset_complete = false;
             loop {
-                let health_clock = self.clock.clone();
-                let health = async move { health_clock.sleep(LOCK_HEALTH_INTERVAL).await };
-                tokio::pin!(health);
                 tokio::select! {
+                    cleanup = self.cleanup.join_next(), if !self.cleanup.is_empty() => self.complete_cleanup(cleanup)?,
                     () = &mut ready_reset, if !reset_complete => {
                         *retry_index = 0;
                         reset_complete = true;
+                        health.set(wait_for_lock_health(self.clock.clone()));
                     }
                     () = &mut health => {
                         if database.ping().await.is_err() {
                             self.handle_lock_loss(active).await?;
                             return Ok(ActiveExit::Reconnect);
                         }
+                        health.set(wait_for_lock_health(self.clock.clone()));
                     }
-                    command = self.commands.recv() => if let Some(exit) = self.handle_active_command(command, database, active).await? {
-                        return Ok(exit);
+                    command = self.commands.recv() => {
+                        if let Some(exit) = self.handle_active_command(command, database, active).await? {
+                            return Ok(exit);
+                        }
+                        health.set(wait_for_lock_health(self.clock.clone()));
                     },
                     request = self.retirements.recv() => {
                         self.handle_retirement(request, active).await?;
                         if active.processing.is_none() || (active.api_required && active.api.is_none()) {
                             break;
                         }
+                        health.set(wait_for_lock_health(self.clock.clone()));
                     }
                 }
             }
@@ -605,24 +665,29 @@ impl StorageServiceWorker {
         let clock = self.clock.clone();
         let sleep = async move { clock.sleep(delay).await };
         tokio::pin!(sleep);
+        let health = wait_for_lock_health(self.clock.clone());
+        tokio::pin!(health);
         loop {
-            let health_clock = self.clock.clone();
-            let health = async move { health_clock.sleep(LOCK_HEALTH_INTERVAL).await };
-            tokio::pin!(health);
             tokio::select! {
+                cleanup = self.cleanup.join_next(), if !self.cleanup.is_empty() => self.complete_cleanup(cleanup)?,
                 () = &mut sleep => return Ok(ActiveRetryExit::Retry),
                 () = &mut health => {
                     if database.ping().await.is_err() {
                         self.handle_lock_loss(active).await?;
                         return Ok(ActiveRetryExit::Exit(ActiveExit::Reconnect));
                     }
+                    health.set(wait_for_lock_health(self.clock.clone()));
                 },
                 command = self.commands.recv() => {
                     if let Some(exit) = self.handle_active_command(command, database, active).await? {
                         return Ok(ActiveRetryExit::Exit(exit));
                     }
+                    health.set(wait_for_lock_health(self.clock.clone()));
                 },
-                request = self.retirements.recv() => self.handle_retirement(request, active).await?,
+                request = self.retirements.recv() => {
+                    self.handle_retirement(request, active).await?;
+                    health.set(wait_for_lock_health(self.clock.clone()));
+                },
             }
         }
     }
@@ -644,6 +709,7 @@ impl StorageServiceWorker {
         tokio::pin!(sleep);
         loop {
             tokio::select! {
+                cleanup = self.cleanup.join_next(), if !self.cleanup.is_empty() => self.complete_cleanup(cleanup)?,
                 () = &mut sleep => return Ok(true),
                 command = self.commands.recv() => match queue_or_shutdown(command, pending) {
                     CommandDisposition::Continue => {}
@@ -713,12 +779,24 @@ impl StorageServiceWorker {
 
     fn track_processing_cleanup(&mut self, client: Arc<ValidatedDbClient>) {
         client.begin_close();
-        self.cleanup.spawn(async move { client.close().await });
+        self.track_cleanup(async move { client.close().await });
     }
 
     fn track_api_cleanup(&mut self, client: Arc<ValidatedApiDbClient>) {
         client.begin_close();
-        self.cleanup.spawn(async move { client.close().await });
+        self.track_cleanup(async move { client.close().await });
+    }
+
+    fn track_cleanup(&mut self, cleanup: impl Future<Output = ()> + Send + 'static) {
+        #[cfg(test)]
+        self.retained_cleanup_tasks.fetch_add(1, Ordering::AcqRel);
+        #[cfg(test)]
+        let panic_after_cleanup = self.panic_next_cleanup.swap(false, Ordering::AcqRel);
+        self.cleanup.spawn(async move {
+            cleanup.await;
+            #[cfg(test)]
+            assert!(!panic_after_cleanup, "injected cleanup task failure");
+        });
     }
 
     fn discard_unpublished(&mut self, processing: Arc<ValidatedDbClient>, api: Option<Arc<ValidatedApiDbClient>>) {
@@ -731,10 +809,34 @@ impl StorageServiceWorker {
     }
 
     async fn join_cleanup(&mut self) -> Result<(), StorageError> {
+        let mut failure = None;
         while let Some(result) = self.cleanup.join_next().await {
-            result.map_err(|error| StorageError::WorkerFailed { diagnostic: Arc::from(error.to_string()) })?;
+            if let Err(error) = self.finish_cleanup(result)
+                && failure.is_none()
+            {
+                failure = Some(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn reap_completed_cleanup(&mut self) -> Result<(), StorageError> {
+        while let Some(result) = self.cleanup.try_join_next() {
+            self.finish_cleanup(result)?;
         }
         Ok(())
+    }
+
+    fn complete_cleanup(&self, result: Option<Result<(), tokio::task::JoinError>>) -> Result<(), StorageError> {
+        let result =
+            result.ok_or_else(|| StorageError::WorkerFailed { diagnostic: Arc::from("cleanup task set closed unexpectedly") })?;
+        self.finish_cleanup(result)
+    }
+
+    fn finish_cleanup(&self, result: Result<(), tokio::task::JoinError>) -> Result<(), StorageError> {
+        #[cfg(test)]
+        self.retained_cleanup_tasks.fetch_sub(1, Ordering::AcqRel);
+        result.map_err(|error| StorageError::WorkerFailed { diagnostic: Arc::from(error.to_string()) })
     }
 
     async fn reject_active(&mut self, active: &mut ActiveGenerations, rejection: StorageRejection) -> Result<(), StorageError> {
@@ -760,6 +862,7 @@ impl StorageServiceWorker {
     async fn wait_rejected_shutdown(&mut self, rejection: StorageRejection) -> Result<(), StorageError> {
         loop {
             tokio::select! {
+                cleanup = self.cleanup.join_next(), if !self.cleanup.is_empty() => self.complete_cleanup(cleanup)?,
                 command = self.commands.recv() => match command {
                     Some(ServiceCommand::Shutdown(completion)) => {
                         self.publish_status(StorageServiceStatusState::Stopped);
@@ -827,6 +930,10 @@ fn complete_stale_retirement(request: Option<RetirementRequest>) -> Result<(), S
     let request = request.ok_or(StorageError::ControlUnavailable)?;
     request.complete(Ok(()));
     Ok(())
+}
+
+async fn wait_for_lock_health(clock: Arc<dyn Clock>) {
+    clock.sleep(LOCK_HEALTH_INTERVAL).await;
 }
 
 #[cfg(test)]
@@ -901,6 +1008,16 @@ mod tests {
 
     async fn next_event(events: &mut StorageServiceEventReceiver) -> StorageServiceEvent {
         timeout(TEST_TIMEOUT, events.recv()).await.expect("storage event must arrive").expect("storage event path must remain open")
+    }
+
+    async fn wait_for_cleanup_tasks(service: &StorageService, expected: usize) {
+        timeout(TEST_TIMEOUT, async {
+            while service.retained_cleanup_tasks() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup task count must converge");
     }
 
     async fn initialize_service(
@@ -1042,6 +1159,58 @@ mod tests {
             .await
             .expect("shutdown must finish after the old connection returns")
             .expect("service shutdown");
+    }
+
+    #[tokio::test]
+    async fn completed_cleanup_tasks_are_reaped_during_repeated_replacement() {
+        let (_container, database_url) = fixture().await;
+        let (service, mut events, _processing, mut api) = initialize_service(database_url).await;
+
+        for _ in 0..8 {
+            api.request_retirement().await.expect("API retirement barrier");
+            match next_event(&mut events).await {
+                StorageServiceEvent::ApiDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &api)),
+                event => panic!("expected API retirement, got {event:?}"),
+            }
+            api = match next_event(&mut events).await {
+                StorageServiceEvent::ApiDbPublished(client) => client,
+                event => panic!("expected replacement API publication, got {event:?}"),
+            };
+            wait_for_cleanup_tasks(&service, 0).await;
+        }
+
+        service.shutdown().await.expect("service shutdown");
+    }
+
+    #[tokio::test]
+    async fn cleanup_task_failure_terminates_the_active_service() {
+        let (_container, database_url) = fixture().await;
+        let (service, mut events, _processing, api) = initialize_service(database_url).await;
+        service.panic_next_cleanup();
+
+        api.request_retirement().await.expect("API retirement barrier");
+        match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &api)),
+            event => panic!("expected API retirement, got {event:?}"),
+        }
+
+        let mut completion = service.completion.clone();
+        let result = timeout(TEST_TIMEOUT, async {
+            loop {
+                if let Some(result) = completion.borrow().clone() {
+                    return result;
+                }
+                completion.changed().await.expect("service completion must remain observable");
+            }
+        })
+        .await
+        .expect("cleanup failure must terminate the active service");
+        assert!(matches!(
+            result,
+            Err(StorageError::WorkerFailed { diagnostic }) if diagnostic.contains("injected cleanup task failure")
+        ));
+        assert_eq!(service.retained_cleanup_tasks(), 0);
+        assert!(matches!(service.shutdown().await, Err(StorageError::WorkerFailed { .. })));
     }
 
     #[tokio::test]
