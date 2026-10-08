@@ -2937,8 +2937,11 @@ dependencies = [
 name = "kgi-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "ctrlc",
  "kaspa-consensus-core",
+ "rand 0.8.8",
+ "tokio",
  "url",
 ]
 
@@ -2962,9 +2965,9 @@ dependencies = [
  "kaspa-grpc-client",
  "kaspa-notify",
  "kaspa-rpc-core",
+ "kgi-core",
  "kgi-model",
  "log",
- "rand 0.8.8",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",

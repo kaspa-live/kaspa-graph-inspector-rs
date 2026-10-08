@@ -122,10 +122,10 @@ test needs repository-specific retry, timeout, or grouping behavior.
 Use `clap` with its derive API for the top-crate command grammar, `serde` derive
 and `toml` for the explicitly selected configuration file, and `url` for parsed
 URL values. Keep these dependencies in the smallest owning crate: command,
-source-loading, and resolution dependencies belong to `kgi`, while
-`kgi-core` depends only on crates needed by its resolved value types and signal
-adapter. Direct dependency versions shared with rusty-kaspa follow its selected
-`v2.1.0` workspace where applicable.
+source-loading, and resolution dependencies belong to `kgi`, while `kgi-core`
+depends only on crates needed by its foundational configuration, signal, and
+timing infrastructure. Direct dependency versions shared with rusty-kaspa
+follow its selected `v2.1.0` workspace where applicable.
 
 Retain the logging system from rusty-kaspa's `core/src/log` when process
 logging is implemented. `LoggingConfig.level` therefore carries that logger's
@@ -194,8 +194,8 @@ Start `kgi-node` with these public modules:
   construction, and lifecycle methods.
 
 Keep the upstream client adapter, raw-response normalization,
-`NotificationRouter`, service-loop commands, and timing utilities in private
-`client`, `normalization`, `notification`, `runtime`, and `timing` modules.
+`NotificationRouter`, and service-loop commands in private `client`,
+`normalization`, `notification`, and `runtime` modules.
 Tests remain beside their owning module, with integration tests added only for
 cross-module generation and routing order. `lib.rs` exposes the public modules
 without wildcard re-exports, so consumers retain paths such as
@@ -219,12 +219,12 @@ facade. The direct `log` dependency exists only because the exported
 the `kaspa-core` facade. Raw upstream values do not leave `kgi-node`.
 
 Use `serde_json` only to decode the upstream `OverrideParams` representation,
-`url` for the already parsed endpoint, `thiserror` for typed errors,
-`async-trait` for private testable adapter traits, and `rand` for the production
-jitter source. Tokio supplies the worker, channels, status observation,
-completion barriers, timer implementation, and RPC permits. All rusty-kaspa
-crates use the same workspace tag and lockfile revision accepted by the
-[current PUAR](../architecture/verification.md#current-puar-result).
+`url` for the already parsed endpoint, `thiserror` for typed errors, and
+`async-trait` for private testable adapter traits. Tokio supplies the worker,
+channels, status observation, completion barriers, and RPC permits;
+`kgi-core::timing` supplies the shared clock and jitter mechanism. All
+rusty-kaspa crates use the same workspace tag and lockfile revision accepted by
+the [current PUAR](../architecture/verification.md#current-puar-result).
 
 ### Lifecycle and generation primitives
 
@@ -260,11 +260,11 @@ that return real upstream response value types. This avoids implementing the
 complete upstream RPC trait or duplicating a gRPC server while still testing
 KGI-owned request construction, normalization, retirement, and ordering.
 
-Inject a private object-safe clock and jitter source through NodeService's
-runtime dependencies. Production uses Tokio time and a mutex-protected
-`rand::rngs::SmallRng` seeded from system entropy. Tests use a manually
-advanced clock and a scripted jitter sequence, so reconnect slots, the Ready
-reset boundary, and shutdown cancellation contain no wall-clock sleeps or
+Inject the shared object-safe `kgi-core::timing` clock and jitter interfaces
+through NodeService's private runtime dependencies. Production uses the shared
+Tokio clock and entropy-seeded equal-jitter source. Tests provide a manually
+advanced clock and scripted jitter, so reconnect slots, the Ready reset
+boundary, and shutdown cancellation contain no wall-clock sleeps or
 probabilistic assertions. Exact delays and reset behavior remain owned by the
 [NodeService lifecycle](../architecture/node-service.md#nodeservice--settled).
 

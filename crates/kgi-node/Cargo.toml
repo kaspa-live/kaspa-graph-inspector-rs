@@ -12,9 +12,9 @@ kaspa-core.workspace = true
 kaspa-grpc-client.workspace = true
 kaspa-notify.workspace = true
 kaspa-rpc-core.workspace = true
+kgi-core = { path = "../kgi-core" }
 kgi-model = { path = "../kgi-model" }
 log.workspace = true
-rand.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

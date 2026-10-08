@@ -6,6 +6,7 @@ use kaspa_rpc_core::{
     GetBlocksRequest, GetServerInfoRequest,
     api::ops::{RPC_API_REVISION, RPC_API_VERSION},
 };
+use kgi_core::timing::{Clock, EqualJitter, Jitter, TokioClock};
 use kgi_model::lifecycle::{NodeServiceStatus, NodeServiceStatusState, ValidatedNodeStatus};
 use tokio::{
     sync::{Mutex, mpsc, oneshot, watch},
@@ -19,7 +20,6 @@ use crate::{
     error::{ConsensusResolutionError, NodeRejection, NodeServiceError, NodeUnavailableReason},
     rpc::{ValidatedNodeInfo, ValidatedRpcClient},
     runtime::{RetirementReceiver, RetirementRequest, retirement_channel},
-    timing::{Clock, EqualJitter, Jitter, TokioClock},
 };
 
 const IBD_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -512,6 +512,7 @@ mod tests {
         RpcError, RpcResult,
         api::ops::{RPC_API_REVISION, RPC_API_VERSION},
     };
+    use kgi_core::timing::{Clock, Jitter, TokioClock};
     use kgi_model::{block::BlockHash, lifecycle::NodeServiceStatusState};
     use tokio::sync::{Semaphore, mpsc};
     use url::Url;
@@ -521,7 +522,6 @@ mod tests {
         client::{RpcConnection, RpcConnector, ServerInfoObservation},
         consensus::KgiConsensusParams,
         error::{NodeError, NodeRejection},
-        timing::{Clock, Jitter, TokioClock},
     };
 
     type ConnectionOutcome = Result<Arc<dyn RpcConnection>, Arc<str>>;
