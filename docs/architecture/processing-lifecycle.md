@@ -132,11 +132,11 @@ Startup behavior:
 - normal startup requests `Resync`;
 - `--clear-db` requests `Rebuild`.
 
-An Empty network-bound DB has no PP or sink for Resync reconciliation. The
-engine reports `Require(Rebuild)`; Supervisor then starts a distinct
-Rebuild run. Structurally valid but inconsistent processing contents also
-require Rebuild, while partial/unsupported schema is rejected by
-StorageService before publishing a DB client.
+The storage-owned
+[session-state classification](storage.md#stored-session-state--settled)
+determines whether the database can prepare Resync. For either `Empty` or
+`Inconsistent`, ResyncEngine reports `Require(Rebuild)` and Supervisor starts a
+distinct Rebuild run.
 
 `RecoveryMode` is immutable for the complete lifetime of one processing
 session, including its preparation phase. ResyncEngine may report
@@ -675,12 +675,11 @@ derivation. ResyncEngine owns the result dispositions and node-side validation
 below; it neither reconstructs storage materiality nor requests the current
 node pruning point during Resync preparation.
 
-An Empty state is genuinely fully empty and requests a distinct Rebuild run
-because ProcessingMetadata, PP, and sink are absent. An `Inconsistent` result
-also requests Rebuild and is not an operational storage failure. ResyncEngine
-therefore forces Rebuild for either local state without sending processor Begin
-commands. Supervisor owns complete teardown and creation of the distinct
-Rebuild session under the session-immutable recovery-mode rule above.
+For either `Empty` or `Inconsistent`, ResyncEngine reports `Require(Rebuild)`
+without sending processor Begin commands. Supervisor owns complete teardown
+and creation of the distinct Rebuild session under the session-immutable
+recovery-mode rule above. The storage owner defines both semantic states and
+distinguishes them from operational storage failures.
 
 ResyncEngine uses the run's exact `Arc<ValidatedRpcClient>` and the normalized
 [individual recovery GetBlock](node-service.md#individual-recovery-getblock)
@@ -707,12 +706,11 @@ Resync requirements after an initialized stored session snapshot:
 For a Genesis PP the common threshold is zero. A coherent
 Genesis-anchored database may use ordinary Resync even while the chain is
 younger than `anticone_finalization_depth`; every other Resync check above
-still applies. `Empty` remains distinct because it has no
-ProcessingMetadata, PP, or committed sink.
+still applies.
 
-A missing or inconsistent stored sink, a definitive absent response from the
-node, a stored/returned DAA-score mismatch, or a sink blue score below the
-boundary seal threshold reports `Require(Rebuild)` to Supervisor. An opaque
+A definitive absent response from the node, a stored/returned DAA-score
+mismatch, or a sink blue score below the boundary seal threshold reports
+`Require(Rebuild)` to Supervisor. An opaque
 `RpcRequestFailed`, cancellation, connection loss, or validated-client loss is
 instead a session fault/retry and does not prove that Rebuild is required.
 NodeService owns classification of a malformed GetBlock response as
