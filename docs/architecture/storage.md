@@ -225,6 +225,15 @@ transaction, connection, and permit have been released. Serialization,
 compression, and response delivery occur outside this permit and cannot issue
 follow-up database reads.
 
+The replacement gate and its active-phase set are owned by StorageService and
+outlive individual `ValidatedApiDbClient` generations. Every API generation
+holds only a shared reference to that same gate. Retiring a generation prevents
+new database phases through it but does not remove a lease already held by an
+admitted operation. Dropping a client reference neither resets the gate nor
+removes such a lease. The gate retains no history of retired generations; it
+retains only currently active database-phase leases and their cancellation
+paths until those leases are released.
+
 Before `rebuild_from_pruning_point` clears or replaces processing data,
 StorageService atomically closes new API DB admission. If a current
 `ValidatedApiDbClient` generation exists, it retires that exact generation and
@@ -237,13 +246,16 @@ therefore `Retired(old), Published(fresh)` when an old generation exists and
 only `Published(fresh)` when it does not.
 
 The fresh generation is available for API construction as soon as it is
-published, while remaining behind the closed gate. When an old generation
-existed, StorageService boundedly drains or cancels its database phases that
-still hold shared permits before acquiring the exclusive replacement permit.
-With no old API generation, that drain is vacuous and cannot produce
-`ApiReadExclusion`. A request that detached its projection before closure may
-finish returning that old coherent image. Every other affected old-generation
-request reports database-backed read unavailability; the
+published, while remaining behind the closed gate. StorageService cancels and
+boundedly drains every active database phase admitted before closure,
+regardless of whether the client generation that admitted it is still current
+or has already been retired. It acquires the exclusive replacement permit only
+after all such leases have been released. Absence of a current API generation
+does not skip this procedure and does not preclude `ApiReadExclusion`; the drain
+is immediately complete only when the service-owned active-phase set is empty.
+A request that detached its projection before closure may finish returning
+that old coherent image. Every other affected old-generation request reports
+database-backed read unavailability; the
 [API protocol](api-protocol.md#anchored-graph-windows--settled) owns its HTTP
 mapping. An API read cannot delay replacement without bound.
 

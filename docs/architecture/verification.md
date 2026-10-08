@@ -1680,6 +1680,14 @@ old generation, and publishing the fresh gated generation. Verify the ordered
 exists and the sole `ApiDbPublished(fresh)` event when none exists. Supervisor
 must forward exactly the emitted sequence without synthesizing the absent
 retirement event.
+Start an API database phase through `G1`, retire `G1` so no current API
+generation remains, and begin Rebuild before that phase releases its
+service-owned shared lease. Verify Rebuild emits no second retirement event,
+publishes gated `G2`, cancels and boundedly drains the admitted `G1` phase, and
+cannot acquire exclusive replacement access until its lease is released. Make
+that drain fail and require `RebuildSetupFailed(ApiReadExclusion)` plus
+retirement of `G2`; absence of a current generation must not make the drain
+vacuous.
 Verify a detached old projection may complete delivery while
 an undetached request returns 503, public reads reopen only after the
 replacement completes `Prewarming` and becomes `Active`, and
