@@ -217,12 +217,14 @@ only by the destination history entry described above.
 An actionable reorg collects the distinct hashes from `removed + added` and
 calls `ValidatedDbClient::resolve_materialized_ids(distinct_hashes)` once. It
 maps those results back to every position in the unchanged ordered vectors when
-constructing `ReadyVspcChange`. The cache-first batch distinguishes absent from
-boundary-identity members and proves the semantic Materialized state for
-directly named chain members, but it does not supply the destination point or
-create the history entry required by `BLOCK_READY`. Added-only changes derive
-their source and member IDs from retained materialization history without that
-database read.
+constructing `ReadyVspcChange`. Storage owns that operation's cache and SQL
+resolution, materiality results, and failure categories; see
+[caches and identity resolution](storage.md#caches-and-identity-resolution--settled).
+A successful result proves the semantic Materialized state for directly named
+chain members, but it does not supply the destination point or create the
+history entry required by `BLOCK_READY`. Added-only changes derive their source
+and member IDs from retained materialization history without that database
+read.
 
 Endpoint `VspcPoint` consensus order comes from `PersistedBlock` history. The
 database batch resolves member IDs; it does not derive endpoint order or load

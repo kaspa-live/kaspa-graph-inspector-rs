@@ -784,7 +784,7 @@ with:
 - removed/added source and destination derivation;
 - the added-only path with no database source;
 - an actionable reorg resolving `removed` followed by `added` through one
-  ordered, cache-first storage batch;
+  ordered storage resolution call;
 - strict-`<` sink-preserving history pruning before Catchup, at the
   Catchup-to-Live transition, and during Live, with pruning disabled throughout
   Catchup;

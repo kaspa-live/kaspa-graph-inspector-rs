@@ -485,12 +485,10 @@ serializing the separately owned VSPC mutation lane.
 
 Keep SQL and committed-payload construction in the private `materialization`
 module and reusable retry classification in the private `transaction` module.
-Each materialization attempt seeds its resolved-identity map from complete
-positive processing-cache entries. A cached materialized identity whose
-independently cached materialized-block metadata is absent remains a SQL miss;
-all remaining hashes use one transaction-local batch query. Only those
-miss-path values, including identities interned later in the attempt, become
-post-success cache updates; complete cache hits are not republished.
+Each materialization attempt applies the storage-owned cache-completeness rule
+when seeding its resolved-identity map. Collect all incomplete values into one
+transaction-local batch query. Cache publication need not republish complete
+hits.
 Intern the remaining absent identities in one `BYTEA[]` statement using
 `WITH ORDINALITY`; the insertion source and returned rows follow the universal
 first-occurrence order. Insert direct-parent rows in one parallel-array
@@ -507,11 +505,10 @@ independent, so their PostgreSQL transactions may overlap as required by the
 Store compact IDs, rather than hashes, in the generation-owned merge-set
 cache. Materialization already resolves those IDs transactionally, and VSPC
 coloring consumes the same persisted representation. Load direct VSPC member
-rows for only the first-occurrence-distinct IDs lacking a complete reverse-hash
-and materialized-block cache path, while retaining the original ordered vectors
+rows for only the first-occurrence-distinct IDs that the storage-owned
+completeness rule sends to SQL, while retaining the original ordered vectors
 for path validation and transition semantics. Load merge sets only for
-distinct added IDs that miss the cache, and publish those immutable entries
-only after definite commit.
+distinct added IDs that miss the cache.
 
 Compute the final merge-member color for each compact ID by replaying every
 added position in memory in its blue-then-red order, then issue one parallel
