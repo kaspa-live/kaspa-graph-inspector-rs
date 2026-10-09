@@ -32,6 +32,10 @@ pub enum StorageRejection {
     /// The database contains an unsupported, partial, or unknown schema.
     #[error("database schema is unsupported: {diagnostic}")]
     UnsupportedSchema { diagnostic: Arc<str> },
+
+    /// The current database and binary cannot complete schema migration.
+    #[error("database migration failed: {diagnostic}")]
+    MigrationFailed { diagnostic: Arc<str> },
 }
 
 /// Failure while preparing or inspecting KGI storage.
@@ -52,10 +56,6 @@ pub enum StorageError {
     /// A persistent mutation did not produce a definite outcome.
     #[error("database persistence fault: {0:?}")]
     Persistence(PersistenceFault),
-
-    /// An embedded migration could not be applied or validated.
-    #[error("database migration failed: {diagnostic}")]
-    Migration { diagnostic: Arc<str> },
 
     /// Persisted metadata cannot be represented by the KGI domain model.
     #[error("invalid persisted database metadata: {diagnostic}")]
@@ -99,11 +99,6 @@ impl StorageError {
     }
 
     #[allow(dead_code, reason = "used by the private bootstrap lifecycle")]
-    pub(crate) fn migration(error: impl std::fmt::Display) -> Self {
-        Self::Migration { diagnostic: Arc::from(error.to_string()) }
-    }
-
-    #[allow(dead_code, reason = "used by the private bootstrap lifecycle")]
     pub(crate) fn invalid_metadata(diagnostic: impl Into<Arc<str>>) -> Self {
         Self::InvalidMetadata { diagnostic: diagnostic.into() }
     }
@@ -113,7 +108,7 @@ impl StorageError {
     }
 }
 
-fn sqlx_connection_lost(error: &sqlx::Error) -> bool {
+pub(crate) fn sqlx_connection_lost(error: &sqlx::Error) -> bool {
     matches!(
         error,
         sqlx::Error::Io(_)
@@ -122,5 +117,8 @@ fn sqlx_connection_lost(error: &sqlx::Error) -> bool {
             | sqlx::Error::PoolClosed
             | sqlx::Error::WorkerCrashed
             | sqlx::Error::BeginFailed
-    )
+    ) || error
+        .as_database_error()
+        .and_then(|database| database.code())
+        .is_some_and(|code| code.starts_with("08") || matches!(code.as_ref(), "57P01" | "57P02" | "57P03"))
 }

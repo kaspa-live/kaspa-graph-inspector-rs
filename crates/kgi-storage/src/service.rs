@@ -1233,6 +1233,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dirty_migration_is_terminal_and_completes_pending_initialization() {
+        let (_container, database_url) = fixture().await;
+        let mut connection = PgConnection::connect(database_url.as_str()).await.expect("fixture connection");
+        crate::migration::MIGRATOR.run_to(1, &mut connection).await.expect("first migration only");
+        sqlx::query("UPDATE _sqlx_migrations SET success = FALSE WHERE version = 1")
+            .execute(&mut connection)
+            .await
+            .expect("dirty migration marker");
+        connection.close().await.expect("close fixture connection");
+
+        assert_terminal_migration_rejection(database_url, "partially applied").await;
+    }
+
+    #[tokio::test]
+    async fn checksum_mismatch_is_terminal_and_completes_pending_initialization() {
+        let (_container, database_url) = fixture().await;
+        let mut connection = PgConnection::connect(database_url.as_str()).await.expect("fixture connection");
+        crate::migration::MIGRATOR.run(&mut connection).await.expect("current migrations");
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = decode('00', 'hex') WHERE version = 1")
+            .execute(&mut connection)
+            .await
+            .expect("migration checksum mismatch");
+        connection.close().await.expect("close fixture connection");
+
+        assert_terminal_migration_rejection(database_url, "modified").await;
+    }
+
+    #[tokio::test]
+    async fn migration_connection_loss_retries_complete_startup_and_shutdown_cancels_backoff() {
+        let (_container, database_url) = fixture().await;
+        let connector = Arc::new(MigrationConnectionLossConnector { attempts: AtomicUsize::new(0), injected_failures: 2 });
+        let (sleep_tx, mut sleeps) = mpsc::unbounded_channel();
+        let clock = Arc::new(ManualClock { sleeps: sleep_tx });
+        let (service, mut events) =
+            StorageService::start_with_dependencies(database_url, connector.clone(), clock, Arc::new(IdentityJitter));
+
+        let first_retry = timeout(TEST_TIMEOUT, sleeps.recv()).await.expect("first migration retry").expect("clock path");
+        assert_eq!(first_retry.duration, Duration::from_secs(1));
+        assert_eq!(service.status().state, StorageServiceStatusState::Unavailable);
+        assert!(events.try_recv().is_err());
+        first_retry.completion.send(()).expect("advance first migration retry");
+
+        let second_retry = timeout(TEST_TIMEOUT, sleeps.recv()).await.expect("second migration retry").expect("clock path");
+        assert_eq!(second_retry.duration, Duration::from_secs(2));
+        assert_eq!(connector.attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(service.status().state, StorageServiceStatusState::Unavailable);
+        assert!(events.try_recv().is_err());
+
+        service.shutdown().await.expect("shutdown must cancel migration retry wait");
+        assert_eq!(service.status().state, StorageServiceStatusState::Stopped);
+    }
+
+    #[tokio::test]
     async fn advisory_lock_loss_retires_both_generations_before_republication() {
         let (_container, database_url) = fixture().await;
         let (service, mut events, processing, api) = initialize_service(database_url.clone()).await;
@@ -1504,6 +1557,40 @@ mod tests {
         }
     }
 
+    struct GatedStartupConnector {
+        attempts: AtomicUsize,
+        started: mpsc::UnboundedSender<()>,
+        permit: Semaphore,
+    }
+
+    #[async_trait]
+    impl DatabaseConnector for GatedStartupConnector {
+        async fn connect(&self, database_url: &str) -> Result<LockedDatabase, StorageError> {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            let database = LockedDatabase::connect(database_url).await?;
+            self.started.send(()).expect("startup observer");
+            self.permit.acquire().await.expect("startup gate").forget();
+            Ok(database)
+        }
+    }
+
+    struct MigrationConnectionLossConnector {
+        attempts: AtomicUsize,
+        injected_failures: usize,
+    }
+
+    #[async_trait]
+    impl DatabaseConnector for MigrationConnectionLossConnector {
+        async fn connect(&self, database_url: &str) -> Result<LockedDatabase, StorageError> {
+            let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
+            let mut database = LockedDatabase::connect(database_url).await?;
+            if attempt < self.injected_failures {
+                database.inject_migration_connection_loss();
+            }
+            Ok(database)
+        }
+    }
+
     struct ReconnectGateConnector {
         attempts: AtomicUsize,
         reconnect_started: mpsc::UnboundedSender<()>,
@@ -1612,6 +1699,42 @@ mod tests {
             (READY_BACKOFF_RESET, LOCK_HEALTH_INTERVAL) => (second, first),
             durations => panic!("unexpected Ready timers: {durations:?}"),
         }
+    }
+
+    async fn assert_terminal_migration_rejection(database_url: Url, expected_diagnostic: &str) {
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let connector =
+            Arc::new(GatedStartupConnector { attempts: AtomicUsize::new(0), started: started_tx, permit: Semaphore::new(0) });
+        let (sleep_tx, mut sleeps) = mpsc::unbounded_channel();
+        let clock = Arc::new(ManualClock { sleeps: sleep_tx });
+        let (service, mut events) =
+            StorageService::start_with_dependencies(database_url, connector.clone(), clock, Arc::new(IdentityJitter));
+
+        timeout(TEST_TIMEOUT, started_rx.recv()).await.expect("startup must begin").expect("startup observer");
+        let initialization_service = service.clone();
+        let initialization =
+            tokio::spawn(async move { initialization_service.initialize_if_uninitialized(mainnet(), hash(12)).await });
+        tokio::task::yield_now().await;
+        connector.permit.add_permits(1);
+
+        let rejection = match next_event(&mut events).await {
+            StorageServiceEvent::Rejected(StorageRejection::MigrationFailed { diagnostic }) => {
+                assert!(diagnostic.contains(expected_diagnostic), "unexpected migration diagnostic: {diagnostic}");
+                StorageRejection::MigrationFailed { diagnostic }
+            }
+            event => panic!("expected terminal migration rejection, got {event:?}"),
+        };
+        assert_eq!(
+            timeout(TEST_TIMEOUT, initialization).await.expect("pending initialization must complete").expect("initialization task"),
+            Err(StorageError::Rejected(rejection))
+        );
+        assert_eq!(service.status().state, StorageServiceStatusState::Rejected);
+        assert_eq!(connector.attempts.load(Ordering::Relaxed), 1);
+        assert!(sleeps.try_recv().is_err(), "terminal migration rejection must not schedule retry");
+        assert!(timeout(Duration::from_millis(100), events.recv()).await.is_err());
+
+        service.shutdown().await.expect("rejected service shutdown");
+        assert_eq!(service.status().state, StorageServiceStatusState::Stopped);
     }
 
     async fn terminate_lock_owner(observer: &mut PgConnection) {

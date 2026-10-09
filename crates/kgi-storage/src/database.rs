@@ -59,6 +59,8 @@ pub(crate) fn blue_score_to_sql(score: u64) -> Result<i64, StorageError> {
 
 pub(crate) struct LockedDatabase {
     connection: PgConnection,
+    #[cfg(test)]
+    inject_migration_connection_loss: bool,
 }
 
 pub(crate) struct PreparedDatabase {
@@ -83,13 +85,29 @@ impl LockedDatabase {
         if !acquired {
             return Err(StorageRejection::DatabaseAlreadyInUse.into());
         }
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            #[cfg(test)]
+            inject_migration_connection_loss: false,
+        })
     }
 
     pub(crate) async fn prepare(mut self) -> Result<(PreparedDatabase, DatabaseState), StorageError> {
+        #[cfg(test)]
+        if self.inject_migration_connection_loss {
+            return Err(crate::migration::classify_error(sqlx::migrate::MigrateError::ExecuteMigration(
+                sqlx::Error::Io(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "injected migration connection loss")),
+                1,
+            )));
+        }
         schema::prepare(&mut self.connection).await?;
         let state = ProcessingStateInspection::classify(&mut self.connection).await?;
         Ok((PreparedDatabase { connection: self.connection }, state))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_migration_connection_loss(&mut self) {
+        self.inject_migration_connection_loss = true;
     }
 }
 
@@ -607,7 +625,7 @@ mod tests {
             .expect("dirty migration marker");
         connection.close().await.expect("close migration connection");
         let dirty = LockedDatabase::connect(&dirty_url).await.expect("database lock");
-        assert!(matches!(dirty.prepare().await, Err(StorageError::Migration { .. })));
+        assert!(matches!(dirty.prepare().await, Err(StorageError::Rejected(StorageRejection::MigrationFailed { .. }))));
     }
 
     #[tokio::test]
