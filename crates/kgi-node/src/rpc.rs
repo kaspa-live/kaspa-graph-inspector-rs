@@ -16,7 +16,7 @@ use kgi_model::{
     lifecycle::{FaultKind, RecoveryInputKind},
     vspc::VspcChange,
 };
-use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use crate::{
     client::RpcConnection,
@@ -131,7 +131,9 @@ pub struct ValidatedRpcClient {
     normalizer: Arc<ResponseNormalizer>,
     notification_router: Arc<NotificationRouter>,
     subscription_state: Mutex<SubscriptionState>,
-    subscription_transition: AsyncMutex<()>,
+    subscription_transition: Arc<AsyncMutex<()>>,
+    #[cfg(test)]
+    activation_publication_gate: Mutex<Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>>,
     admission: AtomicU8,
     admission_tx: watch::Sender<u8>,
     permits: Arc<Semaphore>,
@@ -152,7 +154,9 @@ impl ValidatedRpcClient {
                 normalizer,
                 notification_router,
                 subscription_state: Mutex::new(SubscriptionState::Disabled),
-                subscription_transition: AsyncMutex::new(()),
+                subscription_transition: Arc::new(AsyncMutex::new(())),
+                #[cfg(test)]
+                activation_publication_gate: Mutex::new(None),
                 node_info,
                 admission: AtomicU8::new(GENERATION_ACTIVE),
                 admission_tx,
@@ -186,8 +190,27 @@ impl ValidatedRpcClient {
         *self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    #[cfg(test)]
+    fn set_activation_publication_gate(&self, reached: mpsc::UnboundedSender<()>, gate: Arc<Semaphore>) {
+        *self.activation_publication_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((reached, gate));
+    }
+
+    #[cfg(test)]
+    async fn wait_for_activation_publication(&self) {
+        let publication_gate = self.activation_publication_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        if let Some((reached, gate)) = publication_gate {
+            reached.send(()).expect("activation-publication observer");
+            gate.acquire().await.expect("activation-publication gate").forget();
+        }
+    }
+
     /// Starts both remote notification subscriptions and then enables local routing.
     pub async fn activate_notifications(&self, channels: NotificationChannels) -> Result<(), NodeError> {
+        self.require_active()?;
+        if *self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) != SubscriptionState::Disabled {
+            return Err(NodeError::InvalidSubscriptionState);
+        }
+        let transition_guard = self.subscription_transition.clone().lock_owned().await;
         self.require_active()?;
         {
             let mut state = self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -204,38 +227,49 @@ impl ValidatedRpcClient {
         let client = self.self_weak.upgrade().ok_or(NodeError::GenerationLost)?;
         let cancellation = Arc::new(ActivationCancellation::new());
         let mut cancellation_guard = ActivationCancellationGuard::new(cancellation.clone());
-        let transition = tokio::spawn(async move { client.complete_activation(cancellation).await });
+        let transition = tokio::spawn(async move { client.complete_activation(cancellation, transition_guard).await });
         let result = transition.await;
         cancellation_guard.disarm();
         self.finish_subscription_transition(result).await
     }
 
-    async fn complete_activation(self: Arc<Self>, cancellation: Arc<ActivationCancellation>) -> Result<(), NodeError> {
-        let _transition = self.subscription_transition.lock().await;
-        if let Some(error) = self.activation_interruption() {
-            return Err(error);
+    async fn complete_activation(
+        self: Arc<Self>,
+        cancellation: Arc<ActivationCancellation>,
+        _transition: OwnedMutexGuard<()>,
+    ) -> Result<(), NodeError> {
+        if self.activation_deactivation_requested()? {
+            return self.complete_activation_deactivation(None).await;
         }
         if cancellation.is_abandoned() {
             self.finish_failed_activation();
             return Err(NodeError::Cancelled);
         }
 
-        if let Err(error) = self.subscription_call(self.connection.start_block_added()).await {
-            self.finish_failed_activation();
-            return Err(error);
+        let block_start = self.subscription_call(self.connection.start_block_added()).await;
+        if self.activation_deactivation_requested()? {
+            return self.complete_activation_deactivation(None).await;
         }
-        if let Some(error) = self.activation_interruption() {
-            return Err(error);
+        if let Err(error) = block_start {
+            return self.finish_activation_failure(error).await;
         }
         if cancellation.is_abandoned() {
             return self.cancel_activation_after_block_start().await;
         }
-        if let Err(start_error) = self.subscription_call(self.connection.start_virtual_chain_changed()).await {
+
+        let vspc_start = self.subscription_call(self.connection.start_virtual_chain_changed()).await;
+        if self.activation_deactivation_requested()? {
+            return self.complete_activation_deactivation(None).await;
+        }
+        if let Err(start_error) = vspc_start {
             if is_inactive_error(&start_error) {
                 self.finish_failed_activation();
                 return Err(start_error);
             }
             let rollback = self.subscription_call(self.connection.stop_block_added()).await;
+            if self.activation_deactivation_requested()? {
+                return self.complete_activation_deactivation(Some(rollback)).await;
+            }
             if let Err(rollback_error) = rollback {
                 if is_inactive_error(&rollback_error) {
                     return Err(rollback_error);
@@ -243,12 +277,13 @@ impl ValidatedRpcClient {
                 self.request_retirement(RetirementReason::SubscriptionControlFailure).await?;
                 return Err(NodeError::GenerationLost);
             }
-            self.finish_failed_activation();
-            return Err(start_error);
+            return self.finish_activation_failure(start_error).await;
         }
 
+        #[cfg(test)]
+        self.wait_for_activation_publication().await;
         self.require_active()?;
-        {
+        let deactivating = {
             let abandonment = cancellation.lock();
             let mut state = self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             match *state {
@@ -260,11 +295,11 @@ impl ValidatedRpcClient {
                     return Ok(());
                 }
                 SubscriptionState::Retired => return Err(self.inactive_error()),
-                SubscriptionState::Disabling => return Err(NodeError::InvalidSubscriptionState),
-                SubscriptionState::Disabled | SubscriptionState::Enabled | SubscriptionState::Activating => {}
+                SubscriptionState::Disabling => true,
+                SubscriptionState::Disabled | SubscriptionState::Enabled | SubscriptionState::Activating => false,
             }
-        }
-        self.cancel_activation_after_both_starts().await
+        };
+        if deactivating { self.complete_activation_deactivation(None).await } else { self.cancel_activation_after_both_starts().await }
     }
 
     /// Disables local routing immediately and then stops both remote subscriptions.
@@ -294,6 +329,15 @@ impl ValidatedRpcClient {
 
     async fn complete_disable(self: Arc<Self>) -> Result<(), NodeError> {
         let _transition = self.subscription_transition.lock().await;
+        match *self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+            SubscriptionState::Disabled => {
+                self.notification_router.clear();
+                return Ok(());
+            }
+            SubscriptionState::Retired => return Err(self.inactive_error()),
+            SubscriptionState::Disabling => {}
+            SubscriptionState::Activating | SubscriptionState::Enabled => return Err(NodeError::InvalidSubscriptionState),
+        }
 
         let block_result = self.subscription_call(self.connection.stop_block_added()).await;
         let vspc_result = self.subscription_call(self.connection.stop_virtual_chain_changed()).await;
@@ -314,6 +358,50 @@ impl ValidatedRpcClient {
         Ok(())
     }
 
+    async fn finish_activation_failure(&self, error: NodeError) -> Result<(), NodeError> {
+        let deactivating = {
+            let mut state = self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match *state {
+                SubscriptionState::Activating => {
+                    *state = SubscriptionState::Disabled;
+                    false
+                }
+                SubscriptionState::Disabling => true,
+                SubscriptionState::Retired => return Err(self.inactive_error()),
+                SubscriptionState::Disabled | SubscriptionState::Enabled => return Err(NodeError::InvalidSubscriptionState),
+            }
+        };
+        if deactivating {
+            return self.complete_activation_deactivation(None).await;
+        }
+        self.notification_router.disable();
+        self.notification_router.clear();
+        Err(error)
+    }
+
+    async fn complete_activation_deactivation(&self, block_result: Option<Result<(), NodeError>>) -> Result<(), NodeError> {
+        self.notification_router.disable();
+        let block_result = match block_result {
+            Some(result) => result,
+            None => self.subscription_call(self.connection.stop_block_added()).await,
+        };
+        let vspc_result = self.subscription_call(self.connection.stop_virtual_chain_changed()).await;
+        if let Some(error) = [&block_result, &vspc_result].into_iter().find_map(|result| match result {
+            Err(error) if is_inactive_error(error) => Some(error.clone()),
+            _ => None,
+        }) {
+            return Err(error);
+        }
+        if block_result.and(vspc_result).is_err() {
+            self.request_retirement(RetirementReason::SubscriptionControlFailure).await?;
+            return Err(NodeError::GenerationLost);
+        }
+        self.require_active()?;
+        self.notification_router.clear();
+        self.set_subscription_state_if_not_retired(SubscriptionState::Disabled);
+        Err(NodeError::Cancelled)
+    }
+
     async fn cancel_activation_after_block_start(&self) -> Result<(), NodeError> {
         match self.subscription_call(self.connection.stop_block_added()).await {
             Ok(()) => {
@@ -330,30 +418,15 @@ impl ValidatedRpcClient {
     }
 
     async fn cancel_activation_after_both_starts(&self) -> Result<(), NodeError> {
-        self.notification_router.disable();
-        let block_result = self.subscription_call(self.connection.stop_block_added()).await;
-        let vspc_result = self.subscription_call(self.connection.stop_virtual_chain_changed()).await;
-        if let Some(error) = [&block_result, &vspc_result].into_iter().find_map(|result| match result {
-            Err(error) if is_inactive_error(error) => Some(error.clone()),
-            _ => None,
-        }) {
-            return Err(error);
-        }
-        if block_result.and(vspc_result).is_err() {
-            self.request_retirement(RetirementReason::SubscriptionControlFailure).await?;
-            return Err(NodeError::GenerationLost);
-        }
-        self.finish_failed_activation();
-        Err(NodeError::Cancelled)
+        self.complete_activation_deactivation(None).await
     }
 
-    fn activation_interruption(&self) -> Option<NodeError> {
+    fn activation_deactivation_requested(&self) -> Result<bool, NodeError> {
         match *self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
-            SubscriptionState::Activating => None,
-            SubscriptionState::Retired => Some(self.inactive_error()),
-            SubscriptionState::Disabled | SubscriptionState::Enabled | SubscriptionState::Disabling => {
-                Some(NodeError::InvalidSubscriptionState)
-            }
+            SubscriptionState::Activating => Ok(false),
+            SubscriptionState::Disabling => Ok(true),
+            SubscriptionState::Retired => Err(self.inactive_error()),
+            SubscriptionState::Disabled | SubscriptionState::Enabled => Err(NodeError::InvalidSubscriptionState),
         }
     }
 
@@ -817,6 +890,7 @@ mod tests {
         requests: Mutex<Vec<RecordedRequest>>,
         subscription_results: Mutex<VecDeque<RpcResult<()>>>,
         subscription_calls: Mutex<Vec<&'static str>>,
+        block_start_gate: Option<Arc<Semaphore>>,
         virtual_start_gate: Option<Arc<Semaphore>>,
         block_stop_gate: Option<Arc<Semaphore>>,
         virtual_stop_gate: Option<Arc<Semaphore>>,
@@ -830,6 +904,7 @@ mod tests {
                 requests: Mutex::new(Vec::new()),
                 subscription_results: Mutex::new(VecDeque::new()),
                 subscription_calls: Mutex::new(Vec::new()),
+                block_start_gate: None,
                 virtual_start_gate: None,
                 block_stop_gate: None,
                 virtual_stop_gate: None,
@@ -844,6 +919,11 @@ mod tests {
 
         fn with_virtual_start_gate(mut self, gate: Arc<Semaphore>) -> Self {
             self.virtual_start_gate = Some(gate);
+            self
+        }
+
+        fn with_block_start_gate(mut self, gate: Arc<Semaphore>) -> Self {
+            self.block_start_gate = Some(gate);
             self
         }
 
@@ -867,11 +947,6 @@ mod tests {
 
         fn requests(&self) -> Vec<RecordedRequest> {
             self.requests.lock().expect("request log").clone()
-        }
-
-        fn subscription_call(&self, operation: &'static str) -> RpcResult<()> {
-            self.subscription_calls.lock().expect("subscription log").push(operation);
-            self.subscription_result()
         }
 
         fn subscription_result(&self) -> RpcResult<()> {
@@ -938,7 +1013,11 @@ mod tests {
         }
 
         async fn start_block_added(&self) -> RpcResult<()> {
-            self.subscription_call("start BlockAdded")
+            self.subscription_calls.lock().expect("subscription log").push("start BlockAdded");
+            if let Some(gate) = &self.block_start_gate {
+                gate.acquire().await.expect("block-start gate").forget();
+            }
+            self.subscription_result()
         }
 
         async fn start_virtual_chain_changed(&self) -> RpcResult<()> {
@@ -1405,6 +1484,135 @@ mod tests {
             &["start BlockAdded", "start VirtualChainChanged", "stop BlockAdded", "stop VirtualChainChanged"]
         );
         assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn deactivation_during_block_start_cancels_activation_after_cleanup() {
+        exercise_activation_deactivation_overlap(ActivationOverlap::BlockStart).await;
+    }
+
+    #[tokio::test]
+    async fn deactivation_during_vspc_start_cancels_activation_after_cleanup() {
+        exercise_activation_deactivation_overlap(ActivationOverlap::VspcStart).await;
+    }
+
+    #[tokio::test]
+    async fn deactivation_during_activation_rollback_cancels_after_cleanup() {
+        exercise_activation_deactivation_overlap(ActivationOverlap::Rollback).await;
+    }
+
+    #[tokio::test]
+    async fn deactivation_before_enabled_publication_cancels_activation_after_cleanup() {
+        exercise_activation_deactivation_overlap(ActivationOverlap::Publication).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum ActivationOverlap {
+        BlockStart,
+        VspcStart,
+        Rollback,
+        Publication,
+    }
+
+    async fn exercise_activation_deactivation_overlap(overlap: ActivationOverlap) {
+        let gate = Arc::new(Semaphore::new(0));
+        let connection = Arc::new(match overlap {
+            ActivationOverlap::BlockStart => ScriptedConnection::new([]).with_block_start_gate(gate.clone()),
+            ActivationOverlap::VspcStart => ScriptedConnection::new([]).with_virtual_start_gate(gate.clone()),
+            ActivationOverlap::Rollback => ScriptedConnection::new([])
+                .with_subscription_results([Ok(()), Err(RpcError::General("VSPC start failed".to_string())), Ok(())])
+                .with_block_stop_gate(gate.clone()),
+            ActivationOverlap::Publication => ScriptedConnection::new([]),
+        });
+        let (retirement_tx, mut retirements) = retirement_channel();
+        let client = ValidatedRpcClient::new(connection.clone(), node_info(), retirement_tx);
+        let mut publication_reached = None;
+        if matches!(overlap, ActivationOverlap::Publication) {
+            let (reached_tx, reached_rx) = mpsc::unbounded_channel();
+            client.set_activation_publication_gate(reached_tx, gate.clone());
+            publication_reached = Some(reached_rx);
+        }
+        let (channels, _receivers) = notification_channels();
+        let activation = tokio::spawn({
+            let client = client.clone();
+            async move { client.activate_notifications(channels).await }
+        });
+
+        match overlap {
+            ActivationOverlap::BlockStart => wait_for_subscription_calls(&connection, 1).await,
+            ActivationOverlap::VspcStart => wait_for_subscription_calls(&connection, 2).await,
+            ActivationOverlap::Rollback => wait_for_subscription_calls(&connection, 3).await,
+            ActivationOverlap::Publication => {
+                timeout(Duration::from_secs(1), publication_reached.as_mut().expect("publication observer").recv())
+                    .await
+                    .expect("activation must reach publication boundary")
+                    .expect("publication observer path");
+            }
+        }
+
+        let deactivation = tokio::spawn({
+            let client = client.clone();
+            async move { client.disable_notifications().await }
+        });
+        wait_for_subscription_state(&client, SubscriptionState::Disabling).await;
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Disabled);
+        gate.add_permits(1);
+
+        assert_eq!(activation.await.expect("activation task"), Err(NodeError::Cancelled));
+        assert_eq!(deactivation.await.expect("deactivation task"), Ok(()));
+        assert_eq!(client.subscription_state(), SubscriptionState::Disabled);
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Disabled);
+        let expected_calls: &[&str] = match overlap {
+            ActivationOverlap::BlockStart => &["start BlockAdded", "stop BlockAdded", "stop VirtualChainChanged"],
+            ActivationOverlap::VspcStart | ActivationOverlap::Rollback | ActivationOverlap::Publication => {
+                &["start BlockAdded", "start VirtualChainChanged", "stop BlockAdded", "stop VirtualChainChanged"]
+            }
+        };
+        assert_eq!(connection.subscription_calls.lock().expect("subscription log").as_slice(), expected_calls);
+        assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn failed_overlap_cleanup_retires_and_completes_both_operations() {
+        let gate = Arc::new(Semaphore::new(0));
+        let connection = Arc::new(
+            ScriptedConnection::new([])
+                .with_subscription_results([Ok(()), Ok(()), Err(RpcError::General("BlockAdded stop failed".to_string())), Ok(())])
+                .with_virtual_start_gate(gate.clone()),
+        );
+        let (retirement_tx, mut retirements) = retirement_channel();
+        let client = ValidatedRpcClient::new(connection.clone(), node_info(), retirement_tx);
+        let (channels, _receivers) = notification_channels();
+        let activation = tokio::spawn({
+            let client = client.clone();
+            async move { client.activate_notifications(channels).await }
+        });
+        wait_for_subscription_calls(&connection, 2).await;
+        let deactivation = tokio::spawn({
+            let client = client.clone();
+            async move { client.disable_notifications().await }
+        });
+        wait_for_subscription_state(&client, SubscriptionState::Disabling).await;
+        gate.add_permits(1);
+
+        let retirement = timeout(Duration::from_secs(1), retirements.recv())
+            .await
+            .expect("failed overlap cleanup must request retirement")
+            .expect("retirement path");
+        assert_eq!(retirement.reason(), &RetirementReason::SubscriptionControlFailure);
+        assert!(retirement.target().upgrade().is_some_and(|generation| Arc::ptr_eq(&generation, &client)));
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Disabled);
+        assert_eq!(
+            connection.subscription_calls.lock().expect("subscription log").as_slice(),
+            &["start BlockAdded", "start VirtualChainChanged", "stop BlockAdded", "stop VirtualChainChanged"]
+        );
+        assert!(client.retire().await);
+        retirement.complete(Ok(()));
+
+        assert_eq!(activation.await.expect("activation task"), Err(NodeError::GenerationLost));
+        assert_eq!(deactivation.await.expect("deactivation task"), Err(NodeError::GenerationLost));
+        assert_eq!(client.subscription_state(), SubscriptionState::Retired);
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Retired);
     }
 
     #[tokio::test]
