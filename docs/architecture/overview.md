@@ -125,8 +125,8 @@ kgi-core
 kgi-model
 kgi-api-model   ──► kgi-model
 kgi-api-ingress ──► kgi-model
-kgi-node        ──► kgi-model
-kgi-storage     ──► kgi-model + kgi-api-model
+kgi-node        ──► kgi-core + kgi-model
+kgi-storage     ──► kgi-core + kgi-model + kgi-api-model
 kgi-processing  ──► kgi-model + kgi-api-ingress + kgi-node + kgi-storage
 kgi-api-core    ──► kgi-model + kgi-api-model + kgi-api-ingress + kgi-storage
 kgi             ──► kgi-core + kgi-model + kgi-api-ingress + kgi-node + kgi-storage
@@ -134,10 +134,13 @@ kgi             ──► kgi-core + kgi-model + kgi-api-ingress + kgi-node + kg
 ```
 
 `kgi-core` has no dependency on another KGI crate. It contains reusable
-process-level infrastructure that is outside the domain model and component
-services. Its initial `config` module contains the process configuration value
-structs. Its initial `signals` module contains the platform termination adapter
-described below.
+foundational technical infrastructure that is outside the domain model,
+component services, and orchestration. Any KGI crate may depend directly on
+`kgi-core` when consuming that infrastructure; such a dependency does not
+authorize the consumer to receive the complete process configuration or to
+move component semantics into `kgi-core`. Its initial `config` module contains
+the process configuration value structs. Its initial `signals` module contains
+the platform termination adapter described below.
 
 `kgi-model` contains shared domain values and cross-component message values,
 including `RecoveryMode`, `ParentCommitted`, `LevelCommitted`,
@@ -176,8 +179,7 @@ state.
 graph-update producer, and does not depend on `kgi-api-core`.
 
 The top `kgi` crate owns Supervisor, process composition, CLI command dispatch,
-and global shutdown and is the sole crate that depends on `kgi-core`. Internal
-module boundaries remain deferred in the
+and global shutdown. Internal module boundaries remain deferred in the
 [decision register](../decisions/deferred.md).
 
 ## Process configuration and command entry — settled

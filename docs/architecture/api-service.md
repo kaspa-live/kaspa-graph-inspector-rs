@@ -64,15 +64,21 @@ struct ApiDbState {
 impl ApiDbState {
     async fn current(&self) -> Option<Arc<ValidatedApiDbClient>>;
     fn public_read_client(&self) -> Option<Arc<ValidatedApiDbClient>>;
+    fn begin_rebuild(&self);
     fn set_public_reads_enabled(&self, enabled: bool);
 }
 ```
 
 It initializes with `Running { current: None, public_reads_enabled: true }`.
-`set_public_reads_enabled` is a private synchronous mutation used only by
-ApiService's reset and publication-installation transitions while they hold the
+`set_public_reads_enabled` is a private synchronous mutation used by
+ApiService's publication-installation transition while it holds the
 publication-install boundary. It updates a `Running` snapshot without changing
 `current` and cannot change `Stopped`.
+`begin_rebuild` is a private synchronous mutation under that same boundary. It
+atomically sets `current = None` and `public_reads_enabled = false` without
+retiring or invalidating the previously bound storage-owned client. A later
+exact-client `Retired` event is therefore harmless, and only a subsequent
+`Published` event can bind the Rebuild runtime to an API generation.
 StorageService owns generation retirement and autonomous replacement under the
 [storage lifecycle](storage.md#storageservice-lifecycle--settled). Supervisor
 maps StorageService's ordered API-generation variants to
@@ -114,7 +120,10 @@ the publication-owned
 [`restart_construction()`](api-publication.md#universal-api-reconstruction--settled),
 whose next seed awaits a valid current client. Neither path clears ApiDbState;
 the ordered forwarded `Retired` event performs exact-Arc housekeeping and
-wakes watchers. StorageService has already started autonomous reacquisition.
+wakes watchers. Outside a deliberate Rebuild replacement failure,
+StorageService has already started autonomous reacquisition. The storage-owned
+replacement contract defines when a later Rebuild attempt creates the next
+gated generation.
 For a construction seed attempt, `QueryFailed` and
 `InconsistentProjection` both abandon that attempt and invoke reconstruction
 without changing ApiDbState.
@@ -303,18 +312,17 @@ The publication owner defines the runtime's quiescent reaction; closure is not
 a session-supersession control call.
 
 An ordinary Resync `reset` preserves both fields of `ApiDbState`. A Rebuild
-`reset` sets `public_reads_enabled = false` without clearing `current`; a
-repeated Rebuild reset has the same idempotent effect. During Rebuild, public
+`reset` invokes `begin_rebuild`; a repeated Rebuild reset has the same
+idempotent effect. During Rebuild, public
 database-backed request admission remains disabled in `PreSeal`, `Constructing`,
 `Aligning`, and `Prewarming`.
 
-Keeping `current` does not authorize a stale Rebuild read. StorageService
-retires the old generation before database replacement, and the replacement
-gate prevents that handle from successfully observing replaced contents. If a
-construction attempt reaches the retired handle before Supervisor forwards its
-`Retired` event, `GenerationLost` exposes its invalidity and invokes
-reconstruction. A `Published` replacement becomes immediately available to construction while
-the public-read gate remains disabled.
+Clearing `current` prevents the Rebuild runtime from capturing the old API
+generation. The next forwarded `Published` event from the storage-owned
+[replacement lifecycle](storage.md#api-read-exclusion-during-database-replacement--settled)
+makes its generation immediately available through `current().await`. A first
+construction read may then remain pending inside storage under that contract.
+The ApiService-owned public-read gate remains disabled throughout.
 
 On ordinary initialized startup, StorageService's initial `Published` event
 provides the first usable generation and the normal Resync reset preserves it.
@@ -322,7 +330,8 @@ A coherent network-bound Empty database may likewise supply that generation;
 its valid anchored requests produce ordinary typed anchor-unavailability
 outcomes. If the initial Resync then leads to a distinct Rebuild run under the
 [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled),
-that run's Rebuild reset disables public database reads as above.
+that run's Rebuild reset unbinds the old API generation and disables public
+database reads as above.
 
 ApiService never rebinds an in-flight public request or seed attempt to a newly
 published API DB generation. Each operation finishes against its captured

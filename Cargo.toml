@@ -35,6 +35,14 @@ log = "0.4.20"
 rand = { version = "0.8.5", features = ["small_rng"] }
 serde = { version = "1.0.190", features = ["derive"] }
 serde_json = "1.0.107"
+sqlx = { version = "0.9.0", default-features = false, features = [
+    "macros",
+    "migrate",
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls-ring-webpki",
+] }
+testcontainers-modules = { version = "0.15.0", default-features = false, features = ["postgres", "ring"] }
 thiserror = "2.0.18"
 tokio = { version = "1.42.1", features = ["macros", "rt", "sync", "time"] }
 toml = "0.8.8"

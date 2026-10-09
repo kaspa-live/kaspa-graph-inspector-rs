@@ -132,11 +132,20 @@ Startup behavior:
 - normal startup requests `Resync`;
 - `--clear-db` requests `Rebuild`.
 
-An Empty network-bound DB has no PP or sink for Resync reconciliation. The
-engine reports `Require(Rebuild)`; Supervisor then starts a distinct
-Rebuild run. Structurally valid but inconsistent processing contents also
-require Rebuild, while partial/unsupported schema is rejected by
-StorageService before publishing a DB client.
+The storage-owned
+[session-state classification](storage.md#stored-session-state--settled)
+determines whether the database can prepare Resync. For either `Empty` or
+`Inconsistent`, ResyncEngine reports `Require(Rebuild)` and Supervisor starts a
+distinct Rebuild run.
+
+`RecoveryMode` is immutable for the complete lifetime of one processing
+session, including its preparation phase. ResyncEngine may report
+`Require(Rebuild)` from a Resync attempt, but it must never change that
+session's mode, continue preparation as Rebuild, reuse its channels, or send
+Rebuild processor commands. Supervisor must completely tear down that Resync
+attempt and create a distinct Rebuild session with fresh session resources and
+the ordinary Rebuild API reset. This rule applies even when escalation occurs
+before either processor receives `BeginResync`.
 
 `desired_recovery` is the strongest recovery requirement the Supervisor must
 eventually satisfy. Calling `start` does not consume it. `active_recovery` is
@@ -216,6 +225,7 @@ enum FaultKind {
     ServiceGenerationLost(ServiceKind),
     RpcRequestFailed,
     SubscriptionControlFailed,
+    RebuildSetupFailed(RebuildSetupFault),
     SessionContinuityLost,
     NotificationInputInvalid(NotificationInputKind),
     RecoveryInputInvalid(RecoveryInputKind),
@@ -412,6 +422,29 @@ recovery-response budget.
 
 A definitive not-found dependency remains `DependencyUnavailable` and requires
 Rebuild instead of being classified as malformed.
+
+The storage-owned
+[`RebuildSetupFault`](storage.md#api-read-exclusion-during-database-replacement--settled)
+may be reported only while a Rebuild attempt is preparing database replacement
+and before its transaction starts. `RebuildSetupFailed` aborts that complete
+session with `Retry`, retains the `Rebuild` obligation and current processing
+generation, and uses the general recovery backoff. It does not wait for
+`ProcessingDbPublished`, because storage did not retire that generation. The
+next attempt performs fresh Rebuild preparation and never reissues only the
+failed setup phase. Observing this fault in another recovery mode or in Live is
+an invalid lifecycle condition and is Fatal.
+
+StorageService's typed
+[`StorageError::ReplacementControlUnavailable`](storage.md#api-read-exclusion-during-database-replacement--settled)
+maps to
+`Ownership(ManagedComponentUnavailable)` with `source: StorageService` and a
+Fatal disposition. The service-owned replacement infrastructure cannot be
+recreated by retrying a Rebuild or starting another processing session.
+Supervisor therefore enters Fatal and begins ordinary global shutdown without
+changing the retained recovery obligation. This fault is neither
+`Ownership(InternalControlPathLost)`, which is reserved for worker command
+paths, nor a persistence fault. Expected cancellation after session or service
+shutdown has begun remains ordinary cancellation and reports no fault.
 
 Storage owns local transaction retries, operation-outcome classification, and
 database-generation retirement; see
@@ -646,33 +679,31 @@ The result must be at most the shared `MAX_BLUE_SCORE`. `Overflow` or
 disposition under the fault policy above; never wrap, saturate, or continue
 with an unreachable threshold. The anticone depth comes from the run's exact
 `ValidatedNodeInfo.consensus` and is current-session recovery input, not
-persisted node metadata or a database-compatibility field.
+persisted processing metadata or a database-compatibility field.
 
 For Resync, invoke the function with the database PP hash and persisted
-`db_pp_blue_score` returned by reconciliation. For Rebuild, invoke it with the
-normalized current node pruning-point hash and blue score before any storage
-replacement. Only a successful result may populate
+`db_pp_blue_score` returned by the stored session snapshot. For Rebuild, invoke
+it with the normalized current node pruning-point hash and blue score before
+any storage replacement. Only a successful result may populate
 `PreparedSync.boundary_seal_blue_score` and the BlockProcessor Begin payload.
 The valid Genesis boundary score is zero under the storage invariants, so its
 threshold is zero and requires no addition.
 
 ### Resync preparation
 
-ResyncEngine first calls
-`ValidatedRpcClient::current_pruning_point_block()` on the run's exact RPC
-generation. It then passes that block's hash to
-`ValidatedDbClient::reconciliation_snapshot(current_node_pp)`. The
-[storage contract](storage.md#reconciliation-snapshot--settled) solely owns the
-returned state and snapshot shapes, database reads, committed-sink derivation,
-and Materialized results for the current node PP and committed sink.
-ResyncEngine owns the call ordering, result dispositions, and node-side
-validation below; it does not reconstruct storage materiality.
+ResyncEngine first calls `ValidatedDbClient::load_session_state()` on the run's
+exact DB generation. The
+[storage contract](storage.md#stored-session-state--settled) solely owns the
+returned state and snapshot shapes, bounded database reads, and committed-sink
+derivation. ResyncEngine owns the result dispositions and node-side validation
+below; it neither reconstructs storage materiality nor requests the current
+node pruning point during Resync preparation.
 
-An Empty state is genuinely fully empty and requests a distinct Rebuild run
-because PP, score, and sink are absent. A
-`NodePpNotMaterialized` result also requests Rebuild. A missing or incoherent
-committed sink and any other valid schema with inconsistent processing
-contents likewise request Rebuild but are not treated as Empty.
+For either `Empty` or `Inconsistent`, ResyncEngine reports `Require(Rebuild)`
+without sending processor Begin commands. Supervisor owns complete teardown
+and creation of the distinct Rebuild session under the session-immutable
+recovery-mode rule above. The storage owner defines both semantic states and
+distinguishes them from operational storage failures.
 
 ResyncEngine uses the run's exact `Arc<ValidatedRpcClient>` and the normalized
 [individual recovery GetBlock](node-service.md#individual-recovery-getblock)
@@ -687,28 +718,26 @@ establishing the recognition required to use the sink as a GetBlocks
 [PUAR](verification.md#current-puar-result) checks that upstream assumption
 against the reference revision.
 
-Resync requirements:
+Resync requirements after an initialized stored session snapshot:
 
-1. The current node PP returned by the run's exact validated RPC generation is
-   Materialized in the database snapshot.
-2. The committed VSPC sink used to construct `MaterializedSyncAnchor` is
-   Materialized in the same database snapshot.
-3. The node recognizes that committed sink as a usable `low_hash`.
+1. The committed VSPC sink used to construct `MaterializedSyncAnchor` is
+   Materialized in the stored snapshot.
+2. The node recognizes that committed sink as a usable `low_hash`.
+3. Its normalized DAA score equals the stored sink DAA score.
 4. `sink.blue_score >= boundary_seal_blue_score` produced by the common
    construction above.
 
 For a Genesis PP the common threshold is zero. A coherent
 Genesis-anchored database may use ordinary Resync even while the chain is
-younger than `anticone_finalization_depth`; every other reconciliation check
-above still applies. `Empty` remains distinct because it has no PP or committed
-sink despite also storing `db_pp_blue_score = 0`.
+younger than `anticone_finalization_depth`; every other Resync check above
+still applies.
 
-A missing or inconsistent stored sink, a definitive absent response from the
-node, a stored/returned DAA-score mismatch, or another failed reconciliation
-check reports `Require(Rebuild)` to Supervisor. An opaque `RpcRequestFailed`,
-cancellation, connection loss, or validated-client loss is instead a session
-fault/retry and does not prove that Rebuild is required. NodeService owns
-classification of a malformed GetBlock response as
+A definitive absent response from the node, a stored/returned DAA-score
+mismatch, or a sink blue score below the boundary seal threshold reports
+`Require(Rebuild)` to Supervisor. An opaque
+`RpcRequestFailed`, cancellation, connection loss, or validated-client loss is
+instead a session fault/retry and does not prove that Rebuild is required.
+NodeService owns classification of a malformed GetBlock response as
 `RecoveryInputInvalid(MalformedGetBlock)`; ResyncEngine applies the bounded
 malformed-recovery-input policy above. Rebuild occurs as a separate run.
 
@@ -745,6 +774,14 @@ forwards each result in order through
 `ApiService::update_api_db_generation`. This is a normal downward control call,
 like `reset`; ApiService never calls StorageService and sends no reverse
 generation-loss event.
+
+During Rebuild, the storage-owned
+[replacement lifecycle](storage.md#api-read-exclusion-during-database-replacement--settled)
+can emit retirement and publication events while
+`rebuild_from_pruning_point` is still running. Supervisor forwards each event
+immediately in stream order rather than deferring it until the call returns. It
+does not synthesize a retirement event when storage had no current API
+generation, or another publication event when the call completes.
 
 Supervisor does not start, coalesce, cancel, or classify API-generation
 acquisition tasks. Forwarding a generation event changes neither processing
@@ -809,11 +846,12 @@ ResyncEngine handles it through the same forwarding path, including
 Supervisor's `Rebuild -> Resync` downgrade.
 
 `PpBoundarySealed` has no API database-generation role. StorageService
-autonomously publishes the coherent replacement and Supervisor forwards that
-event independently. `PublishPostSeal` may arrive before the replacement
-`Published` event; the publication runtime then keeps construction pending
-until a current generation is available. The API owner alone opens public
-database-backed reads when the replacement publication becomes Active.
+owns the replacement-generation lifecycle, and Supervisor forwards its events
+independently. `PublishPostSeal` may arrive before Supervisor has forwarded the
+storage-produced `Published` event; the publication runtime then keeps
+construction pending until a current generation is available. The API owner
+alone opens public database-backed reads when the replacement graph publication
+becomes Active.
 
 When the global Live conditions are satisfied, ResyncEngine sends the existing
 processor Live commands and emits `EnteredLive`. The BlockProcessor marker

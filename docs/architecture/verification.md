@@ -328,7 +328,7 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
 3. Hash interning follows the universal five-stage order. Strict
    materialization creates no boundary identity.
 4. Database startup distinguishes Uninitialized, Empty, Initialized,
-   structurally inconsistent processing contents, and rejected schemas.
+   boundedly detected Inconsistent processing contents, and rejected schemas.
    Persistent initialization authorization is idempotent for a compatible
    database and never rebinds its network. Interactive initialization
    identifies the database and complete network binding without exposing
@@ -343,24 +343,37 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
    the database. Unknown tables are never claimed or destroyed, and neither
    form can expose a partially recreated schema.
 6. Advisory-lock contention rejects with `DatabaseAlreadyInUse`, and lock loss
-   retires both DB generations and emits their exact retirement events without
-   directly changing processing-session or API publication state. Compatible
+   retires every currently published DB generation and emits its exact
+   retirement event without directly changing processing-session or API
+   publication state. Cover lock loss both with and without a current API
+   generation. Compatible
    v2 migrations are ordered,
    transactional, revalidated, and finish before client publication. Cover
-   newer-schema and v1/unsupported rejection, failed migration without client
-   publication, and the prohibition on automatic down or online migration.
+   newer-schema and v1/unsupported rejection and the prohibition on automatic
+   down or online migration. At the StorageService boundary, exercise both a
+   dirty migration marker and a checksum mismatch. Each publishes no validated
+   generation, emits exactly one terminal `Rejected(MigrationFailed)` event,
+   completes pending initialization with that rejection, performs no reconnect
+   or migration retry, and makes Supervisor enter Fatal. A later successful
+   service shutdown proves cleanup and does not substitute for the rejection.
+   Separately inject migration execution connection loss and verify transient
+   `Unavailable`, shutdown-cancellable service-backoff retry of the complete
+   startup attempt, and no terminal rejection.
 7. Storage may open, lock, and inspect Uninitialized contents before node
-   validation, but only atomic publication of complete `NodeMetadata` crosses
+   validation, but only atomic publication of complete `DatabaseBinding` crosses
    `Uninitialized -> Empty`. Inject a crash around this transaction and prove
    that no partially bound Empty state can appear.
-8. Node metadata is non-null and distinguishes Empty from Genesis-anchored
-   initialization despite both using `db_pp_blue_score = 0`. Reject the same
-   `NetworkId` paired with a different Genesis rather than rebinding or
-   rebuilding.
+8. `DatabaseBinding` and `ProcessingMetadata` use separate singleton rows and
+   retain their independent lifecycles. Empty has the binding and no processing
+   metadata; Genesis-anchored Initialized has processing metadata with score
+   zero. The single `ValidatedDbClient` exposes the exact binding for compatible
+   Empty, Initialized, and Inconsistent contents. Reject the same `NetworkId`
+   paired with a different Genesis rather than rebinding or rebuilding.
 9. A Genesis anchor is materialized at `(1,0)`, belongs to VSPC, has ORIGIN as
    selected parent and zero actual direct parents, and has a coherent committed
-   sink. Any additional boundary identity classifies processing contents as
-   Inconsistent and requires Rebuild.
+   sink. Rebuild and ordinary writes preserve the rule that ORIGIN is its only
+   boundary identity; session loading does not rescan all identities to prove
+   that global invariant.
 10. `rebuild_from_pruning_point` either publishes the complete replacement or
    leaves the previous contents intact: Compact-ID allocation restarts, the PP
    level receives its VSPC DAA score, every block row is materialized, boundary
@@ -374,16 +387,28 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
     IDs validate transactionally; and coordinate uniqueness plus `levels.size`
     updates are enforced in the insertion transaction.
 12. Verify the
-    [reconciliation snapshot](storage.md#reconciliation-snapshot--settled) with
-    `Existing` including its Materialized `node_pp` and committed sink,
-    `NodePpNotMaterialized` for absent and identity-only node pruning points,
-    coherent Empty, missing or incoherent sink contents, other Inconsistent
-    contents, and operational storage failure as distinct outcomes.
+    [stored session state](storage.md#stored-session-state--settled) with
+    coherent `Empty`, `Initialized` carrying the exact database PP hash and
+    score plus committed sink ID, hash, selected parent, and DAA score, semantic
+    `Inconsistent` for each bounded metadata or anchor defect, and operational
+    storage failure as distinct outcomes. Initial generation publication and
+    the later session read use the same classifier, while the latter returns a
+    fresh snapshot. Verify the storage-owned
+    [bounded-cost contract](storage.md#bounded-processing-state-classification--settled)
+    with query-plan evidence or a large fixture demonstrating that retained
+    graph growth introduces no retained-table scan, recount, or traversal.
 13. Exercise checked score conversion at zero and both domain maxima. SQL
     rejects writes outside the persisted ranges. Compatible bound contents
-    with a negative score or the DAA sentinel stored as a real block score are
-    classified `Inconsistent`, while a defensive out-of-range storage input is
-    rejected before mutation with the typed DAA or blue
+    with a negative metadata score or the DAA sentinel stored on the committed
+    sink are classified `Inconsistent`. A negative processing-metadata score still publishes
+    exactly one `ValidatedDbClient` with the exact binding and no API client;
+    it constructs no `ProcessingMetadata`, stores no processing metadata in the
+    client, and never invents or converts a score. Rebuild keeps that exact
+    processing client, publishes a fresh API generation behind the closed
+    replacement gate before mutation without emitting `ApiDbRetired`, and opens
+    that same generation only after definite commit.
+    A defensive out-of-range storage input is rejected before mutation with
+    the typed DAA or blue
     `StorageError::ScoreOutOfRange` reason. Round-trip timestamps `0`,
     `i64::MAX`, `i64::MAX + 1`, and `u64::MAX` through the signed `BIGINT`
     bit-pattern encoding; upper-half negative storage values are not
@@ -468,11 +493,11 @@ resulting database truth. Retry exhaustion leaves the generation valid.
 ## Recovery lifecycle and Catchup
 
 Verify [Resync preparation](processing-lifecycle.md#resync-preparation) with
-fixtures that combine the normalized current pruning-point block, its
-Materialized result, stored sink ID/hash/selected-parent hash/DAA score, and an
-exact no-transactions GetBlock header. Cover:
+fixtures that combine the stored database PP hash and score, stored sink
+ID/hash/selected-parent hash/DAA score, and an exact no-transactions GetBlock
+header. Cover:
 
-- exact current-node-PP discovery and successful Materialized result;
+- proof that Resync does not request or resolve the current node PP;
 - successful `MaterializedSyncAnchor` construction from
   `ValidatedRecoveryHeader` and a coherent committed Materialized sink,
   including exact Genesis with normalized blue score zero;
@@ -481,8 +506,10 @@ exact no-transactions GetBlock header. Cover:
   seed;
 - a definitively absent sink, incoherent stored sink, and a DAA mismatch
   requiring Rebuild;
-- an absent or identity-only current node PP requiring Rebuild without
-  retiring the valid RPC generation;
+- a Resync preparation result of `Require(Rebuild)` causing complete teardown
+  before Supervisor creates a fresh Rebuild session, without any in-place mode
+  change, reused session channel, or Rebuild processor command from the
+  retiring Resync attempt;
 - `RpcRequestFailed` or another session failure without inferring Rebuild; and
 - a response carrying the wrong trusted header hash or missing required header
   DAA score or blue work, plus an ordinary response missing blue score, as
@@ -497,7 +524,7 @@ through both preparation modes. Cover a zero Genesis threshold, a non-Genesis
 result exactly at `MAX_BLUE_SCORE`, checked-add overflow, and an otherwise
 representable sum above that maximum. Both failures report
 `ScoreOutOfRange(BoundarySealThreshold)` without wrapping or saturation and
-produce no `PreparedSync` or processor Begin. Resync uses the reconciled DB PP
+produce no `PreparedSync` or processor Begin. Resync uses the stored DB PP
 hash and score. Rebuild uses the normalized node PP hash and score and performs
 this check before database replacement. The Genesis branch returns the
 constant zero from NodeService's canonical Genesis representation or
@@ -602,6 +629,11 @@ with injected clocks and deterministic jitter:
   `DefiniteFailure`, retained Resync and Rebuild obligations, DB-generation
   retention versus retirement, complete session teardown, and the prohibition
   on reissuing an ambiguous transaction;
+- both storage-owned `RebuildSetupFault` reasons aborting a Rebuild attempt
+  with `Retry`, retaining its Rebuild obligation and processing generation,
+  using the general backoff, and waiting for no replacement processing
+  generation; reject either fault outside Rebuild as an invalid lifecycle
+  condition;
 - a recoverable failure after `reset` sends no API invalidation control; only
   the next processing attempt's `reset` call supersedes the installed
   ApiService session;
@@ -1614,12 +1646,16 @@ attempt abandons that candidate and invokes ordinary reconstruction while
 retaining the exact current API DB client. `InconsistentProjection` never
 substitutes for an anchor-unavailability result.
 
-For Rebuild, verify `reset(Rebuild)` disables public reads without clearing the
-current client. StorageService retirement prevents the old client from reading
-replaced contents, emits `ApiDbRetired`, and autonomously publishes the coherent
-replacement. Supervisor forwards both events in order. `Published(G2)` makes
-`G2` available to construction while public reads remain disabled; replacement
-publication installation after `Prewarming` enables reads. If the current
+For Rebuild, verify `reset(Rebuild)` atomically clears the locally bound API
+client and disables public reads without changing the old client's
+storage-owned validity. StorageService then closes replacement admission,
+retires the old client, emits `ApiDbRetired(G1)`, creates a fresh `G2`, and
+emits `ApiDbPublished(G2)` before mutating processing contents. Supervisor
+forwards both events in order while Rebuild is running. `Published(G2)` makes
+`G2` available to construction while public reads remain disabled, but its seed
+read opens no transaction before definite commit opens the replacement gate.
+The commit emits no second publication event. Replacement graph-publication
+installation after `Prewarming` enables public reads. If the current
 generation is lost after the seed has detached but before installation,
 alignment and `Prewarming` may finish, installation still enables the gate, and
 database-backed requests remain `503` until a later `Published(G3)`. Repeated
@@ -1644,15 +1680,48 @@ later Rebuild reset, delay an older Rebuild runtime's activation until after
 the new generation disables public reads, then verify its `Superseded` outcome
 cannot install its publication or reopen the gate.
 Resync preserves public database-backed reads, and failed reconciliation followed by
-Rebuild calls `reset` again with a fresh ingress. Rebuild relies on
-StorageService rather than `reset` to close API database admission, retire the
-old API generation, and boundedly drain or cancel active database phases.
+Rebuild calls `reset` again with a fresh ingress. Rebuild reset locally unbinds
+the old API client and disables public request admission; StorageService owns
+closing database admission, conditionally retiring and draining an existing
+old generation, and publishing the fresh gated generation. Verify the ordered
+`ApiDbRetired(old), ApiDbPublished(fresh)` sequence when an old generation
+exists and the sole `ApiDbPublished(fresh)` event when none exists. Supervisor
+must forward exactly the emitted sequence without synthesizing the absent
+retirement event.
+Start an API database phase through `G1`, retire `G1` so no current API
+generation remains, and begin Rebuild before that phase releases its
+service-owned shared lease. Verify Rebuild emits no second retirement event,
+publishes gated `G2`, cancels and boundedly drains the admitted `G1` phase, and
+cannot acquire exclusive replacement access until its lease is released. Make
+that drain fail and require `RebuildSetupFailed(ApiReadExclusion)` plus
+retirement of `G2`; absence of a current generation must not make the drain
+vacuous.
 Verify a detached old projection may complete delivery while
 an undetached request returns 503, public reads reopen only after the
 replacement completes `Prewarming` and becomes `Active`, and
 `PpBoundarySealed` has no API generation role.
-Cover `PublishPostSeal` arriving before StorageService's replacement
-`Published` event and construction remaining pending. No in-flight request
+Cover the replacement `Published` event arriving while the Rebuild transaction
+is still running, construction waiting at the storage gate, and
+`PublishPostSeal` arriving before that event with construction remaining
+pending. A final definite replacement failure retires the gated generation
+without making it readable; an ambiguous outcome retires both API and
+processing generations. Cover fresh-pool validation failure as
+`RebuildSetupFailed(ApiGenerationPreparation)` without publishing an
+unvalidated client, and bounded old-generation drain failure as
+`RebuildSetupFailed(ApiReadExclusion)` with retirement of the still-gated fresh
+API generation. Neither starts the replacement transaction, mutates processing
+contents or caches, or retires the processing generation. Cover setup
+cancellation as ordinary cancellation without a fault. Break replacement
+control before fresh API publication, after gated fresh API publication, and
+while a phase admitted by a retired generation still holds a lease. Each
+unexpected case returns
+`StorageError::ReplacementControlUnavailable`, starts no replacement
+transaction, retires the current API generation if one exists, leaves the
+processing generation and persistent state unchanged, and reports
+`Ownership(ManagedComponentUnavailable)` from StorageService with Fatal
+disposition. Verify active database-phase cancellation is best effort and does
+not delay the fault indefinitely, while the resulting global shutdown performs
+ordinary bounded resource cleanup. No in-flight request
 rebinds to a newly published storage generation,
 and no request observes a partial or mixed generation, including with
 PostgreSQL `TRUNCATE`. Verify ordinary sender teardown may close the installed
@@ -1757,7 +1826,7 @@ parent index addresses the expected member of `direct_parents`, plus Genesis
 with `selected_parent_index = None`, an empty `direct_parents` list, and no
 synthetic ORIGIN parent.
 Genesis recognition must not require the public projection or Web client to
-expose or consult persisted `NodeMetadata.genesis_hash`.
+expose or consult persisted `DatabaseBinding.genesis_hash`.
 
 Browser graph tests cover the [Web contract](web.md): update acquisition,
 fixed-view freeze and follow-live behavior, stable block identity, direct

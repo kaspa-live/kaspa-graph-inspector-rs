@@ -122,10 +122,10 @@ test needs repository-specific retry, timeout, or grouping behavior.
 Use `clap` with its derive API for the top-crate command grammar, `serde` derive
 and `toml` for the explicitly selected configuration file, and `url` for parsed
 URL values. Keep these dependencies in the smallest owning crate: command,
-source-loading, and resolution dependencies belong to `kgi`, while
-`kgi-core` depends only on crates needed by its resolved value types and signal
-adapter. Direct dependency versions shared with rusty-kaspa follow its selected
-`v2.1.0` workspace where applicable.
+source-loading, and resolution dependencies belong to `kgi`, while `kgi-core`
+depends only on crates needed by its foundational configuration, signal, and
+timing infrastructure. Direct dependency versions shared with rusty-kaspa
+follow its selected `v2.1.0` workspace where applicable.
 
 Retain the logging system from rusty-kaspa's `core/src/log` when process
 logging is implemented. `LoggingConfig.level` therefore carries that logger's
@@ -194,8 +194,8 @@ Start `kgi-node` with these public modules:
   construction, and lifecycle methods.
 
 Keep the upstream client adapter, raw-response normalization,
-`NotificationRouter`, service-loop commands, and timing utilities in private
-`client`, `normalization`, `notification`, `runtime`, and `timing` modules.
+`NotificationRouter`, and service-loop commands in private `client`,
+`normalization`, `notification`, and `runtime` modules.
 Tests remain beside their owning module, with integration tests added only for
 cross-module generation and routing order. `lib.rs` exposes the public modules
 without wildcard re-exports, so consumers retain paths such as
@@ -219,12 +219,12 @@ facade. The direct `log` dependency exists only because the exported
 the `kaspa-core` facade. Raw upstream values do not leave `kgi-node`.
 
 Use `serde_json` only to decode the upstream `OverrideParams` representation,
-`url` for the already parsed endpoint, `thiserror` for typed errors,
-`async-trait` for private testable adapter traits, and `rand` for the production
-jitter source. Tokio supplies the worker, channels, status observation,
-completion barriers, timer implementation, and RPC permits. All rusty-kaspa
-crates use the same workspace tag and lockfile revision accepted by the
-[current PUAR](../architecture/verification.md#current-puar-result).
+`url` for the already parsed endpoint, `thiserror` for typed errors, and
+`async-trait` for private testable adapter traits. Tokio supplies the worker,
+channels, status observation, completion barriers, and RPC permits;
+`kgi-core::timing` supplies the shared clock and jitter mechanism. All
+rusty-kaspa crates use the same workspace tag and lockfile revision accepted by
+the [current PUAR](../architecture/verification.md#current-puar-result).
 
 ### Lifecycle and generation primitives
 
@@ -247,9 +247,11 @@ permit and then confirms generation admission before issuing an upstream call.
 Retirement closes admission before disconnecting the physical client. A
 private synchronous mutex protects the router and subscription state needed by
 rusty-kaspa's synchronous notification callback; no mutex guard crosses an
-await. Generation-ending reports travel to the owner loop with a one-shot
-barrier so ordered retirement is complete before the operation returns its
-typed result.
+await. Generation-ending reports use the generic `kgi-core` retirement request
+envelope with a node-local weak generation target and reason. The envelope's
+one-shot barrier carries the service-side `Result`; NodeService acknowledges
+success only after event enqueue and maps a failed barrier to the existing
+operation-level retirement-control error.
 
 ### Deterministic test seams
 
@@ -260,11 +262,11 @@ that return real upstream response value types. This avoids implementing the
 complete upstream RPC trait or duplicating a gRPC server while still testing
 KGI-owned request construction, normalization, retirement, and ordering.
 
-Inject a private object-safe clock and jitter source through NodeService's
-runtime dependencies. Production uses Tokio time and a mutex-protected
-`rand::rngs::SmallRng` seeded from system entropy. Tests use a manually
-advanced clock and a scripted jitter sequence, so reconnect slots, the Ready
-reset boundary, and shutdown cancellation contain no wall-clock sleeps or
+Inject the shared object-safe `kgi-core::timing` clock and jitter interfaces
+through NodeService's private runtime dependencies. Production uses the shared
+Tokio clock and entropy-seeded equal-jitter source. Tests provide a manually
+advanced clock and scripted jitter, so reconnect slots, the Ready reset
+boundary, and shutdown cancellation contain no wall-clock sleeps or
 probabilistic assertions. Exact delays and reset behavior remain owned by the
 [NodeService lifecycle](../architecture/node-service.md#nodeservice--settled).
 
@@ -292,3 +294,160 @@ acknowledged during connect, validation, retry, and rejected phases as well as
 Ready, so a late report cannot disturb a replacement or remain blocked behind
 one. Tests use identity jitter when asserting nominal slots and the manual
 clock for both the Ready reset boundary and shutdown-cancellable waits.
+
+## 7 October 2026: StorageService implementation foundation
+
+### PostgreSQL client and migration stack
+
+Use SQLx `0.9.0` with its PostgreSQL driver, Tokio runtime, embedded migration
+support, and Rustls with WebPKI roots. Disable SQLx's default feature set so
+KGI does not compile unused database drivers or JSON support. The `macros`
+feature is enabled only for embedding the migration directory; production SQL
+uses runtime `query`, `query_as`, and `query_scalar` APIs. KGI therefore does
+not require a live database during an ordinary build, and checked-in SQLx
+offline query metadata remains deferred until a concrete benefit justifies
+the additional workflow.
+
+Migration files remain solely under `crates/kgi-storage/migrations/` and are
+embedded in the binary. Use SQLx's own migration-history table and checksum
+validation. Every migration remains forward-only and transaction-compatible;
+the administrative replacement path will run the embedded migration set
+inside its owning outer transaction rather than introduce a second schema
+definition. When SQLx migration history exists, inspect its maximum version
+before comparing the database's table set with the current binary's known
+layout, so ordinary future migrations that add tables retain the specific
+`SchemaTooNew` classification.
+
+After migration, construct a physical-layout fingerprint from
+`information_schema` and `pg_catalog`. Match the exact KGI table, column,
+default, identity, and constraint signatures, and require the complete set of
+constraint-backed and query-path index signatures, including index validity,
+readiness, access method, key order, sort options, and partial predicate. Extra
+operator-created indexes do not alter KGI semantics and are permitted; an
+altered or missing required object is `UnsupportedSchema`.
+
+### Concrete SQL representations
+
+Implement the SQL representation owned by the
+[storage contract](../architecture/storage.md#persistent-representation--settled)
+with SQLx runtime binds and rows. For the concrete fields left open there, use
+PostgreSQL `SMALLINT` for `BlockColor`, the canonical `NetworkId` string as
+`TEXT`, and nullable `TEXT` for the optional administrative reinitialization
+token. Conversion helpers remain private to `kgi-storage`; they return typed
+errors rather than exposing driver conversion failures across the crate
+boundary.
+
+Use the fixed session advisory-lock key `0x4b47_4932_0000_0001` on one
+dedicated SQLx `PgConnection` outside both pools. PostgreSQL scopes advisory
+locks to the connected database, so the same application key independently
+protects each database. Start the processing pool at four connections. The
+separate API pool takes its size from the
+[ApiService resource owner](../architecture/api-service.md#resource-isolation-and-saturation--settled).
+The private processing-pool size does not become a public API value.
+
+### Crate and module boundaries
+
+Start `kgi-storage` with public `error`, `generation`, and `service` modules.
+They own the typed storage failures, `DatabaseBinding` and validated generation
+capabilities, and the Supervisor-facing service lifecycle respectively. Keep
+SQLx adaptation, migration execution, schema inspection, processing-state
+inspection, service-loop commands, and retirement plumbing in private
+`database`, `migration`, `schema`, `state`, and `runtime` modules. Consume the
+generic clock and jitter mechanism from `kgi-core::timing`. Expose the public
+modules without crate-root wildcard re-exports.
+
+These boundaries do not expose SQLx pools, connections, transactions, raw
+queries, or schema-classification details. Add each module only with its first
+implemented behavior rather than creating placeholder APIs.
+
+### Validated generations and stored session state
+
+Keep `DatabaseBinding`, `ValidatedDbClient`, `ValidatedApiDbClient`, and the
+storage-owned session-state result values together in the public `generation`
+module. `LockedDatabase::prepare` consumes the advisory-lock capability and
+returns `PreparedDatabase` only after migration and physical-layout validation.
+`ValidatedDbClient::load_session_state` delegates to the private state adapter
+and exposes no SQLx value. `ProcessingStateInspection` owns the repeatable-read,
+read-only transaction used by both session loading and initial generation
+classification.
+
+The adapter implements the storage-owned
+[bounded processing-state classification](../architecture/storage.md#bounded-processing-state-classification--settled)
+contract. Query shape and indexes remain implementation details only within
+that settled complexity boundary. It converts immutable network-binding decode,
+construction, and cardinality defects directly to `UnsupportedSchema`; those
+defects never enter the mutable processing-state `Inconsistent` path.
+
+### PostgreSQL integration tests
+
+Use `testcontainers-modules` with the official `postgres:17-alpine` image and
+SQLx itself as the test client. Each fixture receives an isolated temporary
+database and requires no ambient `DATABASE_URL`. Keep the image tag explicit
+so a routine dependency or image update cannot silently change database
+behavior. Tests use runtime SQL APIs, run through Nextest, and retain container
+handles until every database assertion and cleanup barrier has completed.
+
+## 8 October 2026: Permanent StorageService lifecycle
+
+### Worker, observation, and retirement plumbing
+
+Run StorageService ownership in one Tokio task. Use private unbounded Tokio
+MPSC channels for its low-rate control queue, reliable ordered lifecycle-event
+stream, and exact-generation retirement reports. The public service handle
+retains the task join handle and exposes latest-value status through a Tokio
+watch channel. Initialization, shutdown, and operation-detected retirement use
+one-shot completion barriers; the retirement barrier carries
+`Result<(), StorageError>` so an event-path failure reaches the reporting
+operation rather than being mistaken for completed retirement. Initialization
+requests received while the database is unavailable remain in FIFO order.
+
+Both validated client types compose one private generic generation runtime that
+owns their pool, terminal atomic admission flag, retirement sender, and weak
+self-reference. A private generation-kind trait maps each concrete client type
+to its storage-local processing-or-API retirement target. Reports use the
+generic `kgi-core` retirement request envelope with that target and no reason
+payload. The service task compares the weak target with the currently owned
+exact `Arc`, suppresses stale and repeated reports, changes validity before
+event publication, and completes an operation barrier only after the retirement
+event has been enqueued. Retirement synchronously marks the SQLx pool closed,
+then moves its potentially blocking drain into a tracked Tokio task so the
+serialized lifecycle worker can publish and validate the replacement without
+waiting for checked-out connections. Terminal worker completion joins every
+tracked drain. Processing and API pool generations remain independently
+replaceable. Losing the dedicated advisory-lock connection uses the same
+owned-generation retirement path before the service reacquires database
+ownership; the [storage lifecycle](../architecture/storage.md#storageservice-lifecycle--settled)
+owns the exact conditional event contract.
+
+### Connection lifecycle and deterministic timing
+
+Retain the parsed database URL privately in StorageService and create fresh
+SQLx pools for every replacement generation. Poll the dedicated advisory-lock
+connection once per second throughout the active lifecycle, including while a
+missing pool generation is opening or waiting for retry, and recheck it after
+initial or replacement generation validation immediately before publication.
+Unpublished clients from a failed initial ownership recheck are invalidated and
+drained without emitting retirement events. This interval is a private
+health-check implementation choice; the reconnect delays, equal-jitter range,
+and 60-second Ready reset remain defined by the
+[storage lifecycle](../architecture/storage.md#storageservice-lifecycle--settled).
+
+Inject the private lock connector, generation opener, and shared
+`kgi-core::timing` clock and jitter interfaces into the worker. Production uses
+SQLx plus the shared Tokio clock and entropy-seeded equal-jitter source; tests
+use scripted connection results, gated initial and replacement opening,
+individually controlled sleeps, and identity jitter. PostgreSQL container tests
+terminate the actual advisory-lock backend to verify exact retirement,
+suppression of initial or replacement publication until ownership is
+reacquired, and autonomous republication. The
+Rebuild replacement gate and API database-phase drain remain part of the later
+database-replacement-safety implementation rather than this general connection
+lifecycle slice.
+
+Map connection-class failures specifically at a persistent-mutation COMMIT
+boundary to the shared `Persistence(AmbiguousCommit)` value; ordinary SQLx
+operations retain the generic connection-loss mapping. The initialization
+integration fixture can inject acknowledgement loss after PostgreSQL has
+accepted COMMIT, then drops the uncertain connection and runs normal database
+preparation again. This verifies the storage owner's transaction-outcome
+contract without teaching the service to replay an uncertain mutation.

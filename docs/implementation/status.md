@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 7 October 2026.
+Updated 8 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -20,9 +20,54 @@ fault, status, VSPC, and committed graph-update values are implemented against
 the selected rusty-kaspa `v2.1.0` value crates. The session-scoped graph-update
 ingress implements the shared pre-seal gate, nonblocking ordinary offers,
 lossless lifecycle markers, coalescing gap observation, and ingress metrics.
-Storage, processing, and API service crates remain behavior-free scaffolds;
-database migrations have not started. Open architecture requirements continue
-to block only their dependent work.
+Processing and API service crates remain behavior-free scaffolds. The first
+StorageService implementation slice selects SQLx with PostgreSQL and Rustls,
+embeds the forward-only metadata and processing-schema migrations, acquires the
+dedicated advisory ownership lock, classifies database bootstrap states, and
+performs the atomic idempotent `Uninitialized -> Empty` network binding. Its
+post-migration physical-layout fingerprint validates column defaults and
+identity mode, constraints, constraint-backed indexes, and required query-path
+indexes before any database generation can be published. Malformed immutable
+network bindings produce terminal unsupported-schema rejection rather than
+transient connection retry. A recognized future migration version is classified
+before current-layout table validation, including when that migration added
+new tables.
+The validated-generation storage slice adds processing and read-only API pool
+generations without exposing SQLx resources across the crate boundary. The
+processing pool is independently capped at four connections, the API pool at
+eight, and API sessions default to read-only. One `ValidatedDbClient` type is
+used for compatible Empty, Initialized, and Inconsistent contents; it proves
+generation ownership, compatible schema, and immutable `DatabaseBinding`.
+Immutable network metadata and mutable `ProcessingMetadata` use separate
+singleton tables; Empty has no processing-metadata row, and invalid processing
+metadata produces semantic Inconsistent without invalidating the client. Only
+coherent Empty and Initialized contents initially produce an API capability.
+API validity is shared and terminal, while retirement authority remains private
+to storage. The processing client also loads a fresh storage-owned session
+state in one repeatable-read transaction. Initial publication and session
+loading share a bounded classifier based on existence checks, indexed PP and
+VSPC-sink lookup, and primary-key identity resolution; they perform no retained
+graph audit. The permanent autonomous StorageService lifecycle now owns
+connection, advisory-lock health, initialization authorization, exact
+processing and API generation publication and retirement, independent pool
+replacement, terminal rejection, retry with equal jitter and its Ready reset,
+and terminal idempotent shutdown. The implemented session-state operation
+reports connection loss through a private exact-generation retirement barrier,
+so the ordered retirement event is enqueued before `GenerationLost` returns;
+event-enqueue failure is instead returned through that result-bearing barrier.
+Deterministic lifecycle tests cover the nominal retry sequence and reset
+boundary; PostgreSQL integration tests cover publication order, exact and
+independent replacement, advisory-lock contention, lock loss with both
+two-generation and processing-only states, lock loss during blocked replacement
+opening, initial and replacement pre-publication ownership rechecks,
+nonblocking replacement while a retired pool still has a checked-out
+connection, terminal joining of that pool drain, missing required index and
+constraint rejection, initialization COMMIT acknowledgement loss with
+truth-based reconnect classification, and fatal event-path closure.
+The gated Rebuild-start API publication, replacement exclusion, and bounded
+drain/cancellation remain for the database-replacement-safety increment
+together with their dependent storage operations. No open architecture
+requirement currently blocks that work.
 
 The imported browser still uses the v1 graph data source, models, and update
 behavior, so it is not yet compatible with the v2 HTTP, SSE, publication, and

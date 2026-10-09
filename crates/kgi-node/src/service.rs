@@ -6,6 +6,7 @@ use kaspa_rpc_core::{
     GetBlocksRequest, GetServerInfoRequest,
     api::ops::{RPC_API_REVISION, RPC_API_VERSION},
 };
+use kgi_core::timing::{Clock, EqualJitter, Jitter, TokioClock};
 use kgi_model::lifecycle::{NodeServiceStatus, NodeServiceStatusState, ValidatedNodeStatus};
 use tokio::{
     sync::{Mutex, mpsc, oneshot, watch},
@@ -19,7 +20,6 @@ use crate::{
     error::{ConsensusResolutionError, NodeRejection, NodeServiceError, NodeUnavailableReason},
     rpc::{ValidatedNodeInfo, ValidatedRpcClient},
     runtime::{RetirementReceiver, RetirementRequest, retirement_channel},
-    timing::{Clock, EqualJitter, Jitter, TokioClock},
 };
 
 const IBD_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -365,15 +365,15 @@ impl NodeServiceWorker {
                         return Err(NodeServiceError::ControlUnavailable);
                     };
                     if request_targets(&request, &client) {
-                        let reason = request.reason();
+                        let reason = *request.reason();
                         let event_result = self.stop_generation(&client, false).await;
-                        request.complete();
+                        request.complete(event_result.clone());
                         event_result?;
                         return Ok(ReadyExit::Reconnect(NodeUnavailableReason::ConnectionLost {
                             diagnostic: Arc::from(format!("generation retired after {reason:?}")),
                         }));
                     }
-                    request.complete();
+                    request.complete(Ok(()));
                 }
                 result = connection.wait_for_disconnect() => {
                     self.stop_generation(&client, false).await?;
@@ -477,12 +477,12 @@ fn status_from_info(info: &ValidatedNodeInfo) -> ValidatedNodeStatus {
 }
 
 fn request_targets(request: &RetirementRequest, client: &Arc<ValidatedRpcClient>) -> bool {
-    request.generation().upgrade().is_some_and(|reported| Arc::ptr_eq(&reported, client))
+    request.target().upgrade().is_some_and(|reported| Arc::ptr_eq(&reported, client))
 }
 
 fn complete_stale_retirement(request: Option<RetirementRequest>) -> Result<(), NodeServiceError> {
     let request = request.ok_or(NodeServiceError::ControlUnavailable)?;
-    request.complete();
+    request.complete(Ok(()));
     Ok(())
 }
 
@@ -512,6 +512,7 @@ mod tests {
         RpcError, RpcResult,
         api::ops::{RPC_API_REVISION, RPC_API_VERSION},
     };
+    use kgi_core::timing::{Clock, Jitter, TokioClock};
     use kgi_model::{block::BlockHash, lifecycle::NodeServiceStatusState};
     use tokio::sync::{Semaphore, mpsc};
     use url::Url;
@@ -521,7 +522,6 @@ mod tests {
         client::{RpcConnection, RpcConnector, ServerInfoObservation},
         consensus::KgiConsensusParams,
         error::{NodeError, NodeRejection},
-        timing::{Clock, Jitter, TokioClock},
     };
 
     type ConnectionOutcome = Result<Arc<dyn RpcConnection>, Arc<str>>;
@@ -955,6 +955,22 @@ mod tests {
         );
         assert_eq!(service.status().state, NodeServiceStatusState::Unavailable);
         service.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn malformed_runtime_response_reports_retirement_event_path_failure() {
+        let network_id = mainnet();
+        let connection = Arc::new(ScriptedConnection::new([server_info(network_id, true)], hash(1)).with_malformed_blocks());
+        let connector = connector([Ok(connection as Arc<dyn RpcConnection>)]);
+        let (service, mut events) = start_service(network_id, connector, Arc::new(TokioClock));
+        let published = match recv_event(&mut events).await {
+            NodeServiceEvent::RpcPublished(client) => client,
+            _ => panic!("expected published generation"),
+        };
+        drop(events);
+
+        assert_eq!(published.full_block(hash(9)).await, Err(NodeError::RetirementControlUnavailable));
+        assert_eq!(service.shutdown().await, Err(super::NodeServiceError::EventPathClosed));
     }
 
     fn start_service(

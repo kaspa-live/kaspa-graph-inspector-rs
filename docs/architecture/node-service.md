@@ -239,7 +239,7 @@ is valid only for configured devnet or simnet. It uses the same JSON
 It is explicitly unsupported for mainnet and every testnet suffix. An
 explicitly supplied file that is unreadable, malformed, or incompatible, or
 use of the setting with an unsupported network, is a configuration error and
-never falls back silently. The file is not persisted in node metadata.
+never falls back silently. The file is not persisted in database metadata.
 Genesis remains RPC-discovered and is not taken from the file.
 
 After applying any override, inspect the resolved raw `BlockrateParams` before
@@ -761,7 +761,7 @@ The operation does not require verbose data, direct parents, merge sets,
 timestamp, or transactions. A different hash or data missing from the
 applicable branch is `RecoveryInputInvalid(MalformedGetBlock)`. A definitive
 not-found response and a normalized DAA score that disagrees with committed
-storage remain reconciliation evidence under the processing-lifecycle contract
+storage remain Resync-preparation evidence under the processing-lifecycle contract
 rather than malformed response shapes. An opaque failed call is
 `RpcRequestFailed`; cancellation and generation loss retain their KGI-owned
 typed outcomes. Storage supplies the materialized ID, selected parent, and

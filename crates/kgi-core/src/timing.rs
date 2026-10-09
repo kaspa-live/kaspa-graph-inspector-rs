@@ -1,14 +1,19 @@
+//! Injectable timing primitives shared by permanent service workers.
+
 use std::{sync::Mutex, time::Duration};
 
 use async_trait::async_trait;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
+/// Asynchronous monotonic delay source.
 #[async_trait]
-pub(crate) trait Clock: Send + Sync {
+pub trait Clock: Send + Sync {
+    /// Waits until the requested duration has elapsed.
     async fn sleep(&self, duration: Duration);
 }
 
-pub(crate) struct TokioClock;
+/// Production clock backed by Tokio's monotonic timer.
+pub struct TokioClock;
 
 #[async_trait]
 impl Clock for TokioClock {
@@ -17,23 +22,28 @@ impl Clock for TokioClock {
     }
 }
 
-pub(crate) trait Jitter: Send + Sync {
+/// Transforms a nominal retry delay into its actual delay.
+pub trait Jitter: Send + Sync {
+    /// Applies the source's jitter policy to one nominal duration.
     fn apply(&self, nominal: Duration) -> Duration;
 }
 
-pub(crate) struct EqualJitter {
+/// Equal-jitter source selecting from 50% through 100% of a nominal delay.
+pub struct EqualJitter {
     random: Mutex<SmallRng>,
 }
 
 impl EqualJitter {
-    pub(crate) fn from_entropy() -> Self {
+    /// Creates an independently seeded production jitter source.
+    #[must_use]
+    pub fn from_entropy() -> Self {
         Self { random: Mutex::new(SmallRng::from_entropy()) }
     }
 }
 
 impl Jitter for EqualJitter {
     fn apply(&self, nominal: Duration) -> Duration {
-        let upper = u64::try_from(nominal.as_nanos()).expect("NodeService delay fits u64 nanoseconds");
+        let upper = u64::try_from(nominal.as_nanos()).expect("KGI delay fits u64 nanoseconds");
         let lower = upper.div_ceil(2);
         let nanos = self.random.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gen_range(lower..=upper);
         Duration::from_nanos(nanos)

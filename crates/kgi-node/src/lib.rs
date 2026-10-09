@@ -11,4 +11,3 @@ mod client;
 mod normalization;
 mod notification;
 mod runtime;
-mod timing;
