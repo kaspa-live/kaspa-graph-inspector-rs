@@ -504,12 +504,15 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use kaspa_consensus_core::network::{NetworkId, NetworkType};
+    use kaspa_consensus_core::{
+        BlueWorkType,
+        network::{NetworkId, NetworkType},
+    };
     use kaspa_grpc_client::GrpcClientNotify;
     use kaspa_rpc_core::{
         GetBlockDagInfoRequest, GetBlockDagInfoResponse, GetBlockRequest, GetBlockResponse, GetBlocksRequest, GetBlocksResponse,
         GetServerInfoRequest, GetSinkRequest, GetSinkResponse, GetVirtualChainFromBlockV2Request, GetVirtualChainFromBlockV2Response,
-        RpcError, RpcResult,
+        RpcBlock, RpcError, RpcHeader, RpcResult,
         api::ops::{RPC_API_REVISION, RPC_API_VERSION},
     };
     use kgi_core::timing::{Clock, Jitter, TokioClock};
@@ -550,6 +553,7 @@ mod tests {
     struct ScriptedConnection {
         server_infos: tokio::sync::Mutex<VecDeque<ServerInfoObservation>>,
         genesis_hashes: Vec<BlockHash>,
+        genesis_blocks: Vec<RpcBlock>,
         genesis_failure: Option<Arc<str>>,
         malformed_blocks: bool,
         genesis_requests: Mutex<Vec<(Option<BlockHash>, bool, bool)>>,
@@ -565,6 +569,7 @@ mod tests {
             Self {
                 server_infos: tokio::sync::Mutex::new(server_infos.into_iter().collect()),
                 genesis_hashes: vec![genesis],
+                genesis_blocks: Vec::new(),
                 genesis_failure: None,
                 malformed_blocks: false,
                 genesis_requests: Mutex::new(Vec::new()),
@@ -589,6 +594,12 @@ mod tests {
 
         fn with_empty_genesis(mut self) -> Self {
             self.genesis_hashes.clear();
+            self
+        }
+
+        fn with_genesis_response(mut self, hashes: Vec<BlockHash>, blocks: Vec<RpcBlock>) -> Self {
+            self.genesis_hashes = hashes;
+            self.genesis_blocks = blocks;
             self
         }
 
@@ -630,7 +641,7 @@ mod tests {
             if let Some(diagnostic) = &self.genesis_failure {
                 return Err(RpcError::General(diagnostic.to_string()));
             }
-            Ok(GetBlocksResponse::new(self.genesis_hashes.clone(), Vec::new()))
+            Ok(GetBlocksResponse::new(self.genesis_hashes.clone(), self.genesis_blocks.clone()))
         }
 
         async fn get_block_dag_info(&self, _request: GetBlockDagInfoRequest) -> RpcResult<GetBlockDagInfoResponse> {
@@ -699,7 +710,10 @@ mod tests {
         let mut compatible = server_info(network_id, true);
         let newer_revision = RPC_API_REVISION.checked_add(1).expect("compiled API revision has a higher test value");
         compatible.rpc_api_revision = Some(newer_revision);
-        let connection = Arc::new(ScriptedConnection::new([compatible], genesis));
+        let connection = Arc::new(
+            ScriptedConnection::new([compatible], genesis)
+                .with_genesis_response(vec![genesis, hash(8)], vec![ignored_genesis_block(hash(9))]),
+        );
         let connector = connector([Ok(connection.clone() as Arc<dyn RpcConnection>)]);
         let (service, mut events) = start_service(network_id, connector, Arc::new(TokioClock));
 
@@ -1086,5 +1100,27 @@ mod tests {
 
     fn hash(byte: u8) -> BlockHash {
         BlockHash::from_bytes([byte; 32])
+    }
+
+    fn ignored_genesis_block(hash_value: BlockHash) -> RpcBlock {
+        RpcBlock {
+            header: RpcHeader {
+                hash: hash_value,
+                version: 0,
+                parents_by_level: Vec::new(),
+                hash_merkle_root: hash(10),
+                accepted_id_merkle_root: hash(11),
+                utxo_commitment: hash(12),
+                timestamp: 0,
+                bits: 0,
+                nonce: 0,
+                daa_score: 0,
+                blue_work: BlueWorkType::default(),
+                blue_score: 0,
+                pruning_point: hash(13),
+            },
+            transactions: Vec::new(),
+            verbose_data: None,
+        }
     }
 }

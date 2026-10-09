@@ -852,7 +852,7 @@ mod tests {
         api::ops::{RPC_API_REVISION, RPC_API_VERSION},
     };
     use kgi_model::{
-        block::{BlockHash, MAX_DAA_SCORE},
+        block::{BlockHash, MAX_BLUE_SCORE, MAX_DAA_SCORE},
         lifecycle::{RecoveryInputKind, ScoreRangeFault},
     };
     use tokio::{
@@ -899,6 +899,44 @@ mod tests {
         fn vspc(result: RpcResult<GetVirtualChainFromBlockV2Response>) -> Self {
             Self::Vspc(Box::new(result))
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CompositeOperation {
+        PruningPoint,
+        CatchupSink,
+    }
+
+    impl CompositeOperation {
+        async fn execute(self, client: &ValidatedRpcClient) -> Result<(), NodeError> {
+            match self {
+                Self::PruningPoint => client.current_pruning_point_block().await.map(|_| ()),
+                Self::CatchupSink => client.catchup_sink_sample().await.map(|_| ()),
+            }
+        }
+
+        const fn malformed_kind(self) -> RecoveryInputKind {
+            match self {
+                Self::PruningPoint => RecoveryInputKind::MalformedPruningPointResponse,
+                Self::CatchupSink => RecoveryInputKind::MalformedCatchupSinkResponse,
+            }
+        }
+
+        fn initial_script(self, advertised_hash: BlockHash) -> Script {
+            match self {
+                Self::PruningPoint => Script::dag(Ok(dag_info(advertised_hash))),
+                Self::CatchupSink => Script::sink(Ok(GetSinkResponse::new(advertised_hash))),
+            }
+        }
+    }
+
+    fn composite_scripts(
+        operation: CompositeOperation,
+        advertised_hash: BlockHash,
+        block: RpcResult<GetBlockResponse>,
+        gate: Option<Arc<Semaphore>>,
+    ) -> Vec<Script> {
+        vec![operation.initial_script(advertised_hash), Script::block(block, gate)]
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1129,6 +1167,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn composite_operations_canonicalize_exact_genesis() {
+        let genesis = hash(0);
+        let mut genesis_block = rpc_block(genesis, vec![hash(8)]);
+        genesis_block.header.daa_score = 17;
+        genesis_block.header.blue_score = u64::MAX;
+        genesis_block.verbose_data = None;
+        let mut dag = dag_info(genesis);
+        dag.network = NetworkId::with_suffix(NetworkType::Testnet, 10);
+        let scripts = [
+            Script::dag(Ok(dag)),
+            Script::block(Ok(GetBlockResponse { block: genesis_block.clone() }), None),
+            Script::sink(Ok(GetSinkResponse::new(genesis))),
+            Script::block(Ok(GetBlockResponse { block: genesis_block }), None),
+        ];
+        let (client, connection, mut retirements) = client(scripts);
+
+        let pruning_point = client.current_pruning_point_block().await.expect("canonical Genesis pruning point");
+        assert_eq!(pruning_point.hash, genesis);
+        assert_eq!(pruning_point.selected_parent, ORIGIN);
+        assert!(pruning_point.direct_parents.is_empty());
+        assert!(pruning_point.blue_merge_set.is_empty());
+        assert!(pruning_point.red_merge_set.is_empty());
+        assert_eq!(pruning_point.blue_score, 0);
+        assert_eq!(pruning_point.daa_score, 17);
+
+        let sink = client.catchup_sink_sample().await.expect("canonical Genesis sink");
+        assert_eq!(sink.hash, genesis);
+        assert_eq!(sink.daa_score, 17);
+        assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert_eq!(connection.disconnects.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn get_block_not_found_matches_are_exact_and_hash_specific() {
         let requested = hash(1);
@@ -1209,66 +1280,174 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advertised_origin_pruning_point_retires_without_get_block() {
-        let scripts = [Script::dag(Ok(dag_info(ORIGIN)))];
-        let (client, connection, mut retirements) = client(scripts);
-        let operation = tokio::spawn({
-            let client = client.clone();
-            async move { client.current_pruning_point_block().await }
-        });
+    async fn malformed_composite_responses_retire_the_exact_generation() {
+        let pruning_point = hash(4);
+        let sink = hash(5);
+        let mut missing_verbose = rpc_block(pruning_point, vec![hash(8)]);
+        missing_verbose.verbose_data = None;
+        let cases = [
+            ("ORIGIN pruning point", CompositeOperation::PruningPoint, vec![Script::dag(Ok(dag_info(ORIGIN)))]),
+            (
+                "wrong pruning-point hash",
+                CompositeOperation::PruningPoint,
+                composite_scripts(
+                    CompositeOperation::PruningPoint,
+                    pruning_point,
+                    Ok(GetBlockResponse { block: rpc_block(hash(6), vec![hash(8)]) }),
+                    None,
+                ),
+            ),
+            (
+                "missing pruning-point block",
+                CompositeOperation::PruningPoint,
+                composite_scripts(
+                    CompositeOperation::PruningPoint,
+                    pruning_point,
+                    Err(RpcError::General(ConsensusError::HeaderNotFound(pruning_point).to_string())),
+                    None,
+                ),
+            ),
+            (
+                "malformed pruning-point block",
+                CompositeOperation::PruningPoint,
+                composite_scripts(
+                    CompositeOperation::PruningPoint,
+                    pruning_point,
+                    Ok(GetBlockResponse { block: missing_verbose }),
+                    None,
+                ),
+            ),
+            ("ORIGIN sink", CompositeOperation::CatchupSink, vec![Script::sink(Ok(GetSinkResponse::new(ORIGIN)))]),
+            (
+                "missing sink block",
+                CompositeOperation::CatchupSink,
+                composite_scripts(
+                    CompositeOperation::CatchupSink,
+                    sink,
+                    Err(RpcError::General(ConsensusError::HeaderNotFound(sink).to_string())),
+                    None,
+                ),
+            ),
+            (
+                "missing sink header",
+                CompositeOperation::CatchupSink,
+                composite_scripts(
+                    CompositeOperation::CatchupSink,
+                    sink,
+                    Err(RpcError::MissingRpcFieldError("RpcBlock".to_string(), "header".to_string())),
+                    None,
+                ),
+            ),
+            (
+                "wrong sink hash",
+                CompositeOperation::CatchupSink,
+                composite_scripts(
+                    CompositeOperation::CatchupSink,
+                    sink,
+                    Ok(GetBlockResponse { block: rpc_block(hash(7), vec![hash(8)]) }),
+                    None,
+                ),
+            ),
+        ];
 
-        let retirement = retirements.recv().await.expect("retirement request");
-        assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedPruningPointResponse));
-        assert!(retirement.target().upgrade().is_some_and(|generation| Arc::ptr_eq(&generation, &client)));
-        assert_eq!(connection.requests(), vec![RecordedRequest::Dag]);
-        assert!(client.retire().await);
-        retirement.complete(Ok(()));
-        assert_eq!(
-            operation.await.expect("pruning-point operation"),
-            Err(NodeError::RecoveryInputInvalid(RecoveryInputKind::MalformedPruningPointResponse))
-        );
+        for (name, operation, scripts) in cases {
+            assert_malformed_composite(name, operation, scripts).await;
+        }
     }
 
     #[tokio::test]
-    async fn advertised_origin_sink_retires_without_get_block() {
-        let scripts = [Script::sink(Ok(GetSinkResponse::new(ORIGIN)))];
-        let (client, connection, mut retirements) = client(scripts);
-        let operation = tokio::spawn({
-            let client = client.clone();
-            async move { client.catchup_sink_sample().await }
-        });
+    async fn composite_score_and_opaque_failures_do_not_retire_the_generation() {
+        let pruning_point = hash(4);
+        let sink = hash(5);
+        let mut excessive_pruning_daa = rpc_block(pruning_point, vec![hash(8)]);
+        excessive_pruning_daa.header.daa_score = MAX_DAA_SCORE + 1;
+        let mut excessive_pruning_blue = rpc_block(pruning_point, vec![hash(8)]);
+        excessive_pruning_blue.header.blue_score = MAX_BLUE_SCORE + 1;
+        let mut excessive_sink_daa = rpc_block(sink, vec![hash(8)]);
+        excessive_sink_daa.header.daa_score = MAX_DAA_SCORE + 1;
+        let cases = [
+            (
+                CompositeOperation::PruningPoint,
+                composite_scripts(
+                    CompositeOperation::PruningPoint,
+                    pruning_point,
+                    Ok(GetBlockResponse { block: excessive_pruning_daa }),
+                    None,
+                ),
+                NodeError::ScoreOutOfRange(ScoreRangeFault::DaaScore),
+            ),
+            (
+                CompositeOperation::PruningPoint,
+                composite_scripts(
+                    CompositeOperation::PruningPoint,
+                    pruning_point,
+                    Ok(GetBlockResponse { block: excessive_pruning_blue }),
+                    None,
+                ),
+                NodeError::ScoreOutOfRange(ScoreRangeFault::BlueScore),
+            ),
+            (
+                CompositeOperation::CatchupSink,
+                composite_scripts(CompositeOperation::CatchupSink, sink, Ok(GetBlockResponse { block: excessive_sink_daa }), None),
+                NodeError::ScoreOutOfRange(ScoreRangeFault::DaaScore),
+            ),
+            (
+                CompositeOperation::PruningPoint,
+                composite_scripts(
+                    CompositeOperation::PruningPoint,
+                    pruning_point,
+                    Err(RpcError::General("opaque pruning-point failure".to_string())),
+                    None,
+                ),
+                NodeError::RpcRequestFailed { diagnostic: Arc::from("opaque pruning-point failure") },
+            ),
+            (
+                CompositeOperation::CatchupSink,
+                composite_scripts(
+                    CompositeOperation::CatchupSink,
+                    sink,
+                    Err(RpcError::General("opaque sink failure".to_string())),
+                    None,
+                ),
+                NodeError::RpcRequestFailed { diagnostic: Arc::from("opaque sink failure") },
+            ),
+        ];
 
-        let retirement = retirements.recv().await.expect("retirement request");
-        assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedCatchupSinkResponse));
-        assert!(retirement.target().upgrade().is_some_and(|generation| Arc::ptr_eq(&generation, &client)));
-        assert_eq!(connection.requests(), vec![RecordedRequest::Sink]);
-        assert!(client.retire().await);
-        retirement.complete(Ok(()));
-        assert_eq!(
-            operation.await.expect("sink-sample operation"),
-            Err(NodeError::RecoveryInputInvalid(RecoveryInputKind::MalformedCatchupSinkResponse))
-        );
+        for (operation, scripts, expected) in cases {
+            let (client, connection, mut retirements) = client(scripts);
+            assert_eq!(operation.execute(&client).await, Err(expected));
+            assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+            assert_eq!(connection.disconnects.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[tokio::test]
-    async fn advertised_sink_not_found_uses_sink_malformed_classification() {
-        let sink = hash(7);
-        let message = ConsensusError::HeaderNotFound(sink).to_string();
-        let scripts = [Script::sink(Ok(GetSinkResponse::new(sink))), Script::block(Err(RpcError::General(message)), None)];
-        let (client, _connection, mut retirements) = client(scripts);
-        let operation = tokio::spawn({
-            let client = client.clone();
-            async move { client.catchup_sink_sample().await }
-        });
+    async fn composite_cancellation_and_generation_loss_are_not_remapped() {
+        for operation in [CompositeOperation::PruningPoint, CompositeOperation::CatchupSink] {
+            for cancelled in [true, false] {
+                let advertised_hash = hash(4);
+                let gate = Arc::new(Semaphore::new(0));
+                let scripts = composite_scripts(
+                    operation,
+                    advertised_hash,
+                    Ok(GetBlockResponse { block: rpc_block(advertised_hash, vec![hash(8)]) }),
+                    Some(gate),
+                );
+                let (client, connection, mut retirements) = client(scripts);
+                let task = tokio::spawn({
+                    let client = client.clone();
+                    async move { operation.execute(&client).await }
+                });
+                wait_for_requests(&connection, 2).await;
 
-        let retirement = retirements.recv().await.expect("retirement request");
-        assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedCatchupSinkResponse));
-        assert!(client.retire().await);
-        retirement.complete(Ok(()));
-        assert_eq!(
-            operation.await.expect("operation task"),
-            Err(NodeError::RecoveryInputInvalid(RecoveryInputKind::MalformedCatchupSinkResponse))
-        );
+                let changed = if cancelled { client.cancel().await } else { client.retire().await };
+                assert!(changed);
+                let expected = if cancelled { NodeError::Cancelled } else { NodeError::GenerationLost };
+                assert_eq!(task.await.expect("composite operation task"), Err(expected));
+                assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+                assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1);
+            }
+        }
     }
 
     #[tokio::test]
@@ -1831,6 +2010,25 @@ mod tests {
         (client, connection, retirement_rx)
     }
 
+    async fn assert_malformed_composite(name: &str, operation: CompositeOperation, scripts: Vec<Script>) {
+        let expected_kind = operation.malformed_kind();
+        let (client, connection, mut retirements) = client(scripts);
+        let task = tokio::spawn({
+            let client = client.clone();
+            async move { operation.execute(&client).await }
+        });
+
+        let retirement = retirements.recv().await.expect("malformed composite retirement request");
+        assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(expected_kind), "{name}");
+        assert!(retirement.target().upgrade().is_some_and(|generation| Arc::ptr_eq(&generation, &client)), "{name}");
+        assert!(client.retire().await, "{name}");
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "{name} completed before its exact-generation retirement barrier");
+        retirement.complete(Ok(()));
+        assert_eq!(task.await.expect("composite operation task"), Err(NodeError::RecoveryInputInvalid(expected_kind)), "{name}");
+        assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1, "{name}");
+    }
+
     type NotificationReceivers = (
         mpsc::Receiver<kgi_model::block::ValidatedNodeBlock>,
         mpsc::Receiver<kgi_model::vspc::VspcChange>,
@@ -1927,6 +2125,19 @@ mod tests {
         })
         .await
         .expect("subscription calls must reach the expected count");
+    }
+
+    async fn wait_for_requests(connection: &ScriptedConnection, expected: usize) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if connection.requests().len() >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("RPC requests must reach the expected count");
     }
 
     async fn wait_for_subscription_state(client: &ValidatedRpcClient, expected: SubscriptionState) {
