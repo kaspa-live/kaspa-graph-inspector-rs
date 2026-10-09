@@ -314,10 +314,11 @@ run-local state and descendants. The
 owns routing shutdown and recovery disposition.
 
 An isolated orphan below the threshold is acceptable. Connection loss or a
-full notification channel requests recovery. Callbacks intentionally dropped
-during subscription activation are not replayed. If an omitted block later
-becomes a dependency of an admitted block, normal dependency resolution
-exposes it. No independent age fallback is required.
+full notification channel requests recovery. The
+[NodeService activation contract](node-service.md#notificationrouter) owns
+callback delivery. If a block absent from processor input later becomes a
+dependency of an admitted block, normal dependency resolution exposes it. No
+independent age fallback is required.
 
 ## DependencyResolver — settled
 

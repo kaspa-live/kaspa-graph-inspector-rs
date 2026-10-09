@@ -87,6 +87,13 @@ The PUAR checklist is:
    selected Rust client. The review also records that unrelated remote and
    client failures can use the same `General` variant, so the variant itself is
    not a semantic discriminator.
+10. For NodeService
+    [client response-conversion classification](node-service.md#client-response-conversion-failures),
+    the selected client performs the documented eager conversions for
+    `GetSink`, `GetBlock`, `GetBlocks`, `GetBlockDagInfo`, and
+    `GetVirtualChainFromBlockV2`; its error variants and structured
+    missing-field identifiers retain exactly the documented attribution,
+    ambiguity, and ignored-field boundaries.
 
 For each item, inspect the committed source at the full SHA and report one of:
 
@@ -121,8 +128,8 @@ upstream change gives a concrete reason.
 ### Current PUAR result
 
 Architecture accepts the expanded
-[7 October 2026 PUAR](../reviews/2026-10-07-rusty-kaspa-01b532e8-assumptions.md)
-against the full pinned revision above. All nine checklist items are
+[9 October 2026 PUAR](../reviews/2026-10-09-rusty-kaspa-01b532e8-assumptions.md)
+against the full pinned revision above. All ten checklist items are
 `Confirmed`; none is `Not confirmed` or `Contradicted`. The focused contracts
 may therefore rely on those reviewed upstream behaviors for the pinned
 revision, subject to their stated KGI validation and recovery rules.
@@ -256,10 +263,23 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
     becomes `RpcRequestFailed`, leaves the exact generation valid, and exposes
     its message only as diagnostics. After this adapter, only its typed result
     may select caller or lifecycle behavior.
-12. BlockAdded normalization failure disables routing, enqueues no block, and
+12. Exercise the NodeService-owned
+    [client response-conversion mapping](node-service.md#client-response-conversion-failures)
+    at the actual pinned wire-to-typed conversion boundary and at each runtime
+    operation mapper. Cover malformed sink hex; missing individual GetBlock
+    response block and block header; the dedicated blue-work conversion error;
+    a missing GetBlocks block header; and exact-generation retirement before
+    returning each attributable malformed result. Cover ambiguous hash or
+    blue-work conversion in GetBlock, invalid ignored GetBlocks parallel hashes
+    and payload fields, both consumed and ignored GetBlockDagInfo hashes, and
+    both consumed and ignored VSPC fields as opaque `RpcRequestFailed` results
+    that retain the generation. Unknown structured missing-field pairs and
+    generic response-envelope conversion errors are opaque. These fixtures
+    must prove that formatted diagnostics never select this policy.
+13. BlockAdded normalization failure disables routing, enqueues no block, and
     reports `NotificationInputInvalid(MalformedBlockAdded)` without retiring
     the RPC generation.
-13. NotificationRouter drops the valid empty VSPC no-op and rejects a nonempty
+14. NotificationRouter drops the valid empty VSPC no-op and rejects a nonempty
     removed path with an empty added path without enqueueing it, disabling
     routing without retiring the RPC generation. Duplicate members and
     removed/added intersections are preserved and delivered normally.

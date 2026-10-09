@@ -504,17 +504,23 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use kaspa_consensus_core::network::{NetworkId, NetworkType};
+    use kaspa_consensus_core::{
+        BlueWorkType,
+        network::{NetworkId, NetworkType},
+    };
     use kaspa_grpc_client::GrpcClientNotify;
     use kaspa_rpc_core::{
         GetBlockDagInfoRequest, GetBlockDagInfoResponse, GetBlockRequest, GetBlockResponse, GetBlocksRequest, GetBlocksResponse,
         GetServerInfoRequest, GetSinkRequest, GetSinkResponse, GetVirtualChainFromBlockV2Request, GetVirtualChainFromBlockV2Response,
-        RpcError, RpcResult,
+        RpcBlock, RpcError, RpcHeader, RpcResult,
         api::ops::{RPC_API_REVISION, RPC_API_VERSION},
     };
     use kgi_core::timing::{Clock, Jitter, TokioClock};
-    use kgi_model::{block::BlockHash, lifecycle::NodeServiceStatusState};
-    use tokio::sync::{Semaphore, mpsc};
+    use kgi_model::{
+        block::BlockHash,
+        lifecycle::{NodeServiceStatusState, RecoveryInputKind},
+    };
+    use tokio::sync::{Semaphore, mpsc, oneshot};
     use url::Url;
 
     use super::{IBD_POLL_INTERVAL, NodeService, NodeServiceEvent, RETRY_DELAYS};
@@ -522,6 +528,7 @@ mod tests {
         client::{RpcConnection, RpcConnector, ServerInfoObservation},
         consensus::KgiConsensusParams,
         error::{NodeError, NodeRejection},
+        runtime::{RetirementReason, RetirementRequest},
     };
 
     type ConnectionOutcome = Result<Arc<dyn RpcConnection>, Arc<str>>;
@@ -546,6 +553,7 @@ mod tests {
     struct ScriptedConnection {
         server_infos: tokio::sync::Mutex<VecDeque<ServerInfoObservation>>,
         genesis_hashes: Vec<BlockHash>,
+        genesis_blocks: Vec<RpcBlock>,
         genesis_failure: Option<Arc<str>>,
         malformed_blocks: bool,
         genesis_requests: Mutex<Vec<(Option<BlockHash>, bool, bool)>>,
@@ -561,6 +569,7 @@ mod tests {
             Self {
                 server_infos: tokio::sync::Mutex::new(server_infos.into_iter().collect()),
                 genesis_hashes: vec![genesis],
+                genesis_blocks: Vec::new(),
                 genesis_failure: None,
                 malformed_blocks: false,
                 genesis_requests: Mutex::new(Vec::new()),
@@ -585,6 +594,12 @@ mod tests {
 
         fn with_empty_genesis(mut self) -> Self {
             self.genesis_hashes.clear();
+            self
+        }
+
+        fn with_genesis_response(mut self, hashes: Vec<BlockHash>, blocks: Vec<RpcBlock>) -> Self {
+            self.genesis_hashes = hashes;
+            self.genesis_blocks = blocks;
             self
         }
 
@@ -626,7 +641,7 @@ mod tests {
             if let Some(diagnostic) = &self.genesis_failure {
                 return Err(RpcError::General(diagnostic.to_string()));
             }
-            Ok(GetBlocksResponse::new(self.genesis_hashes.clone(), Vec::new()))
+            Ok(GetBlocksResponse::new(self.genesis_hashes.clone(), self.genesis_blocks.clone()))
         }
 
         async fn get_block_dag_info(&self, _request: GetBlockDagInfoRequest) -> RpcResult<GetBlockDagInfoResponse> {
@@ -695,7 +710,10 @@ mod tests {
         let mut compatible = server_info(network_id, true);
         let newer_revision = RPC_API_REVISION.checked_add(1).expect("compiled API revision has a higher test value");
         compatible.rpc_api_revision = Some(newer_revision);
-        let connection = Arc::new(ScriptedConnection::new([compatible], genesis));
+        let connection = Arc::new(
+            ScriptedConnection::new([compatible], genesis)
+                .with_genesis_response(vec![genesis, hash(8)], vec![ignored_genesis_block(hash(9))]),
+        );
         let connector = connector([Ok(connection.clone() as Arc<dyn RpcConnection>)]);
         let (service, mut events) = start_service(network_id, connector, Arc::new(TokioClock));
 
@@ -904,6 +922,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_uses_a_new_identity_and_ignores_repeated_stale_retirement() {
+        let network_id = mainnet();
+        let first_connection = Arc::new(ScriptedConnection::new([server_info(network_id, true)], hash(1)));
+        let second_connection = Arc::new(ScriptedConnection::new([server_info(network_id, true)], hash(2)));
+        let connector = connector([
+            Ok(first_connection.clone() as Arc<dyn RpcConnection>),
+            Ok(second_connection.clone() as Arc<dyn RpcConnection>),
+        ]);
+        let (clock, mut sleeps, permits) = manual_clock();
+        let (service, mut events) = start_service(network_id, connector, clock);
+
+        let first = match recv_event(&mut events).await {
+            NodeServiceEvent::RpcPublished(client) => client,
+            _ => panic!("expected first publication"),
+        };
+        assert_eq!(first.node_info().genesis_hash, hash(1));
+        assert_eq!(sleeps.recv().await.expect("Ready reset timer"), Duration::from_secs(60));
+
+        first_connection.signal_disconnect();
+        let retired = match recv_event(&mut events).await {
+            NodeServiceEvent::RpcRetired(client) => client,
+            _ => panic!("expected first retirement"),
+        };
+        assert!(Arc::ptr_eq(&first, &retired));
+        assert_eq!(sleeps.recv().await.expect("replacement retry"), Duration::from_secs(1));
+        permits.add_permits(1);
+
+        let second = match recv_event(&mut events).await {
+            NodeServiceEvent::RpcPublished(client) => client,
+            _ => panic!("expected replacement publication"),
+        };
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.node_info().genesis_hash, hash(2));
+
+        let retirements = first.retirement_sender();
+        for _ in 0..2 {
+            let (completion_tx, completion_rx) = oneshot::channel();
+            retirements
+                .send(RetirementRequest::with_reason(
+                    Arc::downgrade(&first),
+                    RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedGetBlock),
+                    completion_tx,
+                ))
+                .expect("retirement control path");
+            completion_rx.await.expect("stale retirement acknowledgement").expect("stale retirement completion");
+        }
+
+        assert!(matches!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert_eq!(first.full_block(hash(9)).await, Err(NodeError::GenerationLost));
+        assert!(matches!(second.full_block(hash(9)).await, Err(NodeError::RpcRequestFailed { .. })));
+        assert_eq!(service.status().state, NodeServiceStatusState::Ready);
+        assert_eq!(second_connection.disconnects.load(Ordering::Relaxed), 0);
+
+        service.shutdown().await.expect("shutdown");
+        let retired = match recv_event(&mut events).await {
+            NodeServiceEvent::RpcRetired(client) => client,
+            _ => panic!("expected replacement retirement"),
+        };
+        assert!(Arc::ptr_eq(&second, &retired));
+        assert!(matches!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)));
+    }
+
+    #[tokio::test]
     async fn sixty_continuous_ready_seconds_reset_retry_progress() {
         let network_id = mainnet();
         let first = Arc::new(ScriptedConnection::new([server_info(network_id, true)], hash(1)));
@@ -1019,5 +1100,27 @@ mod tests {
 
     fn hash(byte: u8) -> BlockHash {
         BlockHash::from_bytes([byte; 32])
+    }
+
+    fn ignored_genesis_block(hash_value: BlockHash) -> RpcBlock {
+        RpcBlock {
+            header: RpcHeader {
+                hash: hash_value,
+                version: 0,
+                parents_by_level: Vec::new(),
+                hash_merkle_root: hash(10),
+                accepted_id_merkle_root: hash(11),
+                utxo_commitment: hash(12),
+                timestamp: 0,
+                bits: 0,
+                nonce: 0,
+                daa_score: 0,
+                blue_work: BlueWorkType::default(),
+                blue_score: 0,
+                pruning_point: hash(13),
+            },
+            transactions: Vec::new(),
+            verbose_data: None,
+        }
     }
 }

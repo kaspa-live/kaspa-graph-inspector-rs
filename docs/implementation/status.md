@@ -122,8 +122,11 @@ constructs the required requests, normalizes their responses, classifies the
 pinned exact-message GetBlock compatibility forms, and linearizes completion
 against cancellation or retirement. Malformed recovery responses use an
 exact-generation retirement request and completion barrier; opaque RPC failures
-and range faults do not retire the generation. The private
-`NotificationRouter` implements the synchronous rusty-kaspa callback,
+and range faults do not retire the generation. The operation-specific
+response-conversion adapter classifies only failures uniquely attributable to
+fields KGI consumes as malformed; failures in ignored or ambiguously identified
+fields remain opaque. Its tests exercise the pinned wire-to-typed converters
+directly. The private `NotificationRouter` implements the synchronous rusty-kaspa callback,
 generation-context BlockAdded normalization, empty and malformed virtual-chain
 filtering, bounded nonblocking delivery, and shared disablement after malformed
 input, saturation, or unexpected endpoint loss. Each validated generation now

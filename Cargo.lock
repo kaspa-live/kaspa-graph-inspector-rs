@@ -2963,6 +2963,7 @@ dependencies = [
  "kaspa-consensus-core",
  "kaspa-core",
  "kaspa-grpc-client",
+ "kaspa-grpc-core",
  "kaspa-notify",
  "kaspa-rpc-core",
  "kgi-core",

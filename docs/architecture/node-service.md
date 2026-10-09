@@ -409,17 +409,16 @@ Kaspa path properties under the
 Enable ordering:
 
 ```text
-precondition: ResyncEngine has sent Catchup to both processors for this run
 start BlockAdded remotely
 start VirtualChainChanged remotely
 enable router only when both succeeded
 publish subscription Enabled only when both succeeded
 ```
 
-Catchup is a caller-established lifecycle precondition, not a NodeService
-operation. ResyncEngine is the sole sender of processor commands and invokes
-NodeService subscription activation only after satisfying that precondition.
-NodeService owns the four activation steps following it.
+The
+[processing lifecycle](processing-lifecycle.md#entering-recovery-phases)
+owns activation invocation and its caller-side preconditions. Once invoked,
+NodeService owns the complete activation sequence above.
 
 Disable ordering:
 
@@ -538,6 +537,60 @@ or server message change may conservatively stop recognizing absence, but must
 never broaden either match. Replacing this adapter requires an end-to-end
 structured not-found discriminator in the selected production transport and a
 newly accepted pinned-upstream review.
+
+#### Client response-conversion failures
+
+The selected rusty-kaspa client converts the wire response into its typed RPC
+value before `ResponseNormalizer` receives it. NodeService classifies a
+client-side conversion failure as malformed recovery evidence only when the
+typed `RpcError` variant, its structured fields, and the requested operation
+uniquely establish that conversion failed for response data consumed by KGI.
+That classification returns the operation's existing source-specific
+`RecoveryInputInvalid` value and retires the exact validated RPC generation.
+
+A conversion failure attributable only to an ignored field, or lacking enough
+field provenance to distinguish a consumed field from an ignored one, becomes
+`RpcRequestFailed`. It retains the generation. This conservative result is
+intentional: rusty-kaspa may convert fields that KGI deliberately does not
+consume, and their conversion does not enlarge the
+[node trust boundary](overview.md#node-trust-boundary--settled). The formatted
+error text is diagnostic only. Exact object and field identifiers carried by
+`MissingRpcFieldError` are structured converter evidence and may be matched;
+no other diagnostic-string matching is permitted by this rule.
+
+For the pinned client, apply this exhaustive operation-specific mapping:
+
+| Operation | Attributable conversion failure | Malformed result |
+|---|---|---|
+| `GetSink` within `catchup_sink_sample` | `HexParsingError`; the response converter parses only the consumed sink hash | `MalformedCatchupSinkResponse` |
+| Individual `GetBlock` | `MissingRpcFieldError` naming the response block or its block header; `RpcBlueWorkTypeParseError` | `MalformedGetBlock`, remapped to the composite source when applicable |
+| `GetBlocks` | `MissingRpcFieldError` naming a block header, which is required even for the stripped anchor | `MalformedGetBlocks` |
+| `GetBlockDagInfo` | none with the current converter | — |
+| `GetVirtualChainFromBlockV2` | none with the current converter | — |
+
+Every conversion failure not listed in the table is opaque. In particular:
+
+- `GetBlockDagInfo` hash conversion cannot identify whether the consumed
+  pruning-point hash or an ignored tip, virtual parent, or sink failed;
+- `GetBlock` hash conversion covers both consumed relationship hashes and
+  ignored header commitments, transaction data, and verbose fields;
+- the current gRPC header converter reports invalid blue work as the same
+  unqualified `HexParsingError`, rather than the field-specific blue-work
+  variant;
+- `GetBlocks` also converts the ignored parallel hash vector, the stripped
+  anchor's unused payload, transactions, and ignored block fields without
+  retaining the failing member or field; and
+- VSPC V2 hash conversion does not distinguish consumed removed or added
+  hashes from ignored acceptance data.
+
+Missing or mismatched generic response-envelope payload errors likewise do not
+prove that node-provided data consumed by KGI was malformed and remain opaque.
+If a future adapter preserves additional field and member provenance,
+NodeService may classify a newly attributable consumed-field failure as
+malformed only after the operation table and pinned-upstream evidence are
+updated. The [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
+owns the existing dispositions of `RecoveryInputInvalid` and
+`RpcRequestFailed`.
 
 #### Full-block normalization
 

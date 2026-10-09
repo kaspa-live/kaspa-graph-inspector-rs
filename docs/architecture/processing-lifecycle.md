@@ -918,21 +918,20 @@ Before a fresh Begin:
 
 Begin needs no acknowledgement. Before Catchup:
 
-1. send Catchup commands, including lower bounds;
-2. start both remote subscriptions with NotificationRouter still Disabled;
-3. after both starts succeed, enable the router and publish the client's
-   subscription state Enabled.
+1. send Catchup commands, including lower bounds, to both processors;
+2. invoke the run's exact `ValidatedRpcClient` subscription activation.
+
+The [NodeService activation contract](node-service.md#notificationrouter) owns
+remote subscription starts, router enablement, subscription-state publication,
+rollback, and callback handling during activation.
 
 If activation returns the generation-preserving `SubscriptionControlFailed`,
 ResyncEngine reports that fault with `Retry` and dispatches no Catchup
 notification input. A generation-ending activation result follows the existing
 generation-loss path.
 
-Processor-local notification gates are authoritative for immediate dropping.
-Callbacks arriving while the router remains Disabled during activation are
-intentionally dropped without overlap credit or a recovery request. Synthetic
-pumps continue until the [Live admission](#live-admission) predicate is
-satisfied.
+Synthetic pumps continue until the [Live admission](#live-admission) predicate
+is satisfied.
 
 ### Catchup trigger
 

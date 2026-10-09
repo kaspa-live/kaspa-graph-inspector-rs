@@ -27,6 +27,7 @@ ctrlc = { version = "3.4.1", features = ["termination"] }
 kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }
 kaspa-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }
 kaspa-grpc-client = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }
+kaspa-grpc-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }
 kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }
 kaspa-math = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }
 kaspa-notify = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }

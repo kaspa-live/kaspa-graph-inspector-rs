@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use kaspa_consensus_core::{errors::consensus::ConsensusError, network::NetworkId};
+use kaspa_consensus_core::{blockhash::ORIGIN, errors::consensus::ConsensusError, network::NetworkId};
 use kaspa_rpc_core::{
     GetBlockDagInfoRequest, GetBlockRequest, GetBlocksRequest, GetSinkRequest, GetVirtualChainFromBlockV2Request,
     RpcDataVerbosityLevel, RpcError, RpcResult,
@@ -16,7 +16,7 @@ use kgi_model::{
     lifecycle::{FaultKind, RecoveryInputKind},
     vspc::VspcChange,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use crate::{
     client::RpcConnection,
@@ -131,6 +131,11 @@ pub struct ValidatedRpcClient {
     normalizer: Arc<ResponseNormalizer>,
     notification_router: Arc<NotificationRouter>,
     subscription_state: Mutex<SubscriptionState>,
+    subscription_transition: Arc<AsyncMutex<()>>,
+    #[cfg(test)]
+    activation_publication_gate: Mutex<Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>>,
+    #[cfg(test)]
+    operation_completion_gate: Mutex<Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>>,
     admission: AtomicU8,
     admission_tx: watch::Sender<u8>,
     permits: Arc<Semaphore>,
@@ -151,6 +156,11 @@ impl ValidatedRpcClient {
                 normalizer,
                 notification_router,
                 subscription_state: Mutex::new(SubscriptionState::Disabled),
+                subscription_transition: Arc::new(AsyncMutex::new(())),
+                #[cfg(test)]
+                activation_publication_gate: Mutex::new(None),
+                #[cfg(test)]
+                operation_completion_gate: Mutex::new(None),
                 node_info,
                 admission: AtomicU8::new(GENERATION_ACTIVE),
                 admission_tx,
@@ -179,8 +189,51 @@ impl ValidatedRpcClient {
         self.notification_router.clone()
     }
 
+    #[cfg(test)]
+    fn subscription_state(&self) -> SubscriptionState {
+        *self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(test)]
+    fn set_activation_publication_gate(&self, reached: mpsc::UnboundedSender<()>, gate: Arc<Semaphore>) {
+        *self.activation_publication_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((reached, gate));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retirement_sender(&self) -> RetirementSender {
+        self.retirement_tx.clone()
+    }
+
+    #[cfg(test)]
+    fn set_operation_completion_gate(&self, reached: mpsc::UnboundedSender<()>, gate: Arc<Semaphore>) {
+        *self.operation_completion_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((reached, gate));
+    }
+
+    #[cfg(test)]
+    async fn wait_for_activation_publication(&self) {
+        let publication_gate = self.activation_publication_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        if let Some((reached, gate)) = publication_gate {
+            reached.send(()).expect("activation-publication observer");
+            gate.acquire().await.expect("activation-publication gate").forget();
+        }
+    }
+
+    #[cfg(test)]
+    async fn wait_for_operation_completion(&self) {
+        let completion_gate = self.operation_completion_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        if let Some((reached, gate)) = completion_gate {
+            reached.send(()).expect("operation-completion observer");
+            gate.acquire().await.expect("operation-completion gate").forget();
+        }
+    }
+
     /// Starts both remote notification subscriptions and then enables local routing.
     pub async fn activate_notifications(&self, channels: NotificationChannels) -> Result<(), NodeError> {
+        self.require_active()?;
+        if *self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) != SubscriptionState::Disabled {
+            return Err(NodeError::InvalidSubscriptionState);
+        }
+        let transition_guard = self.subscription_transition.clone().lock_owned().await;
         self.require_active()?;
         {
             let mut state = self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -194,16 +247,52 @@ impl ValidatedRpcClient {
             return Err(NodeError::InvalidSubscriptionState);
         }
 
-        if let Err(error) = self.subscription_call(self.connection.start_block_added()).await {
-            self.finish_failed_activation();
-            return Err(error);
+        let client = self.self_weak.upgrade().ok_or(NodeError::GenerationLost)?;
+        let cancellation = Arc::new(ActivationCancellation::new());
+        let mut cancellation_guard = ActivationCancellationGuard::new(cancellation.clone());
+        let transition = tokio::spawn(async move { client.complete_activation(cancellation, transition_guard).await });
+        let result = transition.await;
+        cancellation_guard.disarm();
+        self.finish_subscription_transition(result).await
+    }
+
+    async fn complete_activation(
+        self: Arc<Self>,
+        cancellation: Arc<ActivationCancellation>,
+        _transition: OwnedMutexGuard<()>,
+    ) -> Result<(), NodeError> {
+        if self.activation_deactivation_requested()? {
+            return self.complete_activation_deactivation(None).await;
         }
-        if let Err(start_error) = self.subscription_call(self.connection.start_virtual_chain_changed()).await {
+        if cancellation.is_abandoned() {
+            self.finish_failed_activation();
+            return Err(NodeError::Cancelled);
+        }
+
+        let block_start = self.subscription_call(self.connection.start_block_added()).await;
+        if self.activation_deactivation_requested()? {
+            return self.complete_activation_deactivation(None).await;
+        }
+        if let Err(error) = block_start {
+            return self.finish_activation_failure(error).await;
+        }
+        if cancellation.is_abandoned() {
+            return self.cancel_activation_after_block_start().await;
+        }
+
+        let vspc_start = self.subscription_call(self.connection.start_virtual_chain_changed()).await;
+        if self.activation_deactivation_requested()? {
+            return self.complete_activation_deactivation(None).await;
+        }
+        if let Err(start_error) = vspc_start {
             if is_inactive_error(&start_error) {
                 self.finish_failed_activation();
                 return Err(start_error);
             }
             let rollback = self.subscription_call(self.connection.stop_block_added()).await;
+            if self.activation_deactivation_requested()? {
+                return self.complete_activation_deactivation(Some(rollback)).await;
+            }
             if let Err(rollback_error) = rollback {
                 if is_inactive_error(&rollback_error) {
                     return Err(rollback_error);
@@ -211,20 +300,29 @@ impl ValidatedRpcClient {
                 self.request_retirement(RetirementReason::SubscriptionControlFailure).await?;
                 return Err(NodeError::GenerationLost);
             }
-            self.finish_failed_activation();
-            return Err(start_error);
+            return self.finish_activation_failure(start_error).await;
         }
 
+        #[cfg(test)]
+        self.wait_for_activation_publication().await;
         self.require_active()?;
-        if !self.notification_router.enable() {
-            return Err(self.inactive_error());
-        }
-        let mut state = self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *state == SubscriptionState::Retired {
-            return Err(self.inactive_error());
-        }
-        *state = SubscriptionState::Enabled;
-        Ok(())
+        let deactivating = {
+            let abandonment = cancellation.lock();
+            let mut state = self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match *state {
+                SubscriptionState::Activating if !*abandonment => {
+                    if !self.notification_router.enable() {
+                        return Err(self.inactive_error());
+                    }
+                    *state = SubscriptionState::Enabled;
+                    return Ok(());
+                }
+                SubscriptionState::Retired => return Err(self.inactive_error()),
+                SubscriptionState::Disabling => true,
+                SubscriptionState::Disabled | SubscriptionState::Enabled | SubscriptionState::Activating => false,
+            }
+        };
+        if deactivating { self.complete_activation_deactivation(None).await } else { self.cancel_activation_after_both_starts().await }
     }
 
     /// Disables local routing immediately and then stops both remote subscriptions.
@@ -233,14 +331,12 @@ impl ValidatedRpcClient {
             let mut state = self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             match *state {
                 SubscriptionState::Disabled => true,
-                SubscriptionState::Enabled => {
+                SubscriptionState::Enabled | SubscriptionState::Activating => {
                     *state = SubscriptionState::Disabling;
                     false
                 }
                 SubscriptionState::Retired => return Err(self.inactive_error()),
-                SubscriptionState::Activating | SubscriptionState::Disabling => {
-                    return Err(NodeError::InvalidSubscriptionState);
-                }
+                SubscriptionState::Disabling => return Err(NodeError::InvalidSubscriptionState),
             }
         };
         if already_disabled {
@@ -248,6 +344,23 @@ impl ValidatedRpcClient {
             return Ok(());
         }
         self.notification_router.disable();
+
+        let client = self.self_weak.upgrade().ok_or(NodeError::GenerationLost)?;
+        let transition = tokio::spawn(async move { client.complete_disable().await });
+        self.finish_subscription_transition(transition.await).await
+    }
+
+    async fn complete_disable(self: Arc<Self>) -> Result<(), NodeError> {
+        let _transition = self.subscription_transition.lock().await;
+        match *self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+            SubscriptionState::Disabled => {
+                self.notification_router.clear();
+                return Ok(());
+            }
+            SubscriptionState::Retired => return Err(self.inactive_error()),
+            SubscriptionState::Disabling => {}
+            SubscriptionState::Activating | SubscriptionState::Enabled => return Err(NodeError::InvalidSubscriptionState),
+        }
 
         let block_result = self.subscription_call(self.connection.stop_block_added()).await;
         let vspc_result = self.subscription_call(self.connection.stop_virtual_chain_changed()).await;
@@ -268,6 +381,93 @@ impl ValidatedRpcClient {
         Ok(())
     }
 
+    async fn finish_activation_failure(&self, error: NodeError) -> Result<(), NodeError> {
+        let deactivating = {
+            let mut state = self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match *state {
+                SubscriptionState::Activating => {
+                    *state = SubscriptionState::Disabled;
+                    false
+                }
+                SubscriptionState::Disabling => true,
+                SubscriptionState::Retired => return Err(self.inactive_error()),
+                SubscriptionState::Disabled | SubscriptionState::Enabled => return Err(NodeError::InvalidSubscriptionState),
+            }
+        };
+        if deactivating {
+            return self.complete_activation_deactivation(None).await;
+        }
+        self.notification_router.disable();
+        self.notification_router.clear();
+        Err(error)
+    }
+
+    async fn complete_activation_deactivation(&self, block_result: Option<Result<(), NodeError>>) -> Result<(), NodeError> {
+        self.notification_router.disable();
+        let block_result = match block_result {
+            Some(result) => result,
+            None => self.subscription_call(self.connection.stop_block_added()).await,
+        };
+        let vspc_result = self.subscription_call(self.connection.stop_virtual_chain_changed()).await;
+        if let Some(error) = [&block_result, &vspc_result].into_iter().find_map(|result| match result {
+            Err(error) if is_inactive_error(error) => Some(error.clone()),
+            _ => None,
+        }) {
+            return Err(error);
+        }
+        if block_result.and(vspc_result).is_err() {
+            self.request_retirement(RetirementReason::SubscriptionControlFailure).await?;
+            return Err(NodeError::GenerationLost);
+        }
+        self.require_active()?;
+        self.notification_router.clear();
+        self.set_subscription_state_if_not_retired(SubscriptionState::Disabled);
+        Err(NodeError::Cancelled)
+    }
+
+    async fn cancel_activation_after_block_start(&self) -> Result<(), NodeError> {
+        match self.subscription_call(self.connection.stop_block_added()).await {
+            Ok(()) => {
+                self.finish_failed_activation();
+                Err(NodeError::Cancelled)
+            }
+            Err(error) if is_inactive_error(&error) => Err(error),
+            Err(_) => {
+                self.notification_router.disable();
+                self.request_retirement(RetirementReason::SubscriptionControlFailure).await?;
+                Err(NodeError::GenerationLost)
+            }
+        }
+    }
+
+    async fn cancel_activation_after_both_starts(&self) -> Result<(), NodeError> {
+        self.complete_activation_deactivation(None).await
+    }
+
+    fn activation_deactivation_requested(&self) -> Result<bool, NodeError> {
+        match *self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+            SubscriptionState::Activating => Ok(false),
+            SubscriptionState::Disabling => Ok(true),
+            SubscriptionState::Retired => Err(self.inactive_error()),
+            SubscriptionState::Disabled | SubscriptionState::Enabled => Err(NodeError::InvalidSubscriptionState),
+        }
+    }
+
+    async fn finish_subscription_transition(
+        &self,
+        result: Result<Result<(), NodeError>, tokio::task::JoinError>,
+    ) -> Result<(), NodeError> {
+        match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.notification_router.disable();
+                kaspa_core::warn!("notification subscription transition task failed: {error}");
+                self.request_retirement(RetirementReason::SubscriptionControlFailure).await?;
+                Err(NodeError::GenerationLost)
+            }
+        }
+    }
+
     /// Obtains and normalizes the current pruning-point block.
     pub async fn current_pruning_point_block(&self) -> Result<ValidatedNodeBlock, NodeError> {
         let mut operation = self.begin_operation().await?;
@@ -276,6 +476,9 @@ impl ValidatedRpcClient {
             .await
             .map_err(map_opaque_rpc_error)?;
         let pruning_point_hash = dag_info.pruning_point_hash;
+        if pruning_point_hash == ORIGIN {
+            return self.return_malformed(&operation, RecoveryInputKind::MalformedPruningPointResponse).await;
+        }
         let block = match self
             .call(&mut operation.admission, self.connection.get_block(GetBlockRequest::new(pruning_point_hash, false)))
             .await
@@ -297,8 +500,16 @@ impl ValidatedRpcClient {
     /// Obtains the current Catchup sink and its normalized DAA score.
     pub async fn catchup_sink_sample(&self) -> Result<CatchupSinkSample, NodeError> {
         let mut operation = self.begin_operation().await?;
-        let sink =
-            self.call(&mut operation.admission, self.connection.get_sink(GetSinkRequest {})).await.map_err(map_opaque_rpc_error)?.sink;
+        let sink = match self.call(&mut operation.admission, self.connection.get_sink(GetSinkRequest {})).await {
+            Ok(response) => response.sink,
+            Err(RawCallError::Rpc(error)) if response_conversion_is_malformed(ResponseConversionOperation::Sink, &error) => {
+                return self.return_malformed(&operation, RecoveryInputKind::MalformedCatchupSinkResponse).await;
+            }
+            Err(error) => return Err(map_opaque_rpc_error(error)),
+        };
+        if sink == ORIGIN {
+            return self.return_malformed(&operation, RecoveryInputKind::MalformedCatchupSinkResponse).await;
+        }
         let block = match self.call(&mut operation.admission, self.connection.get_block(GetBlockRequest::new(sink, false))).await {
             Ok(response) => response.block,
             Err(RawCallError::Rpc(error)) => {
@@ -322,7 +533,7 @@ impl ValidatedRpcClient {
             .await
         {
             Ok(response) => response,
-            Err(RawCallError::Rpc(RpcError::MissingRpcFieldError(_, _))) => {
+            Err(RawCallError::Rpc(error)) if response_conversion_is_malformed(ResponseConversionOperation::Blocks, &error) => {
                 return self.return_malformed(&operation, RecoveryInputKind::MalformedGetBlocks).await;
             }
             Err(error) => return Err(map_opaque_rpc_error(error)),
@@ -430,6 +641,8 @@ impl ValidatedRpcClient {
             Err(ResponseNormalizationError::Malformed(kind)) => self.return_malformed(operation, kind).await,
             Ok(value) => {
                 self.require_active()?;
+                #[cfg(test)]
+                self.wait_for_operation_completion().await;
                 Ok(value)
             }
             Err(ResponseNormalizationError::ScoreOutOfRange(fault)) => {
@@ -456,7 +669,10 @@ impl ValidatedRpcClient {
     fn finish_failed_activation(&self) {
         self.notification_router.disable();
         self.notification_router.clear();
-        self.set_subscription_state_if_not_retired(SubscriptionState::Disabled);
+        let mut state = self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *state == SubscriptionState::Activating {
+            *state = SubscriptionState::Disabled;
+        }
     }
 
     fn set_subscription_state_if_not_retired(&self, next: SubscriptionState) {
@@ -492,12 +708,56 @@ impl ValidatedRpcClient {
             return false;
         }
         self.admission_tx.send_replace(state);
-        self.notification_router.retire();
-        *self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = SubscriptionState::Retired;
+        {
+            let mut subscription_state = self.subscription_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.notification_router.retire();
+            *subscription_state = SubscriptionState::Retired;
+        }
         if let Err(error) = self.connection.disconnect().await {
             kaspa_core::warn!("failed to disconnect retired RPC generation: {error}");
         }
         true
+    }
+}
+
+struct ActivationCancellation {
+    abandoned: Mutex<bool>,
+}
+
+impl ActivationCancellation {
+    const fn new() -> Self {
+        Self { abandoned: Mutex::new(false) }
+    }
+
+    fn is_abandoned(&self) -> bool {
+        *self.lock()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.abandoned.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+struct ActivationCancellationGuard {
+    cancellation: Arc<ActivationCancellation>,
+    armed: bool,
+}
+
+impl ActivationCancellationGuard {
+    const fn new(cancellation: Arc<ActivationCancellation>) -> Self {
+        Self { cancellation, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ActivationCancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            *self.cancellation.lock() = true;
+        }
     }
 }
 
@@ -547,7 +807,7 @@ async fn wait_until_inactive(admission: &mut watch::Receiver<u8>) -> Result<(), 
 }
 
 fn classify_get_block_error(hash: BlockHash, error: RpcError) -> GetBlockCallError {
-    if matches!(error, RpcError::MissingRpcFieldError(_, _)) {
+    if response_conversion_is_malformed(ResponseConversionOperation::Block, &error) {
         return GetBlockCallError::Malformed;
     }
     let diagnostic: Arc<str> = Arc::from(error.to_string());
@@ -559,6 +819,27 @@ fn classify_get_block_error(hash: BlockHash, error: RpcError) -> GetBlockCallErr
         }
     }
     GetBlockCallError::Opaque(NodeError::RpcRequestFailed { diagnostic })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseConversionOperation {
+    Sink,
+    Block,
+    Blocks,
+}
+
+fn response_conversion_is_malformed(operation: ResponseConversionOperation, error: &RpcError) -> bool {
+    match (operation, error) {
+        (ResponseConversionOperation::Sink, RpcError::HexParsingError(_)) => true,
+        (ResponseConversionOperation::Block, RpcError::RpcBlueWorkTypeParseError(_)) => true,
+        (ResponseConversionOperation::Block, RpcError::MissingRpcFieldError(object, field)) => {
+            (object == "GetBlockResponseMessage" && field == "block") || (object == "RpcBlock" && field == "header")
+        }
+        (ResponseConversionOperation::Blocks, RpcError::MissingRpcFieldError(object, field)) => {
+            object == "RpcBlock" && field == "header"
+        }
+        _ => false,
+    }
 }
 
 fn map_opaque_rpc_error(error: RawCallError) -> NodeError {
@@ -580,14 +861,17 @@ mod tests {
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Duration,
     };
 
     use async_trait::async_trait;
     use kaspa_consensus_core::{
         BlueWorkType,
+        blockhash::ORIGIN,
         errors::consensus::ConsensusError,
         network::{NetworkId, NetworkType},
     };
+    use kaspa_grpc_core::protowire;
     use kaspa_rpc_core::{
         GetBlockDagInfoRequest, GetBlockDagInfoResponse, GetBlockRequest, GetBlockResponse, GetBlocksRequest, GetBlocksResponse,
         GetSinkRequest, GetSinkResponse, GetVirtualChainFromBlockV2Request, GetVirtualChainFromBlockV2Response, RpcBlock,
@@ -595,12 +879,18 @@ mod tests {
         api::ops::{RPC_API_REVISION, RPC_API_VERSION},
     };
     use kgi_model::{
-        block::{BlockHash, MAX_DAA_SCORE},
+        block::{BlockHash, MAX_BLUE_SCORE, MAX_DAA_SCORE},
         lifecycle::{RecoveryInputKind, ScoreRangeFault},
     };
-    use tokio::sync::{Semaphore, mpsc};
+    use tokio::{
+        sync::{Semaphore, mpsc},
+        time::timeout,
+    };
 
-    use super::{GetBlockCallError, NotificationChannels, ValidatedNodeInfo, ValidatedRpcClient, classify_get_block_error};
+    use super::{
+        GetBlockCallError, NotificationChannels, ResponseConversionOperation, SubscriptionState, ValidatedNodeInfo,
+        ValidatedRpcClient, classify_get_block_error, response_conversion_is_malformed,
+    };
     use crate::{
         client::RpcConnection,
         consensus::KgiConsensusParams,
@@ -639,6 +929,63 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum CompositeOperation {
+        PruningPoint,
+        CatchupSink,
+    }
+
+    impl CompositeOperation {
+        async fn execute(self, client: &ValidatedRpcClient) -> Result<(), NodeError> {
+            match self {
+                Self::PruningPoint => client.current_pruning_point_block().await.map(|_| ()),
+                Self::CatchupSink => client.catchup_sink_sample().await.map(|_| ()),
+            }
+        }
+
+        const fn malformed_kind(self) -> RecoveryInputKind {
+            match self {
+                Self::PruningPoint => RecoveryInputKind::MalformedPruningPointResponse,
+                Self::CatchupSink => RecoveryInputKind::MalformedCatchupSinkResponse,
+            }
+        }
+
+        fn initial_script(self, advertised_hash: BlockHash) -> Script {
+            match self {
+                Self::PruningPoint => Script::dag(Ok(dag_info(advertised_hash))),
+                Self::CatchupSink => Script::sink(Ok(GetSinkResponse::new(advertised_hash))),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RuntimeConversionOperation {
+        Block(BlockHash),
+        Blocks(BlockHash),
+        PruningPoint,
+        Vspc(BlockHash),
+    }
+
+    impl RuntimeConversionOperation {
+        async fn execute(self, client: &ValidatedRpcClient) -> Result<(), NodeError> {
+            match self {
+                Self::Block(hash) => client.full_block(hash).await.map(|_| ()),
+                Self::Blocks(low_hash) => client.get_blocks(low_hash).await.map(|_| ()),
+                Self::PruningPoint => client.current_pruning_point_block().await.map(|_| ()),
+                Self::Vspc(low_hash) => client.virtual_chain_from(low_hash).await.map(|_| ()),
+            }
+        }
+    }
+
+    fn composite_scripts(
+        operation: CompositeOperation,
+        advertised_hash: BlockHash,
+        block: RpcResult<GetBlockResponse>,
+        gate: Option<Arc<Semaphore>>,
+    ) -> Vec<Script> {
+        vec![operation.initial_script(advertised_hash), Script::block(block, gate)]
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum RecordedRequest {
         Block { hash: BlockHash, include_transactions: bool },
@@ -653,7 +1000,10 @@ mod tests {
         requests: Mutex<Vec<RecordedRequest>>,
         subscription_results: Mutex<VecDeque<RpcResult<()>>>,
         subscription_calls: Mutex<Vec<&'static str>>,
+        block_start_gate: Option<Arc<Semaphore>>,
         virtual_start_gate: Option<Arc<Semaphore>>,
+        block_stop_gate: Option<Arc<Semaphore>>,
+        virtual_stop_gate: Option<Arc<Semaphore>>,
         disconnects: AtomicUsize,
     }
 
@@ -664,7 +1014,10 @@ mod tests {
                 requests: Mutex::new(Vec::new()),
                 subscription_results: Mutex::new(VecDeque::new()),
                 subscription_calls: Mutex::new(Vec::new()),
+                block_start_gate: None,
                 virtual_start_gate: None,
+                block_stop_gate: None,
+                virtual_stop_gate: None,
                 disconnects: AtomicUsize::new(0),
             }
         }
@@ -679,6 +1032,21 @@ mod tests {
             self
         }
 
+        fn with_block_start_gate(mut self, gate: Arc<Semaphore>) -> Self {
+            self.block_start_gate = Some(gate);
+            self
+        }
+
+        fn with_block_stop_gate(mut self, gate: Arc<Semaphore>) -> Self {
+            self.block_stop_gate = Some(gate);
+            self
+        }
+
+        fn with_virtual_stop_gate(mut self, gate: Arc<Semaphore>) -> Self {
+            self.virtual_stop_gate = Some(gate);
+            self
+        }
+
         async fn next(&self) -> Script {
             self.scripts.lock().await.pop_front().expect("scripted RPC response")
         }
@@ -689,11 +1057,6 @@ mod tests {
 
         fn requests(&self) -> Vec<RecordedRequest> {
             self.requests.lock().expect("request log").clone()
-        }
-
-        fn subscription_call(&self, operation: &'static str) -> RpcResult<()> {
-            self.subscription_calls.lock().expect("subscription log").push(operation);
-            self.subscription_result()
         }
 
         fn subscription_result(&self) -> RpcResult<()> {
@@ -760,7 +1123,11 @@ mod tests {
         }
 
         async fn start_block_added(&self) -> RpcResult<()> {
-            self.subscription_call("start BlockAdded")
+            self.subscription_calls.lock().expect("subscription log").push("start BlockAdded");
+            if let Some(gate) = &self.block_start_gate {
+                gate.acquire().await.expect("block-start gate").forget();
+            }
+            self.subscription_result()
         }
 
         async fn start_virtual_chain_changed(&self) -> RpcResult<()> {
@@ -772,11 +1139,19 @@ mod tests {
         }
 
         async fn stop_block_added(&self) -> RpcResult<()> {
-            self.subscription_call("stop BlockAdded")
+            self.subscription_calls.lock().expect("subscription log").push("stop BlockAdded");
+            if let Some(gate) = &self.block_stop_gate {
+                gate.acquire().await.expect("block-stop gate").forget();
+            }
+            self.subscription_result()
         }
 
         async fn stop_virtual_chain_changed(&self) -> RpcResult<()> {
-            self.subscription_call("stop VirtualChainChanged")
+            self.subscription_calls.lock().expect("subscription log").push("stop VirtualChainChanged");
+            if let Some(gate) = &self.virtual_stop_gate {
+                gate.acquire().await.expect("virtual-stop gate").forget();
+            }
+            self.subscription_result()
         }
 
         async fn disconnect(&self) -> Result<(), Arc<str>> {
@@ -839,6 +1214,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn composite_operations_canonicalize_exact_genesis() {
+        let genesis = hash(0);
+        let mut genesis_block = rpc_block(genesis, vec![hash(8)]);
+        genesis_block.header.daa_score = 17;
+        genesis_block.header.blue_score = u64::MAX;
+        genesis_block.verbose_data = None;
+        let mut dag = dag_info(genesis);
+        dag.network = NetworkId::with_suffix(NetworkType::Testnet, 10);
+        let scripts = [
+            Script::dag(Ok(dag)),
+            Script::block(Ok(GetBlockResponse { block: genesis_block.clone() }), None),
+            Script::sink(Ok(GetSinkResponse::new(genesis))),
+            Script::block(Ok(GetBlockResponse { block: genesis_block }), None),
+        ];
+        let (client, connection, mut retirements) = client(scripts);
+
+        let pruning_point = client.current_pruning_point_block().await.expect("canonical Genesis pruning point");
+        assert_eq!(pruning_point.hash, genesis);
+        assert_eq!(pruning_point.selected_parent, ORIGIN);
+        assert!(pruning_point.direct_parents.is_empty());
+        assert!(pruning_point.blue_merge_set.is_empty());
+        assert!(pruning_point.red_merge_set.is_empty());
+        assert_eq!(pruning_point.blue_score, 0);
+        assert_eq!(pruning_point.daa_score, 17);
+
+        let sink = client.catchup_sink_sample().await.expect("canonical Genesis sink");
+        assert_eq!(sink.hash, genesis);
+        assert_eq!(sink.daa_score, 17);
+        assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert_eq!(connection.disconnects.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn get_block_not_found_matches_are_exact_and_hash_specific() {
         let requested = hash(1);
@@ -865,6 +1273,89 @@ mod tests {
             classify_get_block_error(requested, RpcError::MissingRpcFieldError("RpcBlock".to_string(), "header".to_string())),
             GetBlockCallError::Malformed
         );
+        assert!(matches!(
+            classify_get_block_error(requested, RpcError::MissingRpcFieldError("RpcTransaction".to_string(), "payload".to_string())),
+            GetBlockCallError::Opaque(NodeError::RpcRequestFailed { .. })
+        ));
+        assert_eq!(
+            classify_get_block_error(
+                requested,
+                RpcError::RpcBlueWorkTypeParseError("not-blue-work".parse::<u64>().expect_err("invalid integer"))
+            ),
+            GetBlockCallError::Malformed
+        );
+    }
+
+    #[test]
+    fn pinned_wire_conversion_preserves_the_operation_attribution_boundary() {
+        let sink_wire = protowire::GetSinkResponseMessage { sink: "not-a-hash".to_string(), error: None };
+        let sink_error = GetSinkResponse::try_from(&sink_wire).expect_err("invalid sink hash");
+        assert!(matches!(sink_error, RpcError::HexParsingError(_)));
+        assert!(response_conversion_is_malformed(ResponseConversionOperation::Sink, &sink_error));
+
+        let block_response = GetBlockResponse { block: rpc_block(hash(1), vec![hash(8)]) };
+        let missing_block =
+            GetBlockResponse::try_from(&protowire::GetBlockResponseMessage::default()).expect_err("missing response block");
+        assert!(response_conversion_is_malformed(ResponseConversionOperation::Block, &missing_block));
+        let missing_envelope =
+            GetBlockResponse::try_from(&protowire::KaspadResponse::default()).expect_err("missing response envelope");
+        assert!(!response_conversion_is_malformed(ResponseConversionOperation::Block, &missing_envelope));
+
+        let mut block_wire = protowire::GetBlockResponseMessage::from(Ok::<_, RpcError>(&block_response));
+        block_wire.block.as_mut().expect("wire block").header = None;
+        let missing_header = GetBlockResponse::try_from(&block_wire).expect_err("missing block header");
+        assert!(response_conversion_is_malformed(ResponseConversionOperation::Block, &missing_header));
+
+        let mut block_wire = protowire::GetBlockResponseMessage::from(Ok::<_, RpcError>(&block_response));
+        block_wire.block.as_mut().expect("wire block").header.as_mut().expect("wire header").blue_work = "not-blue-work".to_string();
+        let ambiguous_blue_work = GetBlockResponse::try_from(&block_wire).expect_err("invalid gRPC blue work");
+        assert!(matches!(ambiguous_blue_work, RpcError::HexParsingError(_)));
+        assert!(!response_conversion_is_malformed(ResponseConversionOperation::Block, &ambiguous_blue_work));
+
+        let blocks_response = GetBlocksResponse { block_hashes: vec![hash(1)], blocks: vec![rpc_block(hash(1), vec![hash(8)])] };
+        let mut blocks_wire = protowire::GetBlocksResponseMessage::from(Ok::<_, RpcError>(&blocks_response));
+        blocks_wire.block_hashes[0] = "ignored-invalid-hash".to_string();
+        let ignored_parallel_hash = GetBlocksResponse::try_from(&blocks_wire).expect_err("invalid ignored parallel hash");
+        assert!(matches!(ignored_parallel_hash, RpcError::HexParsingError(_)));
+        assert!(!response_conversion_is_malformed(ResponseConversionOperation::Blocks, &ignored_parallel_hash));
+
+        let mut blocks_wire = protowire::GetBlocksResponseMessage::from(Ok::<_, RpcError>(&blocks_response));
+        blocks_wire.blocks[0].transactions.push(protowire::RpcTransaction::default());
+        let ignored_transaction = GetBlocksResponse::try_from(&blocks_wire).expect_err("invalid ignored transaction");
+        assert!(!response_conversion_is_malformed(ResponseConversionOperation::Blocks, &ignored_transaction));
+
+        let mut blocks_wire = protowire::GetBlocksResponseMessage::from(Ok::<_, RpcError>(&blocks_response));
+        blocks_wire.blocks[0].header = None;
+        let missing_page_header = GetBlocksResponse::try_from(&blocks_wire).expect_err("missing page header");
+        assert!(response_conversion_is_malformed(ResponseConversionOperation::Blocks, &missing_page_header));
+
+        let dag_response = dag_info(hash(4));
+        let mut dag_wire = protowire::GetBlockDagInfoResponseMessage::from(Ok::<_, RpcError>(&dag_response));
+        dag_wire.pruning_point_hash = "invalid-consumed-pruning-point".to_string();
+        assert!(matches!(
+            GetBlockDagInfoResponse::try_from(&dag_wire).expect_err("invalid pruning point"),
+            RpcError::HexParsingError(_)
+        ));
+        let mut dag_wire = protowire::GetBlockDagInfoResponseMessage::from(Ok::<_, RpcError>(&dag_response));
+        dag_wire.tip_hashes.push("invalid-ignored-tip".to_string());
+        assert!(matches!(
+            GetBlockDagInfoResponse::try_from(&dag_wire).expect_err("invalid ignored tip"),
+            RpcError::HexParsingError(_)
+        ));
+
+        let vspc_response = vspc(vec![], vec![hash(2)]);
+        let mut vspc_wire = protowire::GetVirtualChainFromBlockV2ResponseMessage::from(Ok::<_, RpcError>(&vspc_response));
+        vspc_wire.added_chain_block_hashes[0] = "invalid-consumed-added-hash".to_string();
+        assert!(matches!(
+            GetVirtualChainFromBlockV2Response::try_from(&vspc_wire).expect_err("invalid added hash"),
+            RpcError::HexParsingError(_)
+        ));
+        let mut vspc_wire = protowire::GetVirtualChainFromBlockV2ResponseMessage::from(Ok::<_, RpcError>(&vspc_response));
+        vspc_wire.chain_block_accepted_transactions.push(protowire::RpcChainBlockAcceptedTransactions::default());
+        assert!(matches!(
+            GetVirtualChainFromBlockV2Response::try_from(&vspc_wire).expect_err("invalid ignored acceptance data"),
+            RpcError::MissingRpcFieldError(_, _)
+        ));
     }
 
     #[tokio::test]
@@ -898,45 +1389,204 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_get_block_field_is_malformed_and_retires() {
+    async fn attributable_get_block_conversion_failures_are_malformed_and_retire() {
         let requested = hash(1);
-        let scripts = [Script::block(Err(RpcError::MissingRpcFieldError("RpcBlock".to_string(), "header".to_string())), None)];
-        let (client, connection, mut retirements) = client(scripts);
-        let operation = tokio::spawn({
-            let client = client.clone();
-            async move { client.full_block(requested).await }
-        });
+        let failures = [
+            RpcError::MissingRpcFieldError("GetBlockResponseMessage".to_string(), "block".to_string()),
+            RpcError::MissingRpcFieldError("RpcBlock".to_string(), "header".to_string()),
+            RpcError::RpcBlueWorkTypeParseError("not-blue-work".parse::<u64>().expect_err("invalid integer")),
+        ];
 
-        let retirement = retirements.recv().await.expect("retirement request");
-        assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedGetBlock));
-        assert!(client.retire().await);
-        retirement.complete(Ok(()));
-        assert_eq!(
-            operation.await.expect("operation task"),
-            Err(NodeError::RecoveryInputInvalid(RecoveryInputKind::MalformedGetBlock))
-        );
-        assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1);
+        for error in failures {
+            let scripts = [Script::block(Err(error), None)];
+            let (client, connection, mut retirements) = client(scripts);
+            let operation = tokio::spawn({
+                let client = client.clone();
+                async move { client.full_block(requested).await }
+            });
+
+            let retirement = retirements.recv().await.expect("retirement request");
+            assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedGetBlock));
+            assert!(client.retire().await);
+            retirement.complete(Ok(()));
+            assert_eq!(
+                operation.await.expect("operation task"),
+                Err(NodeError::RecoveryInputInvalid(RecoveryInputKind::MalformedGetBlock))
+            );
+            assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1);
+        }
     }
 
     #[tokio::test]
-    async fn advertised_sink_not_found_uses_sink_malformed_classification() {
-        let sink = hash(7);
-        let message = ConsensusError::HeaderNotFound(sink).to_string();
-        let scripts = [Script::sink(Ok(GetSinkResponse::new(sink))), Script::block(Err(RpcError::General(message)), None)];
-        let (client, _connection, mut retirements) = client(scripts);
-        let operation = tokio::spawn({
-            let client = client.clone();
-            async move { client.catchup_sink_sample().await }
-        });
+    async fn malformed_composite_responses_retire_the_exact_generation() {
+        let pruning_point = hash(4);
+        let sink = hash(5);
+        let mut missing_verbose = rpc_block(pruning_point, vec![hash(8)]);
+        missing_verbose.verbose_data = None;
+        let cases = [
+            ("ORIGIN pruning point", CompositeOperation::PruningPoint, vec![Script::dag(Ok(dag_info(ORIGIN)))]),
+            (
+                "wrong pruning-point hash",
+                CompositeOperation::PruningPoint,
+                composite_scripts(
+                    CompositeOperation::PruningPoint,
+                    pruning_point,
+                    Ok(GetBlockResponse { block: rpc_block(hash(6), vec![hash(8)]) }),
+                    None,
+                ),
+            ),
+            (
+                "missing pruning-point block",
+                CompositeOperation::PruningPoint,
+                composite_scripts(
+                    CompositeOperation::PruningPoint,
+                    pruning_point,
+                    Err(RpcError::General(ConsensusError::HeaderNotFound(pruning_point).to_string())),
+                    None,
+                ),
+            ),
+            (
+                "malformed pruning-point block",
+                CompositeOperation::PruningPoint,
+                composite_scripts(
+                    CompositeOperation::PruningPoint,
+                    pruning_point,
+                    Ok(GetBlockResponse { block: missing_verbose }),
+                    None,
+                ),
+            ),
+            ("ORIGIN sink", CompositeOperation::CatchupSink, vec![Script::sink(Ok(GetSinkResponse::new(ORIGIN)))]),
+            ("invalid sink encoding", CompositeOperation::CatchupSink, vec![Script::sink(Err(invalid_sink_conversion_error()))]),
+            (
+                "missing sink block",
+                CompositeOperation::CatchupSink,
+                composite_scripts(
+                    CompositeOperation::CatchupSink,
+                    sink,
+                    Err(RpcError::General(ConsensusError::HeaderNotFound(sink).to_string())),
+                    None,
+                ),
+            ),
+            (
+                "missing sink header",
+                CompositeOperation::CatchupSink,
+                composite_scripts(
+                    CompositeOperation::CatchupSink,
+                    sink,
+                    Err(RpcError::MissingRpcFieldError("RpcBlock".to_string(), "header".to_string())),
+                    None,
+                ),
+            ),
+            (
+                "wrong sink hash",
+                CompositeOperation::CatchupSink,
+                composite_scripts(
+                    CompositeOperation::CatchupSink,
+                    sink,
+                    Ok(GetBlockResponse { block: rpc_block(hash(7), vec![hash(8)]) }),
+                    None,
+                ),
+            ),
+        ];
 
-        let retirement = retirements.recv().await.expect("retirement request");
-        assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedCatchupSinkResponse));
-        assert!(client.retire().await);
-        retirement.complete(Ok(()));
-        assert_eq!(
-            operation.await.expect("operation task"),
-            Err(NodeError::RecoveryInputInvalid(RecoveryInputKind::MalformedCatchupSinkResponse))
-        );
+        for (name, operation, scripts) in cases {
+            assert_malformed_composite(name, operation, scripts).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn composite_score_and_opaque_failures_do_not_retire_the_generation() {
+        let pruning_point = hash(4);
+        let sink = hash(5);
+        let mut excessive_pruning_daa = rpc_block(pruning_point, vec![hash(8)]);
+        excessive_pruning_daa.header.daa_score = MAX_DAA_SCORE + 1;
+        let mut excessive_pruning_blue = rpc_block(pruning_point, vec![hash(8)]);
+        excessive_pruning_blue.header.blue_score = MAX_BLUE_SCORE + 1;
+        let mut excessive_sink_daa = rpc_block(sink, vec![hash(8)]);
+        excessive_sink_daa.header.daa_score = MAX_DAA_SCORE + 1;
+        let cases = [
+            (
+                CompositeOperation::PruningPoint,
+                composite_scripts(
+                    CompositeOperation::PruningPoint,
+                    pruning_point,
+                    Ok(GetBlockResponse { block: excessive_pruning_daa }),
+                    None,
+                ),
+                NodeError::ScoreOutOfRange(ScoreRangeFault::DaaScore),
+            ),
+            (
+                CompositeOperation::PruningPoint,
+                composite_scripts(
+                    CompositeOperation::PruningPoint,
+                    pruning_point,
+                    Ok(GetBlockResponse { block: excessive_pruning_blue }),
+                    None,
+                ),
+                NodeError::ScoreOutOfRange(ScoreRangeFault::BlueScore),
+            ),
+            (
+                CompositeOperation::CatchupSink,
+                composite_scripts(CompositeOperation::CatchupSink, sink, Ok(GetBlockResponse { block: excessive_sink_daa }), None),
+                NodeError::ScoreOutOfRange(ScoreRangeFault::DaaScore),
+            ),
+            (
+                CompositeOperation::PruningPoint,
+                composite_scripts(
+                    CompositeOperation::PruningPoint,
+                    pruning_point,
+                    Err(RpcError::General("opaque pruning-point failure".to_string())),
+                    None,
+                ),
+                NodeError::RpcRequestFailed { diagnostic: Arc::from("opaque pruning-point failure") },
+            ),
+            (
+                CompositeOperation::CatchupSink,
+                composite_scripts(
+                    CompositeOperation::CatchupSink,
+                    sink,
+                    Err(RpcError::General("opaque sink failure".to_string())),
+                    None,
+                ),
+                NodeError::RpcRequestFailed { diagnostic: Arc::from("opaque sink failure") },
+            ),
+        ];
+
+        for (operation, scripts, expected) in cases {
+            let (client, connection, mut retirements) = client(scripts);
+            assert_eq!(operation.execute(&client).await, Err(expected));
+            assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+            assert_eq!(connection.disconnects.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn composite_cancellation_and_generation_loss_are_not_remapped() {
+        for operation in [CompositeOperation::PruningPoint, CompositeOperation::CatchupSink] {
+            for cancelled in [true, false] {
+                let advertised_hash = hash(4);
+                let gate = Arc::new(Semaphore::new(0));
+                let scripts = composite_scripts(
+                    operation,
+                    advertised_hash,
+                    Ok(GetBlockResponse { block: rpc_block(advertised_hash, vec![hash(8)]) }),
+                    Some(gate),
+                );
+                let (client, connection, mut retirements) = client(scripts);
+                let task = tokio::spawn({
+                    let client = client.clone();
+                    async move { operation.execute(&client).await }
+                });
+                wait_for_requests(&connection, 2).await;
+
+                let changed = if cancelled { client.cancel().await } else { client.retire().await };
+                assert!(changed);
+                let expected = if cancelled { NodeError::Cancelled } else { NodeError::GenerationLost };
+                assert_eq!(task.await.expect("composite operation task"), Err(expected));
+                assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+                assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1);
+            }
+        }
     }
 
     #[tokio::test]
@@ -957,6 +1607,65 @@ mod tests {
             operation.await.expect("operation task"),
             Err(NodeError::RecoveryInputInvalid(RecoveryInputKind::MalformedGetBlocks))
         );
+    }
+
+    #[tokio::test]
+    async fn ignored_and_ambiguous_conversion_failures_remain_opaque() {
+        let requested = hash(1);
+        let cases = [
+            (
+                "GetBlock ambiguous blue work",
+                RuntimeConversionOperation::Block(requested),
+                vec![Script::block(Err(invalid_get_block_blue_work_conversion_error(requested)), None)],
+            ),
+            (
+                "GetBlock ignored transaction field",
+                RuntimeConversionOperation::Block(requested),
+                vec![Script::block(Err(RpcError::MissingRpcFieldError("RpcTransaction".to_string(), "payload".to_string())), None)],
+            ),
+            (
+                "GetBlock generic response envelope",
+                RuntimeConversionOperation::Block(requested),
+                vec![Script::block(Err(RpcError::MissingRpcFieldError("KaspaResponse".to_string(), "Payload".to_string())), None)],
+            ),
+            (
+                "GetBlocks ignored parallel hash",
+                RuntimeConversionOperation::Blocks(requested),
+                vec![Script::blocks(Err(invalid_get_blocks_parallel_hash_conversion_error(requested)))],
+            ),
+            (
+                "GetBlocks ignored payload field",
+                RuntimeConversionOperation::Blocks(requested),
+                vec![Script::blocks(Err(RpcError::MissingRpcFieldError("RpcTransaction".to_string(), "payload".to_string())))],
+            ),
+            (
+                "GetBlockDagInfo ambiguous pruning-point hash",
+                RuntimeConversionOperation::PruningPoint,
+                vec![Script::dag(Err(invalid_dag_pruning_point_conversion_error()))],
+            ),
+            (
+                "GetBlockDagInfo ignored tip hash",
+                RuntimeConversionOperation::PruningPoint,
+                vec![Script::dag(Err(invalid_dag_tip_conversion_error()))],
+            ),
+            (
+                "VSPC ambiguous added hash",
+                RuntimeConversionOperation::Vspc(requested),
+                vec![Script::vspc(Err(invalid_vspc_added_hash_conversion_error(requested)))],
+            ),
+            (
+                "VSPC ignored acceptance data",
+                RuntimeConversionOperation::Vspc(requested),
+                vec![Script::vspc(Err(invalid_vspc_acceptance_conversion_error(requested)))],
+            ),
+        ];
+
+        for (name, operation, scripts) in cases {
+            let (client, connection, mut retirements) = client(scripts);
+            assert!(matches!(operation.execute(&client).await, Err(NodeError::RpcRequestFailed { .. })), "{name}");
+            assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)), "{name}");
+            assert_eq!(connection.disconnects.load(Ordering::Relaxed), 0, "{name}");
+        }
     }
 
     #[tokio::test]
@@ -1000,24 +1709,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retirement_and_cancellation_win_blocked_operation_races() {
-        for cancelled in [false, true] {
-            let gate = Arc::new(Semaphore::new(0));
-            let requested = hash(1);
-            let scripts = [Script::block(Ok(GetBlockResponse { block: rpc_block(requested, vec![hash(8)]) }), Some(gate))];
-            let (client, connection, _retirements) = client(scripts);
-            let operation = tokio::spawn({
-                let client = client.clone();
-                async move { client.full_block(requested).await }
-            });
-            wait_for_counts(&client, 1, 0).await;
+    async fn rpc_success_linearized_before_retirement_is_preserved() {
+        let requested = hash(1);
+        let scripts = [Script::block(Ok(GetBlockResponse { block: rpc_block(requested, vec![hash(8)]) }), None)];
+        let (client, connection, _retirements) = client(scripts);
+        let (reached_tx, mut reached_rx) = mpsc::unbounded_channel();
+        let completion_gate = Arc::new(Semaphore::new(0));
+        client.set_operation_completion_gate(reached_tx, completion_gate.clone());
+        let operation = tokio::spawn({
+            let client = client.clone();
+            async move { client.full_block(requested).await }
+        });
 
-            let changed = if cancelled { client.cancel().await } else { client.retire().await };
-            assert!(changed);
-            let expected = if cancelled { NodeError::Cancelled } else { NodeError::GenerationLost };
-            assert_eq!(operation.await.expect("operation task"), Err(expected));
-            assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1);
-        }
+        reached_rx.recv().await.expect("operation must linearize success");
+        assert!(client.retire().await);
+        completion_gate.add_permits(1);
+
+        assert_eq!(operation.await.expect("operation task").expect("old-generation success").hash, requested);
+        assert_eq!(client.full_block(requested).await, Err(NodeError::GenerationLost));
+        assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn retirement_wins_blocked_operation_race() {
+        let gate = Arc::new(Semaphore::new(0));
+        let requested = hash(1);
+        let scripts = [Script::block(Ok(GetBlockResponse { block: rpc_block(requested, vec![hash(8)]) }), Some(gate))];
+        let (client, connection, _retirements) = client(scripts);
+        let operation = tokio::spawn({
+            let client = client.clone();
+            async move { client.full_block(requested).await }
+        });
+        wait_for_counts(&client, 1, 0).await;
+
+        assert!(client.retire().await);
+        assert_eq!(operation.await.expect("operation task"), Err(NodeError::GenerationLost));
+        assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_blocked_operation_race() {
+        let gate = Arc::new(Semaphore::new(0));
+        let requested = hash(1);
+        let scripts = [Script::block(Ok(GetBlockResponse { block: rpc_block(requested, vec![hash(8)]) }), Some(gate))];
+        let (client, connection, _retirements) = client(scripts);
+        let operation = tokio::spawn({
+            let client = client.clone();
+            async move { client.full_block(requested).await }
+        });
+        wait_for_counts(&client, 1, 0).await;
+
+        assert!(client.cancel().await);
+        assert_eq!(operation.await.expect("operation task"), Err(NodeError::Cancelled));
+        assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -1057,6 +1801,255 @@ mod tests {
         gate.add_permits(1);
         activation.await.expect("activation task").expect("activation");
         assert_eq!(client.notification_router.state(), NotificationRouterState::Enabled);
+    }
+
+    #[tokio::test]
+    async fn abandoned_activation_after_first_start_completes_remote_cleanup() {
+        let gate = Arc::new(Semaphore::new(0));
+        let connection = Arc::new(ScriptedConnection::new([]).with_virtual_start_gate(gate.clone()));
+        let (retirement_tx, mut retirements) = retirement_channel();
+        let client = ValidatedRpcClient::new(connection.clone(), node_info(), retirement_tx);
+        let (channels, _receivers) = notification_channels();
+        let activation = tokio::spawn({
+            let client = client.clone();
+            async move { client.activate_notifications(channels).await }
+        });
+
+        wait_for_subscription_calls(&connection, 2).await;
+        activation.abort();
+        assert!(activation.await.expect_err("activation caller must be aborted").is_cancelled());
+        gate.add_permits(1);
+
+        wait_for_subscription_state(&client, SubscriptionState::Disabled).await;
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Disabled);
+        assert_eq!(
+            connection.subscription_calls.lock().expect("subscription log").as_slice(),
+            &["start BlockAdded", "start VirtualChainChanged", "stop BlockAdded", "stop VirtualChainChanged"]
+        );
+        assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_of_abandoned_activation_retires_exact_generation() {
+        let gate = Arc::new(Semaphore::new(0));
+        let connection = Arc::new(
+            ScriptedConnection::new([])
+                .with_subscription_results([Ok(()), Ok(()), Err(RpcError::General("BlockAdded cleanup failed".to_string())), Ok(())])
+                .with_virtual_start_gate(gate.clone()),
+        );
+        let (retirement_tx, mut retirements) = retirement_channel();
+        let client = ValidatedRpcClient::new(connection.clone(), node_info(), retirement_tx);
+        let (channels, _receivers) = notification_channels();
+        let activation = tokio::spawn({
+            let client = client.clone();
+            async move { client.activate_notifications(channels).await }
+        });
+
+        wait_for_subscription_calls(&connection, 2).await;
+        activation.abort();
+        assert!(activation.await.expect_err("activation caller must be aborted").is_cancelled());
+        gate.add_permits(1);
+
+        let retirement = timeout(Duration::from_secs(1), retirements.recv())
+            .await
+            .expect("failed cleanup must request retirement")
+            .expect("retirement path");
+        assert_eq!(retirement.reason(), &RetirementReason::SubscriptionControlFailure);
+        assert!(retirement.target().upgrade().is_some_and(|generation| Arc::ptr_eq(&generation, &client)));
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Disabled);
+        assert!(client.retire().await);
+        retirement.complete(Ok(()));
+        wait_for_subscription_state(&client, SubscriptionState::Retired).await;
+        assert_eq!(
+            connection.subscription_calls.lock().expect("subscription log").as_slice(),
+            &["start BlockAdded", "start VirtualChainChanged", "stop BlockAdded", "stop VirtualChainChanged"]
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_activation_during_rollback_finishes_disabled() {
+        let gate = Arc::new(Semaphore::new(0));
+        let connection = Arc::new(
+            ScriptedConnection::new([])
+                .with_subscription_results([Ok(()), Err(RpcError::General("VSPC start failed".to_string())), Ok(())])
+                .with_block_stop_gate(gate.clone()),
+        );
+        let (retirement_tx, mut retirements) = retirement_channel();
+        let client = ValidatedRpcClient::new(connection.clone(), node_info(), retirement_tx);
+        let (channels, _receivers) = notification_channels();
+        let activation = tokio::spawn({
+            let client = client.clone();
+            async move { client.activate_notifications(channels).await }
+        });
+
+        wait_for_subscription_calls(&connection, 3).await;
+        activation.abort();
+        assert!(activation.await.expect_err("activation caller must be aborted").is_cancelled());
+        gate.add_permits(1);
+
+        wait_for_subscription_state(&client, SubscriptionState::Disabled).await;
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Disabled);
+        assert_eq!(
+            connection.subscription_calls.lock().expect("subscription log").as_slice(),
+            &["start BlockAdded", "start VirtualChainChanged", "stop BlockAdded"]
+        );
+        assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn abandoned_deactivation_between_remote_stops_completes_cleanup() {
+        let gate = Arc::new(Semaphore::new(0));
+        let connection = Arc::new(ScriptedConnection::new([]).with_virtual_stop_gate(gate.clone()));
+        let (retirement_tx, mut retirements) = retirement_channel();
+        let client = ValidatedRpcClient::new(connection.clone(), node_info(), retirement_tx);
+        let (channels, _receivers) = notification_channels();
+        client.activate_notifications(channels).await.expect("activation");
+        let deactivation = tokio::spawn({
+            let client = client.clone();
+            async move { client.disable_notifications().await }
+        });
+
+        wait_for_subscription_calls(&connection, 4).await;
+        deactivation.abort();
+        assert!(deactivation.await.expect_err("deactivation caller must be aborted").is_cancelled());
+        gate.add_permits(1);
+
+        wait_for_subscription_state(&client, SubscriptionState::Disabled).await;
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Disabled);
+        assert_eq!(
+            connection.subscription_calls.lock().expect("subscription log").as_slice(),
+            &["start BlockAdded", "start VirtualChainChanged", "stop BlockAdded", "stop VirtualChainChanged"]
+        );
+        assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn deactivation_during_block_start_cancels_activation_after_cleanup() {
+        exercise_activation_deactivation_overlap(ActivationOverlap::BlockStart).await;
+    }
+
+    #[tokio::test]
+    async fn deactivation_during_vspc_start_cancels_activation_after_cleanup() {
+        exercise_activation_deactivation_overlap(ActivationOverlap::VspcStart).await;
+    }
+
+    #[tokio::test]
+    async fn deactivation_during_activation_rollback_cancels_after_cleanup() {
+        exercise_activation_deactivation_overlap(ActivationOverlap::Rollback).await;
+    }
+
+    #[tokio::test]
+    async fn deactivation_before_enabled_publication_cancels_activation_after_cleanup() {
+        exercise_activation_deactivation_overlap(ActivationOverlap::Publication).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum ActivationOverlap {
+        BlockStart,
+        VspcStart,
+        Rollback,
+        Publication,
+    }
+
+    async fn exercise_activation_deactivation_overlap(overlap: ActivationOverlap) {
+        let gate = Arc::new(Semaphore::new(0));
+        let connection = Arc::new(match overlap {
+            ActivationOverlap::BlockStart => ScriptedConnection::new([]).with_block_start_gate(gate.clone()),
+            ActivationOverlap::VspcStart => ScriptedConnection::new([]).with_virtual_start_gate(gate.clone()),
+            ActivationOverlap::Rollback => ScriptedConnection::new([])
+                .with_subscription_results([Ok(()), Err(RpcError::General("VSPC start failed".to_string())), Ok(())])
+                .with_block_stop_gate(gate.clone()),
+            ActivationOverlap::Publication => ScriptedConnection::new([]),
+        });
+        let (retirement_tx, mut retirements) = retirement_channel();
+        let client = ValidatedRpcClient::new(connection.clone(), node_info(), retirement_tx);
+        let mut publication_reached = None;
+        if matches!(overlap, ActivationOverlap::Publication) {
+            let (reached_tx, reached_rx) = mpsc::unbounded_channel();
+            client.set_activation_publication_gate(reached_tx, gate.clone());
+            publication_reached = Some(reached_rx);
+        }
+        let (channels, _receivers) = notification_channels();
+        let activation = tokio::spawn({
+            let client = client.clone();
+            async move { client.activate_notifications(channels).await }
+        });
+
+        match overlap {
+            ActivationOverlap::BlockStart => wait_for_subscription_calls(&connection, 1).await,
+            ActivationOverlap::VspcStart => wait_for_subscription_calls(&connection, 2).await,
+            ActivationOverlap::Rollback => wait_for_subscription_calls(&connection, 3).await,
+            ActivationOverlap::Publication => {
+                timeout(Duration::from_secs(1), publication_reached.as_mut().expect("publication observer").recv())
+                    .await
+                    .expect("activation must reach publication boundary")
+                    .expect("publication observer path");
+            }
+        }
+
+        let deactivation = tokio::spawn({
+            let client = client.clone();
+            async move { client.disable_notifications().await }
+        });
+        wait_for_subscription_state(&client, SubscriptionState::Disabling).await;
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Disabled);
+        gate.add_permits(1);
+
+        assert_eq!(activation.await.expect("activation task"), Err(NodeError::Cancelled));
+        assert_eq!(deactivation.await.expect("deactivation task"), Ok(()));
+        assert_eq!(client.subscription_state(), SubscriptionState::Disabled);
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Disabled);
+        let expected_calls: &[&str] = match overlap {
+            ActivationOverlap::BlockStart => &["start BlockAdded", "stop BlockAdded", "stop VirtualChainChanged"],
+            ActivationOverlap::VspcStart | ActivationOverlap::Rollback | ActivationOverlap::Publication => {
+                &["start BlockAdded", "start VirtualChainChanged", "stop BlockAdded", "stop VirtualChainChanged"]
+            }
+        };
+        assert_eq!(connection.subscription_calls.lock().expect("subscription log").as_slice(), expected_calls);
+        assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn failed_overlap_cleanup_retires_and_completes_both_operations() {
+        let gate = Arc::new(Semaphore::new(0));
+        let connection = Arc::new(
+            ScriptedConnection::new([])
+                .with_subscription_results([Ok(()), Ok(()), Err(RpcError::General("BlockAdded stop failed".to_string())), Ok(())])
+                .with_virtual_start_gate(gate.clone()),
+        );
+        let (retirement_tx, mut retirements) = retirement_channel();
+        let client = ValidatedRpcClient::new(connection.clone(), node_info(), retirement_tx);
+        let (channels, _receivers) = notification_channels();
+        let activation = tokio::spawn({
+            let client = client.clone();
+            async move { client.activate_notifications(channels).await }
+        });
+        wait_for_subscription_calls(&connection, 2).await;
+        let deactivation = tokio::spawn({
+            let client = client.clone();
+            async move { client.disable_notifications().await }
+        });
+        wait_for_subscription_state(&client, SubscriptionState::Disabling).await;
+        gate.add_permits(1);
+
+        let retirement = timeout(Duration::from_secs(1), retirements.recv())
+            .await
+            .expect("failed overlap cleanup must request retirement")
+            .expect("retirement path");
+        assert_eq!(retirement.reason(), &RetirementReason::SubscriptionControlFailure);
+        assert!(retirement.target().upgrade().is_some_and(|generation| Arc::ptr_eq(&generation, &client)));
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Disabled);
+        assert_eq!(
+            connection.subscription_calls.lock().expect("subscription log").as_slice(),
+            &["start BlockAdded", "start VirtualChainChanged", "stop BlockAdded", "stop VirtualChainChanged"]
+        );
+        assert!(client.retire().await);
+        retirement.complete(Ok(()));
+
+        assert_eq!(activation.await.expect("activation task"), Err(NodeError::GenerationLost));
+        assert_eq!(deactivation.await.expect("deactivation task"), Err(NodeError::GenerationLost));
+        assert_eq!(client.subscription_state(), SubscriptionState::Retired);
+        assert_eq!(client.notification_router.state(), NotificationRouterState::Retired);
     }
 
     #[tokio::test]
@@ -1215,6 +2208,25 @@ mod tests {
         (client, connection, retirement_rx)
     }
 
+    async fn assert_malformed_composite(name: &str, operation: CompositeOperation, scripts: Vec<Script>) {
+        let expected_kind = operation.malformed_kind();
+        let (client, connection, mut retirements) = client(scripts);
+        let task = tokio::spawn({
+            let client = client.clone();
+            async move { operation.execute(&client).await }
+        });
+
+        let retirement = retirements.recv().await.expect("malformed composite retirement request");
+        assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(expected_kind), "{name}");
+        assert!(retirement.target().upgrade().is_some_and(|generation| Arc::ptr_eq(&generation, &client)), "{name}");
+        assert!(client.retire().await, "{name}");
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "{name} completed before its exact-generation retirement barrier");
+        retirement.complete(Ok(()));
+        assert_eq!(task.await.expect("composite operation task"), Err(NodeError::RecoveryInputInvalid(expected_kind)), "{name}");
+        assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1, "{name}");
+    }
+
     type NotificationReceivers = (
         mpsc::Receiver<kgi_model::block::ValidatedNodeBlock>,
         mpsc::Receiver<kgi_model::vspc::VspcChange>,
@@ -1252,6 +2264,53 @@ mod tests {
             0,
             hash(9),
         )
+    }
+
+    fn invalid_sink_conversion_error() -> RpcError {
+        let wire = protowire::GetSinkResponseMessage { sink: "not-a-hash".to_string(), error: None };
+        GetSinkResponse::try_from(&wire).expect_err("invalid sink hash")
+    }
+
+    fn invalid_get_block_blue_work_conversion_error(hash_value: BlockHash) -> RpcError {
+        let response = GetBlockResponse { block: rpc_block(hash_value, vec![hash(8)]) };
+        let mut wire = protowire::GetBlockResponseMessage::from(Ok::<_, RpcError>(&response));
+        wire.block.as_mut().expect("wire block").header.as_mut().expect("wire header").blue_work = "not-blue-work".to_string();
+        GetBlockResponse::try_from(&wire).expect_err("invalid gRPC blue work")
+    }
+
+    fn invalid_get_blocks_parallel_hash_conversion_error(low_hash: BlockHash) -> RpcError {
+        let response = GetBlocksResponse { block_hashes: vec![low_hash], blocks: vec![rpc_block(low_hash, vec![hash(8)])] };
+        let mut wire = protowire::GetBlocksResponseMessage::from(Ok::<_, RpcError>(&response));
+        wire.block_hashes[0] = "ignored-invalid-hash".to_string();
+        GetBlocksResponse::try_from(&wire).expect_err("invalid ignored parallel hash")
+    }
+
+    fn invalid_dag_pruning_point_conversion_error() -> RpcError {
+        let response = dag_info(hash(4));
+        let mut wire = protowire::GetBlockDagInfoResponseMessage::from(Ok::<_, RpcError>(&response));
+        wire.pruning_point_hash = "invalid-consumed-pruning-point".to_string();
+        GetBlockDagInfoResponse::try_from(&wire).expect_err("invalid pruning point")
+    }
+
+    fn invalid_dag_tip_conversion_error() -> RpcError {
+        let response = dag_info(hash(4));
+        let mut wire = protowire::GetBlockDagInfoResponseMessage::from(Ok::<_, RpcError>(&response));
+        wire.tip_hashes.push("invalid-ignored-tip".to_string());
+        GetBlockDagInfoResponse::try_from(&wire).expect_err("invalid ignored tip")
+    }
+
+    fn invalid_vspc_added_hash_conversion_error(low_hash: BlockHash) -> RpcError {
+        let response = vspc(vec![], vec![low_hash]);
+        let mut wire = protowire::GetVirtualChainFromBlockV2ResponseMessage::from(Ok::<_, RpcError>(&response));
+        wire.added_chain_block_hashes[0] = "invalid-consumed-added-hash".to_string();
+        GetVirtualChainFromBlockV2Response::try_from(&wire).expect_err("invalid added hash")
+    }
+
+    fn invalid_vspc_acceptance_conversion_error(low_hash: BlockHash) -> RpcError {
+        let response = vspc(vec![], vec![low_hash]);
+        let mut wire = protowire::GetVirtualChainFromBlockV2ResponseMessage::from(Ok::<_, RpcError>(&response));
+        wire.chain_block_accepted_transactions.push(protowire::RpcChainBlockAcceptedTransactions::default());
+        GetVirtualChainFromBlockV2Response::try_from(&wire).expect_err("invalid ignored acceptance data")
     }
 
     fn hash(byte: u8) -> BlockHash {
@@ -1298,6 +2357,45 @@ mod tests {
             added_chain_block_hashes: Arc::new(added),
             chain_block_accepted_transactions: Arc::new(Vec::new()),
         }
+    }
+
+    async fn wait_for_subscription_calls(connection: &ScriptedConnection, expected: usize) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if connection.subscription_calls.lock().expect("subscription log").len() >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscription calls must reach the expected count");
+    }
+
+    async fn wait_for_requests(connection: &ScriptedConnection, expected: usize) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if connection.requests().len() >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("RPC requests must reach the expected count");
+    }
+
+    async fn wait_for_subscription_state(client: &ValidatedRpcClient, expected: SubscriptionState) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if client.subscription_state() == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscription state must converge");
     }
 
     async fn wait_for_counts(client: &ValidatedRpcClient, active: usize, waiting: usize) {
