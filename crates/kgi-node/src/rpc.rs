@@ -134,6 +134,8 @@ pub struct ValidatedRpcClient {
     subscription_transition: Arc<AsyncMutex<()>>,
     #[cfg(test)]
     activation_publication_gate: Mutex<Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>>,
+    #[cfg(test)]
+    operation_completion_gate: Mutex<Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>>,
     admission: AtomicU8,
     admission_tx: watch::Sender<u8>,
     permits: Arc<Semaphore>,
@@ -157,6 +159,8 @@ impl ValidatedRpcClient {
                 subscription_transition: Arc::new(AsyncMutex::new(())),
                 #[cfg(test)]
                 activation_publication_gate: Mutex::new(None),
+                #[cfg(test)]
+                operation_completion_gate: Mutex::new(None),
                 node_info,
                 admission: AtomicU8::new(GENERATION_ACTIVE),
                 admission_tx,
@@ -196,11 +200,30 @@ impl ValidatedRpcClient {
     }
 
     #[cfg(test)]
+    pub(crate) fn retirement_sender(&self) -> RetirementSender {
+        self.retirement_tx.clone()
+    }
+
+    #[cfg(test)]
+    fn set_operation_completion_gate(&self, reached: mpsc::UnboundedSender<()>, gate: Arc<Semaphore>) {
+        *self.operation_completion_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((reached, gate));
+    }
+
+    #[cfg(test)]
     async fn wait_for_activation_publication(&self) {
         let publication_gate = self.activation_publication_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         if let Some((reached, gate)) = publication_gate {
             reached.send(()).expect("activation-publication observer");
             gate.acquire().await.expect("activation-publication gate").forget();
+        }
+    }
+
+    #[cfg(test)]
+    async fn wait_for_operation_completion(&self) {
+        let completion_gate = self.operation_completion_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        if let Some((reached, gate)) = completion_gate {
+            reached.send(()).expect("operation-completion observer");
+            gate.acquire().await.expect("operation-completion gate").forget();
         }
     }
 
@@ -613,6 +636,8 @@ impl ValidatedRpcClient {
             Err(ResponseNormalizationError::Malformed(kind)) => self.return_malformed(operation, kind).await,
             Ok(value) => {
                 self.require_active()?;
+                #[cfg(test)]
+                self.wait_for_operation_completion().await;
                 Ok(value)
             }
             Err(ResponseNormalizationError::ScoreOutOfRange(fault)) => {
@@ -1307,24 +1332,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retirement_and_cancellation_win_blocked_operation_races() {
-        for cancelled in [false, true] {
-            let gate = Arc::new(Semaphore::new(0));
-            let requested = hash(1);
-            let scripts = [Script::block(Ok(GetBlockResponse { block: rpc_block(requested, vec![hash(8)]) }), Some(gate))];
-            let (client, connection, _retirements) = client(scripts);
-            let operation = tokio::spawn({
-                let client = client.clone();
-                async move { client.full_block(requested).await }
-            });
-            wait_for_counts(&client, 1, 0).await;
+    async fn rpc_success_linearized_before_retirement_is_preserved() {
+        let requested = hash(1);
+        let scripts = [Script::block(Ok(GetBlockResponse { block: rpc_block(requested, vec![hash(8)]) }), None)];
+        let (client, connection, _retirements) = client(scripts);
+        let (reached_tx, mut reached_rx) = mpsc::unbounded_channel();
+        let completion_gate = Arc::new(Semaphore::new(0));
+        client.set_operation_completion_gate(reached_tx, completion_gate.clone());
+        let operation = tokio::spawn({
+            let client = client.clone();
+            async move { client.full_block(requested).await }
+        });
 
-            let changed = if cancelled { client.cancel().await } else { client.retire().await };
-            assert!(changed);
-            let expected = if cancelled { NodeError::Cancelled } else { NodeError::GenerationLost };
-            assert_eq!(operation.await.expect("operation task"), Err(expected));
-            assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1);
-        }
+        reached_rx.recv().await.expect("operation must linearize success");
+        assert!(client.retire().await);
+        completion_gate.add_permits(1);
+
+        assert_eq!(operation.await.expect("operation task").expect("old-generation success").hash, requested);
+        assert_eq!(client.full_block(requested).await, Err(NodeError::GenerationLost));
+        assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn retirement_wins_blocked_operation_race() {
+        let gate = Arc::new(Semaphore::new(0));
+        let requested = hash(1);
+        let scripts = [Script::block(Ok(GetBlockResponse { block: rpc_block(requested, vec![hash(8)]) }), Some(gate))];
+        let (client, connection, _retirements) = client(scripts);
+        let operation = tokio::spawn({
+            let client = client.clone();
+            async move { client.full_block(requested).await }
+        });
+        wait_for_counts(&client, 1, 0).await;
+
+        assert!(client.retire().await);
+        assert_eq!(operation.await.expect("operation task"), Err(NodeError::GenerationLost));
+        assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_blocked_operation_race() {
+        let gate = Arc::new(Semaphore::new(0));
+        let requested = hash(1);
+        let scripts = [Script::block(Ok(GetBlockResponse { block: rpc_block(requested, vec![hash(8)]) }), Some(gate))];
+        let (client, connection, _retirements) = client(scripts);
+        let operation = tokio::spawn({
+            let client = client.clone();
+            async move { client.full_block(requested).await }
+        });
+        wait_for_counts(&client, 1, 0).await;
+
+        assert!(client.cancel().await);
+        assert_eq!(operation.await.expect("operation task"), Err(NodeError::Cancelled));
+        assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

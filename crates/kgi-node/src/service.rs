@@ -513,8 +513,11 @@ mod tests {
         api::ops::{RPC_API_REVISION, RPC_API_VERSION},
     };
     use kgi_core::timing::{Clock, Jitter, TokioClock};
-    use kgi_model::{block::BlockHash, lifecycle::NodeServiceStatusState};
-    use tokio::sync::{Semaphore, mpsc};
+    use kgi_model::{
+        block::BlockHash,
+        lifecycle::{NodeServiceStatusState, RecoveryInputKind},
+    };
+    use tokio::sync::{Semaphore, mpsc, oneshot};
     use url::Url;
 
     use super::{IBD_POLL_INTERVAL, NodeService, NodeServiceEvent, RETRY_DELAYS};
@@ -522,6 +525,7 @@ mod tests {
         client::{RpcConnection, RpcConnector, ServerInfoObservation},
         consensus::KgiConsensusParams,
         error::{NodeError, NodeRejection},
+        runtime::{RetirementReason, RetirementRequest},
     };
 
     type ConnectionOutcome = Result<Arc<dyn RpcConnection>, Arc<str>>;
@@ -901,6 +905,69 @@ mod tests {
         assert!(matches!(recv_event(&mut events).await, NodeServiceEvent::RpcPublished(_)));
 
         service.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn replacement_uses_a_new_identity_and_ignores_repeated_stale_retirement() {
+        let network_id = mainnet();
+        let first_connection = Arc::new(ScriptedConnection::new([server_info(network_id, true)], hash(1)));
+        let second_connection = Arc::new(ScriptedConnection::new([server_info(network_id, true)], hash(2)));
+        let connector = connector([
+            Ok(first_connection.clone() as Arc<dyn RpcConnection>),
+            Ok(second_connection.clone() as Arc<dyn RpcConnection>),
+        ]);
+        let (clock, mut sleeps, permits) = manual_clock();
+        let (service, mut events) = start_service(network_id, connector, clock);
+
+        let first = match recv_event(&mut events).await {
+            NodeServiceEvent::RpcPublished(client) => client,
+            _ => panic!("expected first publication"),
+        };
+        assert_eq!(first.node_info().genesis_hash, hash(1));
+        assert_eq!(sleeps.recv().await.expect("Ready reset timer"), Duration::from_secs(60));
+
+        first_connection.signal_disconnect();
+        let retired = match recv_event(&mut events).await {
+            NodeServiceEvent::RpcRetired(client) => client,
+            _ => panic!("expected first retirement"),
+        };
+        assert!(Arc::ptr_eq(&first, &retired));
+        assert_eq!(sleeps.recv().await.expect("replacement retry"), Duration::from_secs(1));
+        permits.add_permits(1);
+
+        let second = match recv_event(&mut events).await {
+            NodeServiceEvent::RpcPublished(client) => client,
+            _ => panic!("expected replacement publication"),
+        };
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.node_info().genesis_hash, hash(2));
+
+        let retirements = first.retirement_sender();
+        for _ in 0..2 {
+            let (completion_tx, completion_rx) = oneshot::channel();
+            retirements
+                .send(RetirementRequest::with_reason(
+                    Arc::downgrade(&first),
+                    RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedGetBlock),
+                    completion_tx,
+                ))
+                .expect("retirement control path");
+            completion_rx.await.expect("stale retirement acknowledgement").expect("stale retirement completion");
+        }
+
+        assert!(matches!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert_eq!(first.full_block(hash(9)).await, Err(NodeError::GenerationLost));
+        assert!(matches!(second.full_block(hash(9)).await, Err(NodeError::RpcRequestFailed { .. })));
+        assert_eq!(service.status().state, NodeServiceStatusState::Ready);
+        assert_eq!(second_connection.disconnects.load(Ordering::Relaxed), 0);
+
+        service.shutdown().await.expect("shutdown");
+        let retired = match recv_event(&mut events).await {
+            NodeServiceEvent::RpcRetired(client) => client,
+            _ => panic!("expected replacement retirement"),
+        };
+        assert!(Arc::ptr_eq(&second, &retired));
+        assert!(matches!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)));
     }
 
     #[tokio::test]
