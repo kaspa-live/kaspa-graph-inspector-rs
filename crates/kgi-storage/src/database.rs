@@ -629,6 +629,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_migration_history_is_rejected_as_unsupported_schema() {
+        let (_container, database_url) = fixture().await;
+        let mut connection = PgConnection::connect(&database_url).await.expect("fixture connection");
+        sqlx::query("CREATE TABLE _sqlx_migrations (not_version BIGINT)")
+            .execute(&mut connection)
+            .await
+            .expect("malformed migration history");
+        connection.close().await.expect("close fixture connection");
+
+        let database = LockedDatabase::connect(&database_url).await.expect("database lock");
+        assert!(matches!(
+            database.prepare().await,
+            Err(StorageError::Rejected(StorageRejection::UnsupportedSchema { diagnostic }))
+                if diagnostic.contains("migration history")
+        ));
+    }
+
+    #[tokio::test]
     async fn unknown_partial_and_newer_schemas_are_rejected() {
         let (_unknown_container, unknown_url) = fixture().await;
         let mut connection = PgConnection::connect(&unknown_url).await.expect("fixture connection");
@@ -668,6 +686,10 @@ mod tests {
         .execute(newer.connection_mut())
         .await
         .expect("future migration marker");
+        sqlx::query("ALTER TABLE _sqlx_migrations ADD COLUMN future_metadata TEXT")
+            .execute(newer.connection_mut())
+            .await
+            .expect("future migration-history column");
         sqlx::query("CREATE TABLE future_projection_state (id BIGINT PRIMARY KEY)")
             .execute(newer.connection_mut())
             .await

@@ -1264,6 +1264,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_migration_history_is_terminal_without_retry_or_reconnect() {
+        let (_container, database_url) = fixture().await;
+        let mut connection = PgConnection::connect(database_url.as_str()).await.expect("fixture connection");
+        sqlx::query("CREATE TABLE _sqlx_migrations (not_version BIGINT)")
+            .execute(&mut connection)
+            .await
+            .expect("malformed migration history");
+        connection.close().await.expect("close fixture connection");
+
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let connector =
+            Arc::new(GatedStartupConnector { attempts: AtomicUsize::new(0), started: started_tx, permit: Semaphore::new(0) });
+        let (sleep_tx, mut sleeps) = mpsc::unbounded_channel();
+        let clock = Arc::new(ManualClock { sleeps: sleep_tx });
+        let (service, mut events) =
+            StorageService::start_with_dependencies(database_url, connector.clone(), clock, Arc::new(IdentityJitter));
+
+        timeout(TEST_TIMEOUT, started_rx.recv()).await.expect("startup must begin").expect("startup observer");
+        connector.permit.add_permits(1);
+        match next_event(&mut events).await {
+            StorageServiceEvent::Rejected(StorageRejection::UnsupportedSchema { diagnostic }) => {
+                assert!(diagnostic.contains("migration history"));
+            }
+            event => panic!("expected malformed migration-history rejection, got {event:?}"),
+        }
+        assert_eq!(service.status().state, StorageServiceStatusState::Rejected);
+        assert_eq!(connector.attempts.load(Ordering::Relaxed), 1);
+        assert!(sleeps.try_recv().is_err(), "malformed migration history must not schedule retry");
+        assert!(timeout(Duration::from_millis(100), events.recv()).await.is_err());
+
+        service.shutdown().await.expect("rejected service shutdown");
+        assert_eq!(service.status().state, StorageServiceStatusState::Stopped);
+    }
+
+    #[tokio::test]
     async fn migration_connection_loss_retries_complete_startup_and_shutdown_cancels_backoff() {
         let (_container, database_url) = fixture().await;
         let connector = Arc::new(MigrationConnectionLossConnector { attempts: AtomicUsize::new(0), injected_failures: 2 });

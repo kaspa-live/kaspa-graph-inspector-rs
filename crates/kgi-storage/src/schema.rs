@@ -8,6 +8,16 @@ use crate::{
 };
 
 const MIGRATION_TABLE: &str = "_sqlx_migrations";
+const MIGRATION_VERSION_COLUMN: &str = "_sqlx_migrations.version:bigint:int8:NO:NO:<none>:<none>";
+const MIGRATION_COLUMNS: [&str; 6] = [
+    MIGRATION_VERSION_COLUMN,
+    "_sqlx_migrations.description:text:text:NO:NO:<none>:<none>",
+    "_sqlx_migrations.installed_on:timestamp with time zone:timestamptz:NO:NO:<none>:now()",
+    "_sqlx_migrations.success:boolean:bool:NO:NO:<none>:<none>",
+    "_sqlx_migrations.checksum:bytea:bytea:NO:NO:<none>:<none>",
+    "_sqlx_migrations.execution_time:bigint:int8:NO:NO:<none>:<none>",
+];
+const MIGRATION_CONSTRAINTS: [&str; 1] = ["_sqlx_migrations._sqlx_migrations_pkey:p:true:false:false:PRIMARY KEY (version)"];
 const KGI_TABLES: [&str; 7] =
     ["administrative_metadata", "block_identifiers", "blocks", "levels", "network_metadata", "parents", "processing_metadata"];
 const KGI_COLUMNS: [&str; 28] = [
@@ -122,6 +132,13 @@ async fn reject_newer_schema(connection: &mut PgConnection) -> Result<(), Storag
     if !table_names(connection).await?.contains(MIGRATION_TABLE) {
         return Ok(());
     }
+    let actual_columns = column_signatures_for(connection, &[MIGRATION_TABLE]).await?;
+    if !actual_columns.contains(MIGRATION_VERSION_COLUMN) {
+        return Err(StorageRejection::UnsupportedSchema {
+            diagnostic: Arc::from("migration history has no compatible version column"),
+        }
+        .into());
+    }
 
     let observed: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&mut *connection)
@@ -130,6 +147,41 @@ async fn reject_newer_schema(connection: &mut PgConnection) -> Result<(), Storag
     let supported = migration::current_version();
     if observed.is_some_and(|version| version > supported) {
         return Err(StorageRejection::SchemaTooNew { observed: observed.expect("checked Some"), supported }.into());
+    }
+    validate_migration_history_layout(connection, actual_columns).await
+}
+
+async fn validate_migration_history_layout(
+    connection: &mut PgConnection,
+    actual_columns: BTreeSet<String>,
+) -> Result<(), StorageError> {
+    let expected_columns = MIGRATION_COLUMNS.iter().copied().map(str::to_owned).collect::<BTreeSet<_>>();
+    if actual_columns != expected_columns {
+        let missing = expected_columns.difference(&actual_columns).cloned().collect::<Vec<_>>();
+        let unexpected = actual_columns.difference(&expected_columns).cloned().collect::<Vec<_>>();
+        return Err(StorageRejection::UnsupportedSchema {
+            diagnostic: Arc::from(format!(
+                "migration history column mismatch (missing: {}; unexpected: {})",
+                display_names(&missing),
+                display_names(&unexpected)
+            )),
+        }
+        .into());
+    }
+
+    let actual_constraints = constraint_signatures_for(connection, &[MIGRATION_TABLE]).await?;
+    let expected_constraints = MIGRATION_CONSTRAINTS.iter().copied().map(str::to_owned).collect::<BTreeSet<_>>();
+    if actual_constraints != expected_constraints {
+        let missing = expected_constraints.difference(&actual_constraints).cloned().collect::<Vec<_>>();
+        let unexpected = actual_constraints.difference(&expected_constraints).cloned().collect::<Vec<_>>();
+        return Err(StorageRejection::UnsupportedSchema {
+            diagnostic: Arc::from(format!(
+                "migration history constraint mismatch (missing: {}; unexpected: {})",
+                display_names(&missing),
+                display_names(&unexpected)
+            )),
+        }
+        .into());
     }
     Ok(())
 }
@@ -150,7 +202,7 @@ async fn validate_current_layout(connection: &mut PgConnection) -> Result<(), St
         .into());
     }
 
-    let actual_columns = column_signatures(connection).await?;
+    let actual_columns = column_signatures_for(connection, KGI_TABLES.as_slice()).await?;
     let expected_columns = KGI_COLUMNS.iter().copied().map(str::to_owned).collect::<BTreeSet<_>>();
     if actual_columns != expected_columns {
         let missing = expected_columns.difference(&actual_columns).cloned().collect::<Vec<_>>();
@@ -165,7 +217,7 @@ async fn validate_current_layout(connection: &mut PgConnection) -> Result<(), St
         .into());
     }
 
-    let actual_constraints = constraint_signatures(connection).await?;
+    let actual_constraints = constraint_signatures_for(connection, KGI_TABLES.as_slice()).await?;
     let expected_constraints = KGI_CONSTRAINTS.iter().copied().map(str::to_owned).collect::<BTreeSet<_>>();
     if actual_constraints != expected_constraints {
         let missing = expected_constraints.difference(&actual_constraints).cloned().collect::<Vec<_>>();
@@ -205,7 +257,7 @@ async fn table_names(connection: &mut PgConnection) -> Result<BTreeSet<String>, 
     .map_err(|error| StorageError::database("schema inspection", error))
 }
 
-async fn column_signatures(connection: &mut PgConnection) -> Result<BTreeSet<String>, StorageError> {
+async fn column_signatures_for(connection: &mut PgConnection, tables: &[&str]) -> Result<BTreeSet<String>, StorageError> {
     let rows = sqlx::query(
         "SELECT table_name, column_name, data_type, udt_name, is_nullable,
                 is_identity, identity_generation, column_default
@@ -213,7 +265,7 @@ async fn column_signatures(connection: &mut PgConnection) -> Result<BTreeSet<Str
          WHERE table_schema = current_schema() AND table_name = ANY($1)
          ORDER BY table_name, ordinal_position",
     )
-    .bind(KGI_TABLES.as_slice())
+    .bind(tables)
     .fetch_all(connection)
     .await
     .map_err(|error| StorageError::database("schema-column inspection", error))?;
@@ -241,7 +293,7 @@ async fn column_signatures(connection: &mut PgConnection) -> Result<BTreeSet<Str
         .collect()
 }
 
-async fn constraint_signatures(connection: &mut PgConnection) -> Result<BTreeSet<String>, StorageError> {
+async fn constraint_signatures_for(connection: &mut PgConnection, tables: &[&str]) -> Result<BTreeSet<String>, StorageError> {
     let rows = sqlx::query(
         "SELECT table_class.relname AS table_name,
                 constraint_record.conname AS constraint_name,
@@ -259,7 +311,7 @@ async fn constraint_signatures(connection: &mut PgConnection) -> Result<BTreeSet
            AND table_class.relname = ANY($1)
          ORDER BY table_class.relname, constraint_record.conname",
     )
-    .bind(KGI_TABLES.as_slice())
+    .bind(tables)
     .fetch_all(connection)
     .await
     .map_err(|error| StorageError::database("schema-constraint inspection", error))?;
