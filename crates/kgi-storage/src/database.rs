@@ -779,6 +779,10 @@ mod tests {
         assert_eq!(snapshot.committed_vspc_sink.id.get(), 2);
         assert_eq!(snapshot.committed_vspc_sink.selected_parent, hash(8));
         assert_eq!(snapshot.committed_vspc_sink.daa_score, 0);
+        assert_eq!(
+            processing.cached_vspc_sink(),
+            Some(crate::cache::CachedVspcSink { id: snapshot.committed_vspc_sink.id, hash: snapshot.committed_vspc_sink.hash })
+        );
 
         sqlx::query("INSERT INTO block_identifiers (id, hash) VALUES (3, $1)")
             .bind(hash(7).as_bytes().as_slice())

@@ -7,13 +7,14 @@ use kgi_model::block::{BlockCoordinate, BlockHash, BlockPresence, CompactId};
 use sqlx::{PgPool, Row};
 
 use crate::{
-    cache::{CachedIdentity, ProcessingCaches},
+    cache::{CachedIdentity, CachedMaterializedBlock, ProcessingCaches},
     error::StorageError,
 };
 
 struct StoredIdentity {
     identity: CachedIdentity,
-    coordinate: Option<BlockCoordinate>,
+    block: Option<CachedMaterializedBlock>,
+    selected_parent_hash: Option<BlockHash>,
 }
 
 pub(crate) enum MaterializedIdResolution {
@@ -26,15 +27,17 @@ pub(crate) async fn block_presence(pool: &PgPool, caches: &ProcessingCaches, has
         if !identity.materialized {
             return Ok(BlockPresence::BoundaryIdentity { id: identity.id });
         }
-        if let Some(coordinate) = caches.coordinate(identity.id) {
-            return Ok(BlockPresence::Materialized { id: identity.id, coordinate });
+        if let Some(block) = caches.materialized_block(identity.id) {
+            return Ok(BlockPresence::Materialized { id: identity.id, coordinate: block.coordinate });
         }
     }
 
     let row = sqlx::query(
-        "SELECT identity.id, block.level, block.slot
+        "SELECT identity.id, block.level, block.slot, block.selected_parent_id,
+                selected_parent.hash AS selected_parent_hash
          FROM block_identifiers identity
          LEFT JOIN blocks block ON block.id = identity.id
+         LEFT JOIN block_identifiers selected_parent ON selected_parent.id = block.selected_parent_id
          WHERE identity.hash = $1",
     )
     .bind(hash.as_bytes().as_slice())
@@ -46,9 +49,9 @@ pub(crate) async fn block_presence(pool: &PgPool, caches: &ProcessingCaches, has
         return Ok(BlockPresence::Absent);
     };
     let stored = decode_identity(&row)?;
-    caches.publish_identity(hash, stored.identity, stored.coordinate);
-    Ok(match stored.coordinate {
-        Some(coordinate) => BlockPresence::Materialized { id: stored.identity.id, coordinate },
+    publish_stored_identity(caches, hash, &stored);
+    Ok(match stored.block {
+        Some(block) => BlockPresence::Materialized { id: stored.identity.id, coordinate: block.coordinate },
         None => BlockPresence::BoundaryIdentity { id: stored.identity.id },
     })
 }
@@ -65,19 +68,21 @@ pub(crate) async fn resolve_materialized_ids(
 
     for hash in &distinct {
         match caches.identity(*hash) {
-            Some(identity) => {
+            Some(identity) if !identity.materialized || caches.materialized_block(identity.id).is_some() => {
                 resolved.insert(*hash, identity);
             }
-            None => misses.push(*hash),
+            Some(_) | None => misses.push(*hash),
         }
     }
 
     if !misses.is_empty() {
         let encoded: Vec<Vec<u8>> = misses.iter().map(|hash| hash.as_bytes().to_vec()).collect();
         let rows = sqlx::query(
-            "SELECT identity.hash, identity.id, block.level, block.slot
+            "SELECT identity.hash, identity.id, block.level, block.slot, block.selected_parent_id,
+                    selected_parent.hash AS selected_parent_hash
              FROM block_identifiers identity
              LEFT JOIN blocks block ON block.id = identity.id
+             LEFT JOIN block_identifiers selected_parent ON selected_parent.id = block.selected_parent_id
              WHERE identity.hash = ANY($1::BYTEA[])",
         )
         .bind(encoded)
@@ -91,7 +96,7 @@ pub(crate) async fn resolve_materialized_ids(
             let hash = BlockHash::try_from(encoded_hash.as_slice())
                 .map_err(|error| StorageError::invalid_metadata(format!("invalid stored block hash: {error}")))?;
             let stored = decode_identity(&row)?;
-            caches.publish_identity(hash, stored.identity, stored.coordinate);
+            publish_stored_identity(caches, hash, &stored);
             resolved.insert(hash, stored.identity);
         }
     }
@@ -120,18 +125,38 @@ fn decode_identity(row: &sqlx::postgres::PgRow) -> Result<StoredIdentity, Storag
         .ok_or_else(|| StorageError::invalid_metadata(format!("stored compact ID is not positive: {raw_id}")))?;
     let level: Option<i64> = row.try_get("level").map_err(|error| StorageError::database("block level decode", error))?;
     let slot: Option<i64> = row.try_get("slot").map_err(|error| StorageError::database("block slot decode", error))?;
-    let coordinate = match (level, slot) {
-        (None, None) => None,
-        (Some(level), Some(slot)) => {
+    let raw_selected_parent_id: Option<i64> =
+        row.try_get("selected_parent_id").map_err(|error| StorageError::database("selected-parent ID decode", error))?;
+    let encoded_selected_parent_hash: Option<Vec<u8>> =
+        row.try_get("selected_parent_hash").map_err(|error| StorageError::database("selected-parent hash decode", error))?;
+    let (block, selected_parent_hash) = match (level, slot, raw_selected_parent_id, encoded_selected_parent_hash) {
+        (None, None, None, None) => (None, None),
+        (Some(level), Some(slot), Some(raw_selected_parent_id), Some(encoded_selected_parent_hash)) => {
             let coordinate = u64::try_from(level)
                 .ok()
                 .and_then(|level| BlockCoordinate::new(level, u64::try_from(slot).ok()?))
                 .ok_or_else(|| StorageError::invalid_metadata(format!("invalid block coordinate ({level}, {slot})")))?;
-            Some(coordinate)
+            let selected_parent_id = CompactId::new(raw_selected_parent_id).ok_or_else(|| {
+                StorageError::invalid_metadata(format!("stored selected-parent ID is not positive: {raw_selected_parent_id}"))
+            })?;
+            let selected_parent_hash = BlockHash::try_from(encoded_selected_parent_hash.as_slice())
+                .map_err(|error| StorageError::invalid_metadata(format!("invalid stored selected-parent hash: {error}")))?;
+            (Some(CachedMaterializedBlock { coordinate, selected_parent_id }), Some(selected_parent_hash))
         }
-        _ => return Err(StorageError::invalid_metadata("stored block has a partial coordinate")),
+        _ => return Err(StorageError::invalid_metadata("stored block has partial immutable metadata")),
     };
-    Ok(StoredIdentity { identity: CachedIdentity { id, materialized: coordinate.is_some() }, coordinate })
+    Ok(StoredIdentity { identity: CachedIdentity { id, materialized: block.is_some() }, block, selected_parent_hash })
+}
+
+fn publish_stored_identity(caches: &ProcessingCaches, hash: BlockHash, stored: &StoredIdentity) {
+    caches.publish_identity(hash, stored.identity);
+    if let Some(block) = stored.block {
+        caches.publish_materialized_block(stored.identity.id, block);
+        caches.publish_hash(
+            block.selected_parent_id,
+            stored.selected_parent_hash.expect("materialized blocks decode their selected-parent hash"),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +260,15 @@ mod tests {
         assert_eq!(
             client.block_presence(materialized_hash).await,
             Ok(BlockPresence::Materialized { id: materialized_id, coordinate: BlockCoordinate::new(2, 0).expect("valid coordinate") })
+        );
+        assert_eq!(client.cached_hash(boundary_id), Some(boundary_hash));
+        assert_eq!(client.cached_hash(materialized_id), Some(materialized_hash));
+        assert_eq!(
+            client.cached_materialized_block(materialized_id),
+            Some(crate::cache::CachedMaterializedBlock {
+                coordinate: BlockCoordinate::new(2, 0).expect("valid coordinate"),
+                selected_parent_id: boundary_id,
+            })
         );
 
         assert_eq!(client.block_presence(initially_absent_hash).await, Ok(BlockPresence::Absent));

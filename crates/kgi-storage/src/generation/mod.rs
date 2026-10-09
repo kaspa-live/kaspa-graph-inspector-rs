@@ -17,13 +17,16 @@ use sqlx::PgPool;
 use tokio::sync::{Mutex, oneshot};
 
 use crate::{
-    cache::ProcessingCaches,
+    cache::{CachedVspcSink, ProcessingCaches},
     error::StorageError,
     identity,
     operation::ResolveMaterializedIdsError,
     runtime::{RetirementRequest, RetirementSender, RetirementTarget},
     state::ProcessingStateInspection,
 };
+
+#[cfg(test)]
+use crate::cache::CachedMaterializedBlock;
 
 mod materialization;
 mod vspc;
@@ -179,7 +182,12 @@ impl ValidatedDbClient {
 
     /// Loads fresh local processing state for one recovery-session attempt.
     pub async fn load_session_state(&self) -> Result<StoredSessionState, StorageError> {
-        self.run_operation(|| ProcessingStateInspection::load(self.runtime.pool(), self.binding)).await
+        let state = self.run_operation(|| ProcessingStateInspection::load(self.runtime.pool(), self.binding)).await?;
+        if let StoredSessionState::Initialized(snapshot) = state {
+            self.caches
+                .publish_vspc_sink(CachedVspcSink { id: snapshot.committed_vspc_sink.id, hash: snapshot.committed_vspc_sink.hash });
+        }
+        Ok(state)
     }
 
     /// Resolves one hash without creating or promoting a persistent identity.
@@ -231,6 +239,21 @@ impl ValidatedDbClient {
     #[cfg(test)]
     pub(crate) fn has_cached_merge_sets(&self, id: CompactId) -> bool {
         self.caches.merge_sets(id).is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_hash(&self, id: CompactId) -> Option<BlockHash> {
+        self.caches.hash(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_materialized_block(&self, id: CompactId) -> Option<CachedMaterializedBlock> {
+        self.caches.materialized_block(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_vspc_sink(&self) -> Option<CachedVspcSink> {
+        self.caches.vspc_sink()
     }
 
     async fn run_operation<T, F, Fut>(&self, operation: F) -> Result<T, StorageError>
@@ -333,7 +356,7 @@ mod tests {
 
     use super::{DatabaseBinding, ValidatedDbClient};
     use crate::{
-        cache::{CachedIdentity, CachedMergeSets},
+        cache::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, CachedVspcSink},
         error::StorageError,
         runtime::{RetirementTarget, retirement_channel},
     };
@@ -352,7 +375,11 @@ mod tests {
         let id = CompactId::new(1).expect("positive compact ID");
         let coordinate = BlockCoordinate::new(1, 0).expect("positive level");
 
-        predecessor.caches.publish_identity(hash(1), CachedIdentity { id, materialized: true }, Some(coordinate));
+        predecessor.caches.publish_identity(hash(1), CachedIdentity { id, materialized: true });
+        predecessor.caches.publish_materialized_block(
+            id,
+            CachedMaterializedBlock { coordinate, selected_parent_id: CompactId::new(4).expect("positive ID") },
+        );
         predecessor.caches.publish_merge_sets(
             id,
             CachedMergeSets {
@@ -360,18 +387,23 @@ mod tests {
                 red: vec![CompactId::new(3).expect("positive ID")].into(),
             },
         );
+        predecessor.caches.publish_vspc_sink(CachedVspcSink { id, hash: hash(1) });
         assert_eq!(predecessor.caches.identity(hash(1)).map(|identity| identity.id), Some(id));
-        assert_eq!(predecessor.caches.coordinate(id), Some(coordinate));
+        assert_eq!(predecessor.caches.hash(id), Some(hash(1)));
+        assert_eq!(predecessor.caches.materialized_block(id).map(|block| block.coordinate), Some(coordinate));
         assert_eq!(
             predecessor.caches.merge_sets(id).map(|sets| sets.blue),
             Some(vec![CompactId::new(2).expect("positive ID")].into())
         );
+        assert_eq!(predecessor.caches.vspc_sink(), Some(CachedVspcSink { id, hash: hash(1) }));
 
         let replacement = ValidatedDbClient::new(pool, binding, retirement_tx);
 
         assert_eq!(replacement.caches.identity(hash(1)), None);
-        assert_eq!(replacement.caches.coordinate(id), None);
+        assert_eq!(replacement.caches.hash(id), None);
+        assert_eq!(replacement.caches.materialized_block(id), None);
         assert_eq!(replacement.caches.merge_sets(id), None);
+        assert_eq!(replacement.caches.vspc_sink(), None);
     }
 
     #[tokio::test]

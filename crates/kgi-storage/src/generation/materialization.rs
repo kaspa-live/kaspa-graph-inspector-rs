@@ -11,7 +11,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use super::ValidatedDbClient;
 use crate::{
-    cache::{CachedIdentity, CachedMergeSets, ProcessingCaches},
+    cache::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, ProcessingCaches},
     database::{NO_VSPC_DAA_SCORE, daa_score_to_sql, timestamp_to_sql},
     error::StorageError,
     operation::{MaterializeBlockError, MaterializeBlockOutcome, ReferencePolicy},
@@ -48,7 +48,17 @@ struct PreparedBlock {
 #[derive(Clone, Copy)]
 struct StoredIdentity {
     id: CompactId,
-    coordinate: Option<BlockCoordinate>,
+    block: Option<CachedMaterializedBlock>,
+    selected_parent_hash: Option<BlockHash>,
+}
+
+impl StoredIdentity {
+    const fn coordinate(self) -> Option<BlockCoordinate> {
+        match self.block {
+            Some(block) => Some(block.coordinate),
+            None => None,
+        }
+    }
 }
 
 struct AttemptSuccess {
@@ -143,11 +153,14 @@ impl ValidatedDbClient {
                 };
 
                 for (hash, stored) in success.cache_updates {
-                    self.caches.publish_identity(
-                        hash,
-                        CachedIdentity { id: stored.id, materialized: stored.coordinate.is_some() },
-                        stored.coordinate,
-                    );
+                    self.caches.publish_identity(hash, CachedIdentity { id: stored.id, materialized: stored.block.is_some() });
+                    if let Some(block) = stored.block {
+                        self.caches.publish_materialized_block(stored.id, block);
+                        self.caches.publish_hash(
+                            block.selected_parent_id,
+                            stored.selected_parent_hash.expect("materialized cache updates include the selected-parent hash"),
+                        );
+                    }
                 }
                 if let Some((id, merge_sets)) = success.merge_sets {
                     self.caches.publish_merge_sets(id, merge_sets);
@@ -198,7 +211,7 @@ async fn attempt(
         load_identities(&mut transaction, caches, &prepared.universal).await?;
 
     if let Some(own) = identities.get(&prepared.hash).copied() {
-        if let Some(coordinate) = own.coordinate {
+        if let Some(coordinate) = own.coordinate() {
             transaction
                 .rollback()
                 .await
@@ -222,7 +235,7 @@ async fn attempt(
         for hash in prepared.references() {
             match identities.get(hash) {
                 None => missing.push(*hash),
-                Some(identity) if identity.coordinate.is_none() => identity_only.push(*hash),
+                Some(identity) if identity.block.is_none() => identity_only.push(*hash),
                 Some(_) => {}
             }
         }
@@ -247,7 +260,7 @@ async fn attempt(
         .collect();
     let level = direct_parents
         .iter()
-        .filter_map(|(_, identity)| identity.coordinate.map(BlockCoordinate::level))
+        .filter_map(|(_, identity)| identity.coordinate().map(BlockCoordinate::level))
         .max()
         .map_or(Some(1), |level| level.checked_add(1))
         .ok_or_else(|| TransactionAttemptError::Storage(StorageError::invalid_metadata("derived block level overflow")))?;
@@ -268,10 +281,11 @@ async fn attempt(
     let coordinate = BlockCoordinate::new(level, slot)
         .ok_or_else(|| TransactionAttemptError::Storage(StorageError::invalid_metadata("allocated block coordinate is invalid")))?;
 
-    let own = identities.get_mut(&prepared.hash).expect("the incoming block identity was interned");
-    own.coordinate = Some(coordinate);
-    let own_id = own.id;
     let selected_parent_id = identities.get(&prepared.selected_parent).expect("selected parent was resolved").id;
+    let own = identities.get_mut(&prepared.hash).expect("the incoming block identity was interned");
+    own.block = Some(CachedMaterializedBlock { coordinate, selected_parent_id });
+    own.selected_parent_hash = Some(prepared.selected_parent);
+    let own_id = own.id;
     let blue_ids: Vec<i64> = prepared
         .blue_merge_set
         .iter()
@@ -307,10 +321,11 @@ async fn attempt(
     for (_, parent) in &direct_parents {
         parent_ids.push(parent.id.get());
         parent_levels.push(
-            parent.coordinate.map_or(0, |coordinate| i64::try_from(coordinate.level()).expect("stored parent level fits BIGINT")),
+            parent.coordinate().map_or(0, |coordinate| i64::try_from(coordinate.level()).expect("stored parent level fits BIGINT")),
         );
-        parent_slots
-            .push(parent.coordinate.map_or(0, |coordinate| i64::try_from(coordinate.slot()).expect("stored parent slot fits BIGINT")));
+        parent_slots.push(
+            parent.coordinate().map_or(0, |coordinate| i64::try_from(coordinate.slot()).expect("stored parent slot fits BIGINT")),
+        );
     }
     sqlx::query(
         "INSERT INTO parents (
@@ -333,7 +348,7 @@ async fn attempt(
     let level_snapshots = load_level_snapshots(
         &mut transaction,
         level,
-        direct_parents.iter().filter_map(|(_, identity)| identity.coordinate.map(BlockCoordinate::level)),
+        direct_parents.iter().filter_map(|(_, identity)| identity.coordinate().map(BlockCoordinate::level)),
     )
     .await?;
     let committed = BlockCommitted {
@@ -345,7 +360,7 @@ async fn attempt(
         selected_parent_index: Some(prepared.selected_parent_index),
         direct_parents: direct_parents
             .iter()
-            .map(|(hash, identity)| ParentCommitted { hash: *hash, coordinate: identity.coordinate })
+            .map(|(hash, identity)| ParentCommitted { hash: *hash, coordinate: identity.coordinate() })
             .collect(),
         blue_merge_set: Arc::clone(&prepared.blue_merge_set),
         red_merge_set: Arc::clone(&prepared.red_merge_set),
@@ -407,9 +422,11 @@ async fn load_identities(
 
     let encoded: Vec<Vec<u8>> = misses.iter().map(|hash| hash.as_bytes().to_vec()).collect();
     let rows = sqlx::query(
-        "SELECT identity.hash, identity.id, block.level, block.slot
+        "SELECT identity.hash, identity.id, block.level, block.slot, block.selected_parent_id,
+                selected_parent.hash AS selected_parent_hash
          FROM block_identifiers identity
          LEFT JOIN blocks block ON block.id = identity.id
+         LEFT JOIN block_identifiers selected_parent ON selected_parent.id = block.selected_parent_id
          WHERE identity.hash = ANY($1::BYTEA[])",
     )
     .bind(encoded)
@@ -431,7 +448,16 @@ async fn load_identities(
         let slot: Option<i64> =
             row.try_get("slot").map_err(|error| TransactionAttemptError::database("block-reference slot decode", error))?;
         let coordinate = decode_coordinate(level, slot).map_err(TransactionAttemptError::Storage)?;
-        identities.insert(hash, StoredIdentity { id, coordinate });
+        let raw_selected_parent_id: Option<i64> = row
+            .try_get("selected_parent_id")
+            .map_err(|error| TransactionAttemptError::database("block-reference selected-parent ID decode", error))?;
+        let encoded_selected_parent_hash: Option<Vec<u8>> = row
+            .try_get("selected_parent_hash")
+            .map_err(|error| TransactionAttemptError::database("block-reference selected-parent hash decode", error))?;
+        let (block, selected_parent_hash) =
+            decode_materialized_block(coordinate, raw_selected_parent_id, encoded_selected_parent_hash)
+                .map_err(TransactionAttemptError::Storage)?;
+        identities.insert(hash, StoredIdentity { id, block, selected_parent_hash });
     }
     Ok(LoadedIdentities { values: identities, cache_misses: misses })
 }
@@ -481,7 +507,7 @@ async fn intern_missing_identities(
         let id = CompactId::new(raw_id).ok_or_else(|| {
             TransactionAttemptError::Storage(StorageError::invalid_metadata(format!("generated compact ID is not positive: {raw_id}")))
         })?;
-        identities.insert(hash, StoredIdentity { id, coordinate: None });
+        identities.insert(hash, StoredIdentity { id, block: None, selected_parent_hash: None });
     }
     Ok(())
 }
@@ -497,16 +523,17 @@ fn seed_identities_from_cache(
             misses.push(*hash);
             continue;
         };
-        let coordinate = if identity.materialized {
-            let Some(coordinate) = caches.coordinate(identity.id) else {
+        let block = if identity.materialized {
+            let Some(block) = caches.materialized_block(identity.id) else {
                 misses.push(*hash);
                 continue;
             };
-            Some(coordinate)
+            Some(block)
         } else {
             None
         };
-        identities.insert(*hash, StoredIdentity { id: identity.id, coordinate });
+        let selected_parent_hash = block.and_then(|block| caches.hash(block.selected_parent_id));
+        identities.insert(*hash, StoredIdentity { id: identity.id, block, selected_parent_hash });
     }
     (identities, misses)
 }
@@ -575,6 +602,25 @@ fn decode_coordinate(level: Option<i64>, slot: Option<i64>) -> Result<Option<Blo
     }
 }
 
+fn decode_materialized_block(
+    coordinate: Option<BlockCoordinate>,
+    raw_selected_parent_id: Option<i64>,
+    encoded_selected_parent_hash: Option<Vec<u8>>,
+) -> Result<(Option<CachedMaterializedBlock>, Option<BlockHash>), StorageError> {
+    match (coordinate, raw_selected_parent_id, encoded_selected_parent_hash) {
+        (None, None, None) => Ok((None, None)),
+        (Some(coordinate), Some(raw_selected_parent_id), Some(encoded_selected_parent_hash)) => {
+            let selected_parent_id = CompactId::new(raw_selected_parent_id).ok_or_else(|| {
+                StorageError::invalid_metadata(format!("stored selected-parent ID is not positive: {raw_selected_parent_id}"))
+            })?;
+            let selected_parent_hash = BlockHash::try_from(encoded_selected_parent_hash.as_slice())
+                .map_err(|error| StorageError::invalid_metadata(format!("invalid stored selected-parent hash: {error}")))?;
+            Ok((Some(CachedMaterializedBlock { coordinate, selected_parent_id }), Some(selected_parent_hash)))
+        }
+        _ => Err(StorageError::invalid_metadata("stored block has partial immutable metadata")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};
@@ -594,7 +640,7 @@ mod tests {
 
     use super::{PreparedBlock, seed_identities_from_cache};
     use crate::{
-        cache::{CachedIdentity, ProcessingCaches},
+        cache::{CachedIdentity, CachedMaterializedBlock, ProcessingCaches},
         database::{LockedDatabase, PreparedDatabase, open_processing_generation},
         error::StorageError,
         generation::ValidatedDbClient,
@@ -614,23 +660,24 @@ mod tests {
     }
 
     #[test]
-    fn identity_cache_seeding_requires_complete_materialized_coordinates() {
+    fn identity_cache_seeding_requires_complete_materialized_metadata() {
         let caches = ProcessingCaches::new();
         let materialized_id = CompactId::new(1).expect("positive ID");
         let boundary_id = CompactId::new(2).expect("positive ID");
         let coordinate_missing_id = CompactId::new(3).expect("positive ID");
         let coordinate = BlockCoordinate::new(1, 0).expect("materialized coordinate");
-        caches.publish_identity(hash(1), CachedIdentity { id: materialized_id, materialized: true }, Some(coordinate));
-        caches.publish_identity(hash(2), CachedIdentity { id: boundary_id, materialized: false }, None);
-        caches.publish_identity(hash(3), CachedIdentity { id: coordinate_missing_id, materialized: true }, None);
+        caches.publish_identity(hash(1), CachedIdentity { id: materialized_id, materialized: true });
+        caches.publish_materialized_block(materialized_id, CachedMaterializedBlock { coordinate, selected_parent_id: boundary_id });
+        caches.publish_identity(hash(2), CachedIdentity { id: boundary_id, materialized: false });
+        caches.publish_identity(hash(3), CachedIdentity { id: coordinate_missing_id, materialized: true });
 
         let (identities, misses) = seed_identities_from_cache(&caches, &[hash(1), hash(2), hash(3), hash(4)]);
 
         assert_eq!(
-            identities.get(&hash(1)).map(|identity| (identity.id, identity.coordinate)),
+            identities.get(&hash(1)).map(|identity| (identity.id, identity.coordinate())),
             Some((materialized_id, Some(coordinate)))
         );
-        assert_eq!(identities.get(&hash(2)).map(|identity| (identity.id, identity.coordinate)), Some((boundary_id, None)));
+        assert_eq!(identities.get(&hash(2)).map(|identity| (identity.id, identity.coordinate())), Some((boundary_id, None)));
         assert!(!identities.contains_key(&hash(3)));
         assert!(!identities.contains_key(&hash(4)));
         assert_eq!(misses, [hash(3), hash(4)]);
@@ -824,7 +871,7 @@ mod tests {
         let parent_a = hash(2);
         let parent_a_id =
             insert_materialized(&mut database, parent_a, origin_id, BlockCoordinate::new(1, 0).expect("coordinate")).await;
-        client.caches.publish_identity(parent_a, CachedIdentity { id: parent_a_id, materialized: true }, None);
+        client.caches.publish_identity(parent_a, CachedIdentity { id: parent_a_id, materialized: true });
         insert_level(&mut database, 2, 1, None).await;
         let parent_b = hash(3);
         let parent_b_id =
@@ -915,7 +962,14 @@ mod tests {
         assert!(client.has_cached_identity(red_missing));
         assert!(client.has_cached_identity(blue_missing));
         assert!(client.has_cached_merge_sets(committed.id));
-        assert_eq!(client.caches.coordinate(parent_a_id), BlockCoordinate::new(1, 0));
+        assert_eq!(client.cached_hash(committed.id), Some(own_hash));
+        assert_eq!(client.cached_hash(boundary_parent_id), Some(boundary_parent));
+        assert_eq!(
+            client.cached_materialized_block(committed.id),
+            Some(CachedMaterializedBlock { coordinate: committed.coordinate, selected_parent_id: parent_a_id })
+        );
+        assert_eq!(client.cached_materialized_block(boundary_parent_id), None);
+        assert_eq!(client.caches.materialized_block(parent_a_id).map(|block| block.coordinate), BlockCoordinate::new(1, 0));
         assert_eq!(
             client.block_presence(own_hash).await,
             Ok(BlockPresence::Materialized { id: committed.id, coordinate: committed.coordinate })

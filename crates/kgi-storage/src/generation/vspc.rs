@@ -4,7 +4,7 @@ use std::{
 };
 
 use kgi_model::{
-    block::{BlockColor, BlockHash, CompactId},
+    block::{BlockColor, BlockCoordinate, BlockHash, CompactId},
     graph_update::LevelCommitted,
     vspc::ReadyVspcChange,
 };
@@ -12,7 +12,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use super::ValidatedDbClient;
 use crate::{
-    cache::{CachedMergeSets, ProcessingCaches},
+    cache::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, CachedVspcSink, ProcessingCaches},
     database::NO_VSPC_DAA_SCORE,
     error::StorageError,
     operation::{VspcCommitOutcome, VspcPathConflict},
@@ -35,7 +35,16 @@ struct StoredMember {
 
 struct AttemptSuccess {
     outcome: VspcCommitOutcome,
+    member_cache_updates: Vec<MemberCacheUpdate>,
     merge_set_cache_updates: Vec<(CompactId, CachedMergeSets)>,
+}
+
+#[derive(Clone, Copy)]
+struct MemberCacheUpdate {
+    id: CompactId,
+    hash: BlockHash,
+    block: CachedMaterializedBlock,
+    selected_parent_hash: BlockHash,
 }
 
 enum SemanticError {
@@ -67,9 +76,16 @@ impl ValidatedDbClient {
                 }
             };
 
+            for update in success.member_cache_updates {
+                self.caches.publish_identity(update.hash, CachedIdentity { id: update.id, materialized: true });
+                self.caches.publish_materialized_block(update.id, update.block);
+                self.caches.publish_hash(update.block.selected_parent_id, update.selected_parent_hash);
+            }
             for (id, merge_sets) in success.merge_set_cache_updates {
                 self.caches.publish_merge_sets(id, merge_sets);
             }
+            self.caches
+                .publish_vspc_sink(CachedVspcSink { id: success.outcome.destination.id(), hash: success.outcome.destination.hash() });
             Ok(success.outcome)
         })
         .await
@@ -103,13 +119,13 @@ async fn attempt(
 ) -> Result<AttemptSuccess, TransactionAttemptError<SemanticError>> {
     let mut transaction = pool.begin().await.map_err(|error| TransactionAttemptError::database("VSPC transaction start", error))?;
 
-    let current_sink = load_current_sink(&mut transaction).await?;
+    let current_sink = load_current_sink(&mut transaction, caches).await?;
     if current_sink != (change.source.id(), change.source.hash()) {
         return rollback_semantic(transaction, SemanticError::SourceDiscontinuity, "VSPC source validation rollback").await;
     }
 
     let member_ids = distinct_member_ids(change);
-    let members = load_members(&mut transaction, &member_ids).await?;
+    let (members, member_cache_updates) = load_members(&mut transaction, caches, &member_ids).await?;
     if let Some(id) = change.removed.iter().chain(change.added.iter()).find(|id| !members.contains_key(id)).copied() {
         return rollback_semantic(transaction, SemanticError::MemberNotMaterialized { id }, "VSPC materiality validation rollback")
             .await;
@@ -130,7 +146,11 @@ async fn attempt(
     let level_snapshots = update_level_scores(&mut transaction, &affected_levels).await?;
 
     commit(transaction, commit_behavior).await.map_err(|error| TransactionAttemptError::commit("VSPC transaction commit", error))?;
-    Ok(AttemptSuccess { outcome: VspcCommitOutcome { destination: change.destination, level_snapshots }, merge_set_cache_updates })
+    Ok(AttemptSuccess {
+        outcome: VspcCommitOutcome { destination: change.destination, level_snapshots },
+        member_cache_updates,
+        merge_set_cache_updates,
+    })
 }
 
 async fn rollback_semantic<T>(
@@ -144,7 +164,11 @@ async fn rollback_semantic<T>(
 
 async fn load_current_sink(
     transaction: &mut Transaction<'_, Postgres>,
+    caches: &ProcessingCaches,
 ) -> Result<(CompactId, BlockHash), TransactionAttemptError<SemanticError>> {
+    if let Some(sink) = caches.vspc_sink() {
+        return Ok((sink.id, sink.hash));
+    }
     let row = sqlx::query(
         "SELECT block.id, identity.hash
          FROM blocks block
@@ -172,11 +196,18 @@ fn distinct_member_ids(change: &ReadyVspcChange) -> Vec<CompactId> {
 
 async fn load_members(
     transaction: &mut Transaction<'_, Postgres>,
+    caches: &ProcessingCaches,
     ids: &[CompactId],
-) -> Result<HashMap<CompactId, StoredMember>, TransactionAttemptError<SemanticError>> {
-    let encoded: Vec<i64> = ids.iter().map(|id| id.get()).collect();
+) -> Result<(HashMap<CompactId, StoredMember>, Vec<MemberCacheUpdate>), TransactionAttemptError<SemanticError>> {
+    let (mut members, misses) = seed_members_from_cache(caches, ids);
+    if misses.is_empty() {
+        return Ok((members, Vec::new()));
+    }
+
+    let encoded: Vec<i64> = misses.iter().map(|id| id.get()).collect();
     let rows = sqlx::query(
-        "SELECT block.id, identity.hash, selected_parent.hash AS selected_parent_hash, block.level
+        "SELECT block.id, identity.hash, block.level, block.slot, block.selected_parent_id,
+                selected_parent.hash AS selected_parent_hash
          FROM blocks block
          JOIN block_identifiers identity ON identity.id = block.id
          JOIN block_identifiers selected_parent ON selected_parent.id = block.selected_parent_id
@@ -187,7 +218,7 @@ async fn load_members(
     .await
     .map_err(|error| TransactionAttemptError::database("VSPC member load", error))?;
 
-    let mut members = HashMap::with_capacity(rows.len());
+    let mut cache_updates = Vec::with_capacity(rows.len());
     for row in rows {
         let raw_id: i64 = row.try_get("id").map_err(|error| TransactionAttemptError::database("VSPC member ID decode", error))?;
         let id = decode_id(raw_id, "VSPC member")?;
@@ -198,20 +229,44 @@ async fn load_members(
             .map_err(|error| TransactionAttemptError::database("VSPC member selected-parent decode", error))?;
         let raw_level: i64 =
             row.try_get("level").map_err(|error| TransactionAttemptError::database("VSPC member level decode", error))?;
-        let level = u64::try_from(raw_level)
-            .ok()
-            .filter(|level| *level > 0)
-            .ok_or_else(|| TransactionAttemptError::Storage(StorageError::invalid_metadata("stored VSPC member level is invalid")))?;
-        members.insert(
-            id,
-            StoredMember {
-                hash: decode_hash(&encoded_hash, "VSPC member")?,
-                selected_parent: decode_hash(&encoded_parent, "VSPC member selected parent")?,
-                level,
-            },
-        );
+        let raw_slot: i64 =
+            row.try_get("slot").map_err(|error| TransactionAttemptError::database("VSPC member slot decode", error))?;
+        let coordinate =
+            u64::try_from(raw_level).ok().and_then(|level| BlockCoordinate::new(level, u64::try_from(raw_slot).ok()?)).ok_or_else(
+                || TransactionAttemptError::Storage(StorageError::invalid_metadata("stored VSPC member coordinate is invalid")),
+            )?;
+        let raw_selected_parent_id: i64 = row
+            .try_get("selected_parent_id")
+            .map_err(|error| TransactionAttemptError::database("VSPC member selected-parent ID decode", error))?;
+        let selected_parent_id = decode_id(raw_selected_parent_id, "VSPC member selected parent")?;
+        let hash = decode_hash(&encoded_hash, "VSPC member")?;
+        let selected_parent = decode_hash(&encoded_parent, "VSPC member selected parent")?;
+        let block = CachedMaterializedBlock { coordinate, selected_parent_id };
+        members.insert(id, StoredMember { hash, selected_parent, level: coordinate.level() });
+        cache_updates.push(MemberCacheUpdate { id, hash, block, selected_parent_hash: selected_parent });
     }
-    Ok(members)
+    Ok((members, cache_updates))
+}
+
+fn seed_members_from_cache(caches: &ProcessingCaches, ids: &[CompactId]) -> (HashMap<CompactId, StoredMember>, Vec<CompactId>) {
+    let mut members = HashMap::with_capacity(ids.len());
+    let mut misses = Vec::new();
+    for id in ids {
+        let Some(hash) = caches.hash(*id) else {
+            misses.push(*id);
+            continue;
+        };
+        let Some(block) = caches.materialized_block(*id) else {
+            misses.push(*id);
+            continue;
+        };
+        let Some(selected_parent) = caches.hash(block.selected_parent_id) else {
+            misses.push(*id);
+            continue;
+        };
+        members.insert(*id, StoredMember { hash, selected_parent, level: block.coordinate.level() });
+    }
+    (members, misses)
 }
 
 fn first_path_conflict(change: &ReadyVspcChange, members: &HashMap<CompactId, StoredMember>) -> Option<VspcPathConflict> {
@@ -449,7 +504,7 @@ mod tests {
 
     use kaspa_consensus_core::network::{NetworkId, NetworkType};
     use kgi_model::{
-        block::{BlockColor, BlockHash, CompactId, ConsensusOrder, VspcPoint},
+        block::{BlockColor, BlockCoordinate, BlockHash, CompactId, ConsensusOrder, VspcPoint},
         graph_update::LevelCommitted,
         lifecycle::PersistenceFault,
         vspc::ReadyVspcChange,
@@ -459,8 +514,9 @@ mod tests {
         testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner},
     };
 
-    use super::CommitBehavior;
+    use super::{CommitBehavior, seed_members_from_cache};
     use crate::{
+        cache::{CachedMaterializedBlock, ProcessingCaches},
         database::{LockedDatabase, PreparedDatabase, open_processing_generation},
         error::StorageError,
         generation::ValidatedDbClient,
@@ -484,6 +540,48 @@ mod tests {
 
     fn hash(byte: u8) -> BlockHash {
         BlockHash::from_bytes([byte; 32])
+    }
+
+    fn id(value: i64) -> CompactId {
+        CompactId::new(value).expect("positive compact ID")
+    }
+
+    #[test]
+    fn member_cache_seeding_requires_every_component_and_batches_all_incomplete_members() {
+        let caches = ProcessingCaches::new();
+        let complete = id(1);
+        let missing_hash = id(2);
+        let missing_block = id(3);
+        let missing_parent_hash = id(4);
+
+        caches.publish_hash(complete, hash(1));
+        caches.publish_materialized_block(
+            complete,
+            CachedMaterializedBlock { coordinate: BlockCoordinate::new(1, 0).expect("coordinate"), selected_parent_id: id(11) },
+        );
+        caches.publish_hash(id(11), hash(11));
+
+        caches.publish_materialized_block(
+            missing_hash,
+            CachedMaterializedBlock { coordinate: BlockCoordinate::new(2, 0).expect("coordinate"), selected_parent_id: id(12) },
+        );
+        caches.publish_hash(id(12), hash(12));
+
+        caches.publish_hash(missing_block, hash(3));
+
+        caches.publish_hash(missing_parent_hash, hash(4));
+        caches.publish_materialized_block(
+            missing_parent_hash,
+            CachedMaterializedBlock { coordinate: BlockCoordinate::new(4, 0).expect("coordinate"), selected_parent_id: id(14) },
+        );
+
+        let (members, misses) = seed_members_from_cache(&caches, &[complete, missing_hash, missing_block, missing_parent_hash]);
+
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[&complete].hash, hash(1));
+        assert_eq!(members[&complete].selected_parent, hash(11));
+        assert_eq!(members[&complete].level, 1);
+        assert_eq!(misses, [missing_hash, missing_block, missing_parent_hash]);
     }
 
     fn point(block: (BlockHash, CompactId)) -> VspcPoint {
@@ -747,6 +845,17 @@ mod tests {
         assert_eq!(block_state(&mut database, graph.red_member.1).await.0, BlockColor::Red as i16);
         assert!(client.has_cached_merge_sets(graph.new_parent.1));
         assert!(client.has_cached_merge_sets(graph.new_sink.1));
+        assert_eq!(client.cached_hash(graph.old_sink.1), Some(graph.old_sink.0));
+        assert_eq!(client.cached_hash(graph.new_sink.1), Some(graph.new_sink.0));
+        assert_eq!(client.cached_hash(graph.common.1), Some(graph.common.0));
+        assert_eq!(
+            client.cached_materialized_block(graph.new_sink.1),
+            Some(CachedMaterializedBlock {
+                coordinate: BlockCoordinate::new(3, 1).expect("coordinate"),
+                selected_parent_id: graph.new_parent.1,
+            })
+        );
+        assert_eq!(client.cached_vspc_sink(), Some(crate::cache::CachedVspcSink { id: graph.new_sink.1, hash: graph.new_sink.0 }));
         let boundary_block: Option<i64> = sqlx::query_scalar("SELECT id FROM blocks WHERE id = $1")
             .bind(graph.boundary.1.get())
             .fetch_optional(database.connection_mut())
@@ -842,6 +951,9 @@ mod tests {
         assert_eq!(block_state(&mut database, graph.old_sink.1).await, (BlockColor::Red as i16, true));
         assert!(!block_state(&mut database, graph.new_parent.1).await.1);
         assert!(!block_state(&mut database, graph.new_sink.1).await.1);
+        assert_eq!(client.cached_vspc_sink(), None);
+        assert_eq!(client.cached_hash(graph.new_parent.1), None);
+        assert_eq!(client.cached_materialized_block(graph.new_parent.1), None);
     }
 
     #[tokio::test]
@@ -891,6 +1003,9 @@ mod tests {
         assert!(!client.is_valid());
         assert!(!client.has_cached_merge_sets(graph.new_parent.1));
         assert!(!client.has_cached_merge_sets(graph.new_sink.1));
+        assert_eq!(client.cached_hash(graph.new_parent.1), None);
+        assert_eq!(client.cached_materialized_block(graph.new_parent.1), None);
+        assert_eq!(client.cached_vspc_sink(), None);
         assert!(!block_state(&mut database, graph.old_sink.1).await.1);
         assert!(block_state(&mut database, graph.new_sink.1).await.1);
     }
