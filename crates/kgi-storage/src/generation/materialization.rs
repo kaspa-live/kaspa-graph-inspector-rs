@@ -156,7 +156,7 @@ impl ValidatedDbClient {
                     self.caches.publish_identity(hash, CachedIdentity { id: stored.id, materialized: stored.block.is_some() });
                     if let Some(block) = stored.block {
                         self.caches.publish_materialized_block(stored.id, block);
-                        self.caches.publish_hash(
+                        self.caches.publish_reverse_hash(
                             block.selected_parent_id,
                             stored.selected_parent_hash.expect("materialized cache updates include the selected-parent hash"),
                         );

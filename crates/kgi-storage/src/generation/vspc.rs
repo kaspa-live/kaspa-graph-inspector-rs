@@ -79,7 +79,7 @@ impl ValidatedDbClient {
             for update in success.member_cache_updates {
                 self.caches.publish_identity(update.hash, CachedIdentity { id: update.id, materialized: true });
                 self.caches.publish_materialized_block(update.id, update.block);
-                self.caches.publish_hash(update.block.selected_parent_id, update.selected_parent_hash);
+                self.caches.publish_reverse_hash(update.block.selected_parent_id, update.selected_parent_hash);
             }
             for (id, merge_sets) in success.merge_set_cache_updates {
                 self.caches.publish_merge_sets(id, merge_sets);
@@ -554,22 +554,22 @@ mod tests {
         let missing_block = id(3);
         let missing_parent_hash = id(4);
 
-        caches.publish_hash(complete, hash(1));
+        caches.publish_reverse_hash(complete, hash(1));
         caches.publish_materialized_block(
             complete,
             CachedMaterializedBlock { coordinate: BlockCoordinate::new(1, 0).expect("coordinate"), selected_parent_id: id(11) },
         );
-        caches.publish_hash(id(11), hash(11));
+        caches.publish_reverse_hash(id(11), hash(11));
 
         caches.publish_materialized_block(
             missing_hash,
             CachedMaterializedBlock { coordinate: BlockCoordinate::new(2, 0).expect("coordinate"), selected_parent_id: id(12) },
         );
-        caches.publish_hash(id(12), hash(12));
+        caches.publish_reverse_hash(id(12), hash(12));
 
-        caches.publish_hash(missing_block, hash(3));
+        caches.publish_reverse_hash(missing_block, hash(3));
 
-        caches.publish_hash(missing_parent_hash, hash(4));
+        caches.publish_reverse_hash(missing_parent_hash, hash(4));
         caches.publish_materialized_block(
             missing_parent_hash,
             CachedMaterializedBlock { coordinate: BlockCoordinate::new(4, 0).expect("coordinate"), selected_parent_id: id(14) },

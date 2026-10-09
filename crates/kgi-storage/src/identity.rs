@@ -152,7 +152,7 @@ fn publish_stored_identity(caches: &ProcessingCaches, hash: BlockHash, stored: &
     caches.publish_identity(hash, stored.identity);
     if let Some(block) = stored.block {
         caches.publish_materialized_block(stored.identity.id, block);
-        caches.publish_hash(
+        caches.publish_reverse_hash(
             block.selected_parent_id,
             stored.selected_parent_hash.expect("materialized blocks decode their selected-parent hash"),
         );

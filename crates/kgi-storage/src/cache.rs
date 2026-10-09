@@ -90,7 +90,7 @@ impl ProcessingCaches {
         self.hashes.insert(identity.id, hash);
     }
 
-    pub(crate) fn publish_hash(&self, id: CompactId, hash: BlockHash) {
+    pub(crate) fn publish_reverse_hash(&self, id: CompactId, hash: BlockHash) {
         self.hashes.insert(id, hash);
     }
 
