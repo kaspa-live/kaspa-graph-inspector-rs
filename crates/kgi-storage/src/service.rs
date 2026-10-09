@@ -415,7 +415,13 @@ impl StorageServiceWorker {
                 }
             };
             match active_exit {
-                ActiveExit::Reconnect => continue,
+                ActiveExit::Reconnect => {
+                    self.publish_status(StorageServiceStatusState::Unavailable);
+                    if self.wait_retry(&mut retry_index, &mut pending_initialization).await? {
+                        continue;
+                    }
+                    return Ok(());
+                }
                 ActiveExit::Rejected(rejection) => return self.reject_active(&mut active, rejection).await,
                 ActiveExit::Stopped => return Ok(()),
             }
@@ -1393,6 +1399,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_lock_loss_waits_before_reconnecting() {
+        exercise_active_lock_loss(ActiveLockLossDisposition::Retry).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_active_lock_loss_backoff() {
+        exercise_active_lock_loss(ActiveLockLossDisposition::Shutdown).await;
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum ActiveLockLossDisposition {
+        Retry,
+        Shutdown,
+    }
+
+    async fn exercise_active_lock_loss(disposition: ActiveLockLossDisposition) {
+        let (_container, database_url) = fixture().await;
+        let (mut database, state) =
+            LockedDatabase::connect(database_url.as_str()).await.expect("database lock").prepare().await.expect("schema preparation");
+        assert_eq!(state, DatabaseState::Uninitialized);
+        database.initialize_if_uninitialized(mainnet(), hash(7), None).await.expect("database initialization");
+        drop(database);
+
+        let (reconnect_tx, mut reconnect_rx) = mpsc::unbounded_channel();
+        let connector = Arc::new(ReconnectGateConnector {
+            attempts: AtomicUsize::new(0),
+            reconnect_started: reconnect_tx,
+            reconnect_permit: Semaphore::new(0),
+        });
+        let (sleep_tx, mut sleeps) = mpsc::unbounded_channel();
+        let clock = Arc::new(ManualClock { sleeps: sleep_tx });
+        let (service, mut events) =
+            StorageService::start_with_dependencies(database_url.clone(), connector.clone(), clock, Arc::new(IdentityJitter));
+
+        let processing = match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbPublished(client) => client,
+            event => panic!("expected initial processing publication, got {event:?}"),
+        };
+        let api = match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbPublished(client) => client,
+            event => panic!("expected initial API publication, got {event:?}"),
+        };
+        wait_for_status(&service, StorageServiceStatusState::Ready).await;
+        let (health, reset) = ready_timers(&mut sleeps).await;
+
+        let mut observer = PgConnection::connect(database_url.as_str()).await.expect("lock observer");
+        terminate_lock_owner(&mut observer).await;
+        health.completion.send(()).expect("run active lock-health check");
+        drop(reset);
+
+        match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &processing)),
+            event => panic!("expected processing retirement after lock loss, got {event:?}"),
+        }
+        match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &api)),
+            event => panic!("expected API retirement after lock loss, got {event:?}"),
+        }
+
+        let retry = timeout(TEST_TIMEOUT, sleeps.recv()).await.expect("active lock-loss retry").expect("clock path");
+        assert_eq!(retry.duration, Duration::from_secs(1));
+        assert_eq!(service.status().state, StorageServiceStatusState::Unavailable);
+        assert_eq!(connector.attempts.load(Ordering::Relaxed), 1);
+        assert!(timeout(Duration::from_millis(100), reconnect_rx.recv()).await.is_err());
+        assert!(timeout(Duration::from_millis(100), events.recv()).await.is_err());
+
+        if disposition == ActiveLockLossDisposition::Shutdown {
+            service.shutdown().await.expect("shutdown must cancel active lock-loss retry");
+            assert_eq!(connector.attempts.load(Ordering::Relaxed), 1);
+            assert_eq!(service.status().state, StorageServiceStatusState::Stopped);
+            return;
+        }
+
+        retry.completion.send(()).expect("advance active lock-loss retry");
+        timeout(TEST_TIMEOUT, reconnect_rx.recv()).await.expect("reconnect attempt").expect("reconnect observer");
+        assert_eq!(connector.attempts.load(Ordering::Relaxed), 2);
+        assert!(timeout(Duration::from_millis(100), events.recv()).await.is_err());
+
+        connector.reconnect_permit.add_permits(1);
+        assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ProcessingDbPublished(_)));
+        assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbPublished(_)));
+        service.shutdown().await.expect("service shutdown");
+    }
+
+    #[tokio::test]
     async fn initial_publication_recheck_waits_before_reconnecting() {
         exercise_failed_initial_publication_recheck(InitialRecheckDisposition::Retry).await;
     }
@@ -1537,6 +1628,10 @@ mod tests {
             StorageServiceEvent::ProcessingDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &processing)),
             event => panic!("expected processing retirement before any replacement publication, got {event:?}"),
         }
+        let reconnect_delay = timeout(TEST_TIMEOUT, sleeps.recv()).await.expect("lock-loss retry").expect("clock path");
+        assert_eq!(reconnect_delay.duration, Duration::from_secs(1));
+        assert!(timeout(Duration::from_millis(100), reconnect_rx.recv()).await.is_err());
+        reconnect_delay.completion.send(()).expect("advance lock-loss retry");
         timeout(TEST_TIMEOUT, reconnect_rx.recv()).await.expect("reconnect attempt").expect("reconnect observer");
         assert!(timeout(Duration::from_millis(100), events.recv()).await.is_err());
 
@@ -1905,9 +2000,12 @@ mod tests {
             StorageServiceEvent::ApiDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &first_api)),
             event => panic!("expected API retirement, got {event:?}"),
         }
-        let second_retry = timeout(TEST_TIMEOUT, sleeps.recv()).await.expect("second retry timer").expect("clock path");
-        assert_eq!(second_retry.duration, Duration::from_secs(2));
-        second_retry.completion.send(()).expect("advance second retry");
+        let lock_loss_retry = timeout(TEST_TIMEOUT, sleeps.recv()).await.expect("lock-loss retry timer").expect("clock path");
+        assert_eq!(lock_loss_retry.duration, Duration::from_secs(2));
+        lock_loss_retry.completion.send(()).expect("advance lock-loss retry");
+        let connection_retry = timeout(TEST_TIMEOUT, sleeps.recv()).await.expect("connection retry timer").expect("clock path");
+        assert_eq!(connection_retry.duration, Duration::from_secs(4));
+        connection_retry.completion.send(()).expect("advance connection retry");
         let second_processing = match next_event(&mut events).await {
             StorageServiceEvent::ProcessingDbPublished(client) => client,
             event => panic!("expected replacement processing publication, got {event:?}"),
