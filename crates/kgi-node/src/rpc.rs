@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use kaspa_consensus_core::{errors::consensus::ConsensusError, network::NetworkId};
+use kaspa_consensus_core::{blockhash::ORIGIN, errors::consensus::ConsensusError, network::NetworkId};
 use kaspa_rpc_core::{
     GetBlockDagInfoRequest, GetBlockRequest, GetBlocksRequest, GetSinkRequest, GetVirtualChainFromBlockV2Request,
     RpcDataVerbosityLevel, RpcError, RpcResult,
@@ -380,6 +380,9 @@ impl ValidatedRpcClient {
             .await
             .map_err(map_opaque_rpc_error)?;
         let pruning_point_hash = dag_info.pruning_point_hash;
+        if pruning_point_hash == ORIGIN {
+            return self.return_malformed(&operation, RecoveryInputKind::MalformedPruningPointResponse).await;
+        }
         let block = match self
             .call(&mut operation.admission, self.connection.get_block(GetBlockRequest::new(pruning_point_hash, false)))
             .await
@@ -403,6 +406,9 @@ impl ValidatedRpcClient {
         let mut operation = self.begin_operation().await?;
         let sink =
             self.call(&mut operation.admission, self.connection.get_sink(GetSinkRequest {})).await.map_err(map_opaque_rpc_error)?.sink;
+        if sink == ORIGIN {
+            return self.return_malformed(&operation, RecoveryInputKind::MalformedCatchupSinkResponse).await;
+        }
         let block = match self.call(&mut operation.admission, self.connection.get_block(GetBlockRequest::new(sink, false))).await {
             Ok(response) => response.block,
             Err(RawCallError::Rpc(error)) => {
@@ -737,6 +743,7 @@ mod tests {
     use async_trait::async_trait;
     use kaspa_consensus_core::{
         BlueWorkType,
+        blockhash::ORIGIN,
         errors::consensus::ConsensusError,
         network::{NetworkId, NetworkType},
     };
@@ -1095,6 +1102,48 @@ mod tests {
             Err(NodeError::RecoveryInputInvalid(RecoveryInputKind::MalformedGetBlock))
         );
         assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn advertised_origin_pruning_point_retires_without_get_block() {
+        let scripts = [Script::dag(Ok(dag_info(ORIGIN)))];
+        let (client, connection, mut retirements) = client(scripts);
+        let operation = tokio::spawn({
+            let client = client.clone();
+            async move { client.current_pruning_point_block().await }
+        });
+
+        let retirement = retirements.recv().await.expect("retirement request");
+        assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedPruningPointResponse));
+        assert!(retirement.target().upgrade().is_some_and(|generation| Arc::ptr_eq(&generation, &client)));
+        assert_eq!(connection.requests(), vec![RecordedRequest::Dag]);
+        assert!(client.retire().await);
+        retirement.complete(Ok(()));
+        assert_eq!(
+            operation.await.expect("pruning-point operation"),
+            Err(NodeError::RecoveryInputInvalid(RecoveryInputKind::MalformedPruningPointResponse))
+        );
+    }
+
+    #[tokio::test]
+    async fn advertised_origin_sink_retires_without_get_block() {
+        let scripts = [Script::sink(Ok(GetSinkResponse::new(ORIGIN)))];
+        let (client, connection, mut retirements) = client(scripts);
+        let operation = tokio::spawn({
+            let client = client.clone();
+            async move { client.catchup_sink_sample().await }
+        });
+
+        let retirement = retirements.recv().await.expect("retirement request");
+        assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedCatchupSinkResponse));
+        assert!(retirement.target().upgrade().is_some_and(|generation| Arc::ptr_eq(&generation, &client)));
+        assert_eq!(connection.requests(), vec![RecordedRequest::Sink]);
+        assert!(client.retire().await);
+        retirement.complete(Ok(()));
+        assert_eq!(
+            operation.await.expect("sink-sample operation"),
+            Err(NodeError::RecoveryInputInvalid(RecoveryInputKind::MalformedCatchupSinkResponse))
+        );
     }
 
     #[tokio::test]
