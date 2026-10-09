@@ -500,8 +500,13 @@ impl ValidatedRpcClient {
     /// Obtains the current Catchup sink and its normalized DAA score.
     pub async fn catchup_sink_sample(&self) -> Result<CatchupSinkSample, NodeError> {
         let mut operation = self.begin_operation().await?;
-        let sink =
-            self.call(&mut operation.admission, self.connection.get_sink(GetSinkRequest {})).await.map_err(map_opaque_rpc_error)?.sink;
+        let sink = match self.call(&mut operation.admission, self.connection.get_sink(GetSinkRequest {})).await {
+            Ok(response) => response.sink,
+            Err(RawCallError::Rpc(error)) if response_conversion_is_malformed(ResponseConversionOperation::Sink, &error) => {
+                return self.return_malformed(&operation, RecoveryInputKind::MalformedCatchupSinkResponse).await;
+            }
+            Err(error) => return Err(map_opaque_rpc_error(error)),
+        };
         if sink == ORIGIN {
             return self.return_malformed(&operation, RecoveryInputKind::MalformedCatchupSinkResponse).await;
         }
@@ -528,7 +533,7 @@ impl ValidatedRpcClient {
             .await
         {
             Ok(response) => response,
-            Err(RawCallError::Rpc(RpcError::MissingRpcFieldError(_, _))) => {
+            Err(RawCallError::Rpc(error)) if response_conversion_is_malformed(ResponseConversionOperation::Blocks, &error) => {
                 return self.return_malformed(&operation, RecoveryInputKind::MalformedGetBlocks).await;
             }
             Err(error) => return Err(map_opaque_rpc_error(error)),
@@ -802,7 +807,7 @@ async fn wait_until_inactive(admission: &mut watch::Receiver<u8>) -> Result<(), 
 }
 
 fn classify_get_block_error(hash: BlockHash, error: RpcError) -> GetBlockCallError {
-    if matches!(error, RpcError::MissingRpcFieldError(_, _)) {
+    if response_conversion_is_malformed(ResponseConversionOperation::Block, &error) {
         return GetBlockCallError::Malformed;
     }
     let diagnostic: Arc<str> = Arc::from(error.to_string());
@@ -814,6 +819,27 @@ fn classify_get_block_error(hash: BlockHash, error: RpcError) -> GetBlockCallErr
         }
     }
     GetBlockCallError::Opaque(NodeError::RpcRequestFailed { diagnostic })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseConversionOperation {
+    Sink,
+    Block,
+    Blocks,
+}
+
+fn response_conversion_is_malformed(operation: ResponseConversionOperation, error: &RpcError) -> bool {
+    match (operation, error) {
+        (ResponseConversionOperation::Sink, RpcError::HexParsingError(_)) => true,
+        (ResponseConversionOperation::Block, RpcError::RpcBlueWorkTypeParseError(_)) => true,
+        (ResponseConversionOperation::Block, RpcError::MissingRpcFieldError(object, field)) => {
+            (object == "GetBlockResponseMessage" && field == "block") || (object == "RpcBlock" && field == "header")
+        }
+        (ResponseConversionOperation::Blocks, RpcError::MissingRpcFieldError(object, field)) => {
+            object == "RpcBlock" && field == "header"
+        }
+        _ => false,
+    }
 }
 
 fn map_opaque_rpc_error(error: RawCallError) -> NodeError {
@@ -845,6 +871,7 @@ mod tests {
         errors::consensus::ConsensusError,
         network::{NetworkId, NetworkType},
     };
+    use kaspa_grpc_core::protowire;
     use kaspa_rpc_core::{
         GetBlockDagInfoRequest, GetBlockDagInfoResponse, GetBlockRequest, GetBlockResponse, GetBlocksRequest, GetBlocksResponse,
         GetSinkRequest, GetSinkResponse, GetVirtualChainFromBlockV2Request, GetVirtualChainFromBlockV2Response, RpcBlock,
@@ -861,7 +888,8 @@ mod tests {
     };
 
     use super::{
-        GetBlockCallError, NotificationChannels, SubscriptionState, ValidatedNodeInfo, ValidatedRpcClient, classify_get_block_error,
+        GetBlockCallError, NotificationChannels, ResponseConversionOperation, SubscriptionState, ValidatedNodeInfo,
+        ValidatedRpcClient, classify_get_block_error, response_conversion_is_malformed,
     };
     use crate::{
         client::RpcConnection,
@@ -926,6 +954,25 @@ mod tests {
             match self {
                 Self::PruningPoint => Script::dag(Ok(dag_info(advertised_hash))),
                 Self::CatchupSink => Script::sink(Ok(GetSinkResponse::new(advertised_hash))),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RuntimeConversionOperation {
+        Block(BlockHash),
+        Blocks(BlockHash),
+        PruningPoint,
+        Vspc(BlockHash),
+    }
+
+    impl RuntimeConversionOperation {
+        async fn execute(self, client: &ValidatedRpcClient) -> Result<(), NodeError> {
+            match self {
+                Self::Block(hash) => client.full_block(hash).await.map(|_| ()),
+                Self::Blocks(low_hash) => client.get_blocks(low_hash).await.map(|_| ()),
+                Self::PruningPoint => client.current_pruning_point_block().await.map(|_| ()),
+                Self::Vspc(low_hash) => client.virtual_chain_from(low_hash).await.map(|_| ()),
             }
         }
     }
@@ -1226,6 +1273,89 @@ mod tests {
             classify_get_block_error(requested, RpcError::MissingRpcFieldError("RpcBlock".to_string(), "header".to_string())),
             GetBlockCallError::Malformed
         );
+        assert!(matches!(
+            classify_get_block_error(requested, RpcError::MissingRpcFieldError("RpcTransaction".to_string(), "payload".to_string())),
+            GetBlockCallError::Opaque(NodeError::RpcRequestFailed { .. })
+        ));
+        assert_eq!(
+            classify_get_block_error(
+                requested,
+                RpcError::RpcBlueWorkTypeParseError("not-blue-work".parse::<u64>().expect_err("invalid integer"))
+            ),
+            GetBlockCallError::Malformed
+        );
+    }
+
+    #[test]
+    fn pinned_wire_conversion_preserves_the_operation_attribution_boundary() {
+        let sink_wire = protowire::GetSinkResponseMessage { sink: "not-a-hash".to_string(), error: None };
+        let sink_error = GetSinkResponse::try_from(&sink_wire).expect_err("invalid sink hash");
+        assert!(matches!(sink_error, RpcError::HexParsingError(_)));
+        assert!(response_conversion_is_malformed(ResponseConversionOperation::Sink, &sink_error));
+
+        let block_response = GetBlockResponse { block: rpc_block(hash(1), vec![hash(8)]) };
+        let missing_block =
+            GetBlockResponse::try_from(&protowire::GetBlockResponseMessage::default()).expect_err("missing response block");
+        assert!(response_conversion_is_malformed(ResponseConversionOperation::Block, &missing_block));
+        let missing_envelope =
+            GetBlockResponse::try_from(&protowire::KaspadResponse::default()).expect_err("missing response envelope");
+        assert!(!response_conversion_is_malformed(ResponseConversionOperation::Block, &missing_envelope));
+
+        let mut block_wire = protowire::GetBlockResponseMessage::from(Ok::<_, RpcError>(&block_response));
+        block_wire.block.as_mut().expect("wire block").header = None;
+        let missing_header = GetBlockResponse::try_from(&block_wire).expect_err("missing block header");
+        assert!(response_conversion_is_malformed(ResponseConversionOperation::Block, &missing_header));
+
+        let mut block_wire = protowire::GetBlockResponseMessage::from(Ok::<_, RpcError>(&block_response));
+        block_wire.block.as_mut().expect("wire block").header.as_mut().expect("wire header").blue_work = "not-blue-work".to_string();
+        let ambiguous_blue_work = GetBlockResponse::try_from(&block_wire).expect_err("invalid gRPC blue work");
+        assert!(matches!(ambiguous_blue_work, RpcError::HexParsingError(_)));
+        assert!(!response_conversion_is_malformed(ResponseConversionOperation::Block, &ambiguous_blue_work));
+
+        let blocks_response = GetBlocksResponse { block_hashes: vec![hash(1)], blocks: vec![rpc_block(hash(1), vec![hash(8)])] };
+        let mut blocks_wire = protowire::GetBlocksResponseMessage::from(Ok::<_, RpcError>(&blocks_response));
+        blocks_wire.block_hashes[0] = "ignored-invalid-hash".to_string();
+        let ignored_parallel_hash = GetBlocksResponse::try_from(&blocks_wire).expect_err("invalid ignored parallel hash");
+        assert!(matches!(ignored_parallel_hash, RpcError::HexParsingError(_)));
+        assert!(!response_conversion_is_malformed(ResponseConversionOperation::Blocks, &ignored_parallel_hash));
+
+        let mut blocks_wire = protowire::GetBlocksResponseMessage::from(Ok::<_, RpcError>(&blocks_response));
+        blocks_wire.blocks[0].transactions.push(protowire::RpcTransaction::default());
+        let ignored_transaction = GetBlocksResponse::try_from(&blocks_wire).expect_err("invalid ignored transaction");
+        assert!(!response_conversion_is_malformed(ResponseConversionOperation::Blocks, &ignored_transaction));
+
+        let mut blocks_wire = protowire::GetBlocksResponseMessage::from(Ok::<_, RpcError>(&blocks_response));
+        blocks_wire.blocks[0].header = None;
+        let missing_page_header = GetBlocksResponse::try_from(&blocks_wire).expect_err("missing page header");
+        assert!(response_conversion_is_malformed(ResponseConversionOperation::Blocks, &missing_page_header));
+
+        let dag_response = dag_info(hash(4));
+        let mut dag_wire = protowire::GetBlockDagInfoResponseMessage::from(Ok::<_, RpcError>(&dag_response));
+        dag_wire.pruning_point_hash = "invalid-consumed-pruning-point".to_string();
+        assert!(matches!(
+            GetBlockDagInfoResponse::try_from(&dag_wire).expect_err("invalid pruning point"),
+            RpcError::HexParsingError(_)
+        ));
+        let mut dag_wire = protowire::GetBlockDagInfoResponseMessage::from(Ok::<_, RpcError>(&dag_response));
+        dag_wire.tip_hashes.push("invalid-ignored-tip".to_string());
+        assert!(matches!(
+            GetBlockDagInfoResponse::try_from(&dag_wire).expect_err("invalid ignored tip"),
+            RpcError::HexParsingError(_)
+        ));
+
+        let vspc_response = vspc(vec![], vec![hash(2)]);
+        let mut vspc_wire = protowire::GetVirtualChainFromBlockV2ResponseMessage::from(Ok::<_, RpcError>(&vspc_response));
+        vspc_wire.added_chain_block_hashes[0] = "invalid-consumed-added-hash".to_string();
+        assert!(matches!(
+            GetVirtualChainFromBlockV2Response::try_from(&vspc_wire).expect_err("invalid added hash"),
+            RpcError::HexParsingError(_)
+        ));
+        let mut vspc_wire = protowire::GetVirtualChainFromBlockV2ResponseMessage::from(Ok::<_, RpcError>(&vspc_response));
+        vspc_wire.chain_block_accepted_transactions.push(protowire::RpcChainBlockAcceptedTransactions::default());
+        assert!(matches!(
+            GetVirtualChainFromBlockV2Response::try_from(&vspc_wire).expect_err("invalid ignored acceptance data"),
+            RpcError::MissingRpcFieldError(_, _)
+        ));
     }
 
     #[tokio::test]
@@ -1259,24 +1389,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_get_block_field_is_malformed_and_retires() {
+    async fn attributable_get_block_conversion_failures_are_malformed_and_retire() {
         let requested = hash(1);
-        let scripts = [Script::block(Err(RpcError::MissingRpcFieldError("RpcBlock".to_string(), "header".to_string())), None)];
-        let (client, connection, mut retirements) = client(scripts);
-        let operation = tokio::spawn({
-            let client = client.clone();
-            async move { client.full_block(requested).await }
-        });
+        let failures = [
+            RpcError::MissingRpcFieldError("GetBlockResponseMessage".to_string(), "block".to_string()),
+            RpcError::MissingRpcFieldError("RpcBlock".to_string(), "header".to_string()),
+            RpcError::RpcBlueWorkTypeParseError("not-blue-work".parse::<u64>().expect_err("invalid integer")),
+        ];
 
-        let retirement = retirements.recv().await.expect("retirement request");
-        assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedGetBlock));
-        assert!(client.retire().await);
-        retirement.complete(Ok(()));
-        assert_eq!(
-            operation.await.expect("operation task"),
-            Err(NodeError::RecoveryInputInvalid(RecoveryInputKind::MalformedGetBlock))
-        );
-        assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1);
+        for error in failures {
+            let scripts = [Script::block(Err(error), None)];
+            let (client, connection, mut retirements) = client(scripts);
+            let operation = tokio::spawn({
+                let client = client.clone();
+                async move { client.full_block(requested).await }
+            });
+
+            let retirement = retirements.recv().await.expect("retirement request");
+            assert_eq!(retirement.reason(), &RetirementReason::MalformedRecoveryInput(RecoveryInputKind::MalformedGetBlock));
+            assert!(client.retire().await);
+            retirement.complete(Ok(()));
+            assert_eq!(
+                operation.await.expect("operation task"),
+                Err(NodeError::RecoveryInputInvalid(RecoveryInputKind::MalformedGetBlock))
+            );
+            assert_eq!(connection.disconnects.load(Ordering::Relaxed), 1);
+        }
     }
 
     #[tokio::test]
@@ -1318,6 +1456,7 @@ mod tests {
                 ),
             ),
             ("ORIGIN sink", CompositeOperation::CatchupSink, vec![Script::sink(Ok(GetSinkResponse::new(ORIGIN)))]),
+            ("invalid sink encoding", CompositeOperation::CatchupSink, vec![Script::sink(Err(invalid_sink_conversion_error()))]),
             (
                 "missing sink block",
                 CompositeOperation::CatchupSink,
@@ -1468,6 +1607,65 @@ mod tests {
             operation.await.expect("operation task"),
             Err(NodeError::RecoveryInputInvalid(RecoveryInputKind::MalformedGetBlocks))
         );
+    }
+
+    #[tokio::test]
+    async fn ignored_and_ambiguous_conversion_failures_remain_opaque() {
+        let requested = hash(1);
+        let cases = [
+            (
+                "GetBlock ambiguous blue work",
+                RuntimeConversionOperation::Block(requested),
+                vec![Script::block(Err(invalid_get_block_blue_work_conversion_error(requested)), None)],
+            ),
+            (
+                "GetBlock ignored transaction field",
+                RuntimeConversionOperation::Block(requested),
+                vec![Script::block(Err(RpcError::MissingRpcFieldError("RpcTransaction".to_string(), "payload".to_string())), None)],
+            ),
+            (
+                "GetBlock generic response envelope",
+                RuntimeConversionOperation::Block(requested),
+                vec![Script::block(Err(RpcError::MissingRpcFieldError("KaspaResponse".to_string(), "Payload".to_string())), None)],
+            ),
+            (
+                "GetBlocks ignored parallel hash",
+                RuntimeConversionOperation::Blocks(requested),
+                vec![Script::blocks(Err(invalid_get_blocks_parallel_hash_conversion_error(requested)))],
+            ),
+            (
+                "GetBlocks ignored payload field",
+                RuntimeConversionOperation::Blocks(requested),
+                vec![Script::blocks(Err(RpcError::MissingRpcFieldError("RpcTransaction".to_string(), "payload".to_string())))],
+            ),
+            (
+                "GetBlockDagInfo ambiguous pruning-point hash",
+                RuntimeConversionOperation::PruningPoint,
+                vec![Script::dag(Err(invalid_dag_pruning_point_conversion_error()))],
+            ),
+            (
+                "GetBlockDagInfo ignored tip hash",
+                RuntimeConversionOperation::PruningPoint,
+                vec![Script::dag(Err(invalid_dag_tip_conversion_error()))],
+            ),
+            (
+                "VSPC ambiguous added hash",
+                RuntimeConversionOperation::Vspc(requested),
+                vec![Script::vspc(Err(invalid_vspc_added_hash_conversion_error(requested)))],
+            ),
+            (
+                "VSPC ignored acceptance data",
+                RuntimeConversionOperation::Vspc(requested),
+                vec![Script::vspc(Err(invalid_vspc_acceptance_conversion_error(requested)))],
+            ),
+        ];
+
+        for (name, operation, scripts) in cases {
+            let (client, connection, mut retirements) = client(scripts);
+            assert!(matches!(operation.execute(&client).await, Err(NodeError::RpcRequestFailed { .. })), "{name}");
+            assert!(matches!(retirements.try_recv(), Err(mpsc::error::TryRecvError::Empty)), "{name}");
+            assert_eq!(connection.disconnects.load(Ordering::Relaxed), 0, "{name}");
+        }
     }
 
     #[tokio::test]
@@ -2066,6 +2264,53 @@ mod tests {
             0,
             hash(9),
         )
+    }
+
+    fn invalid_sink_conversion_error() -> RpcError {
+        let wire = protowire::GetSinkResponseMessage { sink: "not-a-hash".to_string(), error: None };
+        GetSinkResponse::try_from(&wire).expect_err("invalid sink hash")
+    }
+
+    fn invalid_get_block_blue_work_conversion_error(hash_value: BlockHash) -> RpcError {
+        let response = GetBlockResponse { block: rpc_block(hash_value, vec![hash(8)]) };
+        let mut wire = protowire::GetBlockResponseMessage::from(Ok::<_, RpcError>(&response));
+        wire.block.as_mut().expect("wire block").header.as_mut().expect("wire header").blue_work = "not-blue-work".to_string();
+        GetBlockResponse::try_from(&wire).expect_err("invalid gRPC blue work")
+    }
+
+    fn invalid_get_blocks_parallel_hash_conversion_error(low_hash: BlockHash) -> RpcError {
+        let response = GetBlocksResponse { block_hashes: vec![low_hash], blocks: vec![rpc_block(low_hash, vec![hash(8)])] };
+        let mut wire = protowire::GetBlocksResponseMessage::from(Ok::<_, RpcError>(&response));
+        wire.block_hashes[0] = "ignored-invalid-hash".to_string();
+        GetBlocksResponse::try_from(&wire).expect_err("invalid ignored parallel hash")
+    }
+
+    fn invalid_dag_pruning_point_conversion_error() -> RpcError {
+        let response = dag_info(hash(4));
+        let mut wire = protowire::GetBlockDagInfoResponseMessage::from(Ok::<_, RpcError>(&response));
+        wire.pruning_point_hash = "invalid-consumed-pruning-point".to_string();
+        GetBlockDagInfoResponse::try_from(&wire).expect_err("invalid pruning point")
+    }
+
+    fn invalid_dag_tip_conversion_error() -> RpcError {
+        let response = dag_info(hash(4));
+        let mut wire = protowire::GetBlockDagInfoResponseMessage::from(Ok::<_, RpcError>(&response));
+        wire.tip_hashes.push("invalid-ignored-tip".to_string());
+        GetBlockDagInfoResponse::try_from(&wire).expect_err("invalid ignored tip")
+    }
+
+    fn invalid_vspc_added_hash_conversion_error(low_hash: BlockHash) -> RpcError {
+        let response = vspc(vec![], vec![low_hash]);
+        let mut wire = protowire::GetVirtualChainFromBlockV2ResponseMessage::from(Ok::<_, RpcError>(&response));
+        wire.added_chain_block_hashes[0] = "invalid-consumed-added-hash".to_string();
+        GetVirtualChainFromBlockV2Response::try_from(&wire).expect_err("invalid added hash")
+    }
+
+    fn invalid_vspc_acceptance_conversion_error(low_hash: BlockHash) -> RpcError {
+        let response = vspc(vec![], vec![low_hash]);
+        let mut wire = protowire::GetVirtualChainFromBlockV2ResponseMessage::from(Ok::<_, RpcError>(&response));
+        wire.chain_block_accepted_transactions.push(protowire::RpcChainBlockAcceptedTransactions::default());
+        GetVirtualChainFromBlockV2Response::try_from(&wire).expect_err("invalid ignored acceptance data")
     }
 
     fn hash(byte: u8) -> BlockHash {
