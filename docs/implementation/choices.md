@@ -460,12 +460,10 @@ contract without teaching the service to replay an uncertain mutation.
 The processing-generation caches implement the
 [storage-owned cache requirement](../architecture/storage.md#caches-and-identity-resolution--settled).
 Start each block-scaled processing cache at 50,000 entries: forward identity,
-reverse hash, materialized-block metadata, and merge sets. The current-sink
-cache has capacity one. These caches accelerate the recent processing region
-needed by ordinary materialization and VSPC reorganizations; they are not an
-in-memory retention window and every miss retains its authoritative PostgreSQL
-fallback. The initial block-scaled capacity is deliberately tunable from
-observed hit rates, eviction rates, and database-read latency.
+materialized-block metadata, and merge sets. The current-sink cache has
+capacity one. The initial block-scaled capacity targets the recent processing
+working set and is deliberately tunable from observed hit rates, eviction
+rates, and database-read latency.
 
 Put the storage-specific public result types in the module-qualified
 `kgi_storage::operation` namespace. Deduplicate only the SQL misses before

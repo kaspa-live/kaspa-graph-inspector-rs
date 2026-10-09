@@ -440,14 +440,14 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
     inconsistent contents.
 14. Verify the storage-owned
     [processing-cache requirement](storage.md#caches-and-identity-resolution--settled):
-    the forward identity, reverse hash, materialized-block metadata, merge-set,
-    and capacity-one current-sink domains use separate Moka caches. Exercise a
-    complete VSPC member cache hit, every independently missing path component
-    through one batched SQL fallback, current-sink seeding from fresh session
-    state, and replacement by the destination only after definite VSPC commit.
-    Rollback and ambiguous commit publish no transaction-derived cache state.
-    Rebuild and a replacement processing generation replace all five domains
-    together and cannot observe predecessor entries.
+    the forward identity, materialized-block metadata, merge-set, and
+    capacity-one current-sink domains use separate Moka caches. Exercise a
+    complete VSPC member cache hit from block metadata alone and missing block
+    metadata through one batched SQL fallback, current-sink seeding from fresh
+    session state, and replacement by the destination only after definite VSPC
+    commit. Rollback and ambiguous commit publish no transaction-derived cache
+    state. Rebuild and a replacement processing generation replace all four
+    domains together and cannot observe predecessor entries.
 
 Verify the [block materialization transaction](storage.md#block-materialization-transaction--settled)
 and [PP seal behavior](block-processing.md#pp-boundary-phase-behavior--settled)
@@ -514,6 +514,13 @@ ordered removal, addition, and coloring steps. Its definite outcome contains
 one complete post-commit snapshot for every distinct affected level, including
 a level whose remove/add sequence restores its original score, and requires no
 post-commit projection read.
+
+Verify the successful VSPC path compares compact member and selected-parent
+IDs without resolving hashes. For the first ID conflict, verify one bounded
+in-transaction query resolves the distinct child, expected-parent, and
+stored-parent IDs into `VspcPathConflict`; incomplete or invalid evidence
+resolution returns `StorageError::InvalidMetadata` rather than a partial
+conflict.
 
 Verify [transaction retries](storage.md#transaction-retries) with PostgreSQL
 integration fixtures. Only SQLSTATE `40001` and `40P01` retry the complete

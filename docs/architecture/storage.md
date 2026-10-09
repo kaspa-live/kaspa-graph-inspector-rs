@@ -896,12 +896,11 @@ impl ValidatedDbClient {
 Caches contain:
 
 - `BlockHash -> CachedIdentity`;
-- `CompactId -> BlockHash`;
 - `CompactId -> CachedMaterializedBlock`;
 - `CompactId -> MergeSets`; and
 - one capacity-one `CachedVspcSink` entry.
 
-The four block-scaled domains use capacity eviction without a time-to-live.
+The three block-scaled domains use capacity eviction without a time-to-live.
 The current-sink entry stores only the authoritative endpoint used to validate
 the next VSPC source; it does not cache arbitrary VSPC membership. Cache
 retention is never a processing-validity or accepted-reorganization bound.
@@ -910,28 +909,30 @@ Every incomplete lookup falls back to PostgreSQL.
 `CachedIdentity.materialized` remains independent from
 `CachedMaterializedBlock`. A materialized forward identity whose block metadata
 entry was independently evicted is a cache miss, not an identity-only block or
-database inconsistency. Boundary identities have forward and reverse identity
-entries but no `CachedMaterializedBlock`.
+database inconsistency. Boundary identities have forward identity entries but
+no `CachedMaterializedBlock`.
 
-Definite block materialization publishes the forward identity, reverse hash,
-materialized block metadata, and immutable merge sets after commit. A cold
-identity or block-metadata read loads all required immutable fields in one
-batch and may populate the same domains. VSPC direct-member loading first
-requires a complete cache path for each distinct member:
+Definite block materialization publishes the forward identity, materialized
+block metadata, and immutable merge sets after commit. A cold identity or
+block-metadata read loads all required immutable fields in one batch and may
+populate the same domains. VSPC direct-member loading requires one
+`CachedMaterializedBlock` for each distinct member:
 
 ```text
 member ID
-    -> member hash
     -> CachedMaterializedBlock
         -> level through coordinate
         -> selected-parent ID
-            -> selected-parent hash
 ```
 
-Any missing part puts that member in one batched SQL fallback. The returned
-immutable member hash, coordinate, selected-parent ID, and selected-parent hash
-populate the applicable caches. Concurrent cold misses may duplicate this
-read; they do not introduce waiting or cache single-flight coordination.
+A missing block-metadata entry puts that member in one batched SQL fallback.
+The returned coordinate and selected-parent ID populate the block-metadata
+cache. Normal VSPC path validation compares member and selected-parent IDs and
+does not resolve their hashes. The
+[atomic VSPC transaction](#atomic-vspc-transaction--settled) owns lazy hash
+resolution for exceptional conflict evidence. Concurrent cold misses may
+duplicate the metadata read; they do not introduce waiting or cache
+single-flight coordination.
 
 The current-sink entry is seeded after a successful fresh
 `load_session_state()` read and after a definite Rebuild commit. A VSPC
@@ -941,9 +942,9 @@ replaces the entry with the committed destination without an intervening
 await. Rollback or ambiguous commit publishes neither a destination nor other
 transaction-derived cache updates.
 
-Rebuild replaces all five cache domains together after definite replacement
+Rebuild replaces all four cache domains together after definite replacement
 commit because Compact IDs can be reused. A new processing generation likewise
-starts with five fresh empty domains. No predecessor or pre-Rebuild entry may
+starts with four fresh empty domains. No predecessor or pre-Rebuild entry may
 be observed through the replacement cache state.
 
 Do not cache negative identity results, mutable colors, or VSPC membership.
@@ -1097,11 +1098,10 @@ database uses the same complete replacement.
 
 Only after definite commit, the current `ValidatedDbClient`:
 
-1. replaces all five processing-cache domains with fresh empty instances;
-2. seeds every newly interned pruning-point reference in the forward and
-   reverse identity caches, with the forward entry marked
-   `{ id, materialized: false }`;
-3. seeds the pruning point's forward and reverse identity entries,
+1. replaces all four processing-cache domains with fresh empty instances;
+2. seeds every newly interned pruning-point reference in the forward identity
+   cache as `{ id, materialized: false }`;
+3. seeds the pruning point's forward identity entry,
    `CachedMaterializedBlock`, and immutable merge sets; and
 4. seeds `CachedVspcSink` from the committed pruning point.
 
@@ -1370,28 +1370,35 @@ member repeats or appears in both vectors. The normal source, materiality, and
 selected-parent path checks still apply. For an admitted change, the ordered
 mutation rules below determine final state. Storage loads each added block's
 merge sets internally. Before mutation it also loads the persisted
-selected-parent identity for every directly named chain member and validates:
+selected-parent ID for every directly named chain member and validates:
 
 ```text
 removed is empty:
-    selected_parent(added[0]) == source
+    selected_parent_id(added[0]) == source.id
 
 removed is nonempty:
-    removed[0] == source
-    selected_parent(removed[i]) == removed[i + 1]
-    selected_parent(removed.last()) == selected_parent(added[0])
+    removed[0] == source.id
+    selected_parent_id(removed[i]) == removed[i + 1]
+    selected_parent_id(removed.last()) == selected_parent_id(added[0])
 
 for every added i > 0:
-    selected_parent(added[i]) == added[i - 1]
+    selected_parent_id(added[i]) == added[i - 1]
 ```
 
 Every admitted change has nonempty `added`, so each expression above is
-defined. A failed `removed[0] == source` check returns the distinct typed
+defined. A failed `removed[0] == source.id` check returns the distinct typed
 `VspcSourceDiscontinuity` storage error. For the first failed selected-parent
-relationship in the order shown, return
-`VspcPathDiscontinuity(VspcPathConflict)` before mutation. Storage supplies the
-persisted evidence and expected relationship but does not attribute the
-conflict to either the database or the candidate. The
+relationship in the order shown, Storage identifies the child,
+expected-parent, and stored-parent IDs. It resolves the distinct evidence IDs
+to hashes with one bounded `block_identifiers` query inside the same
+transaction, then returns `VspcPathDiscontinuity(VspcPathConflict)` before
+mutation and rolls back. This exceptional evidence query does not populate a
+general reverse-hash cache. This keeps ordinary VSPC validation entirely
+ID-based and confines hash reads to a recovery-triggering exceptional outcome.
+An incomplete or invalid evidence resolution returns
+`StorageError::InvalidMetadata` instead of manufacturing conflict evidence.
+Storage supplies the persisted evidence and expected relationship but does not
+attribute the conflict to either the database or the candidate. The
 [VspcProcessor contract](vspc-processing.md#readiness-and-materiality--settled)
 owns that attribution.
 
