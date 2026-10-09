@@ -409,17 +409,16 @@ Kaspa path properties under the
 Enable ordering:
 
 ```text
-precondition: ResyncEngine has sent Catchup to both processors for this run
 start BlockAdded remotely
 start VirtualChainChanged remotely
 enable router only when both succeeded
 publish subscription Enabled only when both succeeded
 ```
 
-Catchup is a caller-established lifecycle precondition, not a NodeService
-operation. ResyncEngine is the sole sender of processor commands and invokes
-NodeService subscription activation only after satisfying that precondition.
-NodeService owns the four activation steps following it.
+The
+[processing lifecycle](processing-lifecycle.md#entering-recovery-phases)
+owns activation invocation and its caller-side preconditions. Once invoked,
+NodeService owns the complete activation sequence above.
 
 Disable ordering:
 
