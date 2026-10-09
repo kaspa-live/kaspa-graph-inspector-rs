@@ -3,9 +3,9 @@ use std::sync::Arc;
 use kgi_model::block::{BlockCoordinate, BlockHash, CompactId};
 use moka::sync::Cache;
 
-const IDENTITY_CACHE_CAPACITY: u64 = 432_000;
-const COORDINATE_CACHE_CAPACITY: u64 = 432_000;
-const MERGE_SET_CACHE_CAPACITY: u64 = 432_000;
+const IDENTITY_CACHE_CAPACITY: u64 = 50_000;
+const COORDINATE_CACHE_CAPACITY: u64 = 50_000;
+const MERGE_SET_CACHE_CAPACITY: u64 = 50_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CachedIdentity {
@@ -78,12 +78,12 @@ mod tests {
     }
 
     #[test]
-    fn default_capacities_cover_twelve_hours_at_ten_blocks_per_second() {
+    fn default_capacities_limit_each_processing_cache_to_fifty_thousand_entries() {
         let caches = ProcessingCaches::new();
 
-        assert_eq!(caches.identities.policy().max_capacity(), Some(432_000));
-        assert_eq!(caches.coordinates.policy().max_capacity(), Some(432_000));
-        assert_eq!(caches.merge_sets.policy().max_capacity(), Some(432_000));
+        assert_eq!(caches.identities.policy().max_capacity(), Some(50_000));
+        assert_eq!(caches.coordinates.policy().max_capacity(), Some(50_000));
+        assert_eq!(caches.merge_sets.policy().max_capacity(), Some(50_000));
     }
 
     #[test]

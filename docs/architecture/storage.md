@@ -853,8 +853,8 @@ instances rather than sharing or invalidating its predecessor's caches.
 
 This requirement does not apply to API publication caches. Their response
 reuse and single-flight behavior remain owned by the API architecture.
-Exact cache capacities remain deferred in the
-[decision register](../decisions/deferred.md).
+Exact cache capacities are tunable implementation choices recorded in the
+[implementation choices](../implementation/choices.md#9-october-2026-storage-persistence-operations).
 
 ```rust
 struct CachedIdentity {
