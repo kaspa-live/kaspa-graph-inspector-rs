@@ -459,11 +459,13 @@ contract without teaching the service to replay an uncertain mutation.
 
 The processing-generation caches implement the
 [storage-owned cache requirement](../architecture/storage.md#caches-and-identity-resolution--settled).
-Start each processing cache at 50,000 entries. The caches accelerate the recent
-processing region needed by ordinary materialization and VSPC reorganizations;
-they are not an in-memory retention window and every miss retains its
-authoritative PostgreSQL fallback. This initial capacity is deliberately
-tunable from observed hit rates, eviction rates, and database-read latency.
+Start each block-scaled processing cache at 50,000 entries: forward identity,
+reverse hash, materialized-block metadata, and merge sets. The current-sink
+cache has capacity one. These caches accelerate the recent processing region
+needed by ordinary materialization and VSPC reorganizations; they are not an
+in-memory retention window and every miss retains its authoritative PostgreSQL
+fallback. The initial block-scaled capacity is deliberately tunable from
+observed hit rates, eviction rates, and database-read latency.
 
 Put the storage-specific public result types in the module-qualified
 `kgi_storage::operation` namespace. Deduplicate only the SQL misses before
@@ -485,10 +487,10 @@ Keep SQL and committed-payload construction in the private `materialization`
 module and reusable retry classification in the private `transaction` module.
 Each materialization attempt seeds its resolved-identity map from complete
 positive processing-cache entries. A cached materialized identity whose
-independently cached coordinate is absent remains a SQL miss; all remaining
-hashes use one transaction-local batch query. Only those miss-path identities,
-including rows interned later in the attempt, become post-success cache
-updates; complete cache hits are not republished.
+independently cached materialized-block metadata is absent remains a SQL miss;
+all remaining hashes use one transaction-local batch query. Only those
+miss-path values, including identities interned later in the attempt, become
+post-success cache updates; complete cache hits are not republished.
 Intern the remaining absent identities in one `BYTEA[]` statement using
 `WITH ORDINALITY`; the insertion source and returned rows follow the universal
 first-occurrence order. Insert direct-parent rows in one parallel-array
@@ -498,17 +500,18 @@ first-occurrence order. Insert direct-parent rows in one parallel-array
 
 Give each processing generation a second `tokio::sync::Mutex` lane for VSPC
 mutations. Hold it through complete-transaction retries, definite commit, and
-merge-set cache publication. The materialization and VSPC lane guards are
+processing-cache publication. The materialization and VSPC lane guards are
 independent, so their PostgreSQL transactions may overlap as required by the
 [storage concurrency contract](../architecture/storage.md#internal-concurrency).
 
 Store compact IDs, rather than hashes, in the generation-owned merge-set
 cache. Materialization already resolves those IDs transactionally, and VSPC
 coloring consumes the same persisted representation. Load direct VSPC member
-rows once for a first-occurrence-distinct ID batch while retaining the original
-ordered vectors for path validation and transition semantics. Load merge sets
-only for distinct added IDs that miss the cache, and publish those immutable
-entries only after definite commit.
+rows for only the first-occurrence-distinct IDs lacking a complete reverse-hash
+and materialized-block cache path, while retaining the original ordered vectors
+for path validation and transition semantics. Load merge sets only for
+distinct added IDs that miss the cache, and publish those immutable entries
+only after definite commit.
 
 Compute the final merge-member color for each compact ID by replaying every
 added position in memory in its blue-then-red order, then issue one parallel

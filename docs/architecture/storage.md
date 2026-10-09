@@ -847,9 +847,9 @@ Every processing-generation cache owned by `ValidatedDbClient` uses a separate
 `moka::sync::Cache` instance. Moka is the settled implementation for this
 storage cache layer: it provides concurrent access and bounded eviction without
 an outer mutex serializing all cache operations. Separate instances preserve
-independent value domains and capacity policies for identity, coordinate, and
-merge-set entries. A replacement processing generation constructs fresh empty
-instances rather than sharing or invalidating its predecessor's caches.
+independent value domains and capacity policies. A replacement processing
+generation constructs fresh empty instances rather than sharing or invalidating
+its predecessor's caches.
 
 This requirement does not apply to API publication caches. Their response
 reuse and single-flight behavior remain owned by the API architecture.
@@ -860,6 +860,16 @@ Exact cache capacities are tunable implementation choices recorded in the
 struct CachedIdentity {
     id: CompactId,
     materialized: bool,
+}
+
+struct CachedMaterializedBlock {
+    coordinate: BlockCoordinate,
+    selected_parent_id: CompactId,
+}
+
+struct CachedVspcSink {
+    id: CompactId,
+    hash: BlockHash,
 }
 
 enum ResolveMaterializedIdsError {
@@ -886,8 +896,55 @@ impl ValidatedDbClient {
 Caches contain:
 
 - `BlockHash -> CachedIdentity`;
-- `CompactId -> BlockCoordinate`; and
-- `CompactId -> MergeSets`.
+- `CompactId -> BlockHash`;
+- `CompactId -> CachedMaterializedBlock`;
+- `CompactId -> MergeSets`; and
+- one capacity-one `CachedVspcSink` entry.
+
+The four block-scaled domains use capacity eviction without a time-to-live.
+The current-sink entry stores only the authoritative endpoint used to validate
+the next VSPC source; it does not cache arbitrary VSPC membership. Cache
+retention is never a processing-validity or accepted-reorganization bound.
+Every incomplete lookup falls back to PostgreSQL.
+
+`CachedIdentity.materialized` remains independent from
+`CachedMaterializedBlock`. A materialized forward identity whose block metadata
+entry was independently evicted is a cache miss, not an identity-only block or
+database inconsistency. Boundary identities have forward and reverse identity
+entries but no `CachedMaterializedBlock`.
+
+Definite block materialization publishes the forward identity, reverse hash,
+materialized block metadata, and immutable merge sets after commit. A cold
+identity or block-metadata read loads all required immutable fields in one
+batch and may populate the same domains. VSPC direct-member loading first
+requires a complete cache path for each distinct member:
+
+```text
+member ID
+    -> member hash
+    -> CachedMaterializedBlock
+        -> level through coordinate
+        -> selected-parent ID
+            -> selected-parent hash
+```
+
+Any missing part puts that member in one batched SQL fallback. The returned
+immutable member hash, coordinate, selected-parent ID, and selected-parent hash
+populate the applicable caches. Concurrent cold misses may duplicate this
+read; they do not introduce waiting or cache single-flight coordination.
+
+The current-sink entry is seeded after a successful fresh
+`load_session_state()` read and after a definite Rebuild commit. A VSPC
+transaction loads the sink from PostgreSQL on a cache miss. Immediately after
+a definite VSPC commit, while still ordered by the VSPC mutation lane, Storage
+replaces the entry with the committed destination without an intervening
+await. Rollback or ambiguous commit publishes neither a destination nor other
+transaction-derived cache updates.
+
+Rebuild replaces all five cache domains together after definite replacement
+commit because Compact IDs can be reused. A new processing generation likewise
+starts with five fresh empty domains. No predecessor or pre-Rebuild entry may
+be observed through the replacement cache state.
 
 Do not cache negative identity results, mutable colors, or VSPC membership.
 Cold identity batches may left-join `blocks` to obtain the materialized bit.
@@ -1040,11 +1097,13 @@ database uses the same complete replacement.
 
 Only after definite commit, the current `ValidatedDbClient`:
 
-1. clears its identity, coordinate, and merge-set caches;
-2. seeds every newly interned pruning-point reference as
+1. replaces all five processing-cache domains with fresh empty instances;
+2. seeds every newly interned pruning-point reference in the forward and
+   reverse identity caches, with the forward entry marked
    `{ id, materialized: false }`;
-3. seeds the pruning-point identity as `{ id, materialized: true }`; and
-4. seeds the pruning-point coordinate and immutable merge sets.
+3. seeds the pruning point's forward and reverse identity entries,
+   `CachedMaterializedBlock`, and immutable merge sets; and
+4. seeds `CachedVspcSink` from the committed pruning point.
 
 No replacement cache state is visible before commit. A failed or ambiguous
 attempt publishes none of these cache changes.

@@ -440,9 +440,14 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
     inconsistent contents.
 14. Verify the storage-owned
     [processing-cache requirement](storage.md#caches-and-identity-resolution--settled):
-    the identity, coordinate, and merge-set value domains use separate Moka
-    caches, and a replacement processing generation starts with empty caches
-    that cannot observe its predecessor's entries.
+    the forward identity, reverse hash, materialized-block metadata, merge-set,
+    and capacity-one current-sink domains use separate Moka caches. Exercise a
+    complete VSPC member cache hit, every independently missing path component
+    through one batched SQL fallback, current-sink seeding from fresh session
+    state, and replacement by the destination only after definite VSPC commit.
+    Rollback and ambiguous commit publish no transaction-derived cache state.
+    Rebuild and a replacement processing generation replace all five domains
+    together and cannot observe predecessor entries.
 
 Verify the [block materialization transaction](storage.md#block-materialization-transaction--settled)
 and [PP seal behavior](block-processing.md#pp-boundary-phase-behavior--settled)
