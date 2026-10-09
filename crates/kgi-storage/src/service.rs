@@ -394,7 +394,10 @@ impl StorageServiceWorker {
             if database.ping().await.is_err() {
                 self.discard_unpublished(processing, api);
                 self.publish_status(StorageServiceStatusState::Unavailable);
-                continue;
+                if self.wait_retry(&mut retry_index, &mut pending_initialization).await? {
+                    continue;
+                }
+                return Ok(());
             }
             let mut active =
                 ActiveGenerations { binding: processing.binding(), api_required: api.is_some(), processing: Some(processing), api };
@@ -1355,7 +1358,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_publication_rechecks_lock_after_generation_opening() {
+    async fn initial_publication_recheck_waits_before_reconnecting() {
+        exercise_failed_initial_publication_recheck(InitialRecheckDisposition::Retry).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_initial_publication_recheck_backoff() {
+        exercise_failed_initial_publication_recheck(InitialRecheckDisposition::Shutdown).await;
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum InitialRecheckDisposition {
+        Retry,
+        Shutdown,
+    }
+
+    async fn exercise_failed_initial_publication_recheck(disposition: InitialRecheckDisposition) {
         let (_container, database_url) = fixture().await;
         let (mut database, state) =
             LockedDatabase::connect(database_url.as_str()).await.expect("database lock").prepare().await.expect("schema preparation");
@@ -1375,10 +1393,12 @@ mod tests {
             initial_open_started: initial_open_tx,
             initial_open_permit: Semaphore::new(0),
         });
+        let (sleep_tx, mut sleeps) = mpsc::unbounded_channel();
+        let clock = Arc::new(ManualClock { sleeps: sleep_tx });
         let (service, mut events) = StorageService::start_with_generation_opener(
             database_url.clone(),
             connector.clone(),
-            Arc::new(kgi_core::timing::TokioClock),
+            clock,
             Arc::new(IdentityJitter),
             generation_opener.clone(),
         );
@@ -1388,6 +1408,21 @@ mod tests {
         terminate_lock_owner(&mut observer).await;
         generation_opener.initial_open_permit.add_permits(1);
 
+        let retry = timeout(TEST_TIMEOUT, sleeps.recv()).await.expect("ownership recheck retry").expect("clock path");
+        assert_eq!(retry.duration, Duration::from_secs(1));
+        assert_eq!(service.status().state, StorageServiceStatusState::Unavailable);
+        assert!(timeout(Duration::from_millis(100), reconnect_rx.recv()).await.is_err());
+        assert!(timeout(Duration::from_millis(100), events.recv()).await.is_err());
+
+        if disposition == InitialRecheckDisposition::Shutdown {
+            service.shutdown().await.expect("shutdown must cancel ownership-recheck retry");
+            assert_eq!(connector.attempts.load(Ordering::Relaxed), 1);
+            assert_eq!(generation_opener.attempts.load(Ordering::Relaxed), 1);
+            assert_eq!(service.status().state, StorageServiceStatusState::Stopped);
+            return;
+        }
+
+        retry.completion.send(()).expect("advance ownership-recheck retry");
         timeout(TEST_TIMEOUT, reconnect_rx.recv()).await.expect("reconnect attempt").expect("reconnect observer");
         assert!(timeout(Duration::from_millis(100), events.recv()).await.is_err());
 
