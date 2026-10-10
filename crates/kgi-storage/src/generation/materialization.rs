@@ -49,7 +49,6 @@ struct PreparedBlock {
 struct StoredIdentity {
     id: CompactId,
     block: Option<CachedMaterializedBlock>,
-    selected_parent_hash: Option<BlockHash>,
 }
 
 impl StoredIdentity {
@@ -156,10 +155,6 @@ impl ValidatedDbClient {
                     self.caches.publish_identity(hash, CachedIdentity { id: stored.id, materialized: stored.block.is_some() });
                     if let Some(block) = stored.block {
                         self.caches.publish_materialized_block(stored.id, block);
-                        self.caches.publish_reverse_hash(
-                            block.selected_parent_id,
-                            stored.selected_parent_hash.expect("materialized cache updates include the selected-parent hash"),
-                        );
                     }
                 }
                 if let Some((id, merge_sets)) = success.merge_sets {
@@ -284,7 +279,6 @@ async fn attempt(
     let selected_parent_id = identities.get(&prepared.selected_parent).expect("selected parent was resolved").id;
     let own = identities.get_mut(&prepared.hash).expect("the incoming block identity was interned");
     own.block = Some(CachedMaterializedBlock { coordinate, selected_parent_id });
-    own.selected_parent_hash = Some(prepared.selected_parent);
     let own_id = own.id;
     let blue_ids: Vec<i64> = prepared
         .blue_merge_set
@@ -422,11 +416,9 @@ async fn load_identities(
 
     let encoded: Vec<Vec<u8>> = misses.iter().map(|hash| hash.as_bytes().to_vec()).collect();
     let rows = sqlx::query(
-        "SELECT identity.hash, identity.id, block.level, block.slot, block.selected_parent_id,
-                selected_parent.hash AS selected_parent_hash
+        "SELECT identity.hash, identity.id, block.level, block.slot, block.selected_parent_id
          FROM block_identifiers identity
          LEFT JOIN blocks block ON block.id = identity.id
-         LEFT JOIN block_identifiers selected_parent ON selected_parent.id = block.selected_parent_id
          WHERE identity.hash = ANY($1::BYTEA[])",
     )
     .bind(encoded)
@@ -451,13 +443,8 @@ async fn load_identities(
         let raw_selected_parent_id: Option<i64> = row
             .try_get("selected_parent_id")
             .map_err(|error| TransactionAttemptError::database("block-reference selected-parent ID decode", error))?;
-        let encoded_selected_parent_hash: Option<Vec<u8>> = row
-            .try_get("selected_parent_hash")
-            .map_err(|error| TransactionAttemptError::database("block-reference selected-parent hash decode", error))?;
-        let (block, selected_parent_hash) =
-            decode_materialized_block(coordinate, raw_selected_parent_id, encoded_selected_parent_hash)
-                .map_err(TransactionAttemptError::Storage)?;
-        identities.insert(hash, StoredIdentity { id, block, selected_parent_hash });
+        let block = decode_materialized_block(coordinate, raw_selected_parent_id).map_err(TransactionAttemptError::Storage)?;
+        identities.insert(hash, StoredIdentity { id, block });
     }
     Ok(LoadedIdentities { values: identities, cache_misses: misses })
 }
@@ -507,7 +494,7 @@ async fn intern_missing_identities(
         let id = CompactId::new(raw_id).ok_or_else(|| {
             TransactionAttemptError::Storage(StorageError::invalid_metadata(format!("generated compact ID is not positive: {raw_id}")))
         })?;
-        identities.insert(hash, StoredIdentity { id, block: None, selected_parent_hash: None });
+        identities.insert(hash, StoredIdentity { id, block: None });
     }
     Ok(())
 }
@@ -532,8 +519,7 @@ fn seed_identities_from_cache(
         } else {
             None
         };
-        let selected_parent_hash = block.and_then(|block| caches.hash(block.selected_parent_id));
-        identities.insert(*hash, StoredIdentity { id: identity.id, block, selected_parent_hash });
+        identities.insert(*hash, StoredIdentity { id: identity.id, block });
     }
     (identities, misses)
 }
@@ -605,17 +591,14 @@ fn decode_coordinate(level: Option<i64>, slot: Option<i64>) -> Result<Option<Blo
 fn decode_materialized_block(
     coordinate: Option<BlockCoordinate>,
     raw_selected_parent_id: Option<i64>,
-    encoded_selected_parent_hash: Option<Vec<u8>>,
-) -> Result<(Option<CachedMaterializedBlock>, Option<BlockHash>), StorageError> {
-    match (coordinate, raw_selected_parent_id, encoded_selected_parent_hash) {
-        (None, None, None) => Ok((None, None)),
-        (Some(coordinate), Some(raw_selected_parent_id), Some(encoded_selected_parent_hash)) => {
+) -> Result<Option<CachedMaterializedBlock>, StorageError> {
+    match (coordinate, raw_selected_parent_id) {
+        (None, None) => Ok(None),
+        (Some(coordinate), Some(raw_selected_parent_id)) => {
             let selected_parent_id = CompactId::new(raw_selected_parent_id).ok_or_else(|| {
                 StorageError::invalid_metadata(format!("stored selected-parent ID is not positive: {raw_selected_parent_id}"))
             })?;
-            let selected_parent_hash = BlockHash::try_from(encoded_selected_parent_hash.as_slice())
-                .map_err(|error| StorageError::invalid_metadata(format!("invalid stored selected-parent hash: {error}")))?;
-            Ok((Some(CachedMaterializedBlock { coordinate, selected_parent_id }), Some(selected_parent_hash)))
+            Ok(Some(CachedMaterializedBlock { coordinate, selected_parent_id }))
         }
         _ => Err(StorageError::invalid_metadata("stored block has partial immutable metadata")),
     }
@@ -962,8 +945,6 @@ mod tests {
         assert!(client.has_cached_identity(red_missing));
         assert!(client.has_cached_identity(blue_missing));
         assert!(client.has_cached_merge_sets(committed.id));
-        assert_eq!(client.cached_hash(committed.id), Some(own_hash));
-        assert_eq!(client.cached_hash(boundary_parent_id), Some(boundary_parent));
         assert_eq!(
             client.cached_materialized_block(committed.id),
             Some(CachedMaterializedBlock { coordinate: committed.coordinate, selected_parent_id: parent_a_id })

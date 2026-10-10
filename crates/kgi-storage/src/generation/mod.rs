@@ -242,11 +242,6 @@ impl ValidatedDbClient {
     }
 
     #[cfg(test)]
-    pub(crate) fn cached_hash(&self, id: CompactId) -> Option<BlockHash> {
-        self.caches.hash(id)
-    }
-
-    #[cfg(test)]
     pub(crate) fn cached_materialized_block(&self, id: CompactId) -> Option<CachedMaterializedBlock> {
         self.caches.materialized_block(id)
     }
@@ -389,7 +384,6 @@ mod tests {
         );
         predecessor.caches.publish_vspc_sink(CachedVspcSink { id, hash: hash(1) });
         assert_eq!(predecessor.caches.identity(hash(1)).map(|identity| identity.id), Some(id));
-        assert_eq!(predecessor.caches.hash(id), Some(hash(1)));
         assert_eq!(predecessor.caches.materialized_block(id).map(|block| block.coordinate), Some(coordinate));
         assert_eq!(
             predecessor.caches.merge_sets(id).map(|sets| sets.blue),
@@ -400,7 +394,6 @@ mod tests {
         let replacement = ValidatedDbClient::new(pool, binding, retirement_tx);
 
         assert_eq!(replacement.caches.identity(hash(1)), None);
-        assert_eq!(replacement.caches.hash(id), None);
         assert_eq!(replacement.caches.materialized_block(id), None);
         assert_eq!(replacement.caches.merge_sets(id), None);
         assert_eq!(replacement.caches.vspc_sink(), None);

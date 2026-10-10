@@ -32,7 +32,6 @@ pub(crate) struct CachedVspcSink {
 
 pub(crate) struct ProcessingCaches {
     identities: Cache<BlockHash, CachedIdentity>,
-    hashes: Cache<CompactId, BlockHash>,
     materialized_blocks: Cache<CompactId, CachedMaterializedBlock>,
     merge_sets: Cache<CompactId, CachedMergeSets>,
     vspc_sink: Cache<(), CachedVspcSink>,
@@ -40,25 +39,17 @@ pub(crate) struct ProcessingCaches {
 
 impl ProcessingCaches {
     pub(crate) fn new() -> Self {
-        Self::with_capacities(
-            BLOCK_CACHE_CAPACITY,
-            BLOCK_CACHE_CAPACITY,
-            BLOCK_CACHE_CAPACITY,
-            BLOCK_CACHE_CAPACITY,
-            VSPC_SINK_CACHE_CAPACITY,
-        )
+        Self::with_capacities(BLOCK_CACHE_CAPACITY, BLOCK_CACHE_CAPACITY, BLOCK_CACHE_CAPACITY, VSPC_SINK_CACHE_CAPACITY)
     }
 
     fn with_capacities(
         identity_capacity: u64,
-        hash_capacity: u64,
         materialized_block_capacity: u64,
         merge_set_capacity: u64,
         vspc_sink_capacity: u64,
     ) -> Self {
         Self {
             identities: Cache::new(identity_capacity),
-            hashes: Cache::new(hash_capacity),
             materialized_blocks: Cache::new(materialized_block_capacity),
             merge_sets: Cache::new(merge_set_capacity),
             vspc_sink: Cache::new(vspc_sink_capacity),
@@ -67,10 +58,6 @@ impl ProcessingCaches {
 
     pub(crate) fn identity(&self, hash: BlockHash) -> Option<CachedIdentity> {
         self.identities.get(&hash)
-    }
-
-    pub(crate) fn hash(&self, id: CompactId) -> Option<BlockHash> {
-        self.hashes.get(&id)
     }
 
     pub(crate) fn materialized_block(&self, id: CompactId) -> Option<CachedMaterializedBlock> {
@@ -87,11 +74,6 @@ impl ProcessingCaches {
 
     pub(crate) fn publish_identity(&self, hash: BlockHash, identity: CachedIdentity) {
         self.identities.insert(hash, identity);
-        self.hashes.insert(identity.id, hash);
-    }
-
-    pub(crate) fn publish_reverse_hash(&self, id: CompactId, hash: BlockHash) {
-        self.hashes.insert(id, hash);
     }
 
     pub(crate) fn publish_materialized_block(&self, id: CompactId, block: CachedMaterializedBlock) {
@@ -122,11 +104,10 @@ mod tests {
     }
 
     #[test]
-    fn default_capacities_match_the_five_processing_cache_domains() {
+    fn default_capacities_match_the_four_processing_cache_domains() {
         let caches = ProcessingCaches::new();
 
         assert_eq!(caches.identities.policy().max_capacity(), Some(50_000));
-        assert_eq!(caches.hashes.policy().max_capacity(), Some(50_000));
         assert_eq!(caches.materialized_blocks.policy().max_capacity(), Some(50_000));
         assert_eq!(caches.merge_sets.policy().max_capacity(), Some(50_000));
         assert_eq!(caches.vspc_sink.policy().max_capacity(), Some(1));
@@ -134,7 +115,7 @@ mod tests {
 
     #[test]
     fn caches_have_independent_capacity_policies() {
-        let caches = ProcessingCaches::with_capacities(2, 2, 2, 2, 1);
+        let caches = ProcessingCaches::with_capacities(2, 2, 2, 1);
         let coordinate = |level| BlockCoordinate::new(level, 0).expect("positive level");
 
         for value in 1..=2 {
@@ -148,12 +129,10 @@ mod tests {
         caches.publish_vspc_sink(CachedVspcSink { id: id(2), hash: hash(2) });
 
         assert_eq!(caches.identities.policy().max_capacity(), Some(2));
-        assert_eq!(caches.hashes.policy().max_capacity(), Some(2));
         assert_eq!(caches.materialized_blocks.policy().max_capacity(), Some(2));
         assert_eq!(caches.merge_sets.policy().max_capacity(), Some(2));
         assert_eq!(caches.vspc_sink.policy().max_capacity(), Some(1));
         assert_eq!(caches.identity(hash(1)).map(|identity| identity.id), Some(id(1)));
-        assert_eq!(caches.hash(id(1)), Some(hash(1)));
         assert_eq!(caches.materialized_block(id(1)).map(|block| block.coordinate), Some(coordinate(1)));
         assert_eq!(caches.merge_sets(id(1)).map(|sets| sets.blue), Some(vec![id(5)].into()));
         assert_eq!(caches.vspc_sink(), Some(CachedVspcSink { id: id(2), hash: hash(2) }));
@@ -163,15 +142,29 @@ mod tests {
         caches.publish_merge_sets(id(3), CachedMergeSets { blue: vec![id(7)].into(), red: vec![id(8)].into() });
         caches.publish_vspc_sink(CachedVspcSink { id: id(3), hash: hash(3) });
         caches.identities.run_pending_tasks();
-        caches.hashes.run_pending_tasks();
         caches.materialized_blocks.run_pending_tasks();
         caches.merge_sets.run_pending_tasks();
         caches.vspc_sink.run_pending_tasks();
 
         assert!(caches.identities.entry_count() <= 2);
-        assert!(caches.hashes.entry_count() <= 2);
         assert!(caches.materialized_blocks.entry_count() <= 2);
         assert!(caches.merge_sets.entry_count() <= 2);
         assert!(caches.vspc_sink.entry_count() <= 1);
+    }
+
+    #[test]
+    fn vspc_sink_cache_replaces_and_recalls_the_latest_value() {
+        let caches = ProcessingCaches::new();
+        let first = CachedVspcSink { id: id(1), hash: hash(1) };
+        let second = CachedVspcSink { id: id(2), hash: hash(2) };
+
+        caches.publish_vspc_sink(first);
+        assert_eq!(caches.vspc_sink(), Some(first));
+
+        caches.publish_vspc_sink(second);
+        caches.vspc_sink.run_pending_tasks();
+
+        assert_eq!(caches.vspc_sink(), Some(second));
+        assert_eq!(caches.vspc_sink.entry_count(), 1);
     }
 }

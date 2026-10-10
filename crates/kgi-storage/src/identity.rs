@@ -14,7 +14,6 @@ use crate::{
 struct StoredIdentity {
     identity: CachedIdentity,
     block: Option<CachedMaterializedBlock>,
-    selected_parent_hash: Option<BlockHash>,
 }
 
 pub(crate) enum MaterializedIdResolution {
@@ -33,11 +32,9 @@ pub(crate) async fn block_presence(pool: &PgPool, caches: &ProcessingCaches, has
     }
 
     let row = sqlx::query(
-        "SELECT identity.id, block.level, block.slot, block.selected_parent_id,
-                selected_parent.hash AS selected_parent_hash
+        "SELECT identity.id, block.level, block.slot, block.selected_parent_id
          FROM block_identifiers identity
          LEFT JOIN blocks block ON block.id = identity.id
-         LEFT JOIN block_identifiers selected_parent ON selected_parent.id = block.selected_parent_id
          WHERE identity.hash = $1",
     )
     .bind(hash.as_bytes().as_slice())
@@ -78,11 +75,9 @@ pub(crate) async fn resolve_materialized_ids(
     if !misses.is_empty() {
         let encoded: Vec<Vec<u8>> = misses.iter().map(|hash| hash.as_bytes().to_vec()).collect();
         let rows = sqlx::query(
-            "SELECT identity.hash, identity.id, block.level, block.slot, block.selected_parent_id,
-                    selected_parent.hash AS selected_parent_hash
+            "SELECT identity.hash, identity.id, block.level, block.slot, block.selected_parent_id
              FROM block_identifiers identity
              LEFT JOIN blocks block ON block.id = identity.id
-             LEFT JOIN block_identifiers selected_parent ON selected_parent.id = block.selected_parent_id
              WHERE identity.hash = ANY($1::BYTEA[])",
         )
         .bind(encoded)
@@ -127,11 +122,9 @@ fn decode_identity(row: &sqlx::postgres::PgRow) -> Result<StoredIdentity, Storag
     let slot: Option<i64> = row.try_get("slot").map_err(|error| StorageError::database("block slot decode", error))?;
     let raw_selected_parent_id: Option<i64> =
         row.try_get("selected_parent_id").map_err(|error| StorageError::database("selected-parent ID decode", error))?;
-    let encoded_selected_parent_hash: Option<Vec<u8>> =
-        row.try_get("selected_parent_hash").map_err(|error| StorageError::database("selected-parent hash decode", error))?;
-    let (block, selected_parent_hash) = match (level, slot, raw_selected_parent_id, encoded_selected_parent_hash) {
-        (None, None, None, None) => (None, None),
-        (Some(level), Some(slot), Some(raw_selected_parent_id), Some(encoded_selected_parent_hash)) => {
+    let block = match (level, slot, raw_selected_parent_id) {
+        (None, None, None) => None,
+        (Some(level), Some(slot), Some(raw_selected_parent_id)) => {
             let coordinate = u64::try_from(level)
                 .ok()
                 .and_then(|level| BlockCoordinate::new(level, u64::try_from(slot).ok()?))
@@ -139,23 +132,17 @@ fn decode_identity(row: &sqlx::postgres::PgRow) -> Result<StoredIdentity, Storag
             let selected_parent_id = CompactId::new(raw_selected_parent_id).ok_or_else(|| {
                 StorageError::invalid_metadata(format!("stored selected-parent ID is not positive: {raw_selected_parent_id}"))
             })?;
-            let selected_parent_hash = BlockHash::try_from(encoded_selected_parent_hash.as_slice())
-                .map_err(|error| StorageError::invalid_metadata(format!("invalid stored selected-parent hash: {error}")))?;
-            (Some(CachedMaterializedBlock { coordinate, selected_parent_id }), Some(selected_parent_hash))
+            Some(CachedMaterializedBlock { coordinate, selected_parent_id })
         }
         _ => return Err(StorageError::invalid_metadata("stored block has partial immutable metadata")),
     };
-    Ok(StoredIdentity { identity: CachedIdentity { id, materialized: block.is_some() }, block, selected_parent_hash })
+    Ok(StoredIdentity { identity: CachedIdentity { id, materialized: block.is_some() }, block })
 }
 
 fn publish_stored_identity(caches: &ProcessingCaches, hash: BlockHash, stored: &StoredIdentity) {
     caches.publish_identity(hash, stored.identity);
     if let Some(block) = stored.block {
         caches.publish_materialized_block(stored.identity.id, block);
-        caches.publish_reverse_hash(
-            block.selected_parent_id,
-            stored.selected_parent_hash.expect("materialized blocks decode their selected-parent hash"),
-        );
     }
 }
 
@@ -261,8 +248,6 @@ mod tests {
             client.block_presence(materialized_hash).await,
             Ok(BlockPresence::Materialized { id: materialized_id, coordinate: BlockCoordinate::new(2, 0).expect("valid coordinate") })
         );
-        assert_eq!(client.cached_hash(boundary_id), Some(boundary_hash));
-        assert_eq!(client.cached_hash(materialized_id), Some(materialized_hash));
         assert_eq!(
             client.cached_materialized_block(materialized_id),
             Some(crate::cache::CachedMaterializedBlock {

@@ -12,7 +12,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use super::ValidatedDbClient;
 use crate::{
-    cache::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, CachedVspcSink, ProcessingCaches},
+    cache::{CachedMaterializedBlock, CachedMergeSets, CachedVspcSink, ProcessingCaches},
     database::NO_VSPC_DAA_SCORE,
     error::StorageError,
     operation::{VspcCommitOutcome, VspcPathConflict},
@@ -26,25 +26,17 @@ pub(super) enum CommitBehavior {
     CommitThenLoseAcknowledgement,
 }
 
-#[derive(Clone, Copy)]
-struct StoredMember {
-    hash: BlockHash,
-    selected_parent: BlockHash,
-    level: u64,
-}
-
 struct AttemptSuccess {
     outcome: VspcCommitOutcome,
-    member_cache_updates: Vec<MemberCacheUpdate>,
+    member_cache_updates: Vec<(CompactId, CachedMaterializedBlock)>,
     merge_set_cache_updates: Vec<(CompactId, CachedMergeSets)>,
 }
 
 #[derive(Clone, Copy)]
-struct MemberCacheUpdate {
-    id: CompactId,
-    hash: BlockHash,
-    block: CachedMaterializedBlock,
-    selected_parent_hash: BlockHash,
+struct VspcPathConflictIds {
+    child: CompactId,
+    expected_parent: CompactId,
+    stored_parent: CompactId,
 }
 
 enum SemanticError {
@@ -76,10 +68,8 @@ impl ValidatedDbClient {
                 }
             };
 
-            for update in success.member_cache_updates {
-                self.caches.publish_identity(update.hash, CachedIdentity { id: update.id, materialized: true });
-                self.caches.publish_materialized_block(update.id, update.block);
-                self.caches.publish_reverse_hash(update.block.selected_parent_id, update.selected_parent_hash);
+            for (id, block) in success.member_cache_updates {
+                self.caches.publish_materialized_block(id, block);
             }
             for (id, merge_sets) in success.merge_set_cache_updates {
                 self.caches.publish_merge_sets(id, merge_sets);
@@ -133,7 +123,8 @@ async fn attempt(
     if change.removed.first().is_some_and(|id| *id != change.source.id()) {
         return rollback_semantic(transaction, SemanticError::SourceDiscontinuity, "VSPC removed-source validation rollback").await;
     }
-    if let Some(conflict) = first_path_conflict(change, &members) {
+    if let Some(conflict_ids) = first_path_conflict(change, &members) {
+        let conflict = resolve_path_conflict(&mut transaction, conflict_ids).await?;
         return rollback_semantic(transaction, SemanticError::PathDiscontinuity(conflict), "VSPC selected-parent validation rollback")
             .await;
     }
@@ -142,7 +133,7 @@ async fn attempt(
     apply_membership(&mut transaction, &change.removed, &change.added).await?;
     apply_merge_set_colors(&mut transaction, &change.added, &merge_sets).await?;
     let affected_levels: BTreeSet<_> =
-        member_ids.iter().map(|id| members.get(id).expect("every VSPC member was proven materialized").level).collect();
+        member_ids.iter().map(|id| members.get(id).expect("every VSPC member was proven materialized").coordinate.level()).collect();
     let level_snapshots = update_level_scores(&mut transaction, &affected_levels).await?;
 
     commit(transaction, commit_behavior).await.map_err(|error| TransactionAttemptError::commit("VSPC transaction commit", error))?;
@@ -198,7 +189,10 @@ async fn load_members(
     transaction: &mut Transaction<'_, Postgres>,
     caches: &ProcessingCaches,
     ids: &[CompactId],
-) -> Result<(HashMap<CompactId, StoredMember>, Vec<MemberCacheUpdate>), TransactionAttemptError<SemanticError>> {
+) -> Result<
+    (HashMap<CompactId, CachedMaterializedBlock>, Vec<(CompactId, CachedMaterializedBlock)>),
+    TransactionAttemptError<SemanticError>,
+> {
     let (mut members, misses) = seed_members_from_cache(caches, ids);
     if misses.is_empty() {
         return Ok((members, Vec::new()));
@@ -206,11 +200,8 @@ async fn load_members(
 
     let encoded: Vec<i64> = misses.iter().map(|id| id.get()).collect();
     let rows = sqlx::query(
-        "SELECT block.id, identity.hash, block.level, block.slot, block.selected_parent_id,
-                selected_parent.hash AS selected_parent_hash
+        "SELECT block.id, block.level, block.slot, block.selected_parent_id
          FROM blocks block
-         JOIN block_identifiers identity ON identity.id = block.id
-         JOIN block_identifiers selected_parent ON selected_parent.id = block.selected_parent_id
          WHERE block.id = ANY($1::BIGINT[])",
     )
     .bind(encoded)
@@ -222,11 +213,6 @@ async fn load_members(
     for row in rows {
         let raw_id: i64 = row.try_get("id").map_err(|error| TransactionAttemptError::database("VSPC member ID decode", error))?;
         let id = decode_id(raw_id, "VSPC member")?;
-        let encoded_hash: Vec<u8> =
-            row.try_get("hash").map_err(|error| TransactionAttemptError::database("VSPC member hash decode", error))?;
-        let encoded_parent: Vec<u8> = row
-            .try_get("selected_parent_hash")
-            .map_err(|error| TransactionAttemptError::database("VSPC member selected-parent decode", error))?;
         let raw_level: i64 =
             row.try_get("level").map_err(|error| TransactionAttemptError::database("VSPC member level decode", error))?;
         let raw_slot: i64 =
@@ -239,73 +225,100 @@ async fn load_members(
             .try_get("selected_parent_id")
             .map_err(|error| TransactionAttemptError::database("VSPC member selected-parent ID decode", error))?;
         let selected_parent_id = decode_id(raw_selected_parent_id, "VSPC member selected parent")?;
-        let hash = decode_hash(&encoded_hash, "VSPC member")?;
-        let selected_parent = decode_hash(&encoded_parent, "VSPC member selected parent")?;
         let block = CachedMaterializedBlock { coordinate, selected_parent_id };
-        members.insert(id, StoredMember { hash, selected_parent, level: coordinate.level() });
-        cache_updates.push(MemberCacheUpdate { id, hash, block, selected_parent_hash: selected_parent });
+        members.insert(id, block);
+        cache_updates.push((id, block));
     }
     Ok((members, cache_updates))
 }
 
-fn seed_members_from_cache(caches: &ProcessingCaches, ids: &[CompactId]) -> (HashMap<CompactId, StoredMember>, Vec<CompactId>) {
+fn seed_members_from_cache(
+    caches: &ProcessingCaches,
+    ids: &[CompactId],
+) -> (HashMap<CompactId, CachedMaterializedBlock>, Vec<CompactId>) {
     let mut members = HashMap::with_capacity(ids.len());
     let mut misses = Vec::new();
     for id in ids {
-        let Some(hash) = caches.hash(*id) else {
-            misses.push(*id);
-            continue;
-        };
         let Some(block) = caches.materialized_block(*id) else {
             misses.push(*id);
             continue;
         };
-        let Some(selected_parent) = caches.hash(block.selected_parent_id) else {
-            misses.push(*id);
-            continue;
-        };
-        members.insert(*id, StoredMember { hash, selected_parent, level: block.coordinate.level() });
+        members.insert(*id, block);
     }
     (members, misses)
 }
 
-fn first_path_conflict(change: &ReadyVspcChange, members: &HashMap<CompactId, StoredMember>) -> Option<VspcPathConflict> {
+fn first_path_conflict(
+    change: &ReadyVspcChange,
+    members: &HashMap<CompactId, CachedMaterializedBlock>,
+) -> Option<VspcPathConflictIds> {
     let stored = |id: CompactId| members.get(&id).expect("every direct VSPC member was loaded");
+    let conflict = |child: CompactId, expected_parent: CompactId| {
+        let stored_parent = stored(child).selected_parent_id;
+        (stored_parent != expected_parent).then_some(VspcPathConflictIds { child, expected_parent, stored_parent })
+    };
+
     if change.removed.is_empty() {
-        let first = stored(change.added[0]);
-        return (first.selected_parent != change.source.hash()).then_some(VspcPathConflict {
-            child: first.hash,
-            expected_parent: change.source.hash(),
-            stored_parent: first.selected_parent,
-        });
+        return conflict(change.added[0], change.source.id());
     }
 
     for pair in change.removed.windows(2) {
-        let child = stored(pair[0]);
-        let expected_parent = stored(pair[1]).hash;
-        if child.selected_parent != expected_parent {
-            return Some(VspcPathConflict { child: child.hash, expected_parent, stored_parent: child.selected_parent });
+        if let Some(conflict) = conflict(pair[0], pair[1]) {
+            return Some(conflict);
         }
     }
 
-    let removed_tail = stored(*change.removed.last().expect("the removed path is nonempty"));
-    let added_head = stored(change.added[0]);
-    if added_head.selected_parent != removed_tail.selected_parent {
-        return Some(VspcPathConflict {
-            child: added_head.hash,
-            expected_parent: removed_tail.selected_parent,
-            stored_parent: added_head.selected_parent,
-        });
+    let child = change.added[0];
+    let expected_parent = stored(*change.removed.last().expect("the removed path is nonempty")).selected_parent_id;
+    if let Some(conflict) = conflict(child, expected_parent) {
+        return Some(conflict);
     }
 
     for pair in change.added.windows(2) {
-        let expected_parent = stored(pair[0]).hash;
-        let child = stored(pair[1]);
-        if child.selected_parent != expected_parent {
-            return Some(VspcPathConflict { child: child.hash, expected_parent, stored_parent: child.selected_parent });
+        if let Some(conflict) = conflict(pair[1], pair[0]) {
+            return Some(conflict);
         }
     }
     None
+}
+
+async fn resolve_path_conflict(
+    transaction: &mut Transaction<'_, Postgres>,
+    conflict: VspcPathConflictIds,
+) -> Result<VspcPathConflict, TransactionAttemptError<SemanticError>> {
+    let mut seen = HashSet::new();
+    let ids: Vec<_> =
+        [conflict.child, conflict.expected_parent, conflict.stored_parent].into_iter().filter(|id| seen.insert(*id)).collect();
+    let encoded: Vec<_> = ids.iter().map(|id| id.get()).collect();
+    let rows = sqlx::query("SELECT id, hash FROM block_identifiers WHERE id = ANY($1::BIGINT[])")
+        .bind(encoded)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|error| TransactionAttemptError::database("VSPC path-conflict evidence load", error))?;
+    if rows.len() != ids.len() {
+        return Err(TransactionAttemptError::Storage(StorageError::invalid_metadata("VSPC path-conflict evidence is incomplete")));
+    }
+
+    let mut hashes = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let raw_id: i64 = row.try_get("id").map_err(|error| TransactionAttemptError::database("VSPC conflict ID decode", error))?;
+        let id = decode_id(raw_id, "VSPC path-conflict evidence")?;
+        let encoded_hash: Vec<u8> =
+            row.try_get("hash").map_err(|error| TransactionAttemptError::database("VSPC conflict hash decode", error))?;
+        let hash = decode_hash(&encoded_hash, "VSPC path-conflict evidence")?;
+        hashes.insert(id, hash);
+    }
+
+    let resolve = |id: CompactId| {
+        hashes.get(&id).copied().ok_or_else(|| {
+            TransactionAttemptError::Storage(StorageError::invalid_metadata("VSPC path-conflict evidence is incomplete"))
+        })
+    };
+    Ok(VspcPathConflict {
+        child: resolve(conflict.child)?,
+        expected_parent: resolve(conflict.expected_parent)?,
+        stored_parent: resolve(conflict.stored_parent)?,
+    })
 }
 
 async fn load_merge_sets(
@@ -514,7 +527,7 @@ mod tests {
         testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner},
     };
 
-    use super::{CommitBehavior, seed_members_from_cache};
+    use super::{CommitBehavior, VspcPathConflictIds, resolve_path_conflict, seed_members_from_cache};
     use crate::{
         cache::{CachedMaterializedBlock, ProcessingCaches},
         database::{LockedDatabase, PreparedDatabase, open_processing_generation},
@@ -547,41 +560,19 @@ mod tests {
     }
 
     #[test]
-    fn member_cache_seeding_requires_every_component_and_batches_all_incomplete_members() {
+    fn member_cache_seeding_requires_only_materialized_block_metadata() {
         let caches = ProcessingCaches::new();
         let complete = id(1);
-        let missing_hash = id(2);
-        let missing_block = id(3);
-        let missing_parent_hash = id(4);
+        let missing = id(2);
+        let block =
+            CachedMaterializedBlock { coordinate: BlockCoordinate::new(1, 0).expect("coordinate"), selected_parent_id: id(11) };
 
-        caches.publish_reverse_hash(complete, hash(1));
-        caches.publish_materialized_block(
-            complete,
-            CachedMaterializedBlock { coordinate: BlockCoordinate::new(1, 0).expect("coordinate"), selected_parent_id: id(11) },
-        );
-        caches.publish_reverse_hash(id(11), hash(11));
-
-        caches.publish_materialized_block(
-            missing_hash,
-            CachedMaterializedBlock { coordinate: BlockCoordinate::new(2, 0).expect("coordinate"), selected_parent_id: id(12) },
-        );
-        caches.publish_reverse_hash(id(12), hash(12));
-
-        caches.publish_reverse_hash(missing_block, hash(3));
-
-        caches.publish_reverse_hash(missing_parent_hash, hash(4));
-        caches.publish_materialized_block(
-            missing_parent_hash,
-            CachedMaterializedBlock { coordinate: BlockCoordinate::new(4, 0).expect("coordinate"), selected_parent_id: id(14) },
-        );
-
-        let (members, misses) = seed_members_from_cache(&caches, &[complete, missing_hash, missing_block, missing_parent_hash]);
+        caches.publish_materialized_block(complete, block);
+        let (members, misses) = seed_members_from_cache(&caches, &[complete, missing]);
 
         assert_eq!(members.len(), 1);
-        assert_eq!(members[&complete].hash, hash(1));
-        assert_eq!(members[&complete].selected_parent, hash(11));
-        assert_eq!(members[&complete].level, 1);
-        assert_eq!(misses, [missing_hash, missing_block, missing_parent_hash]);
+        assert_eq!(members[&complete], block);
+        assert_eq!(misses, [missing]);
     }
 
     fn point(block: (BlockHash, CompactId)) -> VspcPoint {
@@ -845,9 +836,6 @@ mod tests {
         assert_eq!(block_state(&mut database, graph.red_member.1).await.0, BlockColor::Red as i16);
         assert!(client.has_cached_merge_sets(graph.new_parent.1));
         assert!(client.has_cached_merge_sets(graph.new_sink.1));
-        assert_eq!(client.cached_hash(graph.old_sink.1), Some(graph.old_sink.0));
-        assert_eq!(client.cached_hash(graph.new_sink.1), Some(graph.new_sink.0));
-        assert_eq!(client.cached_hash(graph.common.1), Some(graph.common.0));
         assert_eq!(
             client.cached_materialized_block(graph.new_sink.1),
             Some(CachedMaterializedBlock {
@@ -952,8 +940,24 @@ mod tests {
         assert!(!block_state(&mut database, graph.new_parent.1).await.1);
         assert!(!block_state(&mut database, graph.new_sink.1).await.1);
         assert_eq!(client.cached_vspc_sink(), None);
-        assert_eq!(client.cached_hash(graph.new_parent.1), None);
         assert_eq!(client.cached_materialized_block(graph.new_parent.1), None);
+    }
+
+    #[tokio::test]
+    async fn incomplete_path_conflict_evidence_is_invalid_metadata() {
+        let (_container, database_url) = fixture().await;
+        let (mut database, client, _retirements) = processing_client(&database_url).await;
+        let graph = install_graph(&mut database).await;
+        let mut transaction = client.pool().begin().await.expect("evidence transaction");
+
+        let result = resolve_path_conflict(
+            &mut transaction,
+            VspcPathConflictIds { child: graph.old_sink.1, expected_parent: id(i64::MAX), stored_parent: graph.old_parent.1 },
+        )
+        .await;
+
+        assert!(matches!(result, Err(crate::transaction::TransactionAttemptError::Storage(StorageError::InvalidMetadata { .. }))));
+        transaction.rollback().await.expect("evidence rollback");
     }
 
     #[tokio::test]
@@ -1003,7 +1007,6 @@ mod tests {
         assert!(!client.is_valid());
         assert!(!client.has_cached_merge_sets(graph.new_parent.1));
         assert!(!client.has_cached_merge_sets(graph.new_sink.1));
-        assert_eq!(client.cached_hash(graph.new_parent.1), None);
         assert_eq!(client.cached_materialized_block(graph.new_parent.1), None);
         assert_eq!(client.cached_vspc_sink(), None);
         assert!(!block_state(&mut database, graph.old_sink.1).await.1);
