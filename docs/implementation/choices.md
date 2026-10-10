@@ -441,7 +441,7 @@ controlled sleeps, and identity jitter. PostgreSQL container tests
 terminate the actual advisory-lock backend to verify exact retirement,
 suppression of initial or replacement publication until ownership is
 reacquired, and autonomous republication. The
-Rebuild replacement gate and API database-phase drain remain part of the later
+Rebuild replacement gate and API database read-lease drain remain part of the later
 database-replacement-safety implementation rather than this general connection
 lifecycle slice.
 
@@ -514,3 +514,26 @@ ID/color `UNNEST` update. This preserves the settled last-write result across
 cross-color overlap and repeated added positions without one SQL statement per
 member. Update and return all distinct affected level states through one
 transaction-local CTE, so the committed outcome requires no post-commit read.
+
+## 10 October 2026: API database replacement gate
+
+### Read leases and replacement-attempt fencing
+
+Implement the concrete synchronization mechanism deferred for the
+[storage-owned replacement gate](../architecture/storage.md#api-read-exclusion-during-database-replacement--settled)
+as one private `ApiReplacementGate` shared by every API generation opened by a
+StorageService instance. Represent the architecture's API database phase in
+code with an RAII `ApiDbReadLease`; the lease name distinguishes the concrete
+synchronization object from a lifecycle phase. The gate keeps a short
+standard-library mutex around its admission state and active-lease registry.
+Each lease owns a watch-based cancellation receiver, removes its unique entry
+synchronously on drop, and wakes replacement drainers.
+
+Fence each close-and-replace attempt with a monotonic in-memory epoch carried
+by its exclusive token. Reopening admission requires both the current epoch
+and an empty active-lease registry, preventing a cancelled or timed-out older
+attempt from reopening a newer replacement. A separate Tokio watch revision
+is only a wakeup mechanism for gated readers and drainers; it carries no
+generation or replacement identity. API-generation retirement is serialized
+against lease acquisition by a generation-local standard-library mutex and
+wakes gated acquisition through a validity watch channel.

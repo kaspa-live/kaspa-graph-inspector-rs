@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     sync::{
-        Arc, Weak,
+        Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -14,13 +14,14 @@ use kgi_model::{
 };
 use sqlx::PgPool;
 
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::{
     cache::{CachedVspcSink, ProcessingCaches},
     error::StorageError,
     identity,
     operation::ResolveMaterializedIdsError,
+    replacement::{ApiDbReadLease, ApiReplacementGate},
     runtime::{RetirementRequest, RetirementSender, RetirementTarget},
     state::ProcessingStateInspection,
 };
@@ -286,6 +287,9 @@ impl std::fmt::Debug for ValidatedDbClient {
 /// Read-only API database capability bound to one validated pool generation.
 pub struct ValidatedApiDbClient {
     runtime: GenerationRuntime<Self>,
+    replacement_gate: Arc<ApiReplacementGate>,
+    admission: StdMutex<()>,
+    validity: watch::Sender<bool>,
 }
 
 impl GenerationKind for ValidatedApiDbClient {
@@ -295,8 +299,14 @@ impl GenerationKind for ValidatedApiDbClient {
 }
 
 impl ValidatedApiDbClient {
-    pub(crate) fn new(pool: PgPool, retirement_tx: RetirementSender) -> Arc<Self> {
-        Arc::new_cyclic(|self_weak| Self { runtime: GenerationRuntime::new(pool, retirement_tx, self_weak.clone()) })
+    pub(crate) fn new(pool: PgPool, retirement_tx: RetirementSender, replacement_gate: Arc<ApiReplacementGate>) -> Arc<Self> {
+        let (validity, _) = watch::channel(true);
+        Arc::new_cyclic(|self_weak| Self {
+            runtime: GenerationRuntime::new(pool, retirement_tx, self_weak.clone()),
+            replacement_gate,
+            admission: StdMutex::new(()),
+            validity,
+        })
     }
 
     /// Reports whether StorageService still considers this exact generation usable.
@@ -312,7 +322,40 @@ impl ValidatedApiDbClient {
 
     #[allow(dead_code, reason = "used by the permanent service lifecycle")]
     pub(crate) fn retire(&self) -> bool {
-        self.runtime.retire()
+        let _admission = self.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let retired = self.runtime.retire();
+        if retired {
+            self.validity.send_replace(false);
+        }
+        retired
+    }
+
+    #[allow(dead_code, reason = "used by API projection operations in the persistence increment")]
+    pub(crate) async fn acquire_read_lease(&self) -> Result<ApiDbReadLease, StorageError> {
+        let mut gate_changed = self.replacement_gate.subscribe();
+        let mut validity = self.validity.subscribe();
+        loop {
+            {
+                let _admission = self.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !self.runtime.is_valid() {
+                    return Err(StorageError::GenerationLost);
+                }
+                if let Some(lease) = self.replacement_gate.try_acquire_lease()? {
+                    return Ok(lease);
+                }
+            }
+            tokio::select! {
+                result = gate_changed.changed() => {
+                    result.map_err(|_| StorageError::replacement_control("API replacement notification path closed"))?;
+                }
+                result = validity.changed() => {
+                    result.map_err(|_| StorageError::replacement_control("API generation validity path closed"))?;
+                    if !*validity.borrow() {
+                        return Err(StorageError::GenerationLost);
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn begin_close(&self) {
@@ -343,21 +386,51 @@ mod tests {
     };
 
     use kaspa_consensus_core::network::{NetworkId, NetworkType};
+    use kgi_core::timing::Timing;
     use kgi_model::{
         block::{BlockCoordinate, BlockHash, CompactId},
         lifecycle::PersistenceFault,
     };
     use sqlx::postgres::PgPoolOptions;
 
-    use super::{DatabaseBinding, ValidatedDbClient};
+    use super::{DatabaseBinding, ValidatedApiDbClient, ValidatedDbClient};
     use crate::{
         cache::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, CachedVspcSink},
         error::StorageError,
+        replacement::ApiReplacementGate,
         runtime::{RetirementTarget, retirement_channel},
     };
 
     fn hash(byte: u8) -> BlockHash {
         BlockHash::from_bytes([byte; 32])
+    }
+
+    #[tokio::test]
+    async fn api_read_lease_waits_behind_replacement_and_retirement_wakes_the_waiter() {
+        let pool =
+            PgPoolOptions::new().connect_lazy("postgresql://postgres@localhost/kgi").expect("lazy PostgreSQL pool configuration");
+        let (retirement_tx, _retirements) = retirement_channel();
+        let gate = ApiReplacementGate::new();
+        let client = ValidatedApiDbClient::new(pool, retirement_tx, gate.clone());
+        let attempt = gate.begin_replacement().expect("replacement closes admission");
+        let exclusive =
+            attempt.acquire_exclusive(&Timing::production()).await.expect("empty active set establishes replacement exclusion");
+
+        let waiting_client = client.clone();
+        let mut waiting = tokio::spawn(async move { waiting_client.acquire_read_lease().await });
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting).await.is_err());
+        exclusive.open().expect("replacement completion opens admission");
+        assert!(waiting.await.expect("admission task completes").is_ok());
+
+        let attempt = gate.begin_replacement().expect("next replacement closes admission");
+        let exclusive =
+            attempt.acquire_exclusive(&Timing::production()).await.expect("released lease establishes replacement exclusion");
+        let waiting_client = client.clone();
+        let waiting = tokio::spawn(async move { waiting_client.acquire_read_lease().await });
+        tokio::task::yield_now().await;
+        assert!(client.retire());
+        assert!(matches!(waiting.await.expect("retired waiter completes"), Err(StorageError::GenerationLost)));
+        exclusive.open().expect("test restores gate admission");
     }
 
     #[tokio::test]

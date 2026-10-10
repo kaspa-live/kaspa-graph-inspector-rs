@@ -23,6 +23,7 @@ use crate::{
     },
     error::{StorageError, StorageRejection},
     generation::{DatabaseBinding, ValidatedApiDbClient, ValidatedDbClient},
+    replacement::ApiReplacementGate,
     runtime::{RetirementReceiver, RetirementRequest, RetirementSender, RetirementTarget, retirement_channel},
     state::DatabaseState,
 };
@@ -94,6 +95,7 @@ impl StorageService {
         let (retirement_tx, retirement_rx) = retirement_channel();
         let (status_tx, status_rx) = watch::channel(StorageServiceStatus { state: StorageServiceStatusState::Connecting });
         let (completion_tx, completion_rx) = watch::channel(None);
+        let replacement_gate = ApiReplacementGate::new();
         #[cfg(test)]
         let retained_cleanup_tasks = Arc::new(AtomicUsize::new(0));
         #[cfg(test)]
@@ -108,6 +110,7 @@ impl StorageService {
             retirement_tx,
             status: status_tx,
             generation_opener,
+            replacement_gate,
             cleanup: JoinSet::new(),
             #[cfg(test)]
             retained_cleanup_tasks: retained_cleanup_tasks.clone(),
@@ -218,8 +221,9 @@ trait GenerationOpener: Send + Sync {
         database_url: String,
         state: DatabaseState,
         retirement_tx: RetirementSender,
+        replacement_gate: Arc<ApiReplacementGate>,
     ) -> Result<Option<ValidatedGenerations>, StorageError> {
-        open_validated_generations(database_url, state, retirement_tx).await
+        open_validated_generations(database_url, state, retirement_tx, replacement_gate).await
     }
 
     async fn open_processing(
@@ -235,8 +239,9 @@ trait GenerationOpener: Send + Sync {
         &self,
         database_url: String,
         retirement_tx: RetirementSender,
+        replacement_gate: Arc<ApiReplacementGate>,
     ) -> Result<Arc<ValidatedApiDbClient>, StorageError> {
-        open_api_generation(database_url, retirement_tx).await
+        open_api_generation(database_url, retirement_tx, replacement_gate).await
     }
 }
 
@@ -255,6 +260,7 @@ struct StorageServiceWorker {
     retirement_tx: RetirementSender,
     status: watch::Sender<StorageServiceStatus>,
     generation_opener: Arc<dyn GenerationOpener>,
+    replacement_gate: Arc<ApiReplacementGate>,
     cleanup: JoinSet<()>,
     #[cfg(test)]
     retained_cleanup_tasks: Arc<AtomicUsize>,
@@ -365,7 +371,7 @@ impl StorageServiceWorker {
 
             let generations = match self
                 .generation_opener
-                .open_initial(self.database_url.as_str().to_owned(), state, self.retirement_tx.clone())
+                .open_initial(self.database_url.as_str().to_owned(), state, self.retirement_tx.clone(), self.replacement_gate.clone())
                 .await
             {
                 Ok(Some(generations)) => generations,
@@ -485,7 +491,8 @@ impl StorageServiceWorker {
                 let database_url = self.database_url.as_str().to_owned();
                 let generation_opener = self.generation_opener.clone();
                 let retirement_tx = self.retirement_tx.clone();
-                let opening = async move { generation_opener.open_api(database_url, retirement_tx).await };
+                let replacement_gate = self.replacement_gate.clone();
+                let opening = async move { generation_opener.open_api(database_url, retirement_tx, replacement_gate).await };
                 tokio::pin!(opening);
                 let health = wait_for_lock_health(self.timing.clone());
                 tokio::pin!(health);
@@ -967,6 +974,7 @@ mod tests {
         database::{DatabaseConnector, LockedDatabase, ValidatedGenerations, open_api_generation, open_validated_generations},
         error::{StorageError, StorageRejection},
         generation::{ValidatedApiDbClient, ValidatedDbClient},
+        replacement::ApiReplacementGate,
         runtime::RetirementSender,
         state::DatabaseState,
     };
@@ -1782,12 +1790,13 @@ mod tests {
             database_url: String,
             state: DatabaseState,
             retirement_tx: RetirementSender,
+            replacement_gate: Arc<ApiReplacementGate>,
         ) -> Result<Option<ValidatedGenerations>, StorageError> {
             if self.attempts.fetch_add(1, Ordering::Relaxed) == 0 {
                 self.initial_open_started.send(()).expect("initial-open observer");
                 self.initial_open_permit.acquire().await.expect("initial-open gate").forget();
             }
-            open_validated_generations(database_url, state, retirement_tx).await
+            open_validated_generations(database_url, state, retirement_tx, replacement_gate).await
         }
     }
 
@@ -1797,10 +1806,11 @@ mod tests {
             &self,
             database_url: String,
             retirement_tx: RetirementSender,
+            replacement_gate: Arc<ApiReplacementGate>,
         ) -> Result<Arc<ValidatedApiDbClient>, StorageError> {
             self.api_open_started.send(()).expect("API-open observer");
             self.api_open_permit.acquire().await.expect("API-open gate").forget();
-            open_api_generation(database_url, retirement_tx).await
+            open_api_generation(database_url, retirement_tx, replacement_gate).await
         }
     }
 

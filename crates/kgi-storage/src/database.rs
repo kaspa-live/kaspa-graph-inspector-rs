@@ -11,6 +11,7 @@ use sqlx::{Connection, PgConnection, Postgres, Transaction, postgres::PgPoolOpti
 use crate::{
     error::{StorageError, StorageRejection},
     generation::{DatabaseBinding, ValidatedApiDbClient, ValidatedDbClient},
+    replacement::ApiReplacementGate,
     runtime::RetirementSender,
     schema,
     state::{DatabaseState, ProcessingStateInspection},
@@ -218,6 +219,7 @@ pub(crate) async fn open_validated_generations(
     database_url: String,
     state: DatabaseState,
     retirement_tx: RetirementSender,
+    replacement_gate: Arc<ApiReplacementGate>,
 ) -> Result<Option<ValidatedGenerations>, StorageError> {
     let (binding, coherent) = match state {
         DatabaseState::Uninitialized => return Ok(None),
@@ -228,7 +230,7 @@ pub(crate) async fn open_validated_generations(
     let processing = open_processing_generation(database_url.clone(), binding, retirement_tx.clone()).await?;
 
     let api = if coherent {
-        match open_api_generation(database_url, retirement_tx).await {
+        match open_api_generation(database_url, retirement_tx, replacement_gate).await {
             Ok(api) => Some(api),
             Err(error) => {
                 processing.retire();
@@ -263,6 +265,7 @@ pub(crate) async fn open_processing_generation(
 pub(crate) async fn open_api_generation(
     database_url: String,
     retirement_tx: RetirementSender,
+    replacement_gate: Arc<ApiReplacementGate>,
 ) -> Result<Arc<ValidatedApiDbClient>, StorageError> {
     let pool = PgPoolOptions::new()
         .max_connections(API_POOL_SIZE)
@@ -279,7 +282,7 @@ pub(crate) async fn open_api_generation(
         pool.close().await;
         return Err(error);
     }
-    Ok(ValidatedApiDbClient::new(pool, retirement_tx))
+    Ok(ValidatedApiDbClient::new(pool, retirement_tx, replacement_gate))
 }
 
 async fn validate_processing_pool(pool: &sqlx::PgPool) -> Result<(), StorageError> {
@@ -342,6 +345,7 @@ mod tests {
         error::{StorageError, StorageRejection},
         generation::StoredSessionState,
         migration,
+        replacement::ApiReplacementGate,
         runtime::retirement_channel,
         state::DatabaseState,
     };
@@ -472,14 +476,14 @@ mod tests {
         let (mut database, uninitialized) = prepared_database(&database_url).await;
         let (retirement_tx, _retirement_rx) = retirement_channel();
         assert!(
-            open_validated_generations(database_url.clone(), uninitialized, retirement_tx.clone())
+            open_validated_generations(database_url.clone(), uninitialized, retirement_tx.clone(), ApiReplacementGate::new(),)
                 .await
                 .expect("uninitialized capability classification")
                 .is_none()
         );
         let state = database.initialize_if_uninitialized(mainnet(), hash(6), None).await.expect("initialization");
 
-        let generations = open_validated_generations(database_url.clone(), state, retirement_tx)
+        let generations = open_validated_generations(database_url.clone(), state, retirement_tx, ApiReplacementGate::new())
             .await
             .expect("validated generation creation")
             .expect("initialized database must publish generations");
@@ -541,7 +545,7 @@ mod tests {
         let state = database.classify().await.expect("inconsistent classification");
         let (retirement_tx, _retirement_rx) = retirement_channel();
 
-        let generations = open_validated_generations(database_url.clone(), state, retirement_tx)
+        let generations = open_validated_generations(database_url.clone(), state, retirement_tx, ApiReplacementGate::new())
             .await
             .expect("validated generation creation")
             .expect("bound inconsistent database must publish processing generation");
@@ -764,7 +768,7 @@ mod tests {
         assert!(matches!(initialized, DatabaseState::Initialized(_)));
 
         let (retirement_tx, _retirement_rx) = retirement_channel();
-        let generations = open_validated_generations(database_url.clone(), initialized, retirement_tx)
+        let generations = open_validated_generations(database_url.clone(), initialized, retirement_tx, ApiReplacementGate::new())
             .await
             .expect("validated generation creation")
             .expect("initialized database must publish generations");

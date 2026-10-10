@@ -9,6 +9,18 @@ use thiserror::Error;
 
 use crate::operation::VspcPathConflict;
 
+/// Failure while establishing the database-replacement preconditions.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RebuildSetupFault {
+    /// The fresh read-only API generation could not be prepared.
+    #[error("fresh API database generation preparation failed")]
+    ApiGenerationPreparation,
+
+    /// Existing API database phases could not be cancelled and drained.
+    #[error("API database phases could not be excluded")]
+    ApiReadExclusion,
+}
+
 /// Permanent reason a PostgreSQL database cannot be used by KGI.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum StorageRejection {
@@ -82,6 +94,14 @@ pub enum StorageError {
     #[error("VSPC selected-parent path is discontinuous at {0:?}")]
     VspcPathDiscontinuity(VspcPathConflict),
 
+    /// Rebuild could not establish its API database replacement preconditions.
+    #[error("database rebuild setup failed: {0}")]
+    RebuildSetupFailed(RebuildSetupFault),
+
+    /// StorageService's replacement-control primitive became unusable.
+    #[error("database replacement control is unavailable: {diagnostic}")]
+    ReplacementControlUnavailable { diagnostic: Arc<str> },
+
     /// The database is permanently incompatible with this process.
     #[error(transparent)]
     Rejected(#[from] StorageRejection),
@@ -118,6 +138,10 @@ impl StorageError {
     #[allow(dead_code, reason = "used by the private bootstrap lifecycle")]
     pub(crate) fn invalid_metadata(diagnostic: impl Into<Arc<str>>) -> Self {
         Self::InvalidMetadata { diagnostic: diagnostic.into() }
+    }
+
+    pub(crate) fn replacement_control(diagnostic: impl Into<Arc<str>>) -> Self {
+        Self::ReplacementControlUnavailable { diagnostic: diagnostic.into() }
     }
 
     pub(crate) const fn is_connection_lost(&self) -> bool {
