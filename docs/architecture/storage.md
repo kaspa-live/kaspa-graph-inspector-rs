@@ -200,6 +200,10 @@ operation-completion barrier is required.
 
 ### API read exclusion during database replacement — settled
 
+```text
+API_REPLACEMENT_DRAIN_TIMEOUT = 30 seconds
+```
+
 ```rust
 enum RebuildSetupFault {
     ApiGenerationPreparation,
@@ -252,12 +256,16 @@ published, while remaining behind the closed gate. StorageService cancels and
 boundedly drains every active database phase admitted before closure,
 regardless of whether the client generation that admitted it is still current
 or has already been retired. It acquires the exclusive replacement permit only
-after all such leases have been released. Absence of a current API generation
-does not skip this procedure and does not preclude `ApiReadExclusion`; the drain
-is immediately complete only when the service-owned active-phase set is empty.
-A request that detached its projection before closure may finish returning
-that old coherent image. Every other affected old-generation request reports
-database-backed read unavailability; the
+after all such leases have been released. From the cancellation request,
+StorageService allows at most `API_REPLACEMENT_DRAIN_TIMEOUT` for those leases
+to release and exclusive replacement ownership to be established. Expiry
+returns `StorageError::RebuildSetupFailed(ApiReadExclusion)`. Absence of a
+current API generation does not skip this procedure and does not preclude
+`ApiReadExclusion`; the drain is immediately complete only when the
+service-owned active-phase set is empty. A request that detached its projection
+before closure may finish returning that old coherent image. Every other
+affected old-generation request reports database-backed read unavailability;
+the
 [API protocol](api-protocol.md#anchored-graph-windows--settled) owns its HTTP
 mapping. An API read cannot delay replacement without bound.
 

@@ -1739,9 +1739,10 @@ generation remains, and begin Rebuild before that phase releases its
 service-owned shared lease. Verify Rebuild emits no second retirement event,
 publishes gated `G2`, cancels and boundedly drains the admitted `G1` phase, and
 cannot acquire exclusive replacement access until its lease is released. Make
-that drain fail and require `RebuildSetupFailed(ApiReadExclusion)` plus
-retirement of `G2`; absence of a current generation must not make the drain
-vacuous.
+the lease release before `API_REPLACEMENT_DRAIN_TIMEOUT` and verify replacement
+continues. Hold it through that timeout and require
+`RebuildSetupFailed(ApiReadExclusion)` plus retirement of `G2`; absence of a
+current generation must not make the drain vacuous.
 Verify a detached old projection may complete delivery while
 an undetached request returns 503, public reads reopen only after the
 replacement completes `Prewarming` and becomes `Active`, and
