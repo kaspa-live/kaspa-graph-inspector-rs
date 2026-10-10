@@ -519,7 +519,7 @@ transaction-local CTE, so the committed outcome requires no post-commit read.
 
 ### Read leases and replacement-attempt fencing
 
-Implement the concrete synchronization mechanism deferred for the
+Use this concrete synchronization mechanism for the
 [storage-owned replacement gate](../architecture/storage.md#api-read-exclusion-during-database-replacement--settled)
 as one private `ApiReplacementGate` shared by every API generation opened by a
 StorageService instance. Represent the architecture's API database phase in

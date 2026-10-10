@@ -231,13 +231,13 @@ transaction, connection, and permit have been released. Serialization,
 compression, and response delivery occur outside this permit and cannot issue
 follow-up database reads.
 
-The replacement gate and its active-phase set are owned by StorageService and
-outlive individual `ValidatedApiDbClient` generations. Every API generation
+The replacement gate and its active-lease registry are owned by StorageService
+and outlive individual `ValidatedApiDbClient` generations. Every API generation
 holds only a shared reference to that same gate. Retiring a generation prevents
 new database phases through it but does not remove a lease already held by an
 admitted operation. Dropping a client reference neither resets the gate nor
 removes such a lease. The gate retains no history of retired generations; it
-retains only currently active database-phase leases and their cancellation
+retains only currently active database-read leases and their cancellation
 paths until those leases are released.
 
 Before `rebuild_from_pruning_point` clears or replaces processing data,
@@ -262,10 +262,10 @@ to release and exclusive replacement ownership to be established. Expiry
 returns `StorageError::RebuildSetupFailed(ApiReadExclusion)`. Absence of a
 current API generation does not skip this procedure and does not preclude
 `ApiReadExclusion`; the drain is immediately complete only when the
-service-owned active-phase set is empty. A request that detached its projection
-before closure may finish returning that old coherent image. Every other
-affected old-generation request reports database-backed read unavailability;
-the
+service-owned active-lease registry is empty. A request that detached its
+projection before closure may finish returning that old coherent image. Every
+other affected old-generation request reports database-backed read
+unavailability; the
 [API protocol](api-protocol.md#anchored-graph-windows--settled) owns its HTTP
 mapping. An API read cannot delay replacement without bound.
 
@@ -324,8 +324,9 @@ image, or an unavailable read outcome, never mixed or partially rebuilt
 tables. See PostgreSQL's
 [`TRUNCATE`](https://www.postgresql.org/docs/current/sql-truncate.html) and
 [MVCC caveat](https://www.postgresql.org/docs/current/mvcc-caveats.html)
-documentation. Concrete permit, cancellation, and transaction primitives are
-deferred in the [decision register](../decisions/deferred.md).
+documentation. Concrete PostgreSQL clearing and transaction-locking primitives
+beyond this service-owned exclusion gate remain deferred in the
+[decision register](../decisions/deferred.md).
 
 ### Transaction retries
 

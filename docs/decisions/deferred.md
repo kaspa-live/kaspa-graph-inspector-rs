@@ -18,8 +18,8 @@ become durable project constraints.
    exact storage lock types remain an implementation choice.
 5. Exact gzip compression quality for the settled graph delivery contract in
    the [API protocol](../architecture/api-protocol.md#graph-http-compression--settled).
-6. Detailed shared/exclusive permit, historical-read cancellation, and
-   transaction mechanism for StorageService's database-replacement gate. Safe
+6. Detailed PostgreSQL clearing and transaction-locking primitives beyond
+   StorageService's settled database-replacement exclusion gate. Safe
    transaction locking is one candidate; another mechanism is acceptable when
    it preserves the storage-owned exclusion contract.
 7. Exact metrics export and labels, tracing, operational endpoints, file-log

@@ -27,12 +27,13 @@ struct GateState {
 /// StorageService-owned admission and cancellation registry for API database read leases.
 pub(crate) struct ApiReplacementGate {
     state: Mutex<GateState>,
-    changed: watch::Sender<u64>,
+    // Wakeup revision only; lease identity and replacement ownership use separate values.
+    change_revision: watch::Sender<u64>,
 }
 
 impl ApiReplacementGate {
     pub(crate) fn new() -> Arc<Self> {
-        let (changed, _) = watch::channel(0);
+        let (change_revision, _) = watch::channel(0);
         Arc::new(Self {
             state: Mutex::new(GateState {
                 admission: Admission::Open,
@@ -40,12 +41,12 @@ impl ApiReplacementGate {
                 next_lease_id: 1,
                 active_leases: HashMap::new(),
             }),
-            changed,
+            change_revision,
         })
     }
 
-    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
-        self.changed.subscribe()
+    pub(crate) fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.change_revision.subscribe()
     }
 
     pub(crate) fn try_acquire_lease(self: &Arc<Self>) -> Result<Option<ApiDbReadLease>, StorageError> {
@@ -53,14 +54,14 @@ impl ApiReplacementGate {
         if matches!(state.admission, Admission::Closed { .. }) {
             return Ok(None);
         }
-        let id = state.next_lease_id;
+        let lease_id = state.next_lease_id;
         state.next_lease_id = state
             .next_lease_id
             .checked_add(1)
             .ok_or_else(|| StorageError::replacement_control("API database read-lease identifier overflow"))?;
         let (cancellation, cancellation_rx) = watch::channel(false);
-        state.active_leases.insert(id, cancellation);
-        Ok(Some(ApiDbReadLease { gate: self.clone(), id, cancellation: cancellation_rx }))
+        state.active_leases.insert(lease_id, cancellation);
+        Ok(Some(ApiDbReadLease { gate: self.clone(), lease_id, cancellation: cancellation_rx }))
     }
 
     pub(crate) fn begin_replacement(self: &Arc<Self>) -> Result<ApiReplacementAttempt, StorageError> {
@@ -73,20 +74,20 @@ impl ApiReplacementGate {
             cancellation.send_replace(true);
         }
         drop(state);
-        self.notify_change();
+        self.announce_change();
         Ok(ApiReplacementAttempt { gate: self.clone(), epoch })
     }
 
-    fn release(&self, id: u64) {
-        let removed = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).active_leases.remove(&id);
+    fn release(&self, lease_id: u64) {
+        let removed = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).active_leases.remove(&lease_id);
         if removed.is_some() {
-            self.notify_change();
+            self.announce_change();
         }
     }
 
-    fn notify_change(&self) {
-        let revision = self.changed.borrow().wrapping_add(1);
-        self.changed.send_replace(revision);
+    fn announce_change(&self) {
+        let revision = self.change_revision.borrow().wrapping_add(1);
+        self.change_revision.send_replace(revision);
     }
 
     fn active_is_empty(&self, epoch: u64) -> Result<bool, StorageError> {
@@ -104,7 +105,7 @@ impl ApiReplacementGate {
         }
         state.admission = Admission::Open;
         drop(state);
-        self.notify_change();
+        self.announce_change();
         Ok(())
     }
 
@@ -117,7 +118,7 @@ impl ApiReplacementGate {
 /// One admitted API database read lease, released synchronously on drop.
 pub(crate) struct ApiDbReadLease {
     gate: Arc<ApiReplacementGate>,
-    id: u64,
+    lease_id: u64,
     cancellation: watch::Receiver<bool>,
 }
 
@@ -137,7 +138,7 @@ impl ApiDbReadLease {
 
 impl Drop for ApiDbReadLease {
     fn drop(&mut self) {
-        self.gate.release(self.id);
+        self.gate.release(self.lease_id);
     }
 }
 
@@ -149,7 +150,7 @@ pub(crate) struct ApiReplacementAttempt {
 
 impl ApiReplacementAttempt {
     pub(crate) async fn acquire_exclusive(&self, timing: &Timing) -> Result<ApiReplacementExclusive, StorageError> {
-        let mut changed = self.gate.subscribe();
+        let mut changes = self.gate.subscribe_changes();
         let timeout = timing.sleep(API_REPLACEMENT_DRAIN_TIMEOUT);
         tokio::pin!(timeout);
         loop {
@@ -158,7 +159,7 @@ impl ApiReplacementAttempt {
             }
             tokio::select! {
                 () = &mut timeout => return Err(StorageError::RebuildSetupFailed(RebuildSetupFault::ApiReadExclusion)),
-                result = changed.changed() => {
+                result = changes.changed() => {
                     result.map_err(|_| StorageError::replacement_control("API replacement notification path closed"))?;
                 }
             }

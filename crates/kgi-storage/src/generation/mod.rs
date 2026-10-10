@@ -332,7 +332,7 @@ impl ValidatedApiDbClient {
 
     #[allow(dead_code, reason = "used by API projection operations in the persistence increment")]
     pub(crate) async fn acquire_read_lease(&self) -> Result<ApiDbReadLease, StorageError> {
-        let mut gate_changed = self.replacement_gate.subscribe();
+        let mut gate_changes = self.replacement_gate.subscribe_changes();
         let mut validity = self.validity.subscribe();
         loop {
             {
@@ -345,7 +345,7 @@ impl ValidatedApiDbClient {
                 }
             }
             tokio::select! {
-                result = gate_changed.changed() => {
+                result = gate_changes.changed() => {
                     result.map_err(|_| StorageError::replacement_control("API replacement notification path closed"))?;
                 }
                 result = validity.changed() => {
