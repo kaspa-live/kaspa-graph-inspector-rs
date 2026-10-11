@@ -324,9 +324,7 @@ image, or an unavailable read outcome, never mixed or partially rebuilt
 tables. See PostgreSQL's
 [`TRUNCATE`](https://www.postgresql.org/docs/current/sql-truncate.html) and
 [MVCC caveat](https://www.postgresql.org/docs/current/mvcc-caveats.html)
-documentation. Concrete PostgreSQL clearing and transaction-locking primitives
-beyond this service-owned exclusion gate remain deferred in the
-[decision register](../decisions/deferred.md).
+documentation.
 
 ### Transaction retries
 
