@@ -487,9 +487,10 @@ when seeding its resolved-identity map. Collect all incomplete values into one
 transaction-local batch query. Cache publication need not republish complete
 hits.
 Intern the remaining absent identities in one `BYTEA[]` statement using
-`WITH ORDINALITY`; the insertion source and returned rows follow the universal
-first-occurrence order. Insert direct-parent rows in one parallel-array
-`UNNEST` statement; boundary identities use their persisted `(0,0)` sentinel.
+`WITH ORDINALITY`; the insertion source and returned rows follow the
+storage-owned first-occurrence order. Insert direct-parent rows in one
+parallel-array `UNNEST` statement; boundary identities use their persisted
+`(0,0)` sentinel.
 
 ### VSPC transaction execution
 

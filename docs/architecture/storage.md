@@ -800,6 +800,15 @@ The shared-value contract also guarantees that the incoming block's own hash
 is absent from every relationship vector; Storage relies on that guarantee and
 does not perform another own-reference check.
 
+The reference-first interning order guarantees only that every distinct
+relationship hash is allocated before the incoming block's own hash. Because
+cross-vector overlap is valid, the selected parent can first occur in the
+insertion sequence while interning a merge set or while interning direct
+parents. No storage operation may infer that the selected parent has the
+greatest reference ID, immediately precedes the block's ID, or has any other
+arithmetic relation to it. Persisted `selected_parent_id` and canonical
+direct-parent relations are the authorities for those relationships.
+
 There is no persistent `materialized` flag. In a processing-valid database
 generation, a `blocks` row is the persistent representation of the semantic
 Materialized state because PP bootstrap and every later insertion establish
@@ -1017,17 +1026,24 @@ One database transaction performs the complete replacement:
 1. Clear `parents`, `blocks`, `levels`, `block_identifiers`, and the previous
    `ProcessingMetadata` within the same transaction.
 2. Restart Compact-ID allocation.
-3. Intern pruning-point hashes in the universal order:
+3. Intern pruning-point hashes in the storage order:
 
    ```text
    red merge-set hashes
    blue merge-set hashes
    direct-parent hashes
-   selected-parent hash
    pruning-point hash
    ```
 
-   Deduplicate hashes by first occurrence before insertion.
+   Deduplicate reference hashes by first occurrence through the first three
+   groups, then append the pruning point's own hash unconditionally. For an
+   ordinary non-Genesis pruning point, do not add a separate selected-parent
+   group: the shared `ValidatedNodeBlock` contract guarantees that its selected
+   parent already occurs in canonical `direct_parents`, and an earlier
+   cross-vector occurrence may already have interned the same hash. For exact
+   Genesis, the three relationship groups are empty; intern synthetic ORIGIN
+   explicitly before the Genesis hash so the block row retains its required
+   non-null selected-parent identity.
 4. Represent every retained-boundary-external pruning-point reference as a
    permanent `BoundaryIdentity`. Do not create placeholder `blocks` rows for
    parents, merge-set members, or other references.
@@ -1061,10 +1077,10 @@ committed VSPC sink  = pruning point
 levels(1).size       = 1
 ```
 
-For a Genesis pruning point, the bootstrap path stores synthetic ORIGIN as the
-non-null selected-parent identity while storing zero actual direct parents.
-ORIGIN is not a direct parent. Genesis never enters the ordinary BlockProcessor
-or `PersistedBlock` delivery path.
+For a Genesis pruning point, the bootstrap path stores the explicitly interned
+synthetic ORIGIN as the non-null selected-parent identity while storing zero
+actual direct parents. ORIGIN is not a direct parent. Genesis never enters the
+ordinary BlockProcessor or `PersistedBlock` delivery path.
 
 ### Return value
 
@@ -1251,11 +1267,13 @@ For every materialization, intern hashes in this order:
 1. red merge-set hashes;
 2. blue merge-set hashes;
 3. direct-parent hashes;
-4. selected-parent hash; and
-5. the block's own hash.
+4. the block's own hash.
 
-Deduplicate reference hashes by first occurrence through the first four groups,
-then append the block's own hash unconditionally. The
+Deduplicate reference hashes by first occurrence through the first three
+groups, then append the block's own hash unconditionally. Do not add a separate
+selected-parent group: every ordinary block's selected parent already occurs in
+its canonical `direct_parents`, and cross-vector first occurrence remains
+authoritative for identity allocation. The
 [`ValidatedNodeBlock`](domain-model.md#shared-value-types--settled) contract
 guarantees that it did not occur among those references. Validate the
 database-relative conditions atomically:

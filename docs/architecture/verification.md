@@ -347,11 +347,13 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
 1. Rebuild materializes PP at `(level = 1, slot = 0)`; retained anticone roots
    and nonroots follow the parent-derived placement rule; boundary identities
    never become block rows.
-2. Genesis and any PP whose selected parent is ORIGIN retain a non-null ORIGIN
-   identity without inventing a direct parent. Web Genesis detection uses the
-   actual absence of direct parents rather than visible-edge absence.
-3. Hash interning follows the universal five-stage order. Strict
-   materialization creates no boundary identity.
+2. Exact Genesis retains a non-null ORIGIN identity without inventing a direct
+   parent. Web Genesis detection uses the actual absence of direct parents
+   rather than visible-edge absence.
+3. Hash interning follows the storage-owned reference-first order without a
+   separate selected-parent stage. Exact Genesis explicitly interns synthetic
+   ORIGIN before its own hash. Strict materialization creates no boundary
+   identity.
 4. Database startup distinguishes Uninitialized, Empty, Initialized,
    boundedly detected Inconsistent processing contents, and rejected schemas.
    Persistent initialization authorization is idempotent for a compatible
@@ -489,10 +491,14 @@ creates one row and one `ParentCommitted` per relation, computes the
 selected-parent index in that sequence, and produces no repeated coordinate or
 level contribution. Supply canonical blue and red merge-set vectors with a
 cross-color overlap and verify Storage preserves both ordered arrays without
-another normalization step. Rebuild consumes the same canonical shared value.
+another normalization step. Cover a selected parent first encountered in a
+merge-set group and one first encountered among direct parents; neither case may
+depend on the selected parent's numeric ID position. Rebuild consumes the same
+canonical shared value.
 Verify materialization relies on the shared own-hash exclusion, deduplicates
-only the reference prefix of its interning order, and appends the incoming
-block hash directly. Cover committed initial color and VSPC membership.
+only the reference prefix of its interning order, does not append the selected
+parent as a separate interning stage, and appends the incoming block hash
+directly. Cover committed initial color and VSPC membership.
 Inserted outcomes and their
 BlockProcessor offers preserve increasing IDs while permitting allocation
 gaps; `AlreadyMaterialized` returns no graph-update payload.
