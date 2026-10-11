@@ -614,7 +614,10 @@ impl StorageServiceWorker {
                         if let Some(exit) = self.handle_rebuild(request, database, active).await? {
                             return Ok(exit);
                         }
-                        break;
+                        if active.processing.is_none() || (active.api_required && active.api.is_none()) {
+                            break;
+                        }
+                        health.set(wait_for_lock_health(self.timing.clone()));
                     }
                 }
             }
@@ -2956,6 +2959,27 @@ mod tests {
         }
     }
 
+    async fn latest_live_sleep_after_quiescence(sleeps: &mut mpsc::UnboundedReceiver<SleepRequest>) -> SleepRequest {
+        let mut latest = None;
+        loop {
+            match timeout(Duration::from_millis(50), sleeps.recv()).await {
+                Ok(Some(request)) => {
+                    if !request.completion.is_closed() {
+                        latest = Some(request);
+                    }
+                }
+                Ok(None) => panic!("manual clock path closed"),
+                Err(_) => {
+                    if let Some(request) = latest.take()
+                        && !request.completion.is_closed()
+                    {
+                        return request;
+                    }
+                }
+            }
+        }
+    }
+
     async fn assert_terminal_migration_rejection(database_url: Url, expected_diagnostic: &str) {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let connector =
@@ -3053,6 +3077,95 @@ mod tests {
 
         service.shutdown().await.expect("shutdown must cancel retry wait");
         assert_eq!(service.status().state, StorageServiceStatusState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn successful_rebuild_preserves_ready_retry_reset_deadline() {
+        exercise_rebuild_ready_retry_reset(RebuildReadyOutcome::Success).await;
+    }
+
+    #[tokio::test]
+    async fn definite_rebuild_failure_preserves_ready_retry_reset_deadline() {
+        exercise_rebuild_ready_retry_reset(RebuildReadyOutcome::DefiniteFailure).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum RebuildReadyOutcome {
+        Success,
+        DefiniteFailure,
+    }
+
+    async fn exercise_rebuild_ready_retry_reset(outcome: RebuildReadyOutcome) {
+        let (_container, database_url) = fixture().await;
+        let connector = Arc::new(IntermittentConnector { attempts: AtomicUsize::new(0) });
+        let (sleep_tx, mut sleeps) = mpsc::unbounded_channel();
+        let clock = Arc::new(ManualClock { sleeps: sleep_tx });
+        let (service, mut events) =
+            StorageService::start_with_dependencies(database_url.clone(), connector, Timing::new(clock, Arc::new(IdentityJitter)));
+
+        let first_retry = timeout(TEST_TIMEOUT, sleeps.recv()).await.expect("first retry timer").expect("clock path");
+        assert_eq!(first_retry.duration, Duration::from_secs(1));
+        first_retry.completion.send(()).expect("advance first retry");
+        wait_for_status(&service, StorageServiceStatusState::AwaitingInitialization).await;
+        service.initialize_if_uninitialized(mainnet(), hash(1)).await.expect("database initialization");
+        let processing = match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbPublished(client) => client,
+            event => panic!("expected processing publication, got {event:?}"),
+        };
+        let api = match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbPublished(client) => client,
+            event => panic!("expected API publication, got {event:?}"),
+        };
+        wait_for_status(&service, StorageServiceStatusState::Ready).await;
+        let (ready_health, ready_reset) = ready_timers(&mut sleeps).await;
+
+        let lease = api.acquire_read_lease().await.expect("old API lease");
+        if matches!(outcome, RebuildReadyOutcome::DefiniteFailure) {
+            processing.inject_rebuild_commit_behavior(crate::generation::rebuild::CommitBehavior::RollbackThenFail);
+        }
+        let rebuild_client = processing.clone();
+        let rebuild = tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(genesis_pruning_point()).await });
+        assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
+        let fresh = match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbPublished(client) => client,
+            event => panic!("expected gated API publication, got {event:?}"),
+        };
+
+        ready_reset.completion.send(()).expect("cross Ready-reset boundary during Rebuild");
+        drop(ready_health);
+        drop(lease);
+        match outcome {
+            RebuildReadyOutcome::Success => {
+                rebuild.await.expect("Rebuild task").expect("successful Rebuild");
+            }
+            RebuildReadyOutcome::DefiniteFailure => {
+                assert!(
+                    matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &fresh))
+                );
+                assert_eq!(rebuild.await.expect("Rebuild task"), Err(StorageError::Persistence(PersistenceFault::DefiniteFailure)));
+            }
+        }
+        assert_eq!(service.status().state, StorageServiceStatusState::Ready);
+
+        let health = latest_live_sleep_after_quiescence(&mut sleeps).await;
+        assert_eq!(health.duration, LOCK_HEALTH_INTERVAL);
+        let mut observer = PgConnection::connect(database_url.as_str()).await.expect("lock observer");
+        terminate_lock_owner(&mut observer).await;
+        health.completion.send(()).expect("run post-Rebuild lock-health check");
+        match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &processing)),
+            event => panic!("expected processing retirement after lock loss, got {event:?}"),
+        }
+        if matches!(outcome, RebuildReadyOutcome::Success) {
+            match next_event(&mut events).await {
+                StorageServiceEvent::ApiDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &fresh)),
+                event => panic!("expected rebuilt API retirement after lock loss, got {event:?}"),
+            }
+        }
+        let retry = latest_live_sleep_after_quiescence(&mut sleeps).await;
+        assert_eq!(retry.duration, Duration::from_secs(1), "continuous Ready interval must reset retry progression");
+
+        service.shutdown().await.expect("shutdown must cancel post-Rebuild retry");
     }
 
     #[tokio::test]
