@@ -9,10 +9,14 @@ use kgi_model::{
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
-use super::{ValidatedDbClient, interning};
+use super::{
+    ValidatedDbClient,
+    block_rows::{self, BlockRow, ParentRow},
+    interning,
+};
 use crate::{
     cache::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, ProcessingCacheDomains},
-    database::{NO_VSPC_DAA_SCORE, daa_score_to_sql, timestamp_to_sql},
+    database::{NO_VSPC_DAA_SCORE, daa_score_to_sql},
     error::StorageError,
     operation::{MaterializeBlockError, MaterializeBlockOutcome, ReferencePolicy},
     transaction::{self, TransactionAttemptError},
@@ -280,64 +284,28 @@ async fn attempt(
     let own = identities.get_mut(&prepared.hash).expect("the incoming block identity was interned");
     own.block = Some(CachedMaterializedBlock { coordinate, selected_parent_id });
     let own_id = own.id;
-    let blue_ids: Vec<i64> = prepared
-        .blue_merge_set
-        .iter()
-        .map(|hash| identities.get(hash).expect("blue merge-set identity was resolved").id.get())
-        .collect();
-    let red_ids: Vec<i64> = prepared
-        .red_merge_set
-        .iter()
-        .map(|hash| identities.get(hash).expect("red merge-set identity was resolved").id.get())
-        .collect();
-    sqlx::query(
-        "INSERT INTO blocks (
-             id, timestamp, daa_score, level, slot, selected_parent_id,
-             color, is_in_vspc, blue_merge_set, red_merge_set
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, $8, $9)",
+    let blue_ids: Vec<CompactId> =
+        prepared.blue_merge_set.iter().map(|hash| identities.get(hash).expect("blue merge-set identity was resolved").id).collect();
+    let red_ids: Vec<CompactId> =
+        prepared.red_merge_set.iter().map(|hash| identities.get(hash).expect("red merge-set identity was resolved").id).collect();
+    let parent_rows: Vec<_> =
+        direct_parents.iter().map(|(_, parent)| ParentRow { id: parent.id, coordinate: parent.coordinate() }).collect();
+    block_rows::insert_block_and_parents(
+        &mut transaction,
+        BlockRow {
+            id: own_id,
+            timestamp: prepared.timestamp,
+            daa_score,
+            coordinate,
+            selected_parent_id,
+            color: BlockColor::Gray,
+            is_in_vspc: false,
+            blue_merge_set: &blue_ids,
+            red_merge_set: &red_ids,
+        },
+        &parent_rows,
     )
-    .bind(own_id.get())
-    .bind(timestamp_to_sql(prepared.timestamp))
-    .bind(daa_score)
-    .bind(raw_level)
-    .bind(raw_slot)
-    .bind(selected_parent_id.get())
-    .bind(BlockColor::Gray as i16)
-    .bind(&blue_ids)
-    .bind(&red_ids)
-    .execute(&mut *transaction)
-    .await
-    .map_err(|error| TransactionAttemptError::database("block materialization", error))?;
-
-    let mut parent_ids = Vec::with_capacity(direct_parents.len());
-    let mut parent_levels = Vec::with_capacity(direct_parents.len());
-    let mut parent_slots = Vec::with_capacity(direct_parents.len());
-    for (_, parent) in &direct_parents {
-        parent_ids.push(parent.id.get());
-        parent_levels.push(
-            parent.coordinate().map_or(0, |coordinate| i64::try_from(coordinate.level()).expect("stored parent level fits BIGINT")),
-        );
-        parent_slots.push(
-            parent.coordinate().map_or(0, |coordinate| i64::try_from(coordinate.slot()).expect("stored parent slot fits BIGINT")),
-        );
-    }
-    sqlx::query(
-        "INSERT INTO parents (
-             child_id, parent_id, child_level, child_slot, parent_level, parent_slot
-         )
-         SELECT $1, relation.parent_id, $2, $3, relation.parent_level, relation.parent_slot
-         FROM UNNEST($4::BIGINT[], $5::BIGINT[], $6::BIGINT[])
-             AS relation(parent_id, parent_level, parent_slot)",
-    )
-    .bind(own_id.get())
-    .bind(raw_level)
-    .bind(raw_slot)
-    .bind(&parent_ids)
-    .bind(&parent_levels)
-    .bind(&parent_slots)
-    .execute(&mut *transaction)
-    .await
-    .map_err(|error| TransactionAttemptError::database("direct-parent materialization", error))?;
+    .await?;
 
     let level_snapshots = load_level_snapshots(
         &mut transaction,
@@ -372,13 +340,7 @@ async fn attempt(
             .iter()
             .map(|hash| (*hash, *identities.get(hash).expect("every universal identity was resolved")))
             .collect(),
-        merge_sets: Some((
-            own_id,
-            CachedMergeSets {
-                blue: blue_ids.iter().map(|id| CompactId::new(*id).expect("resolved blue merge-set IDs are positive")).collect(),
-                red: red_ids.iter().map(|id| CompactId::new(*id).expect("resolved red merge-set IDs are positive")).collect(),
-            },
-        )),
+        merge_sets: Some((own_id, CachedMergeSets { blue: blue_ids.into(), red: red_ids.into() })),
     })
 }
 

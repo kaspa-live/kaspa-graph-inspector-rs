@@ -480,8 +480,10 @@ lane; hold its guard through the complete transaction, any retry delay, definite
 commit, and cache publication. This preserves sequential allocation without
 serializing the separately owned VSPC mutation lane.
 
-Keep SQL and committed-payload construction in the private `materialization`
-module and reusable retry classification in the private `transaction` module.
+Keep materialization-specific SQL and committed-payload construction in the
+private `materialization` module, shared block and direct-parent row insertion
+in the private `generation::block_rows` module, and reusable retry
+classification in the private `transaction` module.
 Each materialization attempt applies the storage-owned cache-completeness rule
 when seeding its resolved-identity map. Collect all incomplete values into one
 transaction-local batch query. Cache publication need not republish complete

@@ -5,10 +5,14 @@ use kgi_model::block::{
 };
 use sqlx::{Postgres, Transaction};
 
-use super::{ValidatedDbClient, interning};
+use super::{
+    ValidatedDbClient,
+    block_rows::{self, BlockRow, ParentRow},
+    interning,
+};
 use crate::{
     cache::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, CachedVspcSink, ProcessingCacheDomains},
-    database::{blue_score_to_sql, daa_score_to_sql, timestamp_to_sql},
+    database::{blue_score_to_sql, daa_score_to_sql},
     error::StorageError,
     transaction::{self, TransactionAttemptError},
 };
@@ -116,37 +120,25 @@ async fn attempt(
     let blue_ids = ids(&identities, &prepared.block.blue_merge_set)?;
     let red_ids = ids(&identities, &prepared.block.red_merge_set)?;
 
-    sqlx::query(
-        "INSERT INTO blocks (
-             id, timestamp, daa_score, level, slot, selected_parent_id,
-             color, is_in_vspc, blue_merge_set, red_merge_set
-         ) VALUES ($1, $2, $3, 1, 0, $4, $5, TRUE, $6, $7)",
-    )
-    .bind(own_id.get())
-    .bind(timestamp_to_sql(prepared.block.timestamp))
-    .bind(prepared.daa_score)
-    .bind(selected_parent_id.get())
-    .bind(BlockColor::Gray as i16)
-    .bind(blue_ids.iter().map(|id| id.get()).collect::<Vec<_>>())
-    .bind(red_ids.iter().map(|id| id.get()).collect::<Vec<_>>())
-    .execute(&mut *transaction)
-    .await
-    .map_err(|error| TransactionAttemptError::database("Rebuild pruning-point materialization", error))?;
-
     let parent_ids = ids(&identities, &prepared.block.direct_parents)?;
-    let parent_ids: Vec<_> = parent_ids.iter().map(|id| id.get()).collect();
-    sqlx::query(
-        "INSERT INTO parents (
-             child_id, parent_id, child_level, child_slot, parent_level, parent_slot
-         )
-         SELECT $1, parent_id, 1, 0, 0, 0
-         FROM UNNEST($2::BIGINT[]) AS parent(parent_id)",
+    let coordinate = BlockCoordinate::new(1, 0).expect("Rebuild pruning point uses level one");
+    let parent_rows: Vec<_> = parent_ids.iter().map(|id| ParentRow { id: *id, coordinate: None }).collect();
+    block_rows::insert_block_and_parents(
+        &mut transaction,
+        BlockRow {
+            id: own_id,
+            timestamp: prepared.block.timestamp,
+            daa_score: prepared.daa_score,
+            coordinate,
+            selected_parent_id,
+            color: BlockColor::Gray,
+            is_in_vspc: true,
+            blue_merge_set: &blue_ids,
+            red_merge_set: &red_ids,
+        },
+        &parent_rows,
     )
-    .bind(own_id.get())
-    .bind(parent_ids)
-    .execute(&mut *transaction)
-    .await
-    .map_err(|error| TransactionAttemptError::database("Rebuild direct-parent materialization", error))?;
+    .await?;
 
     sqlx::query("INSERT INTO levels (level, size, daa_score) VALUES (1, 1, $1)")
         .bind(prepared.daa_score)
@@ -175,7 +167,6 @@ async fn attempt(
         .await
         .map_err(|error| TransactionAttemptError::commit("Rebuild transaction commit", error))?;
 
-    let coordinate = BlockCoordinate::new(1, 0).expect("Rebuild pruning point uses level one");
     let caches = ProcessingCacheDomains::new();
     for (hash, id) in &identities {
         caches.publish_identity(*hash, CachedIdentity { id: *id, materialized: *hash == prepared.block.hash });

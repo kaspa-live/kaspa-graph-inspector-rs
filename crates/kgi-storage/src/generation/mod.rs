@@ -29,6 +29,7 @@ use crate::{
 #[cfg(test)]
 use crate::cache::CachedMaterializedBlock;
 
+mod block_rows;
 mod interning;
 mod materialization;
 pub(crate) mod rebuild;
