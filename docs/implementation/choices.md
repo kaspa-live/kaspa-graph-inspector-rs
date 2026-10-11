@@ -440,10 +440,9 @@ connection results, gated initial and replacement opening, individually
 controlled sleeps, and identity jitter. PostgreSQL container tests
 terminate the actual advisory-lock backend to verify exact retirement,
 suppression of initial or replacement publication until ownership is
-reacquired, and autonomous republication. The
-Rebuild replacement gate and API database read-lease drain remain part of the later
-database-replacement-safety implementation rather than this general connection
-lifecycle slice.
+reacquired, and autonomous republication. The Rebuild replacement gate and API
+database read-lease drain are recorded in the later implementation entries
+below rather than this general connection lifecycle slice.
 
 Map connection-class failures specifically at a persistent-mutation COMMIT
 boundary to the shared `Persistence(AmbiguousCommit)` value; ordinary SQLx
@@ -566,3 +565,25 @@ explicit, resets compact-ID allocation in the same transaction, and avoids a
 retained-graph delete scan. Its table locks rely on the storage-owned API
 replacement gate, processing mutation guard, and process advisory lock rather
 than an additional explicit table-lock statement.
+
+### Rebuild lifecycle wiring
+
+Carry rebuild requests from `ValidatedDbClient` to the permanent
+StorageService worker through a private unbounded exact-generation channel.
+The request owns the normalized pruning-point value and a result-bearing
+one-shot completion path. This keeps API-generation lifecycle changes and gate
+tokens inside their existing worker owner while leaving the SQL transaction in
+the private `generation::rebuild` module beside the other processing
+transactions.
+
+Prepare the identity insertion order once, intern it with one ordinal batch,
+and derive all block, parent, merge-set, anchor, and cache values from that
+single returned ID map. The worker continues polling its advisory-lock health,
+shutdown command, retirement requests, and cleanup tasks while API pool
+creation and lease draining are pending. It starts the replacement-exclusive
+future when admission closes and polls it concurrently with fresh API pool
+creation, so the drain timeout is measured from the cancellation request rather
+than from later publication. Once the transaction begins, it runs to a definite
+or ambiguous database outcome even if lifecycle retirement is selected
+concurrently; the worker then applies the exact outcome to the already selected
+lifecycle disposition.

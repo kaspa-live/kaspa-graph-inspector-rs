@@ -9,7 +9,7 @@ use std::{
 use kaspa_consensus_core::network::NetworkId;
 use kgi_core::timing::Timing;
 use kgi_model::{
-    block::{BlockHash, BlockPresence, CompactId},
+    block::{BlockHash, BlockPresence, CompactId, MaterializedSyncAnchor, ValidatedNodeBlock},
     lifecycle::PersistenceFault,
 };
 use sqlx::PgPool;
@@ -22,7 +22,7 @@ use crate::{
     identity,
     operation::ResolveMaterializedIdsError,
     replacement::{ApiDbReadLease, ApiReplacementGate},
-    runtime::{RetirementRequest, RetirementSender, RetirementTarget},
+    runtime::{RebuildRequest, RebuildSender, RetirementRequest, RetirementSender, RetirementTarget},
     state::ProcessingStateInspection,
 };
 
@@ -30,6 +30,7 @@ use crate::{
 use crate::cache::CachedMaterializedBlock;
 
 mod materialization;
+pub(crate) mod rebuild;
 mod vspc;
 
 /// Immutable network binding of one database generation.
@@ -139,10 +140,13 @@ pub struct ValidatedDbClient {
     materialization_lane: Mutex<()>,
     vspc_lane: Mutex<()>,
     transaction_timing: Timing,
+    rebuild_tx: RebuildSender,
     #[cfg(test)]
     materialization_commit_behavior: std::sync::Mutex<Option<materialization::CommitBehavior>>,
     #[cfg(test)]
     vspc_commit_behavior: std::sync::Mutex<Option<vspc::CommitBehavior>>,
+    #[cfg(test)]
+    rebuild_commit_behavior: std::sync::Mutex<Option<rebuild::CommitBehavior>>,
 }
 
 impl GenerationKind for ValidatedDbClient {
@@ -152,14 +156,26 @@ impl GenerationKind for ValidatedDbClient {
 }
 
 impl ValidatedDbClient {
+    #[cfg(test)]
     pub(crate) fn new(pool: PgPool, binding: DatabaseBinding, retirement_tx: RetirementSender) -> Arc<Self> {
-        Self::new_with_transaction_timing(pool, binding, retirement_tx, Timing::production())
+        let (rebuild_tx, _rebuild_rx) = crate::runtime::rebuild_channel();
+        Self::new_managed(pool, binding, retirement_tx, rebuild_tx)
+    }
+
+    pub(crate) fn new_managed(
+        pool: PgPool,
+        binding: DatabaseBinding,
+        retirement_tx: RetirementSender,
+        rebuild_tx: RebuildSender,
+    ) -> Arc<Self> {
+        Self::new_with_transaction_timing(pool, binding, retirement_tx, rebuild_tx, Timing::production())
     }
 
     fn new_with_transaction_timing(
         pool: PgPool,
         binding: DatabaseBinding,
         retirement_tx: RetirementSender,
+        rebuild_tx: RebuildSender,
         transaction_timing: Timing,
     ) -> Arc<Self> {
         Arc::new_cyclic(|self_weak| Self {
@@ -170,10 +186,13 @@ impl ValidatedDbClient {
             materialization_lane: Mutex::new(()),
             vspc_lane: Mutex::new(()),
             transaction_timing,
+            rebuild_tx,
             #[cfg(test)]
             materialization_commit_behavior: std::sync::Mutex::new(None),
             #[cfg(test)]
             vspc_commit_behavior: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            rebuild_commit_behavior: std::sync::Mutex::new(None),
         })
     }
 
@@ -209,6 +228,19 @@ impl ValidatedDbClient {
                 Err(ResolveMaterializedIdsError::NonMaterialized { missing, identity_only })
             }
         }
+    }
+
+    /// Atomically replaces all processing data with one validated pruning-point anchor.
+    pub async fn rebuild_from_pruning_point(&self, pruning_point: ValidatedNodeBlock) -> Result<MaterializedSyncAnchor, StorageError> {
+        rebuild::validate_input(&pruning_point)?;
+        if !self.is_valid() {
+            return Err(StorageError::GenerationLost);
+        }
+        let (completion, acknowledgement) = oneshot::channel();
+        self.rebuild_tx
+            .send(RebuildRequest::new(self.runtime.self_weak.clone(), pruning_point, completion))
+            .map_err(|_| StorageError::ControlUnavailable)?;
+        acknowledgement.await.map_err(|_| StorageError::ControlUnavailable)?
     }
 
     #[allow(dead_code, reason = "used by processing operations in the persistence increment")]

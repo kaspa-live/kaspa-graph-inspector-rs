@@ -1,0 +1,281 @@
+use std::collections::{HashMap, HashSet};
+
+use kgi_model::block::{
+    BlockColor, BlockCoordinate, BlockHash, CompactId, ConsensusOrder, MaterializedSyncAnchor, ValidatedNodeBlock, VspcPoint,
+};
+use sqlx::{Postgres, Row, Transaction};
+
+use super::ValidatedDbClient;
+use crate::{
+    cache::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, CachedVspcSink, ProcessingCacheDomains},
+    database::{blue_score_to_sql, daa_score_to_sql, timestamp_to_sql},
+    error::StorageError,
+    transaction::{self, TransactionAttemptError},
+};
+
+struct PreparedRebuild {
+    block: ValidatedNodeBlock,
+    universal: Vec<BlockHash>,
+    daa_score: i64,
+    blue_score: i64,
+}
+
+struct RebuildCommit {
+    anchor: MaterializedSyncAnchor,
+    caches: ProcessingCacheDomains,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CommitBehavior {
+    Normal,
+    #[cfg(test)]
+    CommitThenLoseAcknowledgement,
+    #[cfg(test)]
+    RollbackThenFail,
+    #[cfg(test)]
+    RollbackThenLoseConnection,
+}
+
+impl PreparedRebuild {
+    fn new(block: ValidatedNodeBlock) -> Result<Self, StorageError> {
+        let daa_score = daa_score_to_sql(block.daa_score)?;
+        let blue_score = blue_score_to_sql(block.blue_score)?;
+        let mut seen = HashSet::new();
+        let mut universal = Vec::new();
+        for hash in block
+            .red_merge_set
+            .iter()
+            .chain(&block.blue_merge_set)
+            .chain(&block.direct_parents)
+            .chain(std::iter::once(&block.selected_parent))
+            .chain(std::iter::once(&block.hash))
+            .copied()
+        {
+            if seen.insert(hash) {
+                universal.push(hash);
+            }
+        }
+        Ok(Self { block, universal, daa_score, blue_score })
+    }
+}
+
+pub(super) fn validate_input(block: &ValidatedNodeBlock) -> Result<(), StorageError> {
+    daa_score_to_sql(block.daa_score)?;
+    blue_score_to_sql(block.blue_score)?;
+    Ok(())
+}
+
+impl ValidatedDbClient {
+    pub(crate) async fn perform_rebuild(&self, pruning_point: ValidatedNodeBlock) -> Result<MaterializedSyncAnchor, StorageError> {
+        let prepared = PreparedRebuild::new(pruning_point)?;
+        let commit_behavior = self.next_rebuild_commit_behavior();
+        let _mutation =
+            self.mutation_guard.try_write().expect("Rebuild requires completed processor deactivation and exclusive mutation access");
+        let committed = transaction::run(&self.transaction_timing, || attempt(self.runtime.pool(), &prepared, commit_behavior))
+            .await?
+            .expect("the Rebuild transaction has no semantic rollback outcome");
+        self.caches.replace(std::sync::Arc::new(committed.caches));
+        Ok(committed.anchor)
+    }
+
+    fn next_rebuild_commit_behavior(&self) -> CommitBehavior {
+        #[cfg(test)]
+        {
+            return self
+                .rebuild_commit_behavior
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .unwrap_or(CommitBehavior::Normal);
+        }
+        #[cfg(not(test))]
+        CommitBehavior::Normal
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_rebuild_commit_behavior(&self, behavior: CommitBehavior) {
+        *self.rebuild_commit_behavior.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(behavior);
+    }
+}
+
+async fn attempt(
+    pool: &sqlx::PgPool,
+    prepared: &PreparedRebuild,
+    commit_behavior: CommitBehavior,
+) -> Result<RebuildCommit, TransactionAttemptError<std::convert::Infallible>> {
+    let mut transaction = pool.begin().await.map_err(|error| TransactionAttemptError::database("Rebuild transaction start", error))?;
+
+    sqlx::query(
+        "TRUNCATE parents, blocks, levels, block_identifiers, processing_metadata
+         RESTART IDENTITY RESTRICT",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| TransactionAttemptError::database("Rebuild processing-data clear", error))?;
+
+    let identities = intern_identities(&mut transaction, &prepared.universal).await?;
+    let own_id = identity(&identities, prepared.block.hash)?;
+    let selected_parent_id = identity(&identities, prepared.block.selected_parent)?;
+    let blue_ids = ids(&identities, &prepared.block.blue_merge_set)?;
+    let red_ids = ids(&identities, &prepared.block.red_merge_set)?;
+
+    sqlx::query(
+        "INSERT INTO blocks (
+             id, timestamp, daa_score, level, slot, selected_parent_id,
+             color, is_in_vspc, blue_merge_set, red_merge_set
+         ) VALUES ($1, $2, $3, 1, 0, $4, $5, TRUE, $6, $7)",
+    )
+    .bind(own_id.get())
+    .bind(timestamp_to_sql(prepared.block.timestamp))
+    .bind(prepared.daa_score)
+    .bind(selected_parent_id.get())
+    .bind(BlockColor::Gray as i16)
+    .bind(blue_ids.iter().map(|id| id.get()).collect::<Vec<_>>())
+    .bind(red_ids.iter().map(|id| id.get()).collect::<Vec<_>>())
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| TransactionAttemptError::database("Rebuild pruning-point materialization", error))?;
+
+    let parent_ids = ids(&identities, &prepared.block.direct_parents)?;
+    let parent_ids: Vec<_> = parent_ids.iter().map(|id| id.get()).collect();
+    sqlx::query(
+        "INSERT INTO parents (
+             child_id, parent_id, child_level, child_slot, parent_level, parent_slot
+         )
+         SELECT $1, parent_id, 1, 0, 0, 0
+         FROM UNNEST($2::BIGINT[]) AS parent(parent_id)",
+    )
+    .bind(own_id.get())
+    .bind(parent_ids)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| TransactionAttemptError::database("Rebuild direct-parent materialization", error))?;
+
+    sqlx::query("INSERT INTO levels (level, size, daa_score) VALUES (1, 1, $1)")
+        .bind(prepared.daa_score)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| TransactionAttemptError::database("Rebuild level initialization", error))?;
+    sqlx::query("INSERT INTO processing_metadata (singleton, db_pp_blue_score) VALUES (TRUE, $1)")
+        .bind(prepared.blue_score)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| TransactionAttemptError::database("Rebuild processing-metadata initialization", error))?;
+
+    #[cfg(test)]
+    if matches!(commit_behavior, CommitBehavior::RollbackThenLoseConnection) {
+        transaction
+            .rollback()
+            .await
+            .map_err(|error| TransactionAttemptError::database("Rebuild rollback before injected connection loss", error))?;
+        return Err(TransactionAttemptError::database(
+            "Rebuild transaction before commit",
+            sqlx::Error::Io(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "injected Rebuild pre-COMMIT connection loss")),
+        ));
+    }
+
+    commit(transaction, commit_behavior)
+        .await
+        .map_err(|error| TransactionAttemptError::commit("Rebuild transaction commit", error))?;
+
+    let coordinate = BlockCoordinate::new(1, 0).expect("Rebuild pruning point uses level one");
+    let caches = ProcessingCacheDomains::new();
+    for (hash, id) in &identities {
+        caches.publish_identity(*hash, CachedIdentity { id: *id, materialized: *hash == prepared.block.hash });
+    }
+    caches.publish_materialized_block(own_id, CachedMaterializedBlock { coordinate, selected_parent_id });
+    caches.publish_merge_sets(own_id, CachedMergeSets { blue: blue_ids.into(), red: red_ids.into() });
+    caches.publish_vspc_sink(CachedVspcSink { id: own_id, hash: prepared.block.hash });
+
+    Ok(RebuildCommit {
+        anchor: MaterializedSyncAnchor {
+            point: VspcPoint::new(ConsensusOrder::new(prepared.block.blue_work, prepared.block.hash), own_id),
+            selected_parent: prepared.block.selected_parent,
+            blue_score: prepared.block.blue_score,
+        },
+        caches,
+    })
+}
+
+async fn commit(transaction: Transaction<'_, Postgres>, behavior: CommitBehavior) -> Result<(), sqlx::Error> {
+    match behavior {
+        CommitBehavior::Normal => transaction.commit().await,
+        #[cfg(test)]
+        CommitBehavior::CommitThenLoseAcknowledgement => {
+            transaction.commit().await?;
+            Err(sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "injected Rebuild COMMIT acknowledgement loss",
+            )))
+        }
+        #[cfg(test)]
+        CommitBehavior::RollbackThenFail => {
+            transaction.rollback().await?;
+            Err(sqlx::Error::RowNotFound)
+        }
+        #[cfg(test)]
+        CommitBehavior::RollbackThenLoseConnection => unreachable!("handled before the COMMIT phase"),
+    }
+}
+
+async fn intern_identities(
+    transaction: &mut Transaction<'_, Postgres>,
+    hashes: &[BlockHash],
+) -> Result<HashMap<BlockHash, CompactId>, TransactionAttemptError<std::convert::Infallible>> {
+    let encoded: Vec<Vec<u8>> = hashes.iter().map(|hash| hash.as_bytes().to_vec()).collect();
+    let rows = sqlx::query(
+        "WITH input(hash, position) AS MATERIALIZED (
+             SELECT hash, position
+             FROM UNNEST($1::BYTEA[]) WITH ORDINALITY AS input(hash, position)
+         ),
+         inserted AS (
+             INSERT INTO block_identifiers (hash)
+             SELECT hash FROM input ORDER BY position
+             RETURNING id, hash
+         )
+         SELECT inserted.id, inserted.hash
+         FROM inserted
+         JOIN input USING (hash)
+         ORDER BY input.position",
+    )
+    .bind(encoded)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|error| TransactionAttemptError::database("Rebuild identity interning", error))?;
+    if rows.len() != hashes.len() {
+        return Err(TransactionAttemptError::Storage(StorageError::invalid_metadata(
+            "Rebuild identity interning returned an incomplete result",
+        )));
+    }
+    let mut identities = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let encoded_hash: Vec<u8> =
+            row.try_get("hash").map_err(|error| TransactionAttemptError::database("Rebuild identity hash decode", error))?;
+        let hash = BlockHash::try_from(encoded_hash.as_slice()).map_err(|error| {
+            TransactionAttemptError::Storage(StorageError::invalid_metadata(format!("invalid rebuilt block hash: {error}")))
+        })?;
+        let raw_id: i64 = row.try_get("id").map_err(|error| TransactionAttemptError::database("Rebuild identity ID decode", error))?;
+        let id = CompactId::new(raw_id).ok_or_else(|| {
+            TransactionAttemptError::Storage(StorageError::invalid_metadata(format!("rebuilt compact ID is not positive: {raw_id}")))
+        })?;
+        identities.insert(hash, id);
+    }
+    Ok(identities)
+}
+
+fn identity(
+    identities: &HashMap<BlockHash, CompactId>,
+    hash: BlockHash,
+) -> Result<CompactId, TransactionAttemptError<std::convert::Infallible>> {
+    identities
+        .get(&hash)
+        .copied()
+        .ok_or_else(|| TransactionAttemptError::Storage(StorageError::invalid_metadata("Rebuild reference identity was not interned")))
+}
+
+fn ids(
+    identities: &HashMap<BlockHash, CompactId>,
+    hashes: &[BlockHash],
+) -> Result<Vec<CompactId>, TransactionAttemptError<std::convert::Infallible>> {
+    hashes.iter().map(|hash| identity(identities, *hash)).collect()
+}

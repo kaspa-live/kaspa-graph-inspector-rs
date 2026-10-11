@@ -12,7 +12,7 @@ use crate::{
     error::{StorageError, StorageRejection},
     generation::{DatabaseBinding, ValidatedApiDbClient, ValidatedDbClient},
     replacement::ApiReplacementGate,
-    runtime::RetirementSender,
+    runtime::{RebuildSender, RetirementSender},
     schema,
     state::{DatabaseState, ProcessingStateInspection},
 };
@@ -33,17 +33,15 @@ impl ValidatedGenerations {
     }
 }
 
-#[allow(dead_code, reason = "used by persistence transactions in the next increment")]
 pub(crate) const fn timestamp_to_sql(timestamp: Timestamp) -> i64 {
     i64::from_ne_bytes(timestamp.to_ne_bytes())
 }
 
-#[allow(dead_code, reason = "used by persistence transactions in the next increment")]
+#[allow(dead_code, reason = "used by timestamp-bearing storage reads in the next persistence slice")]
 pub(crate) const fn timestamp_from_sql(timestamp: i64) -> Timestamp {
     u64::from_ne_bytes(timestamp.to_ne_bytes())
 }
 
-#[allow(dead_code, reason = "used by persistence transactions in the next increment")]
 pub(crate) fn daa_score_to_sql(score: u64) -> Result<i64, StorageError> {
     if score > MAX_DAA_SCORE {
         return Err(StorageError::ScoreOutOfRange(ScoreRangeFault::DaaScore));
@@ -51,7 +49,6 @@ pub(crate) fn daa_score_to_sql(score: u64) -> Result<i64, StorageError> {
     i64::try_from(score).map_err(|_| StorageError::ScoreOutOfRange(ScoreRangeFault::DaaScore))
 }
 
-#[allow(dead_code, reason = "used by persistence transactions in the next increment")]
 pub(crate) fn blue_score_to_sql(score: u64) -> Result<i64, StorageError> {
     if score > MAX_BLUE_SCORE {
         return Err(StorageError::ScoreOutOfRange(ScoreRangeFault::BlueScore));
@@ -215,10 +212,22 @@ async fn commit_initialization(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn open_validated_generations(
     database_url: String,
     state: DatabaseState,
     retirement_tx: RetirementSender,
+    replacement_gate: Arc<ApiReplacementGate>,
+) -> Result<Option<ValidatedGenerations>, StorageError> {
+    let (rebuild_tx, _rebuild_rx) = crate::runtime::rebuild_channel();
+    open_validated_generations_managed(database_url, state, retirement_tx, rebuild_tx, replacement_gate).await
+}
+
+pub(crate) async fn open_validated_generations_managed(
+    database_url: String,
+    state: DatabaseState,
+    retirement_tx: RetirementSender,
+    rebuild_tx: RebuildSender,
     replacement_gate: Arc<ApiReplacementGate>,
 ) -> Result<Option<ValidatedGenerations>, StorageError> {
     let (binding, coherent) = match state {
@@ -227,7 +236,7 @@ pub(crate) async fn open_validated_generations(
         DatabaseState::Inconsistent { binding } => (binding, false),
     };
 
-    let processing = open_processing_generation(database_url.clone(), binding, retirement_tx.clone()).await?;
+    let processing = open_processing_generation_managed(database_url.clone(), binding, retirement_tx.clone(), rebuild_tx).await?;
 
     let api = if coherent {
         match open_api_generation(database_url, retirement_tx, replacement_gate).await {
@@ -245,10 +254,21 @@ pub(crate) async fn open_validated_generations(
     Ok(Some(ValidatedGenerations { processing, api }))
 }
 
+#[cfg(test)]
 pub(crate) async fn open_processing_generation(
     database_url: String,
     binding: DatabaseBinding,
     retirement_tx: RetirementSender,
+) -> Result<Arc<ValidatedDbClient>, StorageError> {
+    let (rebuild_tx, _rebuild_rx) = crate::runtime::rebuild_channel();
+    open_processing_generation_managed(database_url, binding, retirement_tx, rebuild_tx).await
+}
+
+pub(crate) async fn open_processing_generation_managed(
+    database_url: String,
+    binding: DatabaseBinding,
+    retirement_tx: RetirementSender,
+    rebuild_tx: RebuildSender,
 ) -> Result<Arc<ValidatedDbClient>, StorageError> {
     let pool = PgPoolOptions::new()
         .max_connections(PROCESSING_POOL_SIZE)
@@ -259,7 +279,7 @@ pub(crate) async fn open_processing_generation(
         pool.close().await;
         return Err(error);
     }
-    Ok(ValidatedDbClient::new(pool, binding, retirement_tx))
+    Ok(ValidatedDbClient::new_managed(pool, binding, retirement_tx, rebuild_tx))
 }
 
 pub(crate) async fn open_api_generation(

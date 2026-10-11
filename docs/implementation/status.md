@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 8 October 2026.
+Updated 11 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -66,10 +66,21 @@ constraint rejection, initialization COMMIT acknowledgement loss with
 truth-based reconnect classification, and fatal event-path closure.
 The service-owned API replacement gate, generation-spanning read-lease
 registry, bounded drain/cancellation primitive, atomically swappable processing
-cache set, and shared processing mutation guard are implemented. Gated
-Rebuild-start API publication and the pruning-point replacement transaction
-remain for the database-replacement-safety increment. No open architecture
-requirement currently blocks that work.
+cache set, and shared processing mutation guard are implemented. The processing
+client now sends exact-generation rebuild requests to the permanent service
+worker. That worker owns gated API retirement and publication, lease draining,
+advisory-lock rechecks, and outcome-specific generation disposition. The
+pruning-point replacement transaction performs the settled ordered identity
+interning and complete processing-data replacement, constructs the sync anchor,
+and atomically swaps the fully seeded cache set only after definite commit.
+PostgreSQL integration tests cover non-Genesis and exact-Genesis replacement,
+preflight score rejection, an old-generation lease delaying mutation, definite
+rollback, setup preparation failure, drain timeout, setup cancellation,
+an already retired generation retaining a live lease, replacement-control loss
+before and after fresh API publication, pre-commit connection loss with
+rolled-back truth, and ambiguous commit with truth-derived processing
+republication. No open architecture requirement currently blocks the remaining
+storage work.
 
 The imported browser still uses the v1 graph data source, models, and update
 behavior, so it is not yet compatible with the v2 HTTP, SSE, publication, and

@@ -12,7 +12,6 @@ mod database;
 mod identity;
 #[allow(dead_code, reason = "used through the database bootstrap lifecycle")]
 mod migration;
-#[allow(dead_code, reason = "replacement control is consumed by the pending rebuild transaction")]
 mod replacement;
 mod runtime;
 #[allow(dead_code, reason = "used through the database bootstrap lifecycle")]

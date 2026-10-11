@@ -107,8 +107,7 @@ impl ProcessingCaches {
         self.current.load_full()
     }
 
-    #[cfg(test)]
-    fn replace(&self, replacement: Arc<ProcessingCacheDomains>) -> Arc<ProcessingCacheDomains> {
+    pub(crate) fn replace(&self, replacement: Arc<ProcessingCacheDomains>) -> Arc<ProcessingCacheDomains> {
         self.current.swap(replacement)
     }
 }

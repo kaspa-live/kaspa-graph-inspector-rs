@@ -19,6 +19,7 @@ enum Admission {
 
 struct GateState {
     admission: Admission,
+    control_available: bool,
     next_epoch: u64,
     next_lease_id: u64,
     active_leases: HashMap<u64, watch::Sender<bool>>,
@@ -37,6 +38,7 @@ impl ApiReplacementGate {
         Arc::new(Self {
             state: Mutex::new(GateState {
                 admission: Admission::Open,
+                control_available: true,
                 next_epoch: 1,
                 next_lease_id: 1,
                 active_leases: HashMap::new(),
@@ -51,6 +53,7 @@ impl ApiReplacementGate {
 
     pub(crate) fn try_acquire_lease(self: &Arc<Self>) -> Result<Option<ApiDbReadLease>, StorageError> {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        ensure_control_available(&state)?;
         if matches!(state.admission, Admission::Closed { .. }) {
             return Ok(None);
         }
@@ -66,6 +69,7 @@ impl ApiReplacementGate {
 
     pub(crate) fn begin_replacement(self: &Arc<Self>) -> Result<ApiReplacementAttempt, StorageError> {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        ensure_control_available(&state)?;
         let epoch = state.next_epoch;
         state.next_epoch =
             state.next_epoch.checked_add(1).ok_or_else(|| StorageError::replacement_control("API replacement epoch overflow"))?;
@@ -92,14 +96,18 @@ impl ApiReplacementGate {
 
     fn active_is_empty(&self, epoch: u64) -> Result<bool, StorageError> {
         let state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.admission != (Admission::Closed { epoch }) {
-            return Err(StorageError::replacement_control("stale API replacement attempt"));
-        }
+        ensure_current_attempt(&state, epoch)?;
         Ok(state.active_leases.is_empty())
+    }
+
+    fn ensure_current(&self, epoch: u64) -> Result<(), StorageError> {
+        let state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        ensure_current_attempt(&state, epoch)
     }
 
     fn open(&self, epoch: u64) -> Result<(), StorageError> {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        ensure_control_available(&state)?;
         if state.admission != (Admission::Closed { epoch }) || !state.active_leases.is_empty() {
             return Err(StorageError::replacement_control("API replacement attempt cannot open admission"));
         }
@@ -113,16 +121,45 @@ impl ApiReplacementGate {
     fn active_lease_count(&self) -> usize {
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).active_leases.len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn break_control(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.control_available = false;
+        if matches!(state.admission, Admission::Open) {
+            state.admission = Admission::Closed { epoch: state.next_epoch };
+        }
+        for cancellation in state.active_leases.values() {
+            cancellation.send_replace(true);
+        }
+        drop(state);
+        self.announce_change();
+    }
+}
+
+fn ensure_control_available(state: &GateState) -> Result<(), StorageError> {
+    if state.control_available { Ok(()) } else { Err(StorageError::replacement_control("API replacement gate is unavailable")) }
+}
+
+fn ensure_current_attempt(state: &GateState, epoch: u64) -> Result<(), StorageError> {
+    ensure_control_available(state)?;
+    if state.admission == (Admission::Closed { epoch }) {
+        Ok(())
+    } else {
+        Err(StorageError::replacement_control("stale API replacement attempt"))
+    }
 }
 
 /// One admitted API database read lease, released synchronously on drop.
 pub(crate) struct ApiDbReadLease {
     gate: Arc<ApiReplacementGate>,
     lease_id: u64,
+    #[allow(dead_code, reason = "consumed by API database operations in the API projection increment")]
     cancellation: watch::Receiver<bool>,
 }
 
 impl ApiDbReadLease {
+    #[allow(dead_code, reason = "consumed by API database operations in the API projection increment")]
     pub(crate) async fn cancelled(&mut self) {
         if *self.cancellation.borrow() {
             return;
@@ -149,6 +186,10 @@ pub(crate) struct ApiReplacementAttempt {
 }
 
 impl ApiReplacementAttempt {
+    pub(crate) fn ensure_current(&self) -> Result<(), StorageError> {
+        self.gate.ensure_current(self.epoch)
+    }
+
     pub(crate) async fn acquire_exclusive(&self, timing: &Timing) -> Result<ApiReplacementExclusive, StorageError> {
         let mut changes = self.gate.subscribe_changes();
         let timeout = timing.sleep(API_REPLACEMENT_DRAIN_TIMEOUT);
@@ -174,6 +215,10 @@ pub(crate) struct ApiReplacementExclusive {
 }
 
 impl ApiReplacementExclusive {
+    pub(crate) fn ensure_current(&self) -> Result<(), StorageError> {
+        self.gate.ensure_current(self.epoch)
+    }
+
     pub(crate) fn open(self) -> Result<(), StorageError> {
         self.gate.open(self.epoch)
     }
