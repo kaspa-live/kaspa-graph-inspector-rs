@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use arc_swap::{ArcSwap, Guard};
 use kgi_model::block::{BlockCoordinate, BlockHash, CompactId};
 use moka::sync::Cache;
 
@@ -30,14 +31,14 @@ pub(crate) struct CachedVspcSink {
     pub(crate) hash: BlockHash,
 }
 
-pub(crate) struct ProcessingCaches {
+pub(crate) struct ProcessingCacheDomains {
     identities: Cache<BlockHash, CachedIdentity>,
     materialized_blocks: Cache<CompactId, CachedMaterializedBlock>,
     merge_sets: Cache<CompactId, CachedMergeSets>,
     vspc_sink: Cache<(), CachedVspcSink>,
 }
 
-impl ProcessingCaches {
+impl ProcessingCacheDomains {
     pub(crate) fn new() -> Self {
         Self::with_capacities(BLOCK_CACHE_CAPACITY, BLOCK_CACHE_CAPACITY, BLOCK_CACHE_CAPACITY, VSPC_SINK_CACHE_CAPACITY)
     }
@@ -89,11 +90,36 @@ impl ProcessingCaches {
     }
 }
 
+pub(crate) struct ProcessingCaches {
+    current: ArcSwap<ProcessingCacheDomains>,
+}
+
+impl ProcessingCaches {
+    pub(crate) fn new() -> Self {
+        Self { current: ArcSwap::from_pointee(ProcessingCacheDomains::new()) }
+    }
+
+    pub(crate) fn load(&self) -> Guard<Arc<ProcessingCacheDomains>> {
+        self.current.load()
+    }
+
+    pub(crate) fn load_full(&self) -> Arc<ProcessingCacheDomains> {
+        self.current.load_full()
+    }
+
+    #[cfg(test)]
+    fn replace(&self, replacement: Arc<ProcessingCacheDomains>) -> Arc<ProcessingCacheDomains> {
+        self.current.swap(replacement)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use kgi_model::block::{BlockCoordinate, BlockHash, CompactId};
 
-    use super::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, CachedVspcSink, ProcessingCaches};
+    use super::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, CachedVspcSink, ProcessingCacheDomains, ProcessingCaches};
 
     fn hash(byte: u8) -> BlockHash {
         BlockHash::from_bytes([byte; 32])
@@ -105,7 +131,7 @@ mod tests {
 
     #[test]
     fn default_capacities_match_the_four_processing_cache_domains() {
-        let caches = ProcessingCaches::new();
+        let caches = ProcessingCacheDomains::new();
 
         assert_eq!(caches.identities.policy().max_capacity(), Some(50_000));
         assert_eq!(caches.materialized_blocks.policy().max_capacity(), Some(50_000));
@@ -115,7 +141,7 @@ mod tests {
 
     #[test]
     fn caches_have_independent_capacity_policies() {
-        let caches = ProcessingCaches::with_capacities(2, 2, 2, 1);
+        let caches = ProcessingCacheDomains::with_capacities(2, 2, 2, 1);
         let coordinate = |level| BlockCoordinate::new(level, 0).expect("positive level");
 
         for value in 1..=2 {
@@ -154,7 +180,7 @@ mod tests {
 
     #[test]
     fn vspc_sink_cache_replaces_and_recalls_the_latest_value() {
-        let caches = ProcessingCaches::new();
+        let caches = ProcessingCacheDomains::new();
         let first = CachedVspcSink { id: id(1), hash: hash(1) };
         let second = CachedVspcSink { id: id(2), hash: hash(2) };
 
@@ -166,5 +192,23 @@ mod tests {
 
         assert_eq!(caches.vspc_sink(), Some(second));
         assert_eq!(caches.vspc_sink.entry_count(), 1);
+    }
+
+    #[test]
+    fn processing_cache_domains_are_replaced_as_one_snapshot() {
+        let caches = ProcessingCaches::new();
+        let predecessor = caches.load_full();
+        predecessor.publish_identity(hash(1), CachedIdentity { id: id(1), materialized: false });
+
+        let replacement = Arc::new(ProcessingCacheDomains::new());
+        replacement.publish_identity(hash(2), CachedIdentity { id: id(2), materialized: false });
+        let displaced = caches.replace(replacement.clone());
+
+        assert!(Arc::ptr_eq(&predecessor, &displaced));
+        assert!(Arc::ptr_eq(&replacement, &caches.load_full()));
+        assert_eq!(caches.load().identity(hash(1)), None);
+        assert_eq!(caches.load().identity(hash(2)).map(|identity| identity.id), Some(id(2)));
+        assert_eq!(predecessor.identity(hash(1)).map(|identity| identity.id), Some(id(1)));
+        assert_eq!(predecessor.identity(hash(2)), None);
     }
 }

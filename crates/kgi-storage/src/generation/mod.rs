@@ -14,7 +14,7 @@ use kgi_model::{
 };
 use sqlx::PgPool;
 
-use tokio::sync::{Mutex, oneshot, watch};
+use tokio::sync::{Mutex, RwLock, oneshot, watch};
 
 use crate::{
     cache::{CachedVspcSink, ProcessingCaches},
@@ -135,6 +135,7 @@ pub struct ValidatedDbClient {
     runtime: GenerationRuntime<Self>,
     binding: DatabaseBinding,
     caches: ProcessingCaches,
+    mutation_guard: RwLock<()>,
     materialization_lane: Mutex<()>,
     vspc_lane: Mutex<()>,
     transaction_timing: Timing,
@@ -165,6 +166,7 @@ impl ValidatedDbClient {
             runtime: GenerationRuntime::new(pool, retirement_tx, self_weak.clone()),
             binding,
             caches: ProcessingCaches::new(),
+            mutation_guard: RwLock::new(()),
             materialization_lane: Mutex::new(()),
             vspc_lane: Mutex::new(()),
             transaction_timing,
@@ -186,6 +188,7 @@ impl ValidatedDbClient {
         let state = self.run_operation(|| ProcessingStateInspection::load(self.runtime.pool(), self.binding)).await?;
         if let StoredSessionState::Initialized(snapshot) = state {
             self.caches
+                .load()
                 .publish_vspc_sink(CachedVspcSink { id: snapshot.committed_vspc_sink.id, hash: snapshot.committed_vspc_sink.hash });
         }
         Ok(state)
@@ -193,12 +196,14 @@ impl ValidatedDbClient {
 
     /// Resolves one hash without creating or promoting a persistent identity.
     pub async fn block_presence(&self, hash: BlockHash) -> Result<BlockPresence, StorageError> {
-        self.run_operation(|| identity::block_presence(self.runtime.pool(), &self.caches, hash)).await
+        let caches = self.caches.load_full();
+        self.run_operation(|| identity::block_presence(self.runtime.pool(), &caches, hash)).await
     }
 
     /// Resolves an ordered hash batch only when every position is materialized.
     pub async fn resolve_materialized_ids(&self, hashes: &[BlockHash]) -> Result<Box<[CompactId]>, ResolveMaterializedIdsError> {
-        match self.run_operation(|| identity::resolve_materialized_ids(self.runtime.pool(), &self.caches, hashes)).await? {
+        let caches = self.caches.load_full();
+        match self.run_operation(|| identity::resolve_materialized_ids(self.runtime.pool(), &caches, hashes)).await? {
             identity::MaterializedIdResolution::Resolved(ids) => Ok(ids),
             identity::MaterializedIdResolution::NonMaterialized { missing, identity_only } => {
                 Err(ResolveMaterializedIdsError::NonMaterialized { missing, identity_only })
@@ -234,22 +239,22 @@ impl ValidatedDbClient {
 
     #[cfg(test)]
     pub(crate) fn has_cached_identity(&self, hash: BlockHash) -> bool {
-        self.caches.identity(hash).is_some()
+        self.caches.load().identity(hash).is_some()
     }
 
     #[cfg(test)]
     pub(crate) fn has_cached_merge_sets(&self, id: CompactId) -> bool {
-        self.caches.merge_sets(id).is_some()
+        self.caches.load().merge_sets(id).is_some()
     }
 
     #[cfg(test)]
     pub(crate) fn cached_materialized_block(&self, id: CompactId) -> Option<CachedMaterializedBlock> {
-        self.caches.materialized_block(id)
+        self.caches.load().materialized_block(id)
     }
 
     #[cfg(test)]
     pub(crate) fn cached_vspc_sink(&self) -> Option<CachedVspcSink> {
-        self.caches.vspc_sink()
+        self.caches.load().vspc_sink()
     }
 
     async fn run_operation<T, F, Fut>(&self, operation: F) -> Result<T, StorageError>
@@ -443,33 +448,52 @@ mod tests {
         let id = CompactId::new(1).expect("positive compact ID");
         let coordinate = BlockCoordinate::new(1, 0).expect("positive level");
 
-        predecessor.caches.publish_identity(hash(1), CachedIdentity { id, materialized: true });
-        predecessor.caches.publish_materialized_block(
+        let predecessor_caches = predecessor.caches.load();
+        predecessor_caches.publish_identity(hash(1), CachedIdentity { id, materialized: true });
+        predecessor_caches.publish_materialized_block(
             id,
             CachedMaterializedBlock { coordinate, selected_parent_id: CompactId::new(4).expect("positive ID") },
         );
-        predecessor.caches.publish_merge_sets(
+        predecessor_caches.publish_merge_sets(
             id,
             CachedMergeSets {
                 blue: vec![CompactId::new(2).expect("positive ID")].into(),
                 red: vec![CompactId::new(3).expect("positive ID")].into(),
             },
         );
-        predecessor.caches.publish_vspc_sink(CachedVspcSink { id, hash: hash(1) });
-        assert_eq!(predecessor.caches.identity(hash(1)).map(|identity| identity.id), Some(id));
-        assert_eq!(predecessor.caches.materialized_block(id).map(|block| block.coordinate), Some(coordinate));
+        predecessor_caches.publish_vspc_sink(CachedVspcSink { id, hash: hash(1) });
+        assert_eq!(predecessor_caches.identity(hash(1)).map(|identity| identity.id), Some(id));
+        assert_eq!(predecessor_caches.materialized_block(id).map(|block| block.coordinate), Some(coordinate));
         assert_eq!(
-            predecessor.caches.merge_sets(id).map(|sets| sets.blue),
+            predecessor_caches.merge_sets(id).map(|sets| sets.blue),
             Some(vec![CompactId::new(2).expect("positive ID")].into())
         );
-        assert_eq!(predecessor.caches.vspc_sink(), Some(CachedVspcSink { id, hash: hash(1) }));
+        assert_eq!(predecessor_caches.vspc_sink(), Some(CachedVspcSink { id, hash: hash(1) }));
 
         let replacement = ValidatedDbClient::new(pool, binding, retirement_tx);
+        let replacement_caches = replacement.caches.load();
 
-        assert_eq!(replacement.caches.identity(hash(1)), None);
-        assert_eq!(replacement.caches.materialized_block(id), None);
-        assert_eq!(replacement.caches.merge_sets(id), None);
-        assert_eq!(replacement.caches.vspc_sink(), None);
+        assert_eq!(replacement_caches.identity(hash(1)), None);
+        assert_eq!(replacement_caches.materialized_block(id), None);
+        assert_eq!(replacement_caches.merge_sets(id), None);
+        assert_eq!(replacement_caches.vspc_sink(), None);
+    }
+
+    #[tokio::test]
+    async fn processing_mutations_share_one_nonwaiting_exclusive_guard() {
+        let pool =
+            PgPoolOptions::new().connect_lazy("postgresql://postgres@localhost/kgi").expect("lazy PostgreSQL pool configuration");
+        let binding = DatabaseBinding::new(NetworkId::new(NetworkType::Mainnet), hash(0));
+        let (retirement_tx, _retirements) = retirement_channel();
+        let client = ValidatedDbClient::new(pool, binding, retirement_tx);
+
+        let first_mutation = client.mutation_guard.read().await;
+        let second_mutation = client.mutation_guard.try_read().expect("ordinary mutation permits overlap");
+        assert!(client.mutation_guard.try_write().is_err());
+
+        drop(first_mutation);
+        drop(second_mutation);
+        let _replacement = client.mutation_guard.try_write().expect("exclusive replacement does not wait after mutations finish");
     }
 
     #[tokio::test]

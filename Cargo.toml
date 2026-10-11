@@ -21,6 +21,7 @@ repository = "https://github.com/kaspa-live/kaspa-graph-inspector-rs"
 edition = "2024"
 
 [workspace.dependencies]
+arc-swap = "1.9.2"
 async-trait = "0.1.88"
 clap = { version = "4.5.35", features = ["derive", "string", "cargo"] }
 ctrlc = { version = "3.4.1", features = ["termination"] }

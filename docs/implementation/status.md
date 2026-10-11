@@ -64,9 +64,11 @@ nonblocking replacement while a retired pool still has a checked-out
 connection, terminal joining of that pool drain, missing required index and
 constraint rejection, initialization COMMIT acknowledgement loss with
 truth-based reconnect classification, and fatal event-path closure.
-The gated Rebuild-start API publication, replacement exclusion, and bounded
-drain/cancellation remain for the database-replacement-safety increment
-together with their dependent storage operations. No open architecture
+The service-owned API replacement gate, generation-spanning read-lease
+registry, bounded drain/cancellation primitive, atomically swappable processing
+cache set, and shared processing mutation guard are implemented. Gated
+Rebuild-start API publication and the pruning-point replacement transaction
+remain for the database-replacement-safety increment. No open architecture
 requirement currently blocks that work.
 
 The imported browser still uses the v1 graph data source, models, and update

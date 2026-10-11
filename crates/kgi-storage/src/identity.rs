@@ -7,7 +7,7 @@ use kgi_model::block::{BlockCoordinate, BlockHash, BlockPresence, CompactId};
 use sqlx::{PgPool, Row};
 
 use crate::{
-    cache::{CachedIdentity, CachedMaterializedBlock, ProcessingCaches},
+    cache::{CachedIdentity, CachedMaterializedBlock, ProcessingCacheDomains},
     error::StorageError,
 };
 
@@ -21,7 +21,11 @@ pub(crate) enum MaterializedIdResolution {
     NonMaterialized { missing: Arc<[BlockHash]>, identity_only: Arc<[BlockHash]> },
 }
 
-pub(crate) async fn block_presence(pool: &PgPool, caches: &ProcessingCaches, hash: BlockHash) -> Result<BlockPresence, StorageError> {
+pub(crate) async fn block_presence(
+    pool: &PgPool,
+    caches: &ProcessingCacheDomains,
+    hash: BlockHash,
+) -> Result<BlockPresence, StorageError> {
     if let Some(identity) = caches.identity(hash) {
         if !identity.materialized {
             return Ok(BlockPresence::BoundaryIdentity { id: identity.id });
@@ -55,7 +59,7 @@ pub(crate) async fn block_presence(pool: &PgPool, caches: &ProcessingCaches, has
 
 pub(crate) async fn resolve_materialized_ids(
     pool: &PgPool,
-    caches: &ProcessingCaches,
+    caches: &ProcessingCacheDomains,
     hashes: &[BlockHash],
 ) -> Result<MaterializedIdResolution, StorageError> {
     let mut seen = HashSet::with_capacity(hashes.len());
@@ -139,7 +143,7 @@ fn decode_identity(row: &sqlx::postgres::PgRow) -> Result<StoredIdentity, Storag
     Ok(StoredIdentity { identity: CachedIdentity { id, materialized: block.is_some() }, block })
 }
 
-fn publish_stored_identity(caches: &ProcessingCaches, hash: BlockHash, stored: &StoredIdentity) {
+fn publish_stored_identity(caches: &ProcessingCacheDomains, hash: BlockHash, stored: &StoredIdentity) {
     caches.publish_identity(hash, stored.identity);
     if let Some(block) = stored.block {
         caches.publish_materialized_block(stored.identity.id, block);

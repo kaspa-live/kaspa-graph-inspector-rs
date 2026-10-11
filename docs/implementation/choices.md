@@ -537,3 +537,32 @@ is only a wakeup mechanism for gated readers and drainers; it carries no
 generation or replacement identity. API-generation retirement is serialized
 against lease acquisition by a generation-local standard-library mutex and
 wakes gated acquisition through a validity watch channel.
+
+## 11 October 2026: Rebuild transaction prerequisites
+
+### Processing mutation exclusion and cache-set publication
+
+Use one generation-local `tokio::sync::RwLock` as the shared processing
+mutation guard. Materialization and VSPC mutations hold read permits in
+addition to their independent lane mutexes, so those lanes retain their
+permitted overlap. Rebuild will acquire the write permit with `try_write`; it
+will not wait behind an unexpected mutation after processor deactivation.
+
+Group the four independent Moka domains in one `ProcessingCacheDomains` value
+and hold the current value through `ArcSwap`. Short synchronous interactions
+use its borrowed `load` guard, while an operation that retains the cache set
+across an await takes one owned `load_full` snapshot for its complete cache
+interaction. Rebuild will construct and seed a fresh domain set off-path, then
+publish all four domains through one atomic pointer replacement after definite
+commit. This avoids an outer mutex around ordinary Moka access and prevents
+observers from combining predecessor and replacement domains.
+
+### PostgreSQL processing-data clearing
+
+Use one transactional `TRUNCATE parents, blocks, levels, block_identifiers,
+processing_metadata RESTART IDENTITY RESTRICT` statement for pruning-point
+rebuild. Listing the complete processing-table dependency set keeps `RESTRICT`
+explicit, resets compact-ID allocation in the same transaction, and avoids a
+retained-graph delete scan. Its table locks rely on the storage-owned API
+replacement gate, processing mutation guard, and process advisory lock rather
+than an additional explicit table-lock statement.

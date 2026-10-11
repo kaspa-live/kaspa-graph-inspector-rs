@@ -12,7 +12,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use super::ValidatedDbClient;
 use crate::{
-    cache::{CachedMaterializedBlock, CachedMergeSets, CachedVspcSink, ProcessingCaches},
+    cache::{CachedMaterializedBlock, CachedMergeSets, CachedVspcSink, ProcessingCacheDomains},
     database::NO_VSPC_DAA_SCORE,
     error::StorageError,
     operation::{VspcCommitOutcome, VspcPathConflict},
@@ -53,10 +53,11 @@ impl ValidatedDbClient {
         }
         let commit_behavior = self.next_vspc_commit_behavior();
         self.run_operation(|| async {
+            let _mutation = self.mutation_guard.read().await;
             let _lane = self.vspc_lane.lock().await;
+            let caches = self.caches.load_full();
             let result =
-                transaction::run(&self.transaction_timing, || attempt(self.runtime.pool(), &self.caches, &change, commit_behavior))
-                    .await?;
+                transaction::run(&self.transaction_timing, || attempt(self.runtime.pool(), &caches, &change, commit_behavior)).await?;
             let success = match result {
                 Ok(success) => success,
                 Err(SemanticError::SourceDiscontinuity) => return Err(StorageError::VspcSourceDiscontinuity),
@@ -69,12 +70,12 @@ impl ValidatedDbClient {
             };
 
             for (id, block) in success.member_cache_updates {
-                self.caches.publish_materialized_block(id, block);
+                caches.publish_materialized_block(id, block);
             }
             for (id, merge_sets) in success.merge_set_cache_updates {
-                self.caches.publish_merge_sets(id, merge_sets);
+                caches.publish_merge_sets(id, merge_sets);
             }
-            self.caches
+            caches
                 .publish_vspc_sink(CachedVspcSink { id: success.outcome.destination.id(), hash: success.outcome.destination.hash() });
             Ok(success.outcome)
         })
@@ -103,7 +104,7 @@ impl ValidatedDbClient {
 
 async fn attempt(
     pool: &PgPool,
-    caches: &ProcessingCaches,
+    caches: &ProcessingCacheDomains,
     change: &ReadyVspcChange,
     commit_behavior: CommitBehavior,
 ) -> Result<AttemptSuccess, TransactionAttemptError<SemanticError>> {
@@ -155,7 +156,7 @@ async fn rollback_semantic<T>(
 
 async fn load_current_sink(
     transaction: &mut Transaction<'_, Postgres>,
-    caches: &ProcessingCaches,
+    caches: &ProcessingCacheDomains,
 ) -> Result<(CompactId, BlockHash), TransactionAttemptError<SemanticError>> {
     if let Some(sink) = caches.vspc_sink() {
         return Ok((sink.id, sink.hash));
@@ -187,7 +188,7 @@ fn distinct_member_ids(change: &ReadyVspcChange) -> Vec<CompactId> {
 
 async fn load_members(
     transaction: &mut Transaction<'_, Postgres>,
-    caches: &ProcessingCaches,
+    caches: &ProcessingCacheDomains,
     ids: &[CompactId],
 ) -> Result<
     (HashMap<CompactId, CachedMaterializedBlock>, Vec<(CompactId, CachedMaterializedBlock)>),
@@ -233,7 +234,7 @@ async fn load_members(
 }
 
 fn seed_members_from_cache(
-    caches: &ProcessingCaches,
+    caches: &ProcessingCacheDomains,
     ids: &[CompactId],
 ) -> (HashMap<CompactId, CachedMaterializedBlock>, Vec<CompactId>) {
     let mut members = HashMap::with_capacity(ids.len());
@@ -323,7 +324,7 @@ async fn resolve_path_conflict(
 
 async fn load_merge_sets(
     transaction: &mut Transaction<'_, Postgres>,
-    caches: &ProcessingCaches,
+    caches: &ProcessingCacheDomains,
     added: &[CompactId],
 ) -> Result<(HashMap<CompactId, CachedMergeSets>, Vec<(CompactId, CachedMergeSets)>), TransactionAttemptError<SemanticError>> {
     let mut merge_sets = HashMap::new();
@@ -529,7 +530,7 @@ mod tests {
 
     use super::{CommitBehavior, VspcPathConflictIds, resolve_path_conflict, seed_members_from_cache};
     use crate::{
-        cache::{CachedMaterializedBlock, ProcessingCaches},
+        cache::{CachedMaterializedBlock, ProcessingCacheDomains},
         database::{LockedDatabase, PreparedDatabase, open_processing_generation},
         error::StorageError,
         generation::ValidatedDbClient,
@@ -561,7 +562,7 @@ mod tests {
 
     #[test]
     fn member_cache_seeding_requires_only_materialized_block_metadata() {
-        let caches = ProcessingCaches::new();
+        let caches = ProcessingCacheDomains::new();
         let complete = id(1);
         let missing = id(2);
         let block =

@@ -2998,6 +2998,7 @@ dependencies = [
 name = "kgi-storage"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "kaspa-consensus-core",
  "kgi-api-model",

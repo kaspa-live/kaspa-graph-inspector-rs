@@ -11,7 +11,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use super::ValidatedDbClient;
 use crate::{
-    cache::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, ProcessingCaches},
+    cache::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, ProcessingCacheDomains},
     database::{NO_VSPC_DAA_SCORE, daa_score_to_sql, timestamp_to_sql},
     error::StorageError,
     operation::{MaterializeBlockError, MaterializeBlockOutcome, ReferencePolicy},
@@ -134,11 +134,13 @@ impl ValidatedDbClient {
         let commit_behavior = self.next_materialization_commit_behavior();
         let result = self
             .run_operation(|| async {
+                let _mutation = self.mutation_guard.read().await;
                 let _lane = self.materialization_lane.lock().await;
+                let caches = self.caches.load_full();
                 let prepared = PreparedBlock::new(block);
                 let daa_score = daa_score_to_sql(prepared.daa_score)?;
                 let result = transaction::run(&self.transaction_timing, || {
-                    attempt(self.runtime.pool(), &self.caches, &prepared, daa_score, policy, commit_behavior)
+                    attempt(self.runtime.pool(), &caches, &prepared, daa_score, policy, commit_behavior)
                 })
                 .await?;
                 let success = match result {
@@ -152,13 +154,13 @@ impl ValidatedDbClient {
                 };
 
                 for (hash, stored) in success.cache_updates {
-                    self.caches.publish_identity(hash, CachedIdentity { id: stored.id, materialized: stored.block.is_some() });
+                    caches.publish_identity(hash, CachedIdentity { id: stored.id, materialized: stored.block.is_some() });
                     if let Some(block) = stored.block {
-                        self.caches.publish_materialized_block(stored.id, block);
+                        caches.publish_materialized_block(stored.id, block);
                     }
                 }
                 if let Some((id, merge_sets)) = success.merge_sets {
-                    self.caches.publish_merge_sets(id, merge_sets);
+                    caches.publish_merge_sets(id, merge_sets);
                 }
                 Ok(MaterializationResult::Outcome(success.outcome))
             })
@@ -194,7 +196,7 @@ impl ValidatedDbClient {
 
 async fn attempt(
     pool: &PgPool,
-    caches: &ProcessingCaches,
+    caches: &ProcessingCacheDomains,
     prepared: &PreparedBlock,
     daa_score: i64,
     policy: ReferencePolicy,
@@ -406,7 +408,7 @@ async fn commit(transaction: Transaction<'_, Postgres>, behavior: CommitBehavior
 
 async fn load_identities(
     transaction: &mut Transaction<'_, Postgres>,
-    caches: &ProcessingCaches,
+    caches: &ProcessingCacheDomains,
     hashes: &[BlockHash],
 ) -> Result<LoadedIdentities, TransactionAttemptError<SemanticError>> {
     let (mut identities, misses) = seed_identities_from_cache(caches, hashes);
@@ -500,7 +502,7 @@ async fn intern_missing_identities(
 }
 
 fn seed_identities_from_cache(
-    caches: &ProcessingCaches,
+    caches: &ProcessingCacheDomains,
     hashes: &[BlockHash],
 ) -> (HashMap<BlockHash, StoredIdentity>, Vec<BlockHash>) {
     let mut identities = HashMap::with_capacity(hashes.len());
@@ -623,7 +625,7 @@ mod tests {
 
     use super::{PreparedBlock, seed_identities_from_cache};
     use crate::{
-        cache::{CachedIdentity, CachedMaterializedBlock, ProcessingCaches},
+        cache::{CachedIdentity, CachedMaterializedBlock, ProcessingCacheDomains},
         database::{LockedDatabase, PreparedDatabase, open_processing_generation},
         error::StorageError,
         generation::ValidatedDbClient,
@@ -644,7 +646,7 @@ mod tests {
 
     #[test]
     fn identity_cache_seeding_requires_complete_materialized_metadata() {
-        let caches = ProcessingCaches::new();
+        let caches = ProcessingCacheDomains::new();
         let materialized_id = CompactId::new(1).expect("positive ID");
         let boundary_id = CompactId::new(2).expect("positive ID");
         let coordinate_missing_id = CompactId::new(3).expect("positive ID");
@@ -854,7 +856,7 @@ mod tests {
         let parent_a = hash(2);
         let parent_a_id =
             insert_materialized(&mut database, parent_a, origin_id, BlockCoordinate::new(1, 0).expect("coordinate")).await;
-        client.caches.publish_identity(parent_a, CachedIdentity { id: parent_a_id, materialized: true });
+        client.caches.load().publish_identity(parent_a, CachedIdentity { id: parent_a_id, materialized: true });
         insert_level(&mut database, 2, 1, None).await;
         let parent_b = hash(3);
         let parent_b_id =
@@ -950,7 +952,7 @@ mod tests {
             Some(CachedMaterializedBlock { coordinate: committed.coordinate, selected_parent_id: parent_a_id })
         );
         assert_eq!(client.cached_materialized_block(boundary_parent_id), None);
-        assert_eq!(client.caches.materialized_block(parent_a_id).map(|block| block.coordinate), BlockCoordinate::new(1, 0));
+        assert_eq!(client.caches.load().materialized_block(parent_a_id).map(|block| block.coordinate), BlockCoordinate::new(1, 0));
         assert_eq!(
             client.block_presence(own_hash).await,
             Ok(BlockPresence::Materialized { id: committed.id, coordinate: committed.coordinate })
