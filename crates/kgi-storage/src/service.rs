@@ -1465,7 +1465,7 @@ mod tests {
         let (service, mut events, processing, api) = initialize_service(database_url).await;
         let pruning_point = ValidatedNodeBlock {
             hash: hash(9),
-            selected_parent: hash(4),
+            selected_parent: hash(5),
             direct_parents: vec![hash(4), hash(5)],
             blue_merge_set: vec![hash(3), hash(5)],
             red_merge_set: vec![hash(2), hash(3)],
@@ -1521,6 +1521,13 @@ mod tests {
         .await
         .expect("rebuilt pruning-point row");
         assert_eq!(block, (5, -1, 42, 1, 0, BlockColor::Gray as i16, true, vec![2, 3], vec![1, 2]));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT selected_parent_id FROM blocks")
+                .fetch_one(processing.pool())
+                .await
+                .expect("rebuilt selected-parent ID"),
+            3
+        );
         let parents: Vec<(i64, i64, i64, i64)> =
             sqlx::query_as("SELECT parent_id, child_level, parent_level, parent_slot FROM parents ORDER BY parent_id")
                 .fetch_all(processing.pool())
@@ -1646,6 +1653,13 @@ mod tests {
                 .await
                 .expect("Genesis block row"),
             (2, 1)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Vec<u8>>("SELECT hash FROM block_identifiers WHERE id = 1")
+                .fetch_one(processing.pool())
+                .await
+                .expect("Genesis selected-parent identity"),
+            ORIGIN.as_bytes().to_vec()
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM parents")

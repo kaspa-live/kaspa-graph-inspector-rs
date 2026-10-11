@@ -37,24 +37,21 @@ pub(crate) enum CommitBehavior {
 }
 
 impl PreparedRebuild {
-    fn new(block: ValidatedNodeBlock) -> Result<Self, StorageError> {
+    fn new(block: ValidatedNodeBlock, genesis_hash: BlockHash) -> Result<Self, StorageError> {
         let daa_score = daa_score_to_sql(block.daa_score)?;
         let blue_score = blue_score_to_sql(block.blue_score)?;
         let mut seen = HashSet::new();
         let mut universal = Vec::new();
-        for hash in block
-            .red_merge_set
-            .iter()
-            .chain(&block.blue_merge_set)
-            .chain(&block.direct_parents)
-            .chain(std::iter::once(&block.selected_parent))
-            .chain(std::iter::once(&block.hash))
-            .copied()
-        {
+        for hash in block.red_merge_set.iter().chain(&block.blue_merge_set).chain(&block.direct_parents).copied() {
             if seen.insert(hash) {
                 universal.push(hash);
             }
         }
+        if block.hash == genesis_hash {
+            // Exact Genesis has empty relationship vectors, so its synthetic ORIGIN selected parent must be interned explicitly.
+            universal.push(block.selected_parent);
+        }
+        universal.push(block.hash);
         Ok(Self { block, universal, daa_score, blue_score })
     }
 }
@@ -67,7 +64,7 @@ pub(super) fn validate_input(block: &ValidatedNodeBlock) -> Result<(), StorageEr
 
 impl ValidatedDbClient {
     pub(crate) async fn perform_rebuild(&self, pruning_point: ValidatedNodeBlock) -> Result<MaterializedSyncAnchor, StorageError> {
-        let prepared = PreparedRebuild::new(pruning_point)?;
+        let prepared = PreparedRebuild::new(pruning_point, self.binding.genesis_hash())?;
         let commit_behavior = self.next_rebuild_commit_behavior();
         let _mutation =
             self.mutation_guard.try_write().expect("Rebuild requires completed processor deactivation and exclusive mutation access");

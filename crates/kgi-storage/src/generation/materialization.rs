@@ -97,9 +97,7 @@ impl PreparedBlock {
 
         let mut seen = HashSet::new();
         let mut universal = Vec::new();
-        for hash in
-            red_merge_set.iter().chain(&blue_merge_set).chain(&direct_parents).chain(std::iter::once(&selected_parent)).copied()
-        {
+        for hash in red_merge_set.iter().chain(&blue_merge_set).chain(&direct_parents).copied() {
             if seen.insert(hash) {
                 universal.push(hash);
             }
@@ -832,12 +830,12 @@ mod tests {
             own_hash,
             parent_a,
             vec![parent_a, parent_b, boundary_parent],
-            vec![parent_b, parent_a, blue_missing],
-            vec![red_missing, parent_a],
+            vec![parent_b, blue_missing],
+            vec![red_missing, parent_b],
         );
         let prepared = PreparedBlock::new(input.clone());
-        assert_eq!(prepared.references(), [red_missing, parent_a, parent_b, blue_missing, boundary_parent]);
-        assert_eq!(prepared.universal, [red_missing, parent_a, parent_b, blue_missing, boundary_parent, own_hash]);
+        assert_eq!(prepared.references(), [red_missing, parent_b, blue_missing, parent_a, boundary_parent]);
+        assert_eq!(prepared.universal, [red_missing, parent_b, blue_missing, parent_a, boundary_parent, own_hash]);
 
         let outcome = client
             .materialize_block(input.clone(), ReferencePolicy::AllowBoundaryIdentities)
@@ -859,8 +857,8 @@ mod tests {
                 ParentCommitted { hash: boundary_parent, coordinate: None },
             ]
         );
-        assert_eq!(committed.blue_merge_set.as_ref(), [parent_b, parent_a, blue_missing]);
-        assert_eq!(committed.red_merge_set.as_ref(), [red_missing, parent_a]);
+        assert_eq!(committed.blue_merge_set.as_ref(), [parent_b, blue_missing]);
+        assert_eq!(committed.red_merge_set.as_ref(), [red_missing, parent_b]);
         assert_eq!(committed.color, BlockColor::Gray);
         assert!(!committed.is_in_vspc);
         assert_eq!(
@@ -902,8 +900,8 @@ mod tests {
             .await
             .expect("blue identity");
         assert!(red_missing_id < blue_missing_id && blue_missing_id < committed.id.get());
-        assert_eq!(blue_ids, [parent_b_id.get(), parent_a_id.get(), blue_missing_id]);
-        assert_eq!(red_ids, [red_missing_id, parent_a_id.get()]);
+        assert_eq!(blue_ids, [parent_b_id.get(), blue_missing_id]);
+        assert_eq!(red_ids, [red_missing_id, parent_b_id.get()]);
         assert_eq!((color, in_vspc), (BlockColor::Gray as i16, false));
         assert!(client.has_cached_identity(own_hash));
         assert!(client.has_cached_identity(red_missing));
