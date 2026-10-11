@@ -90,11 +90,15 @@ identity carried downstream. Only level-zero parents become `direct_parents`.
 
 For an ordinary non-Genesis block, `selected_parent` must occur in
 `direct_parents`; absence cannot produce KGI's later selected-parent index.
-Parent and merge-set vectors otherwise preserve node order without uniqueness,
-self-reference, or graph-validity checks. Repeated positions in the node-facing
-direct-parent vector are input observations, not distinct durable graph
-relations; [storage](storage.md#persistent-representation--settled) owns their
-canonical representation.
+`direct_parents`, `blue_merge_set`, and `red_merge_set` are independently
+non-repeating sequences ordered by the first occurrence of each hash in their
+respective node-provided vectors. Raw repeated positions are accepted
+normalization input but are not retained in `ValidatedNodeBlock`. A hash may
+still occur in more than one vector, including in both merge-set colors.
+The block's own `hash` is absent from all three vectors. Parents and merge sets
+do not otherwise prove absence of cross-vector overlap or graph validity. The
+[NodeService normalizer](node-service.md#rpc-normalization) owns construction of
+this canonical shared value.
 
 The sole membership exception is the exact Genesis hash discovered for the
 validated RPC generation. KGI gives Genesis its domain-owned canonical
@@ -104,10 +108,12 @@ constraint beyond the common representable range; a configured Genesis DAA
 score may be nonzero.
 
 The type proves that every field KGI consumes is present and representable and
-that an ordinary selected parent can be encoded by index. Under the
+that an ordinary selected parent can be encoded by index. It also proves
+uniqueness within each relationship vector. Under the
 [node trust boundary](overview.md#node-trust-boundary--settled), it does not
-prove consensus correctness, uniqueness or acyclicity, and it makes no claim
-that any referenced hash is materialized in the current database.
+prove consensus correctness, disjointness between relationship vectors,
+acyclicity beyond exclusion of direct own-hash references, or that any
+referenced hash is materialized in the current database.
 
 `ValidatedRecoveryHeader` is the normalized header-only value used by Resync
 preparation. Its DAA score is representable, and its blue score is either a

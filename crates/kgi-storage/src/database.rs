@@ -11,7 +11,8 @@ use sqlx::{Connection, PgConnection, Postgres, Transaction, postgres::PgPoolOpti
 use crate::{
     error::{StorageError, StorageRejection},
     generation::{DatabaseBinding, ValidatedApiDbClient, ValidatedDbClient},
-    runtime::RetirementSender,
+    replacement::ApiReplacementGate,
+    runtime::{RebuildSender, RetirementSender},
     schema,
     state::{DatabaseState, ProcessingStateInspection},
 };
@@ -19,6 +20,7 @@ use crate::{
 const ADVISORY_LOCK_KEY: i64 = 0x4b47_4932_0000_0001;
 const PROCESSING_POOL_SIZE: u32 = 4;
 const API_POOL_SIZE: u32 = 8;
+pub(crate) const NO_VSPC_DAA_SCORE: i64 = i64::MAX;
 
 pub(crate) struct ValidatedGenerations {
     processing: Arc<ValidatedDbClient>,
@@ -31,17 +33,15 @@ impl ValidatedGenerations {
     }
 }
 
-#[allow(dead_code, reason = "used by persistence transactions in the next increment")]
 pub(crate) const fn timestamp_to_sql(timestamp: Timestamp) -> i64 {
     i64::from_ne_bytes(timestamp.to_ne_bytes())
 }
 
-#[allow(dead_code, reason = "used by persistence transactions in the next increment")]
+#[allow(dead_code, reason = "used by timestamp-bearing storage reads in the next persistence slice")]
 pub(crate) const fn timestamp_from_sql(timestamp: i64) -> Timestamp {
     u64::from_ne_bytes(timestamp.to_ne_bytes())
 }
 
-#[allow(dead_code, reason = "used by persistence transactions in the next increment")]
 pub(crate) fn daa_score_to_sql(score: u64) -> Result<i64, StorageError> {
     if score > MAX_DAA_SCORE {
         return Err(StorageError::ScoreOutOfRange(ScoreRangeFault::DaaScore));
@@ -49,7 +49,6 @@ pub(crate) fn daa_score_to_sql(score: u64) -> Result<i64, StorageError> {
     i64::try_from(score).map_err(|_| StorageError::ScoreOutOfRange(ScoreRangeFault::DaaScore))
 }
 
-#[allow(dead_code, reason = "used by persistence transactions in the next increment")]
 pub(crate) fn blue_score_to_sql(score: u64) -> Result<i64, StorageError> {
     if score > MAX_BLUE_SCORE {
         return Err(StorageError::ScoreOutOfRange(ScoreRangeFault::BlueScore));
@@ -213,10 +212,23 @@ async fn commit_initialization(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn open_validated_generations(
     database_url: String,
     state: DatabaseState,
     retirement_tx: RetirementSender,
+    replacement_gate: Arc<ApiReplacementGate>,
+) -> Result<Option<ValidatedGenerations>, StorageError> {
+    let (rebuild_tx, _rebuild_rx) = crate::runtime::rebuild_channel();
+    open_validated_generations_managed(database_url, state, retirement_tx, rebuild_tx, replacement_gate).await
+}
+
+pub(crate) async fn open_validated_generations_managed(
+    database_url: String,
+    state: DatabaseState,
+    retirement_tx: RetirementSender,
+    rebuild_tx: RebuildSender,
+    replacement_gate: Arc<ApiReplacementGate>,
 ) -> Result<Option<ValidatedGenerations>, StorageError> {
     let (binding, coherent) = match state {
         DatabaseState::Uninitialized => return Ok(None),
@@ -224,10 +236,10 @@ pub(crate) async fn open_validated_generations(
         DatabaseState::Inconsistent { binding } => (binding, false),
     };
 
-    let processing = open_processing_generation(database_url.clone(), binding, retirement_tx.clone()).await?;
+    let processing = open_processing_generation_managed(database_url.clone(), binding, retirement_tx.clone(), rebuild_tx).await?;
 
     let api = if coherent {
-        match open_api_generation(database_url, retirement_tx).await {
+        match open_api_generation(database_url, retirement_tx, replacement_gate).await {
             Ok(api) => Some(api),
             Err(error) => {
                 processing.retire();
@@ -242,10 +254,21 @@ pub(crate) async fn open_validated_generations(
     Ok(Some(ValidatedGenerations { processing, api }))
 }
 
+#[cfg(test)]
 pub(crate) async fn open_processing_generation(
     database_url: String,
     binding: DatabaseBinding,
     retirement_tx: RetirementSender,
+) -> Result<Arc<ValidatedDbClient>, StorageError> {
+    let (rebuild_tx, _rebuild_rx) = crate::runtime::rebuild_channel();
+    open_processing_generation_managed(database_url, binding, retirement_tx, rebuild_tx).await
+}
+
+pub(crate) async fn open_processing_generation_managed(
+    database_url: String,
+    binding: DatabaseBinding,
+    retirement_tx: RetirementSender,
+    rebuild_tx: RebuildSender,
 ) -> Result<Arc<ValidatedDbClient>, StorageError> {
     let pool = PgPoolOptions::new()
         .max_connections(PROCESSING_POOL_SIZE)
@@ -256,12 +279,13 @@ pub(crate) async fn open_processing_generation(
         pool.close().await;
         return Err(error);
     }
-    Ok(ValidatedDbClient::new(pool, binding, retirement_tx))
+    Ok(ValidatedDbClient::new_managed(pool, binding, retirement_tx, rebuild_tx))
 }
 
 pub(crate) async fn open_api_generation(
     database_url: String,
     retirement_tx: RetirementSender,
+    replacement_gate: Arc<ApiReplacementGate>,
 ) -> Result<Arc<ValidatedApiDbClient>, StorageError> {
     let pool = PgPoolOptions::new()
         .max_connections(API_POOL_SIZE)
@@ -278,7 +302,7 @@ pub(crate) async fn open_api_generation(
         pool.close().await;
         return Err(error);
     }
-    Ok(ValidatedApiDbClient::new(pool, retirement_tx))
+    Ok(ValidatedApiDbClient::new(pool, retirement_tx, replacement_gate))
 }
 
 async fn validate_processing_pool(pool: &sqlx::PgPool) -> Result<(), StorageError> {
@@ -341,6 +365,7 @@ mod tests {
         error::{StorageError, StorageRejection},
         generation::StoredSessionState,
         migration,
+        replacement::ApiReplacementGate,
         runtime::retirement_channel,
         state::DatabaseState,
     };
@@ -471,14 +496,14 @@ mod tests {
         let (mut database, uninitialized) = prepared_database(&database_url).await;
         let (retirement_tx, _retirement_rx) = retirement_channel();
         assert!(
-            open_validated_generations(database_url.clone(), uninitialized, retirement_tx.clone())
+            open_validated_generations(database_url.clone(), uninitialized, retirement_tx.clone(), ApiReplacementGate::new(),)
                 .await
                 .expect("uninitialized capability classification")
                 .is_none()
         );
         let state = database.initialize_if_uninitialized(mainnet(), hash(6), None).await.expect("initialization");
 
-        let generations = open_validated_generations(database_url.clone(), state, retirement_tx)
+        let generations = open_validated_generations(database_url.clone(), state, retirement_tx, ApiReplacementGate::new())
             .await
             .expect("validated generation creation")
             .expect("initialized database must publish generations");
@@ -540,7 +565,7 @@ mod tests {
         let state = database.classify().await.expect("inconsistent classification");
         let (retirement_tx, _retirement_rx) = retirement_channel();
 
-        let generations = open_validated_generations(database_url.clone(), state, retirement_tx)
+        let generations = open_validated_generations(database_url.clone(), state, retirement_tx, ApiReplacementGate::new())
             .await
             .expect("validated generation creation")
             .expect("bound inconsistent database must publish processing generation");
@@ -763,7 +788,7 @@ mod tests {
         assert!(matches!(initialized, DatabaseState::Initialized(_)));
 
         let (retirement_tx, _retirement_rx) = retirement_channel();
-        let generations = open_validated_generations(database_url.clone(), initialized, retirement_tx)
+        let generations = open_validated_generations(database_url.clone(), initialized, retirement_tx, ApiReplacementGate::new())
             .await
             .expect("validated generation creation")
             .expect("initialized database must publish generations");
@@ -778,6 +803,10 @@ mod tests {
         assert_eq!(snapshot.committed_vspc_sink.id.get(), 2);
         assert_eq!(snapshot.committed_vspc_sink.selected_parent, hash(8));
         assert_eq!(snapshot.committed_vspc_sink.daa_score, 0);
+        assert_eq!(
+            processing.cached_vspc_sink(),
+            Some(crate::cache::CachedVspcSink { id: snapshot.committed_vspc_sink.id, hash: snapshot.committed_vspc_sink.hash })
+        );
 
         sqlx::query("INSERT INTO block_identifiers (id, hash) VALUES (3, $1)")
             .bind(hash(7).as_bytes().as_slice())

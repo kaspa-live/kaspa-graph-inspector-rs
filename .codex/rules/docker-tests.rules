@@ -4,6 +4,7 @@ prefix_rule(
     justification = "KGI integration tests use testcontainers and require Docker socket access",
     match = [
         "cargo nextest run --workspace --locked",
+        "cargo nextest run -p kgi-storage --locked",
         "cargo nextest run -p kgi-storage --lib --locked",
     ],
 )

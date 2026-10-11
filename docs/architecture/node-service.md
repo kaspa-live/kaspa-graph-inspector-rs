@@ -606,17 +606,26 @@ For an ordinary non-Genesis block, the normalizer consumes the header's cached
 and `blue_work`, plus verbose `selected_parent_hash`,
 `merge_set_blues_hashes`, and `merge_set_reds_hashes`. Verbose data is therefore
 mandatory for an ordinary `ValidatedNodeBlock`; absence returns the obtaining
-operation's source-specific malformed-input result. The selected-parent hash
-must occur in the level-zero direct-parent sequence.
+operation's source-specific malformed-input result. The normalizer constructs
+`direct_parents` by retaining the first occurrence of each level-zero parent
+hash in node order and discarding later occurrences. It applies the same
+first-occurrence rule independently to `merge_set_blues_hashes` and
+`merge_set_reds_hashes`. The selected-parent hash must occur in the canonical
+direct-parent sequence. If the block's authoritative header hash occurs in any
+of the three raw relationship vectors, common normalization fails rather than
+retaining or silently removing that occurrence.
 
 The cached header hash is authoritative block identity and is never
-recomputed. The normalizer does not require unique parents or merge-set
-members, reject self-reference, or compare redundant reported hashes. It
-preserves the node's parent and merge-set order, including repeated positions.
-This node-facing sequence is not a promise that repeated direct-parent
-occurrences become distinct durable relations; the
-[storage representation](storage.md#persistent-representation--settled) owns
-that canonicalization.
+recomputed. Repeated raw parent or merge-set positions are accepted
+normalization input rather than malformed evidence. The normalizer does not
+require the relationship vectors to be disjoint or compare redundant reported
+hashes. In particular, a hash other than the block's own hash found in both
+merge-set colors remains once in each canonical vector. Own-hash exclusion is
+the minimum structural condition that prevents Storage from treating the
+incoming block as one of its own references. Canonicalizing each vector at this
+boundary prevents downstream components from retaining or independently
+normalizing repeated observations that have no distinct relationship meaning
+while preserving cross-vector semantics.
 
 For the exact Genesis hash of the validated RPC generation, the normalizer
 does not require verbose data. It copies the header hash, timestamp, DAA score,

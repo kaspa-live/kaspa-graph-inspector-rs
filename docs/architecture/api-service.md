@@ -483,6 +483,15 @@ impl EncodingScheduler {
 
 It owns every queued and active graph JSON serialization and gzip operation.
 Individual request and cache tasks never spawn untracked compression work.
+Under the system-wide
+[process execution model](overview.md#process-execution-model--settled), the
+encoding scheduler is the sole submitter of these CPU phases to
+`tokio::task::spawn_blocking`. It submits work only after the applicable active
+encoding permit has been acquired and detached inputs are ready, retains that
+permit until the blocking call returns, and never uses Tokio's blocking-pool
+capacity as admission. Graph JSON serialization and gzip compression do not
+run directly on an async runtime worker.
+
 The scheduler enforces the existing total and historical limits and priority.
 A historical request reserves bounded queue capacity before database work,
 then submits the detached projection through that reservation after releasing

@@ -93,6 +93,34 @@ graph-update loss reporting, the [API graph model](api-graph.md) owns the
 derived graph state, and [API graph publication](api-publication.md) owns
 reconstruction and publication behavior.
 
+## Process execution model — settled
+
+The production process runs one Tokio multithread runtime. Axum HTTP requests,
+SSE connections, node RPC, SQLx operations, timers, channels, cancellation,
+and component event loops execute as nonblocking async work on that runtime.
+Async tasks may run concurrently across runtime worker threads while each
+component retains the state-serialization rules owned by its focused contract.
+KGI does not dedicate one operating-system thread to each request, connection,
+database operation, or component worker.
+
+A synchronous CPU phase that can occupy an async worker for a material period
+must have bounded admission owned by its component before it is submitted to
+`tokio::task::spawn_blocking`. The admitted job carries detached owned inputs,
+holds its component permit until the blocking call returns, and retains no
+database connection, transaction, async mutex guard, or component-state lock.
+Tokio's blocking pool is only the executor; its capacity never replaces the
+component's semantic work limit, and code outside that owner cannot bypass the
+limit with direct blocking-task submission. Cancellation may discard interest
+in the result but cannot interrupt a blocking call already running, so the
+owner tracks it through completion and discards its output when required.
+
+The [ApiService task contract](api-service.md#cache-and-encoding-jobs) owns the
+application of this execution model to graph response encoding. Short bounded
+transformations and brief synchronous critical sections may execute directly
+on async workers. Exact Tokio worker counts, blocking-pool sizing, and detailed
+runtime fairness remain implementation choices; they do not change component
+admission limits or lifecycle ownership.
+
 ## Responsibility boundaries — settled
 
 | Component | Owned state and responsibility | Focused contract |

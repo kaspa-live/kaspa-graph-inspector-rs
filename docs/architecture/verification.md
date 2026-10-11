@@ -156,10 +156,15 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
 1. Common full-block normalization produces the flattened
    `ValidatedNodeBlock` from the exact consumed header and verbose fields. An
    ordinary block requires verbose data and selected-parent membership, uses
-   the trusted cached header hash and header blue score, preserves parent and
-   merge-set order, and ignores every named unused RPC field. Accept duplicate
-   parents or merge-set members and direct or merge-set self-reference;
-   repeated positions remain present in `ValidatedNodeBlock`.
+   the trusted cached header hash and header blue score, preserves canonical
+   first-occurrence order independently in each relationship vector, and
+   ignores every named unused RPC field. Supply repeated positions in the
+   level-zero parents and in each merge-set color; each resulting vector
+   contains every hash once at its first occurrence. Include one hash in both
+   merge-set colors and verify that cross-vector overlap remains accepted.
+   Separately place the block's own authoritative hash in each of the three
+   relationship vectors and verify common normalization rejects every case;
+   no source operation may receive a self-referential `ValidatedNodeBlock`.
    Separately, cover exact-Genesis construction without verbose data: ORIGIN,
    empty parent and merge-set vectors, and blue score zero are synthesized
    while timestamp, representable DAA score, and blue work come from the
@@ -342,11 +347,13 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
 1. Rebuild materializes PP at `(level = 1, slot = 0)`; retained anticone roots
    and nonroots follow the parent-derived placement rule; boundary identities
    never become block rows.
-2. Genesis and any PP whose selected parent is ORIGIN retain a non-null ORIGIN
-   identity without inventing a direct parent. Web Genesis detection uses the
-   actual absence of direct parents rather than visible-edge absence.
-3. Hash interning follows the universal five-stage order. Strict
-   materialization creates no boundary identity.
+2. Exact Genesis retains a non-null ORIGIN identity without inventing a direct
+   parent. Web Genesis detection uses the actual absence of direct parents
+   rather than visible-edge absence.
+3. Hash interning follows the storage-owned reference-first order without a
+   separate selected-parent stage. Exact Genesis explicitly interns synthetic
+   ORIGIN before its own hash. Strict materialization creates no boundary
+   identity.
 4. Database startup distinguishes Uninitialized, Empty, Initialized,
    boundedly detected Inconsistent processing contents, and rejected schemas.
    Persistent initialization authorization is idempotent for a compatible
@@ -433,6 +440,16 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
     `i64::MAX`, `i64::MAX + 1`, and `u64::MAX` through the signed `BIGINT`
     bit-pattern encoding; upper-half negative storage values are not
     inconsistent contents.
+14. Verify the storage-owned
+    [processing-cache requirement](storage.md#caches-and-identity-resolution--settled):
+    the forward identity, materialized-block metadata, merge-set, and
+    capacity-one current-sink domains use separate Moka caches. Exercise a
+    complete VSPC member cache hit from block metadata alone and missing block
+    metadata through one batched SQL fallback, current-sink seeding from fresh
+    session state, and replacement by the destination only after definite VSPC
+    commit. Rollback and ambiguous commit publish no transaction-derived cache
+    state. Rebuild and a replacement processing generation replace all four
+    domains together and cannot observe predecessor entries.
 
 Verify the [block materialization transaction](storage.md#block-materialization-transaction--settled)
 and [PP seal behavior](block-processing.md#pp-boundary-phase-behavior--settled)
@@ -469,11 +486,19 @@ outside-boundary parent. Its non-repeating `level_snapshots` must contain the
 complete resulting block level and every distinct materialized parent level,
 preserve an existing level's DAA score while its size changes, translate the
 no-VSPC sentinel to `None`, and exclude outside-boundary parents. Supply a
-validated parent sequence in which the selected parent and another parent each
-repeat. Verify first-occurrence canonicalization, one row and one
-`ParentCommitted` per relation, the selected-parent index in the canonical
-sequence, and no repeated coordinate or level contribution. Rebuild applies
-the same canonicalization. Cover committed initial color and VSPC membership.
+canonical validated parent sequence and verify Storage preserves its order,
+creates one row and one `ParentCommitted` per relation, computes the
+selected-parent index in that sequence, and produces no repeated coordinate or
+level contribution. Supply canonical blue and red merge-set vectors with a
+cross-color overlap and verify Storage preserves both ordered arrays without
+another normalization step. Cover a selected parent first encountered in a
+merge-set group and one first encountered among direct parents; neither case may
+depend on the selected parent's numeric ID position. Rebuild consumes the same
+canonical shared value.
+Verify materialization relies on the shared own-hash exclusion, deduplicates
+only the reference prefix of its interning order, does not append the selected
+parent as a separate interning stage, and appends the incoming block hash
+directly. Cover committed initial color and VSPC membership.
 Inserted outcomes and their
 BlockProcessor offers preserve increasing IDs while permitting allocation
 gaps; `AlreadyMaterialized` returns no graph-update payload.
@@ -495,6 +520,13 @@ ordered removal, addition, and coloring steps. Its definite outcome contains
 one complete post-commit snapshot for every distinct affected level, including
 a level whose remove/add sequence restores its original score, and requires no
 post-commit projection read.
+
+Verify the successful VSPC path compares compact member and selected-parent
+IDs without resolving hashes. For the first ID conflict, verify one bounded
+in-transaction query resolves the distinct child, expected-parent, and
+stored-parent IDs into `VspcPathConflict`; incomplete or invalid evidence
+resolution returns `StorageError::InvalidMetadata` rather than a partial
+conflict.
 
 Verify [transaction retries](storage.md#transaction-retries) with PostgreSQL
 integration fixtures. Only SQLSTATE `40001` and `40P01` retry the complete
@@ -765,7 +797,7 @@ with:
 - removed/added source and destination derivation;
 - the added-only path with no database source;
 - an actionable reorg resolving `removed` followed by `added` through one
-  ordered, cache-first storage batch;
+  ordered storage resolution call;
 - strict-`<` sink-preserving history pruning before Catchup, at the
   Catchup-to-Live transition, and during Live, with pruning disabled throughout
   Catchup;
@@ -837,13 +869,14 @@ index for an ordinary block, the Genesis `None` case, and propagation of the
 committed initial color and VSPC membership.
 
 For below-range block updates, verify that every delivered `BlockCommitted` is
-consumed, its complete level snapshot updates retained external state, and the
-resulting endpoint change is published as one atomic revision. Parent snapshots
-seed exact external level state for new crossing edges. The update must neither
-expand the view extent nor restore the below-range block or level as head-view
-content. An update for a level with no retained crossing-edge endpoint produces
-no visible revision, and unreferenced external endpoint metadata can be
-discarded.
+consumed, its complete level snapshot updates retained external size while
+preserving an existing DAA score, and a resulting size change is published as
+one atomic revision. Parent snapshots seed complete external level state for
+new crossing edges; verify exact size and permit the settled contextual DAA
+score. The update must neither expand the view extent nor restore the
+below-range block or level as head-view content. An update for a level with no
+retained crossing-edge endpoint produces no visible revision, and unreferenced
+external endpoint metadata can be discarded.
 
 Verify the settled [head block mutation](api-graph.md#head-block-mutation--settled)
 below and at full depth, at the existing high level, at a new high level, and
@@ -945,11 +978,26 @@ and verify that its supplied final snapshot still updates its DAA score and
 produces the corresponding level-only delta. A snapshot for a level absent
 from the view is ignored.
 
+Deterministically overlap materialization of a child whose retained parent
+level already exists with a VSPC transaction that changes that parent level's
+DAA score. Deliver the two committed outcomes in both possible orders and
+verify that the final `GraphView` combines the materialization snapshot's size
+with the VSPC snapshot's DAA score and equals the corresponding persisted
+fields. Neither order may restore the other transaction's contextual field.
+Repeat with the VSPC snapshot arriving while the level is absent and the later
+block update first retaining it only as an external endpoint: the VSPC update
+has no visible effect, the seeded size is exact, and the contextual DAA score
+is accepted. This case must not require cross-lane transaction or delivery
+serialization.
+
 Verify [anchored graph windows](api-protocol.md#anchored-graph-windows--settled)
 for floor selection and tie break, the sentinel result, a reorg-created
 VSPC-empty level, atomic level-score publication, and navigation plus window
 consistency from one image. Accept zero and `MAX_DAA_SCORE` as query bounds and
-reject the no-VSPC sentinel as a real DAA query.
+reject the no-VSPC sentinel as a real DAA query. Retain an external endpoint
+below Head's nominal extent with a contextual DAA score and verify that
+in-memory DAA-floor resolution excludes it; a query below nominal in-memory
+coverage uses the consistent database path.
 
 Verify successful level, block-hash, and DAA anchors return a
 `GraphWindowResolution` whose resolved level lies in its effective capped
@@ -1713,9 +1761,10 @@ generation remains, and begin Rebuild before that phase releases its
 service-owned shared lease. Verify Rebuild emits no second retirement event,
 publishes gated `G2`, cancels and boundedly drains the admitted `G1` phase, and
 cannot acquire exclusive replacement access until its lease is released. Make
-that drain fail and require `RebuildSetupFailed(ApiReadExclusion)` plus
-retirement of `G2`; absence of a current generation must not make the drain
-vacuous.
+the lease release before `API_REPLACEMENT_DRAIN_TIMEOUT` and verify replacement
+continues. Hold it through that timeout and require
+`RebuildSetupFailed(ApiReadExclusion)` plus retirement of `G2`; absence of a
+current generation must not make the drain vacuous.
 Verify a detached old projection may complete delivery while
 an undetached request returns 503, public reads reopen only after the
 replacement completes `Prewarming` and becomes `Active`, and
@@ -1784,10 +1833,18 @@ tracker. Include tier-keyed Head snapshot jobs and mandatory `Prewarming` work
 in the same tracked cache and encoding infrastructure. For encoding, reserve
 bounded historical capacity before database work,
 release every database resource before submitting the detached projection,
-and enforce the settled total and historical concurrency limits. Scheduler
-shutdown rejects new work, cancels queued work, lets already active blocking
-serialization or compression finish while discarding its output, and joins
-the scheduler without a publication lock or database resource held.
+and enforce the settled total and historical concurrency limits. Verify the
+[process execution model](overview.md#process-execution-model--settled) and
+[ApiService encoding scheduler](api-service.md#cache-and-encoding-jobs) with a
+composition-root runtime assertion, a production-adapter assertion for
+`spawn_blocking`, and an instrumented blocking executor.
+Hold every active encode at a test barrier: additional jobs remain in the
+scheduler queue while async status, SSE, cancellation, and processing work
+remain pollable, and no database resource or component-state lock is held by a
+blocked encode.
+Scheduler shutdown rejects new work, cancels queued work, lets already active
+blocking serialization or compression finish while discarding its output, and
+joins the scheduler without a publication lock or database resource held.
 
 Verify the [ApiService shutdown barrier](api-service.md#apiservice-shutdown--settled)
 from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`, `Prewarming`, and

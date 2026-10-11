@@ -20,12 +20,12 @@ delivered `BlockCommitted`, including updates for blocks below the current head
 view. A block within the view follows normal insertion handling. A block below
 `low_level` does not reintroduce its block into the view or extend its extent.
 Its complete committed level snapshot updates that level when it remains cached
-as an external endpoint for a crossing edge. Parent-level snapshots can seed
-external levels required by the incoming child's edges. A later below-range
-update publishes an atomic graph revision only when a supplied snapshot changes
-retained endpoint state. An update for a level with no retained crossing-edge
-endpoint has no visible view effect. The graph-view contract below owns endpoint
-retention and removal.
+as an external endpoint for a crossing edge under the source-specific merge
+rules below. Parent-level snapshots can seed external levels required by the
+incoming child's edges. A later below-range update publishes an atomic graph
+revision only when a supplied snapshot changes retained endpoint state. An
+update for a level with no retained crossing-edge endpoint has no visible view
+effect. The graph-view contract below owns endpoint retention and removal.
 
 Ordered `VspcProcessor` delivery certifies VSPC sequencing for ApiService.
 `GraphView` does not retain a committed VSPC sink and ApiService does not repeat
@@ -214,7 +214,10 @@ impl GraphDelta {
 actual child-parent relation once. Its order has no cross-view semantic
 meaning; `selected_parent_index` addresses the selected parent in that same
 local sequence. Consequently one `EdgeId` represents the complete occurrence
-of one child-parent relation.
+of one child-parent relation. `blue_merge_set` and `red_merge_set` are likewise
+independently non-repeating and first-occurrence ordered. A hash may occur in
+both colors; the settled blue-then-red VSPC application order determines its
+final color. `GraphBlock.hash` is absent from all three relationship vectors.
 
 A `GraphView` has no clock origin,
 liveness, database, or publication status. A view constructed from a database
@@ -311,10 +314,11 @@ The operation then performs one atomic graph-state transition:
    `GraphEdge` and retain it when its span intersects the target extent under
    the predicate owned below. An outside-PP parent has no coordinate and
    produces no edge.
-3. Apply every relevant `LevelCommitted` snapshot to the inserted block level
-   or a retained parent endpoint level. A snapshot replaces only the public
-   `Level { size, daa_score }` value. It preserves an existing derived
-   `usage_count`; a newly retained level starts with `usage_count = 0`.
+3. Apply every relevant materialization `LevelCommitted` snapshot to the
+   inserted block level or a retained parent endpoint level. When the level is
+   absent, create its public `Level { size, daa_score }` from the complete
+   snapshot with `usage_count = 0`. When the level already exists, replace only
+   its `size` and preserve its `daa_score` and derived `usage_count`.
 4. Each retained edge addition increments the referenced parent level's
    `usage_count`. Multiple distinct edges to one parent level contribute
    separately.
@@ -334,8 +338,13 @@ publication-supplied timestamp for revision `n + 1`.
 
 This procedure also covers a committed block below `target_low`: its block and
 edges are not reintroduced, while a supplied level snapshot can still update
-an already retained external endpoint. Concrete indexes, collection types,
-and internal mutation staging remain implementation choices. Enclosing
+the size of an already retained external endpoint without replacing its DAA
+score. A snapshot that first seeds an external endpoint supplies a structurally
+complete `Level`; its DAA score is contextual and may precede a concurrent VSPC
+change that arrived while the level was absent. This accepted imprecision is
+permitted because only size and derived edge usage govern the external
+endpoint's structural role. Concrete indexes, collection types, and internal
+mutation staging remain implementation choices. Enclosing
 publication synchronization belongs to the
 [publication owner](api-publication.md#publication-synchronization-and-request-capture--settled).
 
@@ -566,8 +575,8 @@ order as the storage transaction, projected onto its retained blocks:
 3. for every present added block in order, each present blue merge-set member
    becomes `Blue`, then each present red merge-set member becomes `Red`; and
 4. every supplied final level snapshot whose level is already retained replaces
-   that level's public `size` and `daa_score`, preserving its derived
-   `usage_count`.
+   that level's public `daa_score`, preserving its materialization-owned `size`
+   and derived `usage_count`.
 
 Membership and color are separate mutable fields. The two change maps are
 independent and may contain the same block hash. Each atomic update records the
@@ -604,13 +613,22 @@ interval whose mutations cancel completely still advances from its recorded
 
 VSPC DAA-score projection uses the existing `level_changes` collection. For
 each supplied snapshot whose level is retained, capture the original public
-value and install the snapshot's complete final `size` and `daa_score` while
-preserving the derived `usage_count`. Emit one `LevelChange` only when that
-public value changed. Both sides remain `Some(Level)` because a VSPC update
-does not create or remove levels. Existing `LevelChange` composition then
-combines block-level creation or size changes with the VSPC result and removes
-composed no-ops. A retained level-score change alone is sufficient to produce
-a graph revision.
+value and install only the snapshot's final `daa_score`, preserving the
+materialization-owned `size` and derived `usage_count`. Emit one `LevelChange`
+only when that public value changed. Both sides remain `Some(Level)` because a
+VSPC update does not create or remove levels. Existing `LevelChange`
+composition then combines block-level creation or size changes with the VSPC
+result and removes composed no-ops. A retained level-score change alone is
+sufficient to produce a graph revision.
+
+Materialization and VSPC outcomes can reach the view in either commit-delivery
+order. Following Storage's
+[source-field authority](storage.md#internal-concurrency), the operations above
+update disjoint fields and preserve the other field, so neither can reapply a
+stale contextual value observed by its independent storage transaction. A VSPC
+snapshot for an absent level remains ignored; if a later block snapshot first
+retains that level only as an external endpoint, the preceding paragraph's
+accepted contextual DAA value applies.
 
 An edge belongs to an extent `[low_level, high_level]` when its level span
 intersects that extent:

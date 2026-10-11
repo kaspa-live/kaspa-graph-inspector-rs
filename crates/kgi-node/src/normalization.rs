@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use kaspa_consensus_core::blockhash::ORIGIN;
 use kaspa_rpc_core::{GetBlocksResponse, GetVirtualChainFromBlockV2Response, RpcBlock};
@@ -20,6 +20,7 @@ pub(crate) enum ResponseNormalizationError {
 pub(crate) enum BlockNormalizationError {
     ScoreOutOfRange(ScoreRangeFault),
     MissingVerboseData,
+    OwnHashReference,
     SelectedParentNotDirect,
 }
 
@@ -164,23 +165,31 @@ impl ResponseNormalizer {
 
         check_score(header.blue_score, MAX_BLUE_SCORE, ScoreRangeFault::BlueScore).map_err(response_to_block_error)?;
         let verbose = block.verbose_data.ok_or(BlockNormalizationError::MissingVerboseData)?;
-        let direct_parents = header.parents_by_level.into_iter().next().unwrap_or_default();
+        let direct_parents = retain_first_occurrences(header.parents_by_level.into_iter().next().unwrap_or_default(), header.hash)?;
         if !direct_parents.contains(&verbose.selected_parent_hash) {
             return Err(BlockNormalizationError::SelectedParentNotDirect);
         }
+        let blue_merge_set = retain_first_occurrences(verbose.merge_set_blues_hashes, header.hash)?;
+        let red_merge_set = retain_first_occurrences(verbose.merge_set_reds_hashes, header.hash)?;
 
         Ok(ValidatedNodeBlock {
             hash: header.hash,
             selected_parent: verbose.selected_parent_hash,
             direct_parents,
-            blue_merge_set: verbose.merge_set_blues_hashes,
-            red_merge_set: verbose.merge_set_reds_hashes,
+            blue_merge_set,
+            red_merge_set,
             timestamp: header.timestamp,
             daa_score: header.daa_score,
             blue_score: header.blue_score,
             blue_work: header.blue_work,
         })
     }
+}
+
+fn retain_first_occurrences(mut hashes: Vec<BlockHash>, own_hash: BlockHash) -> Result<Vec<BlockHash>, BlockNormalizationError> {
+    let mut seen = HashSet::with_capacity(hashes.len());
+    hashes.retain(|hash| seen.insert(*hash));
+    if seen.contains(&own_hash) { Err(BlockNormalizationError::OwnHashReference) } else { Ok(hashes) }
 }
 
 fn check_score(value: u64, maximum: u64, fault: ScoreRangeFault) -> Result<(), ResponseNormalizationError> {
@@ -197,9 +206,9 @@ const fn response_to_block_error(error: ResponseNormalizationError) -> BlockNorm
 const fn classify_block_error(error: BlockNormalizationError, malformed_kind: RecoveryInputKind) -> ResponseNormalizationError {
     match error {
         BlockNormalizationError::ScoreOutOfRange(fault) => ResponseNormalizationError::ScoreOutOfRange(fault),
-        BlockNormalizationError::MissingVerboseData | BlockNormalizationError::SelectedParentNotDirect => {
-            ResponseNormalizationError::Malformed(malformed_kind)
-        }
+        BlockNormalizationError::MissingVerboseData
+        | BlockNormalizationError::OwnHashReference
+        | BlockNormalizationError::SelectedParentNotDirect => ResponseNormalizationError::Malformed(malformed_kind),
     }
 }
 
@@ -218,28 +227,46 @@ mod tests {
         lifecycle::{MalformedVspcResponseReason, RecoveryInputKind, ScoreRangeFault},
     };
 
-    use super::{ResponseNormalizationError, ResponseNormalizer};
+    use super::{BlockNormalizationError, ResponseNormalizationError, ResponseNormalizer};
 
     #[test]
-    fn ordinary_full_block_preserves_consumed_sequences_and_ignores_redundancy() {
+    fn ordinary_full_block_canonicalizes_relationships_and_ignores_redundancy() {
         let own = hash(1);
         let selected_parent = hash(2);
         let repeated_parent = hash(3);
+        let overlap = hash(4);
         let mut block = rpc_block(own, vec![selected_parent, repeated_parent, selected_parent]);
         let verbose = block.verbose_data.as_mut().expect("verbose data");
         verbose.hash = hash(90);
         verbose.blue_score = u64::MAX;
-        verbose.merge_set_blues_hashes = vec![own, hash(4), hash(4)];
-        verbose.merge_set_reds_hashes = vec![hash(5), selected_parent, hash(5)];
+        verbose.merge_set_blues_hashes = vec![hash(6), overlap, overlap];
+        verbose.merge_set_reds_hashes = vec![hash(5), overlap, selected_parent, hash(5)];
 
         let normalized = normalizer(hash(0)).validated_block(block).expect("valid ordinary block");
 
         assert_eq!(normalized.hash, own);
         assert_eq!(normalized.selected_parent, selected_parent);
-        assert_eq!(normalized.direct_parents, vec![selected_parent, repeated_parent, selected_parent]);
-        assert_eq!(normalized.blue_merge_set, vec![own, hash(4), hash(4)]);
-        assert_eq!(normalized.red_merge_set, vec![hash(5), selected_parent, hash(5)]);
+        assert_eq!(normalized.direct_parents, vec![selected_parent, repeated_parent]);
+        assert_eq!(normalized.blue_merge_set, vec![hash(6), overlap]);
+        assert_eq!(normalized.red_merge_set, vec![hash(5), overlap, selected_parent]);
         assert_eq!(normalized.blue_score, 12);
+    }
+
+    #[test]
+    fn ordinary_full_block_rejects_own_hash_in_every_relationship_vector() {
+        let own = hash(1);
+        let parent = hash(2);
+        let direct_parent = rpc_block(own, vec![parent, own]);
+
+        let mut blue_merge_set = rpc_block(own, vec![parent]);
+        blue_merge_set.verbose_data.as_mut().expect("verbose data").merge_set_blues_hashes = vec![hash(3), own];
+
+        let mut red_merge_set = rpc_block(own, vec![parent]);
+        red_merge_set.verbose_data.as_mut().expect("verbose data").merge_set_reds_hashes = vec![hash(3), own];
+
+        for block in [direct_parent, blue_merge_set, red_merge_set] {
+            assert_eq!(normalizer(hash(0)).validated_block(block), Err(BlockNormalizationError::OwnHashReference));
+        }
     }
 
     #[test]

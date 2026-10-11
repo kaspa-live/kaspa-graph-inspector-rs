@@ -200,6 +200,10 @@ operation-completion barrier is required.
 
 ### API read exclusion during database replacement — settled
 
+```text
+API_REPLACEMENT_DRAIN_TIMEOUT = 30 seconds
+```
+
 ```rust
 enum RebuildSetupFault {
     ApiGenerationPreparation,
@@ -227,13 +231,13 @@ transaction, connection, and permit have been released. Serialization,
 compression, and response delivery occur outside this permit and cannot issue
 follow-up database reads.
 
-The replacement gate and its active-phase set are owned by StorageService and
-outlive individual `ValidatedApiDbClient` generations. Every API generation
+The replacement gate and its active-lease registry are owned by StorageService
+and outlive individual `ValidatedApiDbClient` generations. Every API generation
 holds only a shared reference to that same gate. Retiring a generation prevents
 new database phases through it but does not remove a lease already held by an
 admitted operation. Dropping a client reference neither resets the gate nor
 removes such a lease. The gate retains no history of retired generations; it
-retains only currently active database-phase leases and their cancellation
+retains only currently active database-read leases and their cancellation
 paths until those leases are released.
 
 Before `rebuild_from_pruning_point` clears or replaces processing data,
@@ -252,12 +256,16 @@ published, while remaining behind the closed gate. StorageService cancels and
 boundedly drains every active database phase admitted before closure,
 regardless of whether the client generation that admitted it is still current
 or has already been retired. It acquires the exclusive replacement permit only
-after all such leases have been released. Absence of a current API generation
-does not skip this procedure and does not preclude `ApiReadExclusion`; the drain
-is immediately complete only when the service-owned active-phase set is empty.
-A request that detached its projection before closure may finish returning
-that old coherent image. Every other affected old-generation request reports
-database-backed read unavailability; the
+after all such leases have been released. From the cancellation request,
+StorageService allows at most `API_REPLACEMENT_DRAIN_TIMEOUT` for those leases
+to release and exclusive replacement ownership to be established. Expiry
+returns `StorageError::RebuildSetupFailed(ApiReadExclusion)`. Absence of a
+current API generation does not skip this procedure and does not preclude
+`ApiReadExclusion`; the drain is immediately complete only when the
+service-owned active-lease registry is empty. A request that detached its
+projection before closure may finish returning that old coherent image. Every
+other affected old-generation request reports database-backed read
+unavailability; the
 [API protocol](api-protocol.md#anchored-graph-windows--settled) owns its HTTP
 mapping. An API read cannot delay replacement without bound.
 
@@ -316,8 +324,7 @@ image, or an unavailable read outcome, never mixed or partially rebuilt
 tables. See PostgreSQL's
 [`TRUNCATE`](https://www.postgresql.org/docs/current/sql-truncate.html) and
 [MVCC caveat](https://www.postgresql.org/docs/current/mvcc-caveats.html)
-documentation. Concrete permit, cancellation, and transaction primitives are
-deferred in the [decision register](../decisions/deferred.md).
+documentation.
 
 ### Transaction retries
 
@@ -340,7 +347,14 @@ cross-worker disposition. No cache state is published before definite commit.
 The storage implementation provides separate sequential materialization and
 VSPC mutation lanes while allowing their transactions to overlap. Rebuild
 gets exclusive mutation access after processor deactivation. Reads remain
-concurrent.
+concurrent. A materialization `LevelCommitted` is authoritative downstream for
+its level's committed `size`; its `daa_score` is contextual evidence observed
+by that transaction. A VSPC `LevelCommitted` is authoritative downstream for
+its level's committed `daa_score`; its unchanged `size` is contextual evidence.
+The [graph model](api-graph.md#graph-update-consumption--settled) owns how those
+disjoint authorities are merged when independently ordered committed outcomes
+reach one view. Storage does not serialize the two lanes merely to order their
+contextual fields.
 
 ## Database bootstrap and validation — settled
 
@@ -782,14 +796,25 @@ endpoint coordinates. An outside-boundary parent uses the sentinel `(0,0)`.
 `levels.size` is the number of allocated slots at the level.
 
 Storage represents direct parents as child-parent relations, so one child has
-at most one relation to a given parent. Whenever rebuild or ordinary
-materialization consumes a `ValidatedNodeBlock`, it derives the canonical
-direct-parent sequence by retaining the first occurrence of each hash in node
-order. A repeated occurrence is not rejected and creates no additional parent
-row, `ParentCommitted` entry, or level snapshot. This canonical sequence drives
-reference classification, coordinate allocation, parent-row insertion, and
-`BlockCommitted`; merge-set arrays remain governed by their separate ordered
-representation.
+at most one relation to a given parent. The shared `ValidatedNodeBlock` already
+supplies canonical non-repeating direct-parent, blue-merge-set, and
+red-merge-set sequences. Rebuild and ordinary materialization preserve those
+sequences for reference classification, coordinate allocation, parent-row
+insertion, persisted merge-set arrays, and `BlockCommitted`; Storage neither
+retains the raw node sequences nor performs a second relationship-vector
+canonicalization. The same hash may remain in multiple vectors.
+The shared-value contract also guarantees that the incoming block's own hash
+is absent from every relationship vector; Storage relies on that guarantee and
+does not perform another own-reference check.
+
+The reference-first interning order guarantees only that every distinct
+relationship hash is allocated before the incoming block's own hash. Because
+cross-vector overlap is valid, the selected parent can first occur in the
+insertion sequence while interning a merge set or while interning direct
+parents. No storage operation may infer that the selected parent has the
+greatest reference ID, immediately precedes the block's ID, or has any other
+arithmetic relation to it. Persisted `selected_parent_id` and canonical
+direct-parent relations are the authorities for those relationships.
 
 There is no persistent `materialized` flag. In a processing-valid database
 generation, a `blocks` row is the persistent representation of the semantic
@@ -841,15 +866,33 @@ and validation when constructing a `MaterializedSyncAnchor`.
 
 ## Caches and identity resolution — settled
 
-The architecture fixes cache contents and publication rules rather than the
-cache library.
-Exact cache capacities remain deferred in the
-[decision register](../decisions/deferred.md).
+Every processing-generation cache owned by `ValidatedDbClient` uses a separate
+`moka::sync::Cache` instance. Moka is the settled implementation for this
+storage cache layer: it provides concurrent access and bounded eviction without
+an outer mutex serializing all cache operations. Separate instances preserve
+independent value domains and capacity policies. A replacement processing
+generation constructs fresh empty instances rather than sharing or invalidating
+its predecessor's caches.
+
+This requirement does not apply to API publication caches. Their response
+reuse and single-flight behavior remain owned by the API architecture.
+Exact cache capacities are tunable implementation choices recorded in the
+[implementation choices](../implementation/choices.md#9-october-2026-storage-persistence-operations).
 
 ```rust
 struct CachedIdentity {
     id: CompactId,
     materialized: bool,
+}
+
+struct CachedMaterializedBlock {
+    coordinate: BlockCoordinate,
+    selected_parent_id: CompactId,
+}
+
+struct CachedVspcSink {
+    id: CompactId,
+    hash: BlockHash,
 }
 
 enum ResolveMaterializedIdsError {
@@ -876,8 +919,56 @@ impl ValidatedDbClient {
 Caches contain:
 
 - `BlockHash -> CachedIdentity`;
-- `CompactId -> BlockCoordinate`; and
-- `CompactId -> MergeSets`.
+- `CompactId -> CachedMaterializedBlock`;
+- `CompactId -> MergeSets`; and
+- one capacity-one `CachedVspcSink` entry.
+
+The three block-scaled domains use capacity eviction without a time-to-live.
+The current-sink entry stores only the authoritative endpoint used to validate
+the next VSPC source; it does not cache arbitrary VSPC membership. Cache
+retention is never a processing-validity or accepted-reorganization bound.
+Every incomplete lookup falls back to PostgreSQL.
+
+`CachedIdentity.materialized` remains independent from
+`CachedMaterializedBlock`. A materialized forward identity whose block metadata
+entry was independently evicted is a cache miss, not an identity-only block or
+database inconsistency. Boundary identities have forward identity entries but
+no `CachedMaterializedBlock`.
+
+Definite block materialization publishes the forward identity, materialized
+block metadata, and immutable merge sets after commit. A cold identity or
+block-metadata read loads all required immutable fields in one batch and may
+populate the same domains. VSPC direct-member loading requires one
+`CachedMaterializedBlock` for each distinct member:
+
+```text
+member ID
+    -> CachedMaterializedBlock
+        -> level through coordinate
+        -> selected-parent ID
+```
+
+A missing block-metadata entry puts that member in one batched SQL fallback.
+The returned coordinate and selected-parent ID populate the block-metadata
+cache. Normal VSPC path validation compares member and selected-parent IDs and
+does not resolve their hashes. The
+[atomic VSPC transaction](#atomic-vspc-transaction--settled) owns lazy hash
+resolution for exceptional conflict evidence. Concurrent cold misses may
+duplicate the metadata read; they do not introduce waiting or cache
+single-flight coordination.
+
+The current-sink entry is seeded after a successful fresh
+`load_session_state()` read and after a definite Rebuild commit. A VSPC
+transaction loads the sink from PostgreSQL on a cache miss. Immediately after
+a definite VSPC commit, while still ordered by the VSPC mutation lane, Storage
+replaces the entry with the committed destination without an intervening
+await. Rollback or ambiguous commit publishes neither a destination nor other
+transaction-derived cache updates.
+
+Rebuild replaces all four cache domains together after definite replacement
+commit because Compact IDs can be reused. A new processing generation likewise
+starts with four fresh empty domains. No predecessor or pre-Rebuild entry may
+be observed through the replacement cache state.
 
 Do not cache negative identity results, mutable colors, or VSPC membership.
 Cold identity batches may left-join `blocks` to obtain the materialized bit.
@@ -942,17 +1033,24 @@ One database transaction performs the complete replacement:
 1. Clear `parents`, `blocks`, `levels`, `block_identifiers`, and the previous
    `ProcessingMetadata` within the same transaction.
 2. Restart Compact-ID allocation.
-3. Intern pruning-point hashes in the universal order:
+3. Intern pruning-point hashes in the storage order:
 
    ```text
    red merge-set hashes
    blue merge-set hashes
    direct-parent hashes
-   selected-parent hash
    pruning-point hash
    ```
 
-   Deduplicate hashes by first occurrence before insertion.
+   Deduplicate reference hashes by first occurrence through the first three
+   groups, then append the pruning point's own hash unconditionally. For an
+   ordinary non-Genesis pruning point, do not add a separate selected-parent
+   group: the shared `ValidatedNodeBlock` contract guarantees that its selected
+   parent already occurs in canonical `direct_parents`, and an earlier
+   cross-vector occurrence may already have interned the same hash. For exact
+   Genesis, the three relationship groups are empty; intern synthetic ORIGIN
+   explicitly before the Genesis hash so the block row retains its required
+   non-null selected-parent identity.
 4. Represent every retained-boundary-external pruning-point reference as a
    permanent `BoundaryIdentity`. Do not create placeholder `blocks` rows for
    parents, merge-set members, or other references.
@@ -965,7 +1063,7 @@ One database transaction performs the complete replacement:
    ```
 
    Its block row stores timestamp, DAA score, the non-null selected-parent ID,
-   and the ordered blue and red merge-set IDs.
+   and the canonical ordered blue and red merge-set IDs.
 6. Insert each canonical direct-parent relation once using the parent's
    interned ID and the outside-boundary coordinate sentinel `(0,0)`. The child
    coordinate is the pruning point's `(1,0)`.
@@ -986,10 +1084,10 @@ committed VSPC sink  = pruning point
 levels(1).size       = 1
 ```
 
-For a Genesis pruning point, the bootstrap path stores synthetic ORIGIN as the
-non-null selected-parent identity while storing zero actual direct parents.
-ORIGIN is not a direct parent. Genesis never enters the ordinary BlockProcessor
-or `PersistedBlock` delivery path.
+For a Genesis pruning point, the bootstrap path stores the explicitly interned
+synthetic ORIGIN as the non-null selected-parent identity while storing zero
+actual direct parents. ORIGIN is not a direct parent. Genesis never enters the
+ordinary BlockProcessor or `PersistedBlock` delivery path.
 
 ### Return value
 
@@ -1030,11 +1128,12 @@ database uses the same complete replacement.
 
 Only after definite commit, the current `ValidatedDbClient`:
 
-1. clears its identity, coordinate, and merge-set caches;
-2. seeds every newly interned pruning-point reference as
-   `{ id, materialized: false }`;
-3. seeds the pruning-point identity as `{ id, materialized: true }`; and
-4. seeds the pruning-point coordinate and immutable merge sets.
+1. replaces all four processing-cache domains with fresh empty instances;
+2. seeds every newly interned pruning-point reference in the forward identity
+   cache as `{ id, materialized: false }`;
+3. seeds the pruning point's forward identity entry,
+   `CachedMaterializedBlock`, and immutable merge sets; and
+4. seeds `CachedVspcSink` from the committed pruning point.
 
 No replacement cache state is visible before commit. A failed or ambiguous
 attempt publishes none of these cache changes.
@@ -1144,23 +1243,23 @@ impl ValidatedDbClient {
 
 The shared [validated node block](domain-model.md#shared-value-types--settled)
 is hash/consensus-level input and contains no DB ID, level, or slot. Storage
-persists its hash, selected parent, canonical direct-parent relations, merge
-sets, timestamp, and DAA score; blue score and blue work remain available to
-processing but are not duplicated in the block row. Storage owns transactional
-ID resolution, coordinate allocation, initial color, persistence, and
-construction of the `BlockCommitted` value for a new insertion. Its `id` is the
-inserted block's committed `CompactId`.
+persists its hash, selected parent, canonical direct-parent relations,
+canonical merge sets, timestamp, and DAA score; blue score and blue work remain
+available to processing but are not duplicated in the block row. Storage owns
+transactional ID resolution, coordinate allocation, initial color,
+persistence, and construction of the `BlockCommitted` value for a new
+insertion. Its `id` is the inserted block's committed `CompactId`.
 
 The parent payload contains the canonical direct-parent sequence only. For
 every non-Genesis block, `selected_parent_index` is `Some(index)`, the index is
 representable as `u32` and in bounds for `direct_parents`, and that entry is the
-block's selected parent. First-occurrence canonicalization retains the first
-matching selected-parent position and removes any later occurrence. Its
-coordinate can be `None` at the outside-PP boundary. Genesis has an empty
-`direct_parents` payload and `selected_parent_index = None`. Synthetic ORIGIN
-is Genesis's persisted selected-parent identity, but it is never inserted into
-`direct_parents` or emitted as a graph parent. The payload therefore identifies
-the selected-parent coordinate without duplicating its hash.
+block's selected parent. The index addresses the shared value's canonical
+first-occurrence position. Its coordinate can be `None` at the outside-PP
+boundary. Genesis has an empty `direct_parents` payload and
+`selected_parent_index = None`. Synthetic ORIGIN is Genesis's persisted
+selected-parent identity, but it is never inserted into `direct_parents` or
+emitted as a graph parent. The payload therefore identifies the selected-parent
+coordinate without duplicating its hash.
 
 `level_snapshots` is non-repeating by level and contains complete post-commit
 snapshots for the inserted block's level, always, and every distinct
@@ -1168,17 +1267,25 @@ materialized direct-parent level needed by its emitted edges. It contains no
 entry for an outside-boundary parent. `None` represents storage's no-VSPC DAA
 sentinel. The collection includes parent-level context even when the
 materialization transaction did not mutate that parent level; it is therefore
-not named or interpreted as a change list.
+not named or interpreted as a change list. Its committed `size` is the
+materialization lane's authoritative downstream field. Its `daa_score` records
+the value observed by this transaction but does not supersede a VSPC outcome
+at the graph consumer.
 
 For every materialization, intern hashes in this order:
 
 1. red merge-set hashes;
 2. blue merge-set hashes;
 3. direct-parent hashes;
-4. selected-parent hash; and
-5. the block's own hash.
+4. the block's own hash.
 
-Deduplicate by first occurrence within this sequence. Validate the
+Deduplicate reference hashes by first occurrence through the first three
+groups, then append the block's own hash unconditionally. Do not add a separate
+selected-parent group: every ordinary block's selected parent already occurs in
+its canonical `direct_parents`, and cross-vector first occurrence remains
+authoritative for identity allocation. The
+[`ValidatedNodeBlock`](domain-model.md#shared-value-types--settled) contract
+guarantees that it did not occur among those references. Validate the
 database-relative conditions atomically:
 
 - semantic Materialized state for every retained reference under the selected
@@ -1298,28 +1405,35 @@ member repeats or appears in both vectors. The normal source, materiality, and
 selected-parent path checks still apply. For an admitted change, the ordered
 mutation rules below determine final state. Storage loads each added block's
 merge sets internally. Before mutation it also loads the persisted
-selected-parent identity for every directly named chain member and validates:
+selected-parent ID for every directly named chain member and validates:
 
 ```text
 removed is empty:
-    selected_parent(added[0]) == source
+    selected_parent_id(added[0]) == source.id
 
 removed is nonempty:
-    removed[0] == source
-    selected_parent(removed[i]) == removed[i + 1]
-    selected_parent(removed.last()) == selected_parent(added[0])
+    removed[0] == source.id
+    selected_parent_id(removed[i]) == removed[i + 1]
+    selected_parent_id(removed.last()) == selected_parent_id(added[0])
 
 for every added i > 0:
-    selected_parent(added[i]) == added[i - 1]
+    selected_parent_id(added[i]) == added[i - 1]
 ```
 
 Every admitted change has nonempty `added`, so each expression above is
-defined. A failed `removed[0] == source` check returns the distinct typed
+defined. A failed `removed[0] == source.id` check returns the distinct typed
 `VspcSourceDiscontinuity` storage error. For the first failed selected-parent
-relationship in the order shown, return
-`VspcPathDiscontinuity(VspcPathConflict)` before mutation. Storage supplies the
-persisted evidence and expected relationship but does not attribute the
-conflict to either the database or the candidate. The
+relationship in the order shown, Storage identifies the child,
+expected-parent, and stored-parent IDs. It resolves the distinct evidence IDs
+to hashes with one bounded `block_identifiers` query inside the same
+transaction, then returns `VspcPathDiscontinuity(VspcPathConflict)` before
+mutation and rolls back. This exceptional evidence query does not populate a
+general reverse-hash cache. This keeps ordinary VSPC validation entirely
+ID-based and confines hash reads to a recovery-triggering exceptional outcome.
+An incomplete or invalid evidence resolution returns
+`StorageError::InvalidMetadata` instead of manufacturing conflict evidence.
+Storage supplies the persisted evidence and expected relationship but does not
+attribute the conflict to either the database or the candidate. The
 [VspcProcessor contract](vspc-processing.md#readiness-and-materiality--settled)
 owns that attribution.
 
@@ -1344,11 +1458,13 @@ score the transaction evaluates in step 4. It contains final snapshots rather
 than a change list: the consumer decides whether a supplied value changes its
 projection. Construct the snapshots inside the same transaction and return
 them only after definite commit. `None` represents storage's no-VSPC DAA
-sentinel; `size` is the level's unchanged committed size.
+sentinel. The committed `daa_score` is the VSPC lane's authoritative downstream
+field. `size` is the unchanged value observed by this transaction and does not
+supersede a materialization outcome at the graph consumer.
 
 The owned change is consumed so definite commit can return its destination
 `VspcPoint` without cloning it. The result carries both the committed
-destination and the authoritative final state of every affected level; no
+destination and the authoritative final DAA state of every affected level; no
 post-commit projection read is allowed.
 
 ## Stored session state — settled

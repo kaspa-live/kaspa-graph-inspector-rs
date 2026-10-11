@@ -6,7 +6,7 @@ use kaspa_rpc_core::{
     GetBlocksRequest, GetServerInfoRequest,
     api::ops::{RPC_API_REVISION, RPC_API_VERSION},
 };
-use kgi_core::timing::{Clock, EqualJitter, Jitter, TokioClock};
+use kgi_core::timing::Timing;
 use kgi_model::lifecycle::{NodeServiceStatus, NodeServiceStatusState, ValidatedNodeStatus};
 use tokio::{
     sync::{Mutex, mpsc, oneshot, watch},
@@ -63,14 +63,7 @@ impl NodeService {
         override_params_file: Option<&Path>,
     ) -> Result<(Arc<Self>, NodeServiceEventReceiver), ConsensusResolutionError> {
         let consensus = KgiConsensusParams::resolve(network_id, override_params_file)?;
-        Ok(Self::start_with_dependencies(
-            endpoint,
-            network_id,
-            consensus,
-            Arc::new(GrpcConnector),
-            Arc::new(TokioClock),
-            Arc::new(EqualJitter::from_entropy()),
-        ))
+        Ok(Self::start_with_dependencies(endpoint, network_id, consensus, Arc::new(GrpcConnector), Timing::production()))
     }
 
     fn start_with_dependencies(
@@ -78,8 +71,7 @@ impl NodeService {
         network_id: NetworkId,
         consensus: KgiConsensusParams,
         connector: Arc<dyn RpcConnector>,
-        clock: Arc<dyn Clock>,
-        jitter: Arc<dyn Jitter>,
+        timing: Timing,
     ) -> (Arc<Self>, NodeServiceEventReceiver) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -93,8 +85,7 @@ impl NodeService {
             network_id,
             consensus,
             connector,
-            clock,
-            jitter,
+            timing,
             events: event_tx,
             commands: command_rx,
             retirements: retirement_rx,
@@ -162,8 +153,7 @@ struct NodeServiceWorker {
     network_id: NetworkId,
     consensus: KgiConsensusParams,
     connector: Arc<dyn RpcConnector>,
-    clock: Arc<dyn Clock>,
-    jitter: Arc<dyn Jitter>,
+    timing: Timing,
     events: mpsc::UnboundedSender<NodeServiceEvent>,
     commands: mpsc::UnboundedReceiver<ServiceCommand>,
     retirements: RetirementReceiver,
@@ -202,7 +192,7 @@ impl NodeServiceWorker {
                 connection.clone(),
                 self.network_id,
                 self.consensus,
-                self.clock.clone(),
+                self.timing.clone(),
                 self.status.clone(),
                 self.last_validated.clone(),
             );
@@ -263,7 +253,7 @@ impl NodeServiceWorker {
         connection: Arc<dyn RpcConnection>,
         network_id: NetworkId,
         consensus: KgiConsensusParams,
-        clock: Arc<dyn Clock>,
+        timing: Timing,
         status: watch::Sender<NodeServiceStatus>,
         last_validated: Option<ValidatedNodeStatus>,
     ) -> Result<ValidatedNodeInfo, ValidationFailure> {
@@ -296,7 +286,7 @@ impl NodeServiceWorker {
                 state: NodeServiceStatusState::Unavailable,
                 last_validated: last_validated.clone(),
             });
-            clock.sleep(IBD_POLL_INTERVAL).await;
+            timing.sleep(IBD_POLL_INTERVAL).await;
             server_info = Self::server_info(&connection).await?;
             Self::validate_server_info(network_id, &server_info)?;
         }
@@ -347,8 +337,8 @@ impl NodeServiceWorker {
         connection: Arc<dyn RpcConnection>,
         retry_index: &mut usize,
     ) -> Result<ReadyExit, NodeServiceError> {
-        let clock = self.clock.clone();
-        let ready_reset = clock.sleep(READY_BACKOFF_RESET);
+        let timing = self.timing.clone();
+        let ready_reset = timing.sleep(READY_BACKOFF_RESET);
         tokio::pin!(ready_reset);
         let mut reset_complete = false;
         loop {
@@ -402,8 +392,7 @@ impl NodeServiceWorker {
     async fn wait_retry(&mut self, retry_index: &mut usize) -> Result<bool, NodeServiceError> {
         let nominal = RETRY_DELAYS[(*retry_index).min(RETRY_DELAYS.len() - 1)];
         *retry_index = retry_index.saturating_add(1);
-        let delay = self.jitter.apply(nominal);
-        let sleep = self.clock.sleep(delay);
+        let sleep = self.timing.sleep_jittered(nominal);
         tokio::pin!(sleep);
         loop {
             tokio::select! {
@@ -515,7 +504,7 @@ mod tests {
         RpcBlock, RpcError, RpcHeader, RpcResult,
         api::ops::{RPC_API_REVISION, RPC_API_VERSION},
     };
-    use kgi_core::timing::{Clock, Jitter, TokioClock};
+    use kgi_core::timing::{Clock, Jitter, Timing, TokioClock};
     use kgi_model::{
         block::BlockHash,
         lifecycle::{NodeServiceStatusState, RecoveryInputKind},
@@ -1065,8 +1054,7 @@ mod tests {
             network_id,
             consensus,
             connector,
-            clock,
-            Arc::new(IdentityJitter),
+            Timing::new(clock, Arc::new(IdentityJitter)),
         )
     }
 

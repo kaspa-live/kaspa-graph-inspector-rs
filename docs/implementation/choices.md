@@ -222,7 +222,8 @@ Use `serde_json` only to decode the upstream `OverrideParams` representation,
 `url` for the already parsed endpoint, `thiserror` for typed errors, and
 `async-trait` for private testable adapter traits. Tokio supplies the worker,
 channels, status observation, completion barriers, and RPC permits;
-`kgi-core::timing` supplies the shared clock and jitter mechanism. All
+`kgi-core::timing` supplies one cloneable `Timing` dependency wrapping the
+shared object-safe clock and jitter interfaces. All
 rusty-kaspa crates use the same workspace tag and lockfile revision accepted by
 the [current PUAR](../architecture/verification.md#current-puar-result).
 
@@ -262,11 +263,11 @@ that return real upstream response value types. This avoids implementing the
 complete upstream RPC trait or duplicating a gRPC server while still testing
 KGI-owned request construction, normalization, retirement, and ordering.
 
-Inject the shared object-safe `kgi-core::timing` clock and jitter interfaces
-through NodeService's private runtime dependencies. Production uses the shared
-Tokio clock and entropy-seeded equal-jitter source. Tests provide a manually
-advanced clock and scripted jitter, so reconnect slots, the Ready reset
-boundary, and shutdown cancellation contain no wall-clock sleeps or
+Inject the shared `kgi-core::timing::Timing` value through NodeService's private
+runtime dependencies. Production combines the Tokio clock and entropy-seeded
+equal-jitter source. Tests combine a manually advanced clock and scripted
+jitter, so reconnect slots, the Ready reset boundary, and shutdown cancellation
+contain no wall-clock sleeps or
 probabilistic assertions. Exact delays and reset behavior remain owned by the
 [NodeService lifecycle](../architecture/node-service.md#nodeservice--settled).
 
@@ -353,7 +354,7 @@ capabilities, and the Supervisor-facing service lifecycle respectively. Keep
 SQLx adaptation, migration execution, schema inspection, processing-state
 inspection, service-loop commands, and retirement plumbing in private
 `database`, `migration`, `schema`, `state`, and `runtime` modules. Consume the
-generic clock and jitter mechanism from `kgi-core::timing`. Expose the public
+generic `Timing` wrapper from `kgi-core::timing`. Expose the public
 modules without crate-root wildcard re-exports.
 
 These boundaries do not expose SQLx pools, connections, transactions, raw
@@ -433,16 +434,15 @@ and 60-second Ready reset remain defined by the
 [storage lifecycle](../architecture/storage.md#storageservice-lifecycle--settled).
 
 Inject the private lock connector, generation opener, and shared
-`kgi-core::timing` clock and jitter interfaces into the worker. Production uses
-SQLx plus the shared Tokio clock and entropy-seeded equal-jitter source; tests
-use scripted connection results, gated initial and replacement opening,
-individually controlled sleeps, and identity jitter. PostgreSQL container tests
+`kgi-core::timing::Timing` value into the worker. Production uses SQLx plus the
+Tokio clock and entropy-seeded equal-jitter source; tests use scripted
+connection results, gated initial and replacement opening, individually
+controlled sleeps, and identity jitter. PostgreSQL container tests
 terminate the actual advisory-lock backend to verify exact retirement,
 suppression of initial or replacement publication until ownership is
-reacquired, and autonomous republication. The
-Rebuild replacement gate and API database-phase drain remain part of the later
-database-replacement-safety implementation rather than this general connection
-lifecycle slice.
+reacquired, and autonomous republication. The Rebuild replacement gate and API
+database read-lease drain are recorded in the later implementation entries
+below rather than this general connection lifecycle slice.
 
 Map connection-class failures specifically at a persistent-mutation COMMIT
 boundary to the shared `Persistence(AmbiguousCommit)` value; ordinary SQLx
@@ -451,3 +451,142 @@ integration fixture can inject acknowledgement loss after PostgreSQL has
 accepted COMMIT, then drops the uncertain connection and runs normal database
 preparation again. This verifies the storage owner's transaction-outcome
 contract without teaching the service to replay an uncertain mutation.
+
+## 9 October 2026: Storage persistence operations
+
+### Processing-generation caches and identity reads
+
+The processing-generation caches implement the
+[storage-owned cache requirement](../architecture/storage.md#caches-and-identity-resolution--settled).
+Start each block-scaled processing cache at 50,000 entries: forward identity,
+materialized-block metadata, and merge sets. The current-sink cache has
+capacity one. The initial block-scaled capacity targets the recent processing
+working set and is deliberately tunable from observed hit rates, eviction
+rates, and database-read latency.
+
+Put the storage-specific public result types in the module-qualified
+`kgi_storage::operation` namespace. Deduplicate only the SQL misses before
+constructing the cold batch's left-joined query.
+
+### Materialization transaction execution
+
+Implement the
+[storage-owned transaction policy](../architecture/storage.md#transaction-retries)
+through one private closure-based runner shared by processing mutations. It
+classifies raw SQLx errors before their SQLSTATE is erased and consumes the
+shared injectable `Timing` value. Give each processing generation a
+`tokio::sync::Mutex` materialization
+lane; hold its guard through the complete transaction, any retry delay, definite
+commit, and cache publication. This preserves sequential allocation without
+serializing the separately owned VSPC mutation lane.
+
+Keep materialization-specific SQL and committed-payload construction in the
+private `materialization` module, shared block and direct-parent row insertion
+in the private `generation::block_rows` module, and reusable retry
+classification in the private `transaction` module.
+Each materialization attempt applies the storage-owned cache-completeness rule
+when seeding its resolved-identity map. Collect all incomplete values into one
+transaction-local batch query. Cache publication need not republish complete
+hits.
+Intern the remaining absent identities in one `BYTEA[]` statement using
+`WITH ORDINALITY`; the insertion source and returned rows follow the
+storage-owned first-occurrence order. Insert direct-parent rows in one
+parallel-array `UNNEST` statement; boundary identities use their persisted
+`(0,0)` sentinel.
+
+### VSPC transaction execution
+
+Give each processing generation a second `tokio::sync::Mutex` lane for VSPC
+mutations. Hold it through complete-transaction retries, definite commit, and
+processing-cache publication. The materialization and VSPC lane guards are
+independent, so their PostgreSQL transactions may overlap as required by the
+[storage concurrency contract](../architecture/storage.md#internal-concurrency).
+
+Store compact IDs, rather than hashes, in the generation-owned merge-set
+cache. Materialization already resolves those IDs transactionally, and VSPC
+coloring consumes the same persisted representation. Load direct VSPC member
+rows for only the first-occurrence-distinct IDs that the storage-owned
+completeness rule sends to SQL, while retaining the original ordered vectors
+for path validation and transition semantics. Load merge sets only for
+distinct added IDs that miss the cache.
+
+Compute the final merge-member color for each compact ID by replaying every
+added position in memory in its blue-then-red order, then issue one parallel
+ID/color `UNNEST` update. This preserves the settled last-write result across
+cross-color overlap and repeated added positions without one SQL statement per
+member. Update and return all distinct affected level states through one
+transaction-local CTE, so the committed outcome requires no post-commit read.
+
+## 10 October 2026: API database replacement gate
+
+### Read leases and replacement-attempt fencing
+
+Use this concrete synchronization mechanism for the
+[storage-owned replacement gate](../architecture/storage.md#api-read-exclusion-during-database-replacement--settled)
+as one private `ApiReplacementGate` shared by every API generation opened by a
+StorageService instance. Represent the architecture's API database phase in
+code with an RAII `ApiDbReadLease`; the lease name distinguishes the concrete
+synchronization object from a lifecycle phase. The gate keeps a short
+standard-library mutex around its admission state and active-lease registry.
+Each lease owns a watch-based cancellation receiver, removes its unique entry
+synchronously on drop, and wakes replacement drainers.
+
+Fence each close-and-replace attempt with a monotonic in-memory epoch carried
+by its exclusive token. Reopening admission requires both the current epoch
+and an empty active-lease registry, preventing a cancelled or timed-out older
+attempt from reopening a newer replacement. A separate Tokio watch revision
+is only a wakeup mechanism for gated readers and drainers; it carries no
+generation or replacement identity. API-generation retirement is serialized
+against lease acquisition by a generation-local standard-library mutex and
+wakes gated acquisition through a validity watch channel.
+
+## 11 October 2026: Rebuild transaction prerequisites
+
+### Processing mutation exclusion and cache-set publication
+
+Use one generation-local `tokio::sync::RwLock` as the shared processing
+mutation guard. Materialization and VSPC mutations hold read permits in
+addition to their independent lane mutexes, so those lanes retain their
+permitted overlap. Rebuild will acquire the write permit with `try_write`; it
+will not wait behind an unexpected mutation after processor deactivation.
+
+Group the four independent Moka domains in one `ProcessingCacheDomains` value
+and hold the current value through `ArcSwap`. Short synchronous interactions
+use its borrowed `load` guard, while an operation that retains the cache set
+across an await takes one owned `load_full` snapshot for its complete cache
+interaction. Rebuild will construct and seed a fresh domain set off-path, then
+publish all four domains through one atomic pointer replacement after definite
+commit. This avoids an outer mutex around ordinary Moka access and prevents
+observers from combining predecessor and replacement domains.
+
+### PostgreSQL processing-data clearing
+
+Use one transactional `TRUNCATE parents, blocks, levels, block_identifiers,
+processing_metadata RESTART IDENTITY RESTRICT` statement for pruning-point
+rebuild. Listing the complete processing-table dependency set keeps `RESTRICT`
+explicit, resets compact-ID allocation in the same transaction, and avoids a
+retained-graph delete scan. Its table locks rely on the storage-owned API
+replacement gate, processing mutation guard, and process advisory lock rather
+than an additional explicit table-lock statement.
+
+### Rebuild lifecycle wiring
+
+Carry rebuild requests from `ValidatedDbClient` to the permanent
+StorageService worker through a private unbounded exact-generation channel.
+The request owns the normalized pruning-point value and a result-bearing
+one-shot completion path. This keeps API-generation lifecycle changes and gate
+tokens inside their existing worker owner while leaving the SQL transaction in
+the private `generation::rebuild` module beside the other processing
+transactions.
+
+Prepare the identity insertion order once, intern it with one ordinal batch,
+and derive all block, parent, merge-set, anchor, and cache values from that
+single returned ID map. The worker continues polling its advisory-lock health,
+shutdown command, retirement requests, and cleanup tasks while API pool
+creation and lease draining are pending. It starts the replacement-exclusive
+future when admission closes and polls it concurrently with fresh API pool
+creation, so the drain timeout is measured from the cancellation request rather
+than from later publication. Once the transaction begins, it runs to a definite
+or ambiguous database outcome even if lifecycle retirement is selected
+concurrently; the worker then applies the exact outcome to the already selected
+lifecycle disposition.
