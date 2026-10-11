@@ -869,13 +869,14 @@ index for an ordinary block, the Genesis `None` case, and propagation of the
 committed initial color and VSPC membership.
 
 For below-range block updates, verify that every delivered `BlockCommitted` is
-consumed, its complete level snapshot updates retained external state, and the
-resulting endpoint change is published as one atomic revision. Parent snapshots
-seed exact external level state for new crossing edges. The update must neither
-expand the view extent nor restore the below-range block or level as head-view
-content. An update for a level with no retained crossing-edge endpoint produces
-no visible revision, and unreferenced external endpoint metadata can be
-discarded.
+consumed, its complete level snapshot updates retained external size while
+preserving an existing DAA score, and a resulting size change is published as
+one atomic revision. Parent snapshots seed complete external level state for
+new crossing edges; verify exact size and permit the settled contextual DAA
+score. The update must neither expand the view extent nor restore the
+below-range block or level as head-view content. An update for a level with no
+retained crossing-edge endpoint produces no visible revision, and unreferenced
+external endpoint metadata can be discarded.
 
 Verify the settled [head block mutation](api-graph.md#head-block-mutation--settled)
 below and at full depth, at the existing high level, at a new high level, and
@@ -977,11 +978,26 @@ and verify that its supplied final snapshot still updates its DAA score and
 produces the corresponding level-only delta. A snapshot for a level absent
 from the view is ignored.
 
+Deterministically overlap materialization of a child whose retained parent
+level already exists with a VSPC transaction that changes that parent level's
+DAA score. Deliver the two committed outcomes in both possible orders and
+verify that the final `GraphView` combines the materialization snapshot's size
+with the VSPC snapshot's DAA score and equals the corresponding persisted
+fields. Neither order may restore the other transaction's contextual field.
+Repeat with the VSPC snapshot arriving while the level is absent and the later
+block update first retaining it only as an external endpoint: the VSPC update
+has no visible effect, the seeded size is exact, and the contextual DAA score
+is accepted. This case must not require cross-lane transaction or delivery
+serialization.
+
 Verify [anchored graph windows](api-protocol.md#anchored-graph-windows--settled)
 for floor selection and tie break, the sentinel result, a reorg-created
 VSPC-empty level, atomic level-score publication, and navigation plus window
 consistency from one image. Accept zero and `MAX_DAA_SCORE` as query bounds and
-reject the no-VSPC sentinel as a real DAA query.
+reject the no-VSPC sentinel as a real DAA query. Retain an external endpoint
+below Head's nominal extent with a contextual DAA score and verify that
+in-memory DAA-floor resolution excludes it; a query below nominal in-memory
+coverage uses the consistent database path.
 
 Verify successful level, block-hash, and DAA anchors return a
 `GraphWindowResolution` whose resolved level lies in its effective capped

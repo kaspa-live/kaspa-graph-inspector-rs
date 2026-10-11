@@ -1809,12 +1809,16 @@ indexed database lookup and consistent historical transaction.
 There may be VSPC-empty levels after reorg. If `q` precedes the retained PP
 and no floor exists, return `NoRetainedDaaMatch`. A `q` beyond the current VSPC
 DAA resolves the current VSPC level. If `q` is at or above the
-DAA of the current head view's lowest cached VSPC level, that view can resolve it; otherwise use the
-storage lookup. Level resolution and its window must come from **one immutable
-graph view** or one consistent DB transaction, never different revisions.
-ApiService obtains cached levels' authoritative final scores from the complete
-level snapshots carried by `VspcCommitted`. Historical DAA/window responses
-are not cached in v2.
+DAA of the current head view's lowest nominal VSPC level, that view can resolve
+it from nominal levels; otherwise use the storage lookup. External endpoint
+levels retained outside Head's nominal extent never participate in in-memory
+DAA-floor resolution; the [graph model](api-graph.md#head-block-mutation--settled)
+owns their level-state semantics. Level resolution and its window must come
+from **one immutable graph view** or one consistent DB transaction, never
+different revisions.
+ApiService obtains nominal cached levels' authoritative final scores from the
+complete level snapshots carried by `VspcCommitted`. Historical DAA/window
+responses are not cached in v2.
 
 For a database-backed anchored window, each
 `GraphWindowAnchorUnavailable` variant is a normal request-local `404 Not

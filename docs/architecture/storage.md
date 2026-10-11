@@ -347,7 +347,14 @@ cross-worker disposition. No cache state is published before definite commit.
 The storage implementation provides separate sequential materialization and
 VSPC mutation lanes while allowing their transactions to overlap. Rebuild
 gets exclusive mutation access after processor deactivation. Reads remain
-concurrent.
+concurrent. A materialization `LevelCommitted` is authoritative downstream for
+its level's committed `size`; its `daa_score` is contextual evidence observed
+by that transaction. A VSPC `LevelCommitted` is authoritative downstream for
+its level's committed `daa_score`; its unchanged `size` is contextual evidence.
+The [graph model](api-graph.md#graph-update-consumption--settled) owns how those
+disjoint authorities are merged when independently ordered committed outcomes
+reach one view. Storage does not serialize the two lanes merely to order their
+contextual fields.
 
 ## Database bootstrap and validation — settled
 
@@ -1260,7 +1267,10 @@ materialized direct-parent level needed by its emitted edges. It contains no
 entry for an outside-boundary parent. `None` represents storage's no-VSPC DAA
 sentinel. The collection includes parent-level context even when the
 materialization transaction did not mutate that parent level; it is therefore
-not named or interpreted as a change list.
+not named or interpreted as a change list. Its committed `size` is the
+materialization lane's authoritative downstream field. Its `daa_score` records
+the value observed by this transaction but does not supersede a VSPC outcome
+at the graph consumer.
 
 For every materialization, intern hashes in this order:
 
@@ -1448,11 +1458,13 @@ score the transaction evaluates in step 4. It contains final snapshots rather
 than a change list: the consumer decides whether a supplied value changes its
 projection. Construct the snapshots inside the same transaction and return
 them only after definite commit. `None` represents storage's no-VSPC DAA
-sentinel; `size` is the level's unchanged committed size.
+sentinel. The committed `daa_score` is the VSPC lane's authoritative downstream
+field. `size` is the unchanged value observed by this transaction and does not
+supersede a materialization outcome at the graph consumer.
 
 The owned change is consumed so definite commit can return its destination
 `VspcPoint` without cloning it. The result carries both the committed
-destination and the authoritative final state of every affected level; no
+destination and the authoritative final DAA state of every affected level; no
 post-commit projection read is allowed.
 
 ## Stored session state — settled
