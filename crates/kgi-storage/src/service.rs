@@ -2086,6 +2086,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ambiguous_operation_joins_advisory_lock_loss_retirement_barrier() {
+        let (_container, database_url) = fixture().await;
+        let (sleep_tx, mut sleeps) = mpsc::unbounded_channel();
+        let clock = Arc::new(ManualClock { sleeps: sleep_tx });
+        let (service, mut events) = StorageService::start_with_dependencies(
+            database_url.clone(),
+            Arc::new(SqlxDatabaseConnector),
+            Timing::new(clock, Arc::new(IdentityJitter)),
+        );
+        wait_for_status(&service, StorageServiceStatusState::AwaitingInitialization).await;
+        service.initialize_if_uninitialized(mainnet(), hash(1)).await.expect("database initialization");
+        let processing = match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbPublished(client) => client,
+            event => panic!("expected initial processing publication, got {event:?}"),
+        };
+        let api = match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbPublished(client) => client,
+            event => panic!("expected initial API publication, got {event:?}"),
+        };
+        wait_for_status(&service, StorageServiceStatusState::Ready).await;
+        let (health, reset) = ready_timers(&mut sleeps).await;
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let operation_client = processing.clone();
+        let operation = tokio::spawn(async move {
+            operation_client
+                .run_gated_test_operation(started_tx, release_rx, Err(StorageError::Persistence(PersistenceFault::AmbiguousCommit)))
+                .await
+        });
+        started_rx.await.expect("ambiguous operation must start while the generation is valid");
+
+        let mut observer = PgConnection::connect(database_url.as_str()).await.expect("lock observer");
+        terminate_lock_owner(&mut observer).await;
+        health.completion.send(()).expect("run active lock-health check");
+        drop(reset);
+
+        match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &processing)),
+            event => panic!("expected processing retirement after lock loss, got {event:?}"),
+        }
+        match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &api)),
+            event => panic!("expected API retirement after lock loss, got {event:?}"),
+        }
+
+        release_tx.send(()).expect("release ambiguous operation after retirement publication");
+        assert_eq!(
+            timeout(TEST_TIMEOUT, operation).await.expect("retirement barrier must complete").expect("operation task"),
+            Err(StorageError::Persistence(PersistenceFault::AmbiguousCommit))
+        );
+        assert!(timeout(Duration::from_millis(100), events.recv()).await.is_err(), "old generation must retire exactly once");
+
+        service.shutdown().await.expect("shutdown during reconnect wait");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_operation_joins_competing_operation_retirement_barrier() {
+        let (_container, database_url) = fixture().await;
+        let (service, mut events, processing, api) = initialize_service(database_url).await;
+
+        let (ambiguous_started_tx, ambiguous_started_rx) = tokio::sync::oneshot::channel();
+        let (ambiguous_release_tx, ambiguous_release_rx) = tokio::sync::oneshot::channel();
+        let ambiguous_client = processing.clone();
+        let ambiguous = tokio::spawn(async move {
+            ambiguous_client
+                .run_gated_test_operation(
+                    ambiguous_started_tx,
+                    ambiguous_release_rx,
+                    Err(StorageError::Persistence(PersistenceFault::AmbiguousCommit)),
+                )
+                .await
+        });
+        ambiguous_started_rx.await.expect("ambiguous operation must start");
+
+        let (failed_started_tx, failed_started_rx) = tokio::sync::oneshot::channel();
+        let (failed_release_tx, failed_release_rx) = tokio::sync::oneshot::channel();
+        let failed_client = processing.clone();
+        let failed = tokio::spawn(async move {
+            failed_client
+                .run_gated_test_operation(
+                    failed_started_tx,
+                    failed_release_rx,
+                    Err(StorageError::ConnectionLost {
+                        operation: "injected competing operation",
+                        diagnostic: Arc::from("connection lost"),
+                    }),
+                )
+                .await
+        });
+        failed_started_rx.await.expect("competing operation must start");
+        failed_release_tx.send(()).expect("release competing operation first");
+
+        match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &processing)),
+            event => panic!("expected exact processing retirement, got {event:?}"),
+        }
+        assert_eq!(failed.await.expect("competing operation task"), Err(StorageError::GenerationLost));
+
+        ambiguous_release_tx.send(()).expect("release ambiguity after competing retirement publication");
+        assert_eq!(
+            timeout(TEST_TIMEOUT, ambiguous).await.expect("stale retirement barrier must complete").expect("ambiguous operation task"),
+            Err(StorageError::Persistence(PersistenceFault::AmbiguousCommit))
+        );
+        let replacement = match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbPublished(client) => client,
+            StorageServiceEvent::ProcessingDbRetired(retired) if Arc::ptr_eq(&retired, &processing) => {
+                panic!("old processing generation retired more than once")
+            }
+            event => panic!("expected processing replacement after one retirement, got {event:?}"),
+        };
+        assert!(!Arc::ptr_eq(&replacement, &processing));
+        assert!(api.is_valid(), "processing retirement remains independent of the API generation");
+
+        service.shutdown().await.expect("service shutdown");
+    }
+
+    #[tokio::test]
     async fn api_retirement_replaces_before_checked_out_connection_returns() {
         let (_container, database_url) = fixture().await;
         let (service, mut events, processing, api) = initialize_service(database_url).await;

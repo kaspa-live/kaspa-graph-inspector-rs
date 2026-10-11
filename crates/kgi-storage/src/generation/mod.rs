@@ -126,6 +126,12 @@ impl<T: GenerationKind> GenerationRuntime<T> {
         if !self.is_valid() {
             return Err(StorageError::GenerationLost);
         }
+        self.request_operation_retirement().await
+    }
+
+    async fn request_operation_retirement(&self) -> Result<(), StorageError> {
+        // Always join the service barrier: another failure may have selected this
+        // generation's retirement after the operation itself started.
         let (completion, acknowledgement) = oneshot::channel();
         let target = T::retirement_target(self.self_weak.clone());
         self.retirement_tx.send(RetirementRequest::new(target, completion)).map_err(|_| StorageError::ControlUnavailable)?;
@@ -267,6 +273,7 @@ impl ValidatedDbClient {
         self.runtime.close().await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn request_retirement(&self) -> Result<(), StorageError> {
         self.runtime.request_retirement().await
     }
@@ -301,15 +308,30 @@ impl ValidatedDbClient {
         }
         match operation().await {
             Err(error @ StorageError::Persistence(PersistenceFault::AmbiguousCommit)) => {
-                self.request_retirement().await?;
+                self.runtime.request_operation_retirement().await?;
                 Err(error)
             }
             Err(error) if error.is_connection_lost() => {
-                self.request_retirement().await?;
+                self.runtime.request_operation_retirement().await?;
                 Err(StorageError::GenerationLost)
             }
             result => result,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn run_gated_test_operation(
+        &self,
+        started: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+        result: Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        self.run_operation(|| async move {
+            let _ = started.send(());
+            let _ = release.await;
+            result
+        })
+        .await
     }
 }
 
