@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use kgi_model::block::{
     BlockColor, BlockCoordinate, BlockHash, CompactId, ConsensusOrder, MaterializedSyncAnchor, ValidatedNodeBlock, VspcPoint,
 };
-use sqlx::{Postgres, Row, Transaction};
+use sqlx::{Postgres, Transaction};
 
-use super::ValidatedDbClient;
+use super::{ValidatedDbClient, interning};
 use crate::{
     cache::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, CachedVspcSink, ProcessingCacheDomains},
     database::{blue_score_to_sql, daa_score_to_sql, timestamp_to_sql},
@@ -113,7 +113,7 @@ async fn attempt(
     .await
     .map_err(|error| TransactionAttemptError::database("Rebuild processing-data clear", error))?;
 
-    let identities = intern_identities(&mut transaction, &prepared.universal).await?;
+    let identities = interning::intern_identities(&mut transaction, &prepared.universal).await?;
     let own_id = identity(&identities, prepared.block.hash)?;
     let selected_parent_id = identity(&identities, prepared.block.selected_parent)?;
     let blue_ids = ids(&identities, &prepared.block.blue_merge_set)?;
@@ -216,51 +216,6 @@ async fn commit(transaction: Transaction<'_, Postgres>, behavior: CommitBehavior
         #[cfg(test)]
         CommitBehavior::RollbackThenLoseConnection => unreachable!("handled before the COMMIT phase"),
     }
-}
-
-async fn intern_identities(
-    transaction: &mut Transaction<'_, Postgres>,
-    hashes: &[BlockHash],
-) -> Result<HashMap<BlockHash, CompactId>, TransactionAttemptError<std::convert::Infallible>> {
-    let encoded: Vec<Vec<u8>> = hashes.iter().map(|hash| hash.as_bytes().to_vec()).collect();
-    let rows = sqlx::query(
-        "WITH input(hash, position) AS MATERIALIZED (
-             SELECT hash, position
-             FROM UNNEST($1::BYTEA[]) WITH ORDINALITY AS input(hash, position)
-         ),
-         inserted AS (
-             INSERT INTO block_identifiers (hash)
-             SELECT hash FROM input ORDER BY position
-             RETURNING id, hash
-         )
-         SELECT inserted.id, inserted.hash
-         FROM inserted
-         JOIN input USING (hash)
-         ORDER BY input.position",
-    )
-    .bind(encoded)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(|error| TransactionAttemptError::database("Rebuild identity interning", error))?;
-    if rows.len() != hashes.len() {
-        return Err(TransactionAttemptError::Storage(StorageError::invalid_metadata(
-            "Rebuild identity interning returned an incomplete result",
-        )));
-    }
-    let mut identities = HashMap::with_capacity(rows.len());
-    for row in rows {
-        let encoded_hash: Vec<u8> =
-            row.try_get("hash").map_err(|error| TransactionAttemptError::database("Rebuild identity hash decode", error))?;
-        let hash = BlockHash::try_from(encoded_hash.as_slice()).map_err(|error| {
-            TransactionAttemptError::Storage(StorageError::invalid_metadata(format!("invalid rebuilt block hash: {error}")))
-        })?;
-        let raw_id: i64 = row.try_get("id").map_err(|error| TransactionAttemptError::database("Rebuild identity ID decode", error))?;
-        let id = CompactId::new(raw_id).ok_or_else(|| {
-            TransactionAttemptError::Storage(StorageError::invalid_metadata(format!("rebuilt compact ID is not positive: {raw_id}")))
-        })?;
-        identities.insert(hash, id);
-    }
-    Ok(identities)
 }
 
 fn identity(

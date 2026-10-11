@@ -9,7 +9,7 @@ use kgi_model::{
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
-use super::ValidatedDbClient;
+use super::{ValidatedDbClient, interning};
 use crate::{
     cache::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, ProcessingCacheDomains},
     database::{NO_VSPC_DAA_SCORE, daa_score_to_sql, timestamp_to_sql},
@@ -457,45 +457,7 @@ async fn intern_missing_identities(
     cache_misses: &[BlockHash],
 ) -> Result<(), TransactionAttemptError<SemanticError>> {
     let missing: Vec<_> = cache_misses.iter().filter(|&hash| !identities.contains_key(hash)).copied().collect();
-    if missing.is_empty() {
-        return Ok(());
-    }
-
-    let encoded: Vec<Vec<u8>> = missing.iter().map(|hash| hash.as_bytes().to_vec()).collect();
-    let rows = sqlx::query(
-        "WITH input(hash, position) AS MATERIALIZED (
-             SELECT hash, position
-             FROM UNNEST($1::BYTEA[]) WITH ORDINALITY AS input(hash, position)
-         ),
-         inserted AS (
-             INSERT INTO block_identifiers (hash)
-             SELECT hash FROM input ORDER BY position
-             RETURNING id, hash
-         )
-         SELECT inserted.id, inserted.hash
-         FROM inserted
-         JOIN input USING (hash)
-         ORDER BY input.position",
-    )
-    .bind(encoded)
-    .fetch_all(&mut **transaction)
-    .await
-    .map_err(|error| TransactionAttemptError::database("block-identity interning", error))?;
-    if rows.len() != missing.len() {
-        return Err(TransactionAttemptError::Storage(StorageError::invalid_metadata(
-            "batched block-identity interning returned an incomplete result",
-        )));
-    }
-    for row in rows {
-        let encoded_hash: Vec<u8> =
-            row.try_get("hash").map_err(|error| TransactionAttemptError::database("interned block hash decode", error))?;
-        let hash = BlockHash::try_from(encoded_hash.as_slice()).map_err(|error| {
-            TransactionAttemptError::Storage(StorageError::invalid_metadata(format!("invalid interned block hash: {error}")))
-        })?;
-        let raw_id: i64 = row.try_get("id").map_err(|error| TransactionAttemptError::database("interned block ID decode", error))?;
-        let id = CompactId::new(raw_id).ok_or_else(|| {
-            TransactionAttemptError::Storage(StorageError::invalid_metadata(format!("generated compact ID is not positive: {raw_id}")))
-        })?;
+    for (hash, id) in interning::intern_identities(transaction, &missing).await? {
         identities.insert(hash, StoredIdentity { id, block: None });
     }
     Ok(())
