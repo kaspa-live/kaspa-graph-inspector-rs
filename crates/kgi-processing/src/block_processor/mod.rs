@@ -3,6 +3,7 @@ use kgi_node::error::NodeError;
 
 mod dependency;
 mod error;
+mod marker;
 mod orphan;
 
 pub(crate) const PROCESSING_DATA_CHANNEL_CAPACITY: usize = 1024;

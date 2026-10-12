@@ -633,3 +633,13 @@ DependencyResolver enforces the
 with a Tokio semaphore. Tasks waiting for a local permit and tasks holding one
 are measured separately. Per-hash cancellation aborts either state;
 Deactivate and Shutdown abort and join all tasks before acknowledging.
+
+### Lifecycle-marker worker primitive
+
+Use a Tokio unbounded MPSC channel for the BlockProcessor-owned marker worker.
+Its architecture-owned protocol admits at most the two ordered commands for
+one session, so the channel is intrinsically bounded by the producer protocol
+while keeping command handoff independent of graph-update-channel capacity.
+Dropping the sole command sender closes the input and detaches the worker to
+drain accepted commands; the graph-update producer remains the sole owner of
+lossless marker backpressure and receiver-closure classification.

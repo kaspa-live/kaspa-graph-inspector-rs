@@ -171,7 +171,11 @@ maximum-release ordering, pending-state retention, Resolve/Cancel FIFO order,
 active and waiting RPC limits, node-outcome preservation, nested command
 priority and fault propagation, full-result-channel failure, cancellation, and
 exact RPC-generation release.
-BlockProcessor integration and VspcProcessor remain pending in this increment.
+The BlockProcessor-owned lifecycle-marker worker now provides the nonblocking
+two-command local FIFO, lossless graph-ingress delivery, accepted-command drain
+after local closure, and receiver-closure termination without retaining RPC or
+database generations. BlockProcessor integration and VspcProcessor remain
+pending in this increment.
 
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.
