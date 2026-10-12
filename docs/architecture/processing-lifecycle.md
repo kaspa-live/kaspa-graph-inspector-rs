@@ -551,14 +551,16 @@ Detailed Tokio fairness and drain mechanics remain deferred in the
 `ResyncEngine::start` and the processor `Begin`, `Catchup`, and `Live` commands
 are exact-once and state-specific. Duplicate or invalid-state delivery reports
 `Ownership(InvalidLifecycleControl)`. Successful `start` means the operation
-was accepted; later milestones
-or faults report the run's outcome. The two processor `Live` sends need not be
-simultaneous; enqueue is not completion. `ResyncEngine::deactivate` completes
-only at Idle and is idempotent there. `ResyncEngine::shutdown` is terminal,
-idempotent from every state, supersedes an in-progress `deactivate`, and
-completes only after full shutdown. Processor Deactivate and Shutdown commands
-retain their corresponding completed-barrier acknowledgements. Unexpected
-internal command-channel closure while its worker is meant to live reports
+was accepted; later milestones or faults report the run's outcome. Processor
+Begin is an acknowledged readiness barrier under the contract owned below;
+`Catchup` and `Live` remain ordered command sends rather than completion
+barriers. The two processor `Live` sends need not be simultaneous; enqueue is
+not completion. `ResyncEngine::deactivate` completes only at Idle and is
+idempotent there. `ResyncEngine::shutdown` is terminal, idempotent from every
+state, supersedes an in-progress `deactivate`, and completes only after full
+shutdown. Processor Deactivate and Shutdown commands retain their corresponding
+completed-barrier acknowledgements. Unexpected internal command-channel or
+acknowledgement closure while its worker is meant to live reports
 `Ownership(InternalControlPathLost)`.
 
 `Rebuild` intent must not outlive successful PP-boundary sealing.
@@ -628,14 +630,23 @@ struct VspcProcessorBegin {
 
 After preparation, ResyncEngine constructs both Begin payloads from the same
 `PreparedSync` and the `GraphUpdateProducer` received by `start`, and
-sends the mode-specific `BeginResync` or `BeginRebuild` command to each
-processor. BlockProcessor receives the exact RPC and DB generations, the
-committed anchor, the seal threshold, and its producer handle for the run's
-fresh graph-update channel. VspcProcessor receives the same RPC and DB
-generations, anchor, and another producer handle for that channel; it uses the RPC client only for the
-selected-parent attribution contract owned by VspcProcessor. Both commands are
-exact-once and have no acknowledgement. Once both have been enqueued, the
-common pump may start.
+sends the mode-specific `BeginResync` or `BeginRebuild` command independently
+to both processors and awaits both successful readiness acknowledgements.
+There is no required issue or acknowledgement order between the processors.
+BlockProcessor receives the exact RPC and DB generations, the committed
+anchor, the seal threshold, and its producer handle for the run's fresh
+graph-update channel. VspcProcessor receives the same RPC and DB generations,
+anchor, and another producer handle for that channel; it uses the RPC client
+only for the selected-parent attribution contract owned by VspcProcessor.
+
+Except for BlockProcessor's Begin-owned marker and milestone actions, no
+synchronization producer, ordinary processor data sender, Catchup command, or
+notification activation may start before both Begin acknowledgements succeed.
+Only then may the common pump start. A Begin barrier failure follows its
+existing typed ownership-fault disposition and the applicable complete
+teardown; it never starts a partial pump or continues with only one active
+processor. Teardown includes every processor that accepted Begin, regardless
+of whether its acknowledgement had completed when the failure was observed.
 
 Once prepared, both modes use the same block/VSPC synchronization pump. Their
 only material difference is storage policy before PP-boundary sealing.
@@ -912,11 +923,11 @@ Before a fresh Begin:
 1. disable/unsubscribe processing notifications;
 2. ensure Supervisor has installed the fresh graph-update topology through
    `reset` and passed its producer through `start`; and
-3. send Begin to BlockProcessor and VspcProcessor. `BeginResync` enqueues the
-   `PublishPostSeal` worker command, while Rebuild waits for the post-Begin
-   seal point.
+3. send Begin independently to both processors and await both readiness
+   acknowledgements. `BeginResync` enqueues the `PublishPostSeal` worker
+   command, while Rebuild waits for the post-Begin seal point.
 
-Begin needs no acknowledgement. Before Catchup:
+Before Catchup:
 
 1. send Catchup commands, including lower bounds, to both processors;
 2. invoke the run's exact `ValidatedRpcClient` subscription activation.

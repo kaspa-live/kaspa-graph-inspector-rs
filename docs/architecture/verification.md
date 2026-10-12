@@ -629,9 +629,12 @@ Verify [phase entry](processing-lifecycle.md#entering-recovery-phases),
 and [global Live admission](processing-lifecycle.md#live-admission)
 together. Required cases are:
 
-1. Command priority, the Begin gate and immediate closed-gate drop, objective
-   lower-bound filtering, both overlap flags, observation only at full-page
-   boundaries, and Live entry while valid ordinary orphans remain.
+1. Command priority, independently issued acknowledged processor Begin
+   barriers with acknowledgements completing in either order, no
+   synchronization producer or new-session data before both acknowledgements,
+   the Begin gate and immediate closed-gate drop, objective lower-bound
+   filtering, both overlap flags, observation only at full-page boundaries,
+   and Live entry while valid ordinary orphans remain.
 2. Cross-response synthetic block repeats; add to the Catchup-only sent-hash
    set only after a successful enqueue and grant no overlap credit to a
    filtered repeat. This set does not participate in Live admission.
@@ -751,36 +754,43 @@ Verify [block admission](block-processing.md#admission-and-materialization),
 [OrphanManager](block-processing.md#orphanmanager--settled), and
 [DependencyResolver](block-processing.md#dependencyresolver--settled) with:
 
-1. Reverse orphan topology releases every newly ready child.
-2. Resolver pending state remains until `AddOrphan` or `BlockPersisted`.
-3. Resolver cancellation and deactivation are safe with full child-result
+1. BlockProcessor Begin awaits OrphanManager before DependencyResolver. Hold an
+   old OrphanManager data handler across Begin, then verify its final resolver
+   work is drained by the later resolver barrier; neither child nor
+   BlockProcessor may reinterpret old queued data under the new session. Submit
+   the first new-session value only after the processor acknowledgement and
+   verify it is retained. Cover invalid lifecycle control and closed child
+   command or acknowledgement paths through their existing ownership faults.
+2. Reverse orphan topology releases every newly ready child.
+3. Resolver pending state remains until `AddOrphan` or `BlockPersisted`.
+4. Resolver cancellation and deactivation are safe with full child-result
    channels.
-4. A resolver-confirmed unavailable dependency requires Rebuild, whereas RPC
+5. A resolver-confirmed unavailable dependency requires Rebuild, whereas RPC
    or connection failure does not establish unavailability.
-5. A failed post-commit `PersistedBlock` delivery cannot be treated as a
+6. A failed post-commit `PersistedBlock` delivery cannot be treated as a
    harmless duplicate or omission.
-6. A malformed resolver full-block response retires the exact RPC generation:
+7. A malformed resolver full-block response retires the exact RPC generation:
    during Catchup it follows the shared malformed recovery-input budget, while
    during Live it requires Resync without consuming that budget.
-7. An incoming hash already classified as a permanent boundary identity, or a
+8. An incoming hash already classified as a permanent boundary identity, or a
    strict materialization result containing any identity-only reference,
    reports `MaterialityViolation` and requires Rebuild without orphan or
    resolver admission. When the same result also contains absent hashes, the
    identity-only disposition takes precedence.
-8. A strict missing-only result before Catchup reports
+9. A strict missing-only result before Catchup reports
    `ReconciliationFailed` and `Require(Resync)`. During Catchup and Live, the
    complete missing set enters ordinary orphan/dependency resolution without a
    partial database write.
-9. A second BlockAdded for a hash whose notification source bit is already set
+10. A second BlockAdded for a hash whose notification source bit is already set
    is discarded before materialization and orphan admission without changing
    overlap or requesting recovery. A synthetic copy followed by the first
    notification still establishes ordinary overlap.
-10. Fill orphan storage with distinct hashes, then verify that another distinct
+11. Fill orphan storage with distinct hashes, then verify that another distinct
     orphan reports `BoundedStateExhausted(Orphans)` without partial topology,
     reverse-index, or pending-resolution mutation and accepts only lifecycle
     commands until Deactivate. Re-admitting an existing orphan at capacity
     consumes no new slot and does not report exhaustion.
-11. At the focused owner's exact orphan threshold and capacity, verify
+12. At the focused owner's exact orphan threshold and capacity, verify
     dependency selection begins at the threshold and admission remains valid
     through capacity. Hold resolver RPCs open and prove active work never
     exceeds its focused-owner concurrency bound while cancellation and queued
@@ -794,6 +804,10 @@ Verify [change semantics](vspc-processing.md#change-semantics--settled),
 [Catchup crossing](vspc-processing.md#catchup-filtering-crossing-and-overlap--settled)
 with:
 
+- prefilled old-session synthetic, notification, and persisted-block inputs
+  discarded before the Begin acknowledgement; anchor-derived state and exact
+  generations installed at acknowledgement; and the first data submitted after
+  both processor barriers retained as new-session input;
 - removed/added source and destination derivation;
 - the added-only path with no database source;
 - an actionable reorg resolving `removed` followed by `added` through one

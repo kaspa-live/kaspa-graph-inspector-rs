@@ -96,16 +96,33 @@ generation. It validates the Begin payload and applies the mode-specific phase
 and milestone behavior owned by the
 [PP-boundary contract](#pp-boundary-phase-behavior--settled).
 
+Begin is an acknowledged readiness barrier. While handling it, BlockProcessor
+does not consume lower-priority session data. It first sends acknowledged Begin
+commands to OrphanManager and then DependencyResolver, awaiting each in that
+order. Quiescing OrphanManager first stops the sole producer of resolver work;
+DependencyResolver can then discard every old work item without a later
+old-session send racing its reset. After both child barriers, BlockProcessor
+discards its own previously queued session data, installs the new local state,
+and acknowledges only when it and both descendants are ready for new-session
+input. The [processing lifecycle](processing-lifecycle.md#processor-begin-payloads)
+owns the rule that no producer may submit that input before the acknowledgement.
+
 `BeginResync` starts directly in PostSeal and immediately enqueues
 `PublishPostSeal` to its lifecycle-marker worker. `BeginRebuild` follows the
 marker-command enqueue points owned by the PP-boundary contract above.
 Processing cannot reach Catchup before the Rebuild command has been accepted
-by the marker worker.
+by the marker worker. Begin acknowledgement follows creation of the session's
+marker worker, acceptance of every marker command required by the Begin path,
+and completion of every Begin-triggered phase or milestone action. It does not
+wait for marker delivery through the graph-update channel.
 
-Begin has no acknowledgement. `Deactivate` is an acknowledged descendant
-barrier; Shutdown is terminal under the shared lifecycle contract. No separate
-Genesis flag, recovery-mode field, or boundary-phase field is carried in the
-payload.
+An invalid Begin state or payload fails the barrier with
+`Ownership(InvalidLifecycleControl)`. Child command or acknowledgement loss
+while the worker is meant to live fails it with
+`Ownership(InternalControlPathLost)`. `Deactivate` is an acknowledged
+descendant barrier; Shutdown is terminal under the shared lifecycle contract.
+No separate Genesis flag, recovery-mode field, or boundary-phase field is
+carried in the payload.
 
 ### Graph lifecycle-marker delivery — settled
 
@@ -284,11 +301,13 @@ Every newly ready orphan is removed from orphan storage and returned through
 BlockProcessor's Intern/resolved lane. No waiter belongs in the committed
 block index, and deduplicated hashes are harmless.
 
-Begin and Deactivate clear or cancel run-local state. Deactivate acknowledges
-only after descendants have stopped. After a resolver RPC succeeds, keep its
-hash in `resolution_pending` until OrphanManager observes `AddOrphan` or
-`BlockPersisted` for that hash. RPC completion alone must not reopen the
-request gap before BlockProcessor accounts for the result.
+Begin clears or cancels run-local state, drains every previously queued data
+message, enters the new active state, and then acknowledges BlockProcessor.
+BlockProcessor submits no new-session child data while awaiting that barrier.
+Deactivate acknowledges only after descendants have stopped. After a resolver
+RPC succeeds, keep its hash in `resolution_pending` until OrphanManager observes
+`AddOrphan` or `BlockPersisted` for that hash. RPC completion alone must not
+reopen the request gap before BlockProcessor accounts for the result.
 
 Dependency selection uses orphan topology only. Age and DAA score are not
 inputs. Define:
@@ -341,6 +360,11 @@ Dependency resolution is exceptional repair work rather than an intensive
 steady-state RPC lane. The limit allows parallel release of orphan topology
 without dominating the validated node connection.
 DependencyResolver reports active and permit-waiting RPC operations.
+
+Begin aborts and joins every old RPC task, drains every previously queued work
+item, installs the new session's exact RPC generation, and then acknowledges
+BlockProcessor. Because the acknowledged OrphanManager Begin precedes this
+barrier, no old-session producer can refill the drained work mailbox.
 
 OrphanManager sends Resolve work and `Cancel(hash)` when a block arrives
 naturally. It owns the pending set and prevents duplicate requests. Resolver

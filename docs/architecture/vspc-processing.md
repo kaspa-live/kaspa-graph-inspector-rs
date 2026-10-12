@@ -64,7 +64,18 @@ new history from the same anchor as defined below, then enters the pre-Catchup
 synthetic-priority phase. Continue polling the
 notification receiver while the gate is closed and discard notifications
 immediately rather than accumulating them. Catchup opens the gate with its
-objective synthetic-sink lower bound. Begin has no acknowledgement. Deactivate
+objective synthetic-sink lower bound.
+
+Begin is an acknowledged readiness barrier. VspcProcessor does not consume
+ordinary session data while applying it. Before acknowledging, it clears the
+prior run state, drains every previously queued session-data input, installs
+the supplied generations and anchor-derived state, closes the notification
+gate, and enters the pre-Catchup phase. The
+[processing lifecycle](processing-lifecycle.md#processor-begin-payloads) owns
+the rule that no producer may submit new-session data before this
+acknowledgement. An invalid Begin state or payload fails the barrier with
+`Ownership(InvalidLifecycleControl)`; command or acknowledgement loss while the
+worker is meant to live is `Ownership(InternalControlPathLost)`. Deactivate
 clears run-local state, releases both processing-session client clones, and
 acknowledges only after the local barrier is complete.
 
