@@ -436,7 +436,7 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
     that same generation only after definite commit.
     A defensive out-of-range storage input is rejected before mutation with
     the typed DAA or blue
-    `StorageError::ScoreOutOfRange` reason. Round-trip timestamps `0`,
+    `ProcessingDbError::ScoreOutOfRange` reason. Round-trip timestamps `0`,
     `i64::MAX`, `i64::MAX + 1`, and `u64::MAX` through the signed `BIGINT`
     bit-pattern encoding; upper-half negative storage values are not
     inconsistent contents.
@@ -525,8 +525,9 @@ Verify the successful VSPC path compares compact member and selected-parent
 IDs without resolving hashes. For the first ID conflict, verify one bounded
 in-transaction query resolves the distinct child, expected-parent, and
 stored-parent IDs into `VspcPathConflict`; incomplete or invalid evidence
-resolution returns `StorageError::InvalidMetadata` rather than a partial
-conflict.
+resolution returns
+`ApplyVspcChangeError::Database(ProcessingDbError::InvalidStoredState)` rather
+than a partial conflict.
 
 Verify [transaction retries](storage.md#transaction-retries) with PostgreSQL
 integration fixtures. Only SQLSTATE `40001` and `40P01` retry the complete
@@ -541,6 +542,30 @@ local retry, and retires it. Each retirement emits exactly one
 `ProcessingDbPublished`. Exercise both actual commit and rollback behind that
 ambiguous result and require the replacement generation to derive the
 resulting database truth. Retry exhaustion leaves the generation valid.
+
+Verify the
+[validated processing-operation error boundary](storage.md#validated-processing-operation-errors--settled)
+for `load_session_state`, `block_presence`, `resolve_materialized_ids`,
+`materialize_block`, `apply_vspc_change`, and
+`rebuild_from_pruning_point`. Their common database branches expose only
+`ProcessingDbError`; raw `StorageError` database, connection, rejection,
+control, event-path, worker, setup, and replacement-control variants cannot
+escape through that capability. Cover these classifications and their
+[lifecycle mapping](processing-lifecycle.md#supervisor-and-recovery-intent--settled):
+
+- a failed nonmutating query returns `QueryFailed`, leaves the exact generation
+  usable, retries the complete recovery attempt with ordinary backoff, and
+  requires Resync in Live without waiting for a replacement generation;
+- invalid persisted evidence from a bounded later read returns
+  `InvalidStoredState`, retains the generation for replacement, and tears down
+  the session before Supervisor starts a distinct Rebuild session;
+- an internal or representation failure that Storage cannot safely continue
+  after returns `ServiceUnavailable` and is Fatal as
+  `Ownership(ManagedComponentUnavailable)` from StorageService;
+- connection loss returns `GenerationLost` only after exact-generation
+  retirement and follows `ServiceGenerationLost(Storage)`; and
+- mutation failures retain their exact `PersistenceFault` classification and
+  never become `QueryFailed`.
 
 ## Recovery lifecycle and Catchup
 
@@ -1802,7 +1827,7 @@ cancellation as ordinary cancellation without a fault. Break replacement
 control before fresh API publication, after gated fresh API publication, and
 while a phase admitted by a retired generation still holds a lease. Each
 unexpected case returns
-`StorageError::ReplacementControlUnavailable`, starts no replacement
+`RebuildFromPruningPointError::ReplacementControlUnavailable`, starts no replacement
 transaction, retires the current API generation if one exists, leaves the
 processing generation and persistent state unchanged, and reports
 `Ownership(ManagedComponentUnavailable)` from StorageService with Fatal

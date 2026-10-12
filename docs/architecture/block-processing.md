@@ -185,6 +185,12 @@ Handle its typed semantic failures in this precedence order:
 4. The same missing-only result during Catchup or Live admits the block to
    OrphanManager with the complete missing set.
 
+`block_presence` failures and the `Database(ProcessingDbError)` branch of
+`MaterializeBlockError` retain Storage's typed normalization. BlockProcessor
+reports the corresponding cross-worker fault through the
+[processing-lifecycle mapping](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
+without inspecting diagnostics or reclassifying the database outcome.
+
 PreSeal boundary absences are accepted only through
 `AllowBoundaryIdentities`; they do not produce
 `NonMaterializedReferences`. An `IncomingBoundaryIdentity` remains a violation

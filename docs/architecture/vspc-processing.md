@@ -300,6 +300,11 @@ solely owns their retirement, retry-budget, and recovery-strength consequences.
 Definite readiness commits through
 `ValidatedDbClient::apply_vspc_change(ready)` and adopts the returned
 outcome's destination as the new committed sink.
+The `Database(ProcessingDbError)` branches returned by member resolution or
+commit retain Storage's typed normalization. VspcProcessor reports their
+cross-worker faults through the
+[processing-lifecycle mapping](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
+without inspecting diagnostics or reclassifying the database outcome.
 
 ## Catchup filtering, crossing, and overlap — settled
 

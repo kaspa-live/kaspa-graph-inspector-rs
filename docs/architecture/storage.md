@@ -188,10 +188,16 @@ replacement can be published. Each operation reports its actual outcome:
 
 - a definitely committed transaction remains successful and authoritative;
 - connection loss before commit with a proven rollback is
-  `ServiceGenerationLost(Storage)` rather than a persistence-transaction
-  fault; and
+  `ProcessingDbError::GenerationLost`, inside the operation-specific wrapper
+  when one exists, rather than a persistence-transaction fault; and
 - a connection loss with an ambiguous commit outcome remains ambiguous and is
-  reported as `Persistence(AmbiguousCommit)`.
+  reported as `ProcessingDbError::Persistence(AmbiguousCommit)`, inside the
+  operation-specific wrapper when one exists.
+
+The processing lifecycle maps the first result to
+`ServiceGenerationLost(Storage)` and the second to
+`Persistence(AmbiguousCommit)`; Storage owns the operation classification and
+exact-generation retirement that precede those cross-worker faults.
 
 All persistent mutations are transactional. Cache entries become visible
 only after definite commit. Outside the database-replacement gate below, no
@@ -220,9 +226,9 @@ loss or service-rejection classifications.
 `ApiReadExclusion` means that the bounded cancellation and drain procedure
 could not establish exclusive replacement access. An unexpectedly closed or
 broken replacement-control primitive returns
-`StorageError::ReplacementControlUnavailable { diagnostic }`. This is an
-internal StorageService failure, not a recoverable setup fault and not a
-persistence failure.
+`RebuildFromPruningPointError::ReplacementControlUnavailable { diagnostic }`.
+This is an internal StorageService failure, not a recoverable setup fault and
+not a persistence failure.
 
 Every database phase performed through `ValidatedApiDbClient` holds a shared
 database-replacement permit from before its read-only transaction begins until
@@ -259,7 +265,7 @@ or has already been retired. It acquires the exclusive replacement permit only
 after all such leases have been released. From the cancellation request,
 StorageService allows at most `API_REPLACEMENT_DRAIN_TIMEOUT` for those leases
 to release and exclusive replacement ownership to be established. Expiry
-returns `StorageError::RebuildSetupFailed(ApiReadExclusion)`. Absence of a
+returns `RebuildFromPruningPointError::Setup(ApiReadExclusion)`. Absence of a
 current API generation does not skip this procedure and does not preclude
 `ApiReadExclusion`; the drain is immediately complete only when the
 service-owned active-lease registry is empty. A request that detached its
@@ -270,7 +276,7 @@ unavailability; the
 mapping. An API read cannot delay replacement without bound.
 
 A non-cancellation setup failure starts no replacement transaction and returns
-`StorageError::RebuildSetupFailed(reason)`. For
+`RebuildFromPruningPointError::Setup(reason)`. For
 `ApiGenerationPreparation`, no unvalidated API client is published. For
 `ApiReadExclusion`, StorageService retires the already published fresh API
 generation while its gate is still closed. Both outcomes leave the database,
@@ -280,16 +286,18 @@ the complete-attempt retry.
 
 Session or service cancellation during setup performs the same applicable API
 generation cleanup and follows the ordinary cancellation path rather than
-returning `StorageError::RebuildSetupFailed`. If connection loss proves the
+returning `RebuildFromPruningPointError::Setup`. If connection loss proves the
 processing generation unusable, StorageService instead retires it and returns
-`ServiceGenerationLost(Storage)` under the existing generation-loss contract.
+`RebuildFromPruningPointError::Database(ProcessingDbError::GenerationLost)`;
+the processing lifecycle maps that result to
+`ServiceGenerationLost(Storage)`.
 
 If replacement control becomes unavailable unexpectedly while StorageService
 is required to operate, no replacement transaction starts. StorageService
 keeps API database admission closed wherever the remaining control path permits,
 retires the currently published API generation if one exists, and emits its
 exact `ApiDbRetired` event before returning
-`StorageError::ReplacementControlUnavailable`. It requests cancellation of
+`RebuildFromPruningPointError::ReplacementControlUnavailable`. It requests cancellation of
 active API database phases on a best-effort basis but does not delay fault
 reporting indefinitely through the broken control path. Database contents,
 processing caches, and the current processing generation remain unchanged:
@@ -616,7 +624,7 @@ disposition.
 | Condition | Storage classification |
 |---|---|
 | Database temporarily unreachable | `Unavailable`; retry connection under the service backoff policy |
-| Validated pool or advisory-lock connection fails | `ServiceGenerationLost(Storage)` under the connection-level outcome contract above |
+| Validated pool or advisory-lock connection fails | Retire the exact generation; a processing operation returns `ProcessingDbError::GenerationLost`, and the processing lifecycle maps the retirement to `ServiceGenerationLost(Storage)` |
 | Database already owned by another KGI | `Rejected(DatabaseAlreadyInUse)` |
 | Immutable `(network_id, genesis_hash)` mismatch | `Rejected(NetworkMismatch)` |
 | Schema newer than the binary | `Rejected(SchemaTooNew)` |
@@ -839,8 +847,8 @@ The database representation enforces the score ranges owned by the
 is `MAX_BLUE_SCORE`. Bind domain scores only through checked `i64::try_from`
 conversion, and reject negative SQL values before converting them to `u64`.
 Storage APIs defensively reject an out-of-range caller value as typed
-`StorageError::ScoreOutOfRange(DaaScore)` or
-`StorageError::ScoreOutOfRange(BlueScore)` before opening a mutation
+`ProcessingDbError::ScoreOutOfRange(DaaScore)` or
+`ProcessingDbError::ScoreOutOfRange(BlueScore)` before opening a mutation
 transaction; the
 [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
 owns its fault disposition.
@@ -863,6 +871,60 @@ Per-block blue work and blue score are not stored.
 metadata. The
 [processing lifecycle](processing-lifecycle.md) owns node-header enrichment
 and validation when constructing a `MaterializedSyncAnchor`.
+
+## Validated processing-operation errors — settled
+
+`StorageError` is StorageService's internal and service-control error domain.
+It is not exposed as the result of a `ValidatedDbClient` processing operation.
+Every such operation exposes its semantic outcomes together with this closed
+common error:
+
+```rust
+enum ProcessingDbError {
+    GenerationLost,
+    QueryFailed {
+        diagnostic: Arc<str>,
+    },
+    InvalidStoredState {
+        diagnostic: Arc<str>,
+    },
+    Persistence(PersistenceFault),
+    ScoreOutOfRange(ScoreRangeFault),
+    ServiceUnavailable {
+        diagnostic: Arc<str>,
+    },
+}
+```
+
+Storage performs this normalization before an error crosses into processing:
+
+| Internal observation | `ValidatedDbClient` result |
+|---|---|
+| The exact generation was already retired | `GenerationLost` |
+| Connection loss followed by successful exact-generation retirement | `GenerationLost` |
+| A nonmutating query fails while the generation remains valid | `QueryFailed` |
+| A mutation produces a classified transaction outcome | `Persistence(...)` |
+| A later bounded read discovers invalid persisted processing data | `InvalidStoredState` |
+| Defensive score conversion rejects a caller value | `ScoreOutOfRange(...)` |
+| The retirement/control path is unavailable, or Storage cannot safely continue after an internal or non-persisted representation failure | `ServiceUnavailable` |
+
+`QueryFailed` proves that the failed operation performed no mutation. A
+mutation must instead return its classified `PersistenceFault`; it must not
+erase a definite, exhausted, or ambiguous transaction outcome into a query
+failure. `InvalidStoredState` is limited to evidence read from persisted
+processing contents. It does not classify invalid caller input, an impossible
+internal postcondition, or a value rejected before persistence by the
+representation bounds. Those cases use an existing semantic or range result
+when applicable and otherwise return `ServiceUnavailable`.
+
+`Rejected`, `EventPathClosed`, `ControlUnavailable`, `WorkerFailed`, raw
+`Database`/`ConnectionLost`, and rebuild-only setup or replacement-control
+errors never cross this boundary. A terminal StorageService rejection or
+worker/event-path failure retires any published generations through the
+service lifecycle. If retirement coordination itself is unavailable, the
+operation returns `ServiceUnavailable`. The
+[processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
+solely owns cross-worker fault kinds and dispositions for every common variant.
 
 ## Caches and identity resolution — settled
 
@@ -896,7 +958,7 @@ struct CachedVspcSink {
 }
 
 enum ResolveMaterializedIdsError {
-    Storage(StorageError),
+    Database(ProcessingDbError),
     NonMaterialized {
         missing: Arc<[BlockHash]>,
         identity_only: Arc<[BlockHash]>,
@@ -907,7 +969,7 @@ impl ValidatedDbClient {
     async fn block_presence(
         &self,
         hash: BlockHash,
-    ) -> Result<BlockPresence, StorageError>;
+    ) -> Result<BlockPresence, ProcessingDbError>;
 
     async fn resolve_materialized_ids(
         &self,
@@ -991,11 +1053,19 @@ hashes separately; only materialized hashes succeed.
 The sole processing-recovery API allowed to clear processing data is:
 
 ```rust
+enum RebuildFromPruningPointError {
+    Database(ProcessingDbError),
+    Setup(RebuildSetupFault),
+    ReplacementControlUnavailable {
+        diagnostic: Arc<str>,
+    },
+}
+
 impl ValidatedDbClient {
     async fn rebuild_from_pruning_point(
         &self,
         pruning_point: ValidatedNodeBlock,
-    ) -> Result<MaterializedSyncAnchor, StorageError>;
+    ) -> Result<MaterializedSyncAnchor, RebuildFromPruningPointError>;
 }
 ```
 
@@ -1222,7 +1292,7 @@ enum MaterializeBlockOutcome {
 }
 
 enum MaterializeBlockError {
-    Storage(StorageError),
+    Database(ProcessingDbError),
     IncomingBoundaryIdentity {
         hash: BlockHash,
     },
@@ -1382,11 +1452,20 @@ struct VspcCommitOutcome {
     level_snapshots: Arc<[LevelCommitted]>,
 }
 
+enum ApplyVspcChangeError {
+    Database(ProcessingDbError),
+    VspcSourceDiscontinuity,
+    VspcMemberNotMaterialized {
+        id: CompactId,
+    },
+    VspcPathDiscontinuity(VspcPathConflict),
+}
+
 impl ValidatedDbClient {
     async fn apply_vspc_change(
         &self,
         change: ReadyVspcChange,
-    ) -> Result<VspcCommitOutcome, StorageError>;
+    ) -> Result<VspcCommitOutcome, ApplyVspcChangeError>;
 }
 
 struct VspcPathConflict {
@@ -1431,7 +1510,8 @@ mutation and rolls back. This exceptional evidence query does not populate a
 general reverse-hash cache. This keeps ordinary VSPC validation entirely
 ID-based and confines hash reads to a recovery-triggering exceptional outcome.
 An incomplete or invalid evidence resolution returns
-`StorageError::InvalidMetadata` instead of manufacturing conflict evidence.
+`ApplyVspcChangeError::Database(ProcessingDbError::InvalidStoredState)` instead
+of manufacturing conflict evidence.
 Storage supplies the persisted evidence and expected relationship but does not
 attribute the conflict to either the database or the candidate. The
 [VspcProcessor contract](vspc-processing.md#readiness-and-materiality--settled)
@@ -1492,7 +1572,7 @@ struct StoredVspcSink {
 impl ValidatedDbClient {
     async fn load_session_state(
         &self,
-    ) -> Result<StoredSessionState, StorageError>;
+    ) -> Result<StoredSessionState, ProcessingDbError>;
 }
 ```
 

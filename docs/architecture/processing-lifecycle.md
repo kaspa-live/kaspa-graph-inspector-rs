@@ -224,6 +224,8 @@ enum OwnershipFault {
 enum FaultKind {
     ServiceGenerationLost(ServiceKind),
     RpcRequestFailed,
+    StorageQueryFailed,
+    StorageInvariantViolation,
     SubscriptionControlFailed,
     RebuildSetupFailed(RebuildSetupFault),
     SessionContinuityLost,
@@ -317,6 +319,26 @@ compatibility classification before constructing this envelope.
   malformed-input budget, and does not wait for a replacement generation. In
   Live it requires Resync. A generation-ending subscription-control result
   enters this lifecycle as `ServiceGenerationLost(Node)`.
+- Storage's generation-preserving
+  [`ProcessingDbError::QueryFailed`](storage.md#validated-processing-operation-errors--settled)
+  maps to `StorageQueryFailed`. It aborts an active recovery attempt with
+  `Retry`, retains the current recovery obligation and exact database
+  generation, and uses the general recovery backoff. In Live it requires
+  Resync. It does not wait for `ProcessingDbPublished` and never retries only
+  the failed query in place.
+- Storage's
+  [`ProcessingDbError::InvalidStoredState`](storage.md#validated-processing-operation-errors--settled)
+  maps to `StorageInvariantViolation` and requires Rebuild from every active
+  recovery mode and from Live while retaining the current database generation
+  for replacement. This always tears down the complete current session and
+  lets Supervisor create a distinct Rebuild session; ResyncEngine never changes
+  session intent in place. Rebuild encountering the same fault likewise starts
+  no in-place repair or partial retry.
+- `ProcessingDbError::GenerationLost` maps to
+  `ServiceGenerationLost(Storage)`. `ProcessingDbError::Persistence(reason)`
+  maps to `Persistence(reason)`. Their dispositions and replacement waits are
+  the existing generation-loss and persistence policies below; processors do
+  not introduce an intermediate storage-failure classification.
 - A nonmaterialized hash directly named in VSPC `added`/`removed` and a
   resolver-confirmed unavailable dependency each require Rebuild directly:
   the DB can no longer be trusted against node state. RPC connection failure
@@ -338,9 +360,10 @@ compatibility classification before constructing this envelope.
   representable. A range fault does not retire the validated RPC generation or
   consume the malformed recovery-response budget. The actual value or addition
   operands belong in diagnostics and do not select control flow.
-- Storage's defensive `StorageError::ScoreOutOfRange` maps to the corresponding
-  `ScoreOutOfRange(DaaScore)` or `ScoreOutOfRange(BlueScore)` fault and the same
-  Fatal disposition; it is not a persistence retry.
+- Storage's defensive `ProcessingDbError::ScoreOutOfRange` maps to the
+  corresponding `ScoreOutOfRange(DaaScore)` or
+  `ScoreOutOfRange(BlueScore)` fault and the same Fatal disposition; it is not
+  a persistence retry.
 - A malformed BlockAdded notification reports
   `NotificationInputInvalid(MalformedBlockAdded)`, disables notification
   routing, and requires Resync. It does not retire the validated RPC generation
@@ -434,14 +457,16 @@ next attempt performs fresh Rebuild preparation and never reissues only the
 failed setup phase. Observing this fault in another recovery mode or in Live is
 an invalid lifecycle condition and is Fatal.
 
-StorageService's typed
-[`StorageError::ReplacementControlUnavailable`](storage.md#api-read-exclusion-during-database-replacement--settled)
-maps to
+Storage's typed
+[`ProcessingDbError::ServiceUnavailable`](storage.md#validated-processing-operation-errors--settled)
+and rebuild-specific
+[`RebuildFromPruningPointError::ReplacementControlUnavailable`](storage.md#rebuild-transaction--settled)
+map to
 `Ownership(ManagedComponentUnavailable)` with `source: StorageService` and a
-Fatal disposition. The service-owned replacement infrastructure cannot be
-recreated by retrying a Rebuild or starting another processing session.
-Supervisor therefore enters Fatal and begins ordinary global shutdown without
-changing the retained recovery obligation. This fault is neither
+Fatal disposition. The service-owned infrastructure cannot be recreated by
+retrying an operation, a Rebuild, or another processing session. Supervisor
+therefore enters Fatal and begins ordinary global shutdown without changing
+the retained recovery obligation. This fault is neither
 `Ownership(InternalControlPathLost)`, which is reserved for worker command
 paths, nor a persistence fault. Expected cancellation after session or service
 shutdown has begun remains ordinary cancellation and reports no fault.
