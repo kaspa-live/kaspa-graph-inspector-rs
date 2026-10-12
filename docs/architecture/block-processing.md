@@ -91,21 +91,19 @@ Shutdown
 
 A Begin command resets all processor-local run state: phase, source gates,
 overlap map and flag, orphan state, and descendants. It installs the exact DB
-and RPC generations for the run and activates DependencyResolver with that RPC
-generation. It validates the Begin payload and applies the mode-specific phase
-and milestone behavior owned by the
+and RPC generations for the run and passes that RPC generation through
+OrphanManager's transitive Begin barrier. It validates the Begin payload and
+applies the mode-specific phase and milestone behavior owned by the
 [PP-boundary contract](#pp-boundary-phase-behavior--settled).
 
 Begin is an acknowledged readiness barrier. While handling it, BlockProcessor
-does not consume lower-priority session data. It first sends acknowledged Begin
-commands to OrphanManager and then DependencyResolver, awaiting each in that
-order. Quiescing OrphanManager first stops the sole producer of resolver work;
-DependencyResolver can then discard every old work item without a later
-old-session send racing its reset. After both child barriers, BlockProcessor
-discards its own previously queued session data, installs the new local state,
-and acknowledges only when it and both descendants are ready for new-session
-input. The [processing lifecycle](processing-lifecycle.md#processor-begin-payloads)
-owns the rule that no producer may submit that input before the acknowledgement.
+does not consume lower-priority session data. It sends one acknowledged Begin
+command to OrphanManager and awaits that child's transitive barrier. After the
+child barrier, BlockProcessor discards its own previously queued session data,
+installs the new local state, and acknowledges only when it, OrphanManager, and
+DependencyResolver are ready for new-session input. The
+[processing lifecycle](processing-lifecycle.md#processor-begin-payloads) owns
+the rule that no producer may submit that input before the acknowledgement.
 
 `BeginResync` starts directly in PostSeal and immediately enqueues
 `PublishPostSeal` to its lifecycle-marker worker. `BeginRebuild` follows the
@@ -282,9 +280,11 @@ A later session rederives authoritative state from the database.
 
 ## OrphanManager — settled
 
-OrphanManager is an asynchronous child owned by BlockProcessor. It has a
-prioritized unbounded command input and a bounded data-message input so
-lifecycle commands remain prompt.
+The [system control tree](overview.md#system-shape--settled) defines
+OrphanManager's component parent and child relationships. OrphanManager is the
+sole producer of DependencyResolver work, and its resolver command and work
+channels are private. OrphanManager has a prioritized unbounded command input
+and a bounded data-message input so lifecycle commands remain prompt.
 
 It owns:
 
@@ -295,19 +295,28 @@ It owns:
 - dependency request selection; and
 - cancellation when natural arrival makes a request unnecessary.
 
-Messages include new orphan, `BlockPersisted`, dependency result/failure, and
-capacity/topology updates. `BlockPersisted` resolves every affected edge.
-Every newly ready orphan is removed from orphan storage and returned through
-BlockProcessor's Intern/resolved lane. No waiter belongs in the committed
-block index, and deduplicated hashes are harmless.
+Messages from BlockProcessor include new orphan, `BlockPersisted`, and
+capacity/topology updates. DependencyResolver results return directly to
+BlockProcessor's Intern/resolved lane; BlockProcessor retains result
+classification and materialization and reports the resulting `AddOrphan` or
+`BlockPersisted` state change to OrphanManager. `BlockPersisted` resolves every
+affected edge. Every newly ready orphan is removed from orphan storage and
+returned through the same BlockProcessor lane. No waiter belongs in the
+committed block index, and deduplicated hashes are harmless.
 
-Begin clears or cancels run-local state, drains every previously queued data
-message, enters the new active state, and then acknowledges BlockProcessor.
-BlockProcessor submits no new-session child data while awaiting that barrier.
-Deactivate acknowledges only after descendants have stopped. After a resolver
-RPC succeeds, keep its hash in `resolution_pending` until OrphanManager observes
-`AddOrphan` or `BlockPersisted` for that hash. RPC completion alone must not
-reopen the request gap before BlockProcessor accounts for the result.
+Begin clears or cancels run-local state and drains every previously queued data
+message before it begins DependencyResolver with the new session's exact RPC
+generation. This quiesces the resolver's sole work producer before the resolver
+aborts old tasks and drains old work. OrphanManager awaits the resolver's Begin
+acknowledgement, enters its new active state, and only then acknowledges
+BlockProcessor. BlockProcessor submits no new-session child data while awaiting
+that transitive barrier. Deactivate and Shutdown are likewise transitive:
+OrphanManager stops resolver work admission, cancels and joins resolver tasks,
+releases the child's RPC-generation clone, and completes its own barrier before
+acknowledging BlockProcessor. After a resolver RPC succeeds, keep its hash in
+`resolution_pending` until OrphanManager observes `AddOrphan` or
+`BlockPersisted` for that hash. RPC completion alone must not reopen the request
+gap before BlockProcessor accounts for the result.
 
 Dependency selection uses orphan topology only. Age and DAA score are not
 inputs. Define:
@@ -327,8 +336,12 @@ the topology consumes no additional slot. If admitting a new orphan would
 exceed capacity, reject that block before changing orphan storage, reverse
 indexes, topology, or `resolution_pending`; do not evict an existing orphan.
 OrphanManager reports `BoundedStateExhausted(Orphans)` through BlockProcessor,
-then both admit only lifecycle commands until Deactivate clears their retained
-run-local state and descendants. The
+then BlockProcessor and OrphanManager admit only lifecycle commands until
+Deactivate clears their retained run-local state and descendants. Entering
+this or any other terminal local fault state immediately closes resolver work
+admission and cancels and joins DependencyResolver. The later acknowledged
+Deactivate barrier confirms that the child is stopped and its RPC-generation
+clone is released. The
 [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
 owns routing shutdown and recovery disposition.
 
@@ -341,8 +354,8 @@ independent age fallback is required.
 
 ## DependencyResolver — settled
 
-DependencyResolver is owned for lifecycle by BlockProcessor and driven by
-OrphanManager. It has:
+The [system control tree](overview.md#system-shape--settled) owns
+DependencyResolver's component parent. Its local worker contract has:
 
 - separate command and bounded work channels;
 - the processing session's exact `Arc<ValidatedRpcClient>`;
@@ -363,8 +376,8 @@ DependencyResolver reports active and permit-waiting RPC operations.
 
 Begin aborts and joins every old RPC task, drains every previously queued work
 item, installs the new session's exact RPC generation, and then acknowledges
-BlockProcessor. Because the acknowledged OrphanManager Begin precedes this
-barrier, no old-session producer can refill the drained work mailbox.
+OrphanManager. OrphanManager invokes this barrier only after quiescing its old
+handlers, so no old-session producer can refill the drained work mailbox.
 
 OrphanManager sends Resolve work and `Cancel(hash)` when a block arrives
 naturally. It owns the pending set and prevents duplicate requests. Resolver
@@ -385,7 +398,8 @@ For OrphanManager-to-Resolver bounded work sends, full reports
 `SessionContinuityLost`, while closed or unavailable reports
 `Ownership(SessionDataEndpointLost)`. Their dispositions belong to the shared
 [session-channel policy](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
-Deactivation cancels and joins tasks and releases descendant
-session-resource clones before acknowledging. BlockProcessor continues
-draining and discarding child results while joining descendants so a full
-result channel cannot deadlock the barrier.
+Resolver control-path faults and unexpected termination follow the
+[owner-directed fault route](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
+During OrphanManager's transitive Deactivate or Shutdown barrier,
+BlockProcessor continues draining and discarding resolver results so a full
+result channel cannot deadlock task cancellation and join.

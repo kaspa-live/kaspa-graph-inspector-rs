@@ -50,7 +50,7 @@ Supervisor
 ├── Arc<ResyncEngine>
 │   ├── Arc<BlockProcessor>
 │   │   ├── OrphanManager
-│   │   ├── DependencyResolver
+│   │   │   └── DependencyResolver
 │   │   └── lifecycle-marker worker
 │   └── Arc<VspcProcessor>
 └── Arc<ApiService> ────────────► GraphPublication
@@ -75,12 +75,13 @@ The top `kgi` crate is the binary, composition root, and home of Supervisor. It
 constructs the long-lived components and gives Supervisor their `Arc` values.
 Autonomous long-lived workers form a control tree. `ResyncEngine` owns both
 processors and a run's `ProcessingSession`; `BlockProcessor` owns
-OrphanManager, DependencyResolver, and its lifecycle-marker worker. Supervisor
-invokes public control methods on the four components it manages. Internal
-owners may retain explicit child-worker command protocols. Children report
-reliable faults and milestones upward. Strong reference cycles are forbidden.
-`Arc<Component>` is the settled Supervisor-facing shape; separate control
-handles are unnecessary.
+OrphanManager and its lifecycle-marker worker; OrphanManager owns
+DependencyResolver. Supervisor invokes public control methods on the four
+components it manages. Internal owners may retain explicit child-worker command
+protocols. Child fault and milestone delivery follows the
+[processing-lifecycle contract](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
+Strong reference cycles are forbidden. `Arc<Component>` is the settled
+Supervisor-facing shape; separate control handles are unnecessary.
 
 Every worker serializes its local state changes in one event loop despite
 concurrent inputs. Live ingestion remains subscription-based. Notifications

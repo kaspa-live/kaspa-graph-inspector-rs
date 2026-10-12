@@ -473,9 +473,10 @@ shutdown without first inventing a new recovery obligation.
 Fault ownership:
 
 ```text
-DependencyResolver / OrphanManager -> BlockProcessor
-BlockProcessor / VspcProcessor     -> ResyncEngine
-ResyncEngine                       -> Supervisor
+DependencyResolver -> OrphanManager
+OrphanManager       -> BlockProcessor
+BlockProcessor / VspcProcessor -> ResyncEngine
+ResyncEngine                   -> Supervisor
 ```
 
 Faults and milestones use reliable owner-directed events. Each run retains its

@@ -484,9 +484,11 @@ MAX_RPC_CONCURRENCY = 32
 Every runtime operation waits cancellably for a permit before issuing its RPC.
 Permit waiting is ordinary local backpressure, not notification loss or a
 recovery fault. DependencyResolver independently admits at most its
-BlockProcessor-owned concurrency limit, leaving capacity for recovery and VSPC
-operations. Connection validation precedes publication and remains sequential;
-it does not consume this runtime budget.
+concurrency limit owned by the focused
+[block-processing contract](block-processing.md#dependencyresolver--settled),
+leaving capacity for recovery and VSPC operations. Connection validation
+precedes publication and remains sequential; it does not consume this runtime
+budget.
 NodeService reports active and permit-waiting runtime RPC operations.
 
 #### GetBlock not-found compatibility classification

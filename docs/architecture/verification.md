@@ -754,17 +754,19 @@ Verify [block admission](block-processing.md#admission-and-materialization),
 [OrphanManager](block-processing.md#orphanmanager--settled), and
 [DependencyResolver](block-processing.md#dependencyresolver--settled) with:
 
-1. BlockProcessor Begin awaits OrphanManager before DependencyResolver. Hold an
-   old OrphanManager data handler across Begin, then verify its final resolver
-   work is drained by the later resolver barrier; neither child nor
+1. BlockProcessor Begin awaits OrphanManager's transitive barrier. Hold an old
+   OrphanManager data handler across Begin and verify OrphanManager quiesces it
+   before beginning DependencyResolver; the resolver then drains that final old
+   work before either child enters the new session. Neither child nor
    BlockProcessor may reinterpret old queued data under the new session. Submit
    the first new-session value only after the processor acknowledgement and
    verify it is retained. Cover invalid lifecycle control and closed child
    command or acknowledgement paths through their existing ownership faults.
 2. Reverse orphan topology releases every newly ready child.
 3. Resolver pending state remains until `AddOrphan` or `BlockPersisted`.
-4. Resolver cancellation and deactivation are safe with full child-result
-   channels.
+4. Resolver cancellation and transitive Deactivate and Shutdown are safe with
+   full child-result channels, release the resolver's exact RPC-generation
+   clone, and propagate resolver control-path faults through OrphanManager.
 5. A resolver-confirmed unavailable dependency requires Rebuild, whereas RPC
    or connection failure does not establish unavailability.
 6. A failed post-commit `PersistedBlock` delivery cannot be treated as a
@@ -788,7 +790,9 @@ Verify [block admission](block-processing.md#admission-and-materialization),
 11. Fill orphan storage with distinct hashes, then verify that another distinct
     orphan reports `BoundedStateExhausted(Orphans)` without partial topology,
     reverse-index, or pending-resolution mutation and accepts only lifecycle
-    commands until Deactivate. Re-admitting an existing orphan at capacity
+    commands until Deactivate. Its resolver child immediately stops admitting
+    work, cancels and joins its tasks, and remains stopped through the later
+    transitive Deactivate barrier. Re-admitting an existing orphan at capacity
     consumes no new slot and does not report exhaustion.
 12. At the focused owner's exact orphan threshold and capacity, verify
     dependency selection begins at the threshold and admission remains valid
