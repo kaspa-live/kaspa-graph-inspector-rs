@@ -10,6 +10,8 @@ kgi-api-ingress = { path = "../kgi-api-ingress" }
 kgi-model = { path = "../kgi-model" }
 kgi-node = { path = "../kgi-node" }
 kgi-storage = { path = "../kgi-storage" }
+thiserror.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

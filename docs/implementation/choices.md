@@ -590,3 +590,46 @@ than from later publication. Once the transaction begins, it runs to a definite
 or ambiguous database outcome even if lifecycle retirement is selected
 concurrently; the worker then applies the exact outcome to the already selected
 lifecycle disposition.
+
+## 12 October 2026: Processing child workers
+
+### Module and channel boundaries
+
+Keep OrphanManager and DependencyResolver in private `block_processor::orphan`
+and `block_processor::dependency` modules. Their owner-facing data values stay
+beside BlockProcessor so the later processor loop can consume one resolution
+lane without exposing child protocols from `kgi-processing`. Keep shared typed
+child control failures, worker faults, and session-data path diagnostics in
+the private `block_processor::error` module; operation-local topology errors
+remain with their implementation.
+
+Use separate `tokio::sync::mpsc::unbounded_channel` command mailboxes and
+bounded Tokio data mailboxes. Explicit command draining precedes every lower
+priority receive. Size every processing data mailbox with the capacity owned
+by the [processing lifecycle](../architecture/processing-lifecycle.md#supervisor-and-recovery-intent--settled).
+Lifecycle acknowledgements use Tokio one-shots.
+
+The DependencyResolver worker is private and generic over a minimal async RPC
+operation adapter. OrphanManager constructs that child and installs the exact
+`Arc<ValidatedRpcClient>` received through its Begin barrier; tests instantiate
+the same nested workers with deterministic RPC behavior. The adapter uses
+static dispatch and does not create a public mock surface or boxed futures.
+
+### Orphan topology and resolver scheduling
+
+Represent orphan storage by block hash, each block's distinct unresolved
+reference set, and a reverse missing-hash-to-dependent-block index.
+Keep the focused owner's `resolution_pending` state as a distinct hash set.
+
+When active, rank frontier hashes by the number of distinct stored orphans
+transitively blocked behind them, with block hash as a deterministic tie
+breaker. Send Resolve requests in that order. This realizes the focused
+owner's topology-only maximum-release policy without using arrival time or
+consensus scores. Resolve and best-effort Cancel use the same bounded FIFO
+mailbox, preserving their single-producer causal order.
+
+DependencyResolver enforces the
+[architecture-owned local allowance](../architecture/block-processing.md#dependencyresolver--settled)
+with a Tokio semaphore. Tasks waiting for a local permit and tasks holding one
+are measured separately. Per-hash cancellation aborts either state;
+Deactivate and Shutdown abort and join all tasks before acknowledging.

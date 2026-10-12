@@ -20,7 +20,9 @@ fault, status, VSPC, and committed graph-update values are implemented against
 the selected rusty-kaspa `v2.1.0` value crates. The session-scoped graph-update
 ingress implements the shared pre-seal gate, nonblocking ordinary offers,
 lossless lifecycle markers, coalescing gap observation, and ingress metrics.
-Processing and API service crates remain behavior-free scaffolds. The first
+The API service crate remains behavior-free scaffolding. The processing crate
+contains the first BlockProcessor-owned child-worker slice described below.
+The first
 StorageService implementation slice selects SQLx with PostgreSQL and Rustls,
 embeds the forward-only metadata and processing-schema migrations, acquires the
 dedicated advisory ownership lock, classifies database bootstrap states, and
@@ -152,6 +154,24 @@ and provides terminal idempotent shutdown. Deterministic tests cover the owner
 loop, subscription failure paths, publication and retirement order, IBD gate,
 retry sequence and reset boundary, and the operation-retirement completion
 barrier.
+
+The processing-worker increment has begun with complete private OrphanManager
+and DependencyResolver child loops. OrphanManager owns bounded normalized-block
+storage, reverse missing-reference topology, topology-ranked frontier
+selection, logical resolution-pending state, natural-arrival cancellation, and
+induced ready-block delivery. It owns DependencyResolver as a private child;
+that worker owns the exact session RPC generation, its local concurrency
+allowance, cancellable GetBlock tasks, and typed result delivery without
+reclassifying node outcomes. Separate prioritized command paths preempt bounded
+data backlogs. Transitive acknowledged Begin barriers discard old-session data
+before admitting new-session work; Deactivate and Shutdown clear or cancel
+transient state and join resolver tasks before acknowledging. Focused tests
+cover reverse-topology release, exact threshold and capacity boundaries,
+maximum-release ordering, pending-state retention, Resolve/Cancel FIFO order,
+active and waiting RPC limits, node-outcome preservation, nested command
+priority and fault propagation, full-result-channel failure, cancellation, and
+exact RPC-generation release.
+BlockProcessor integration and VspcProcessor remain pending in this increment.
 
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.
