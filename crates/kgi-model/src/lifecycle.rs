@@ -103,6 +103,8 @@ pub enum OwnershipFault {
 pub enum FaultKind {
     ServiceGenerationLost(ServiceKind),
     RpcRequestFailed,
+    StorageQueryFailed,
+    StorageInvariantViolation,
     SubscriptionControlFailed,
     SessionContinuityLost,
     NotificationInputInvalid(NotificationInputKind),

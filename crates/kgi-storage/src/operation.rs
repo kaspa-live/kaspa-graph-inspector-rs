@@ -6,14 +6,14 @@ use kgi_model::{
 };
 use thiserror::Error;
 
-use crate::error::StorageError;
+use crate::error::{ProcessingDbError, RebuildSetupFault};
 
 /// Failure to resolve an ordered batch exclusively to materialized block IDs.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ResolveMaterializedIdsError {
     /// The storage operation itself failed.
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Database(#[from] ProcessingDbError),
 
     /// At least one requested hash does not name a materialized block.
     #[error("requested hashes include absent or boundary-only block identities")]
@@ -48,7 +48,7 @@ pub enum MaterializeBlockOutcome {
 pub enum MaterializeBlockError {
     /// The storage operation itself failed.
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Database(#[from] ProcessingDbError),
 
     /// The incoming block was previously fixed as a permanent boundary identity.
     #[error("incoming block is already a permanent boundary identity: {hash}")]
@@ -62,6 +62,42 @@ pub enum MaterializeBlockError {
         /// Boundary references, deduplicated in universal first-occurrence order.
         identity_only: Arc<[BlockHash]>,
     },
+}
+
+/// Failure while applying one ready VSPC transition.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum ApplyVspcChangeError {
+    /// The validated database operation failed.
+    #[error(transparent)]
+    Database(#[from] ProcessingDbError),
+
+    /// The supplied source is not the committed database sink.
+    #[error("VSPC source does not equal the currently committed sink")]
+    VspcSourceDiscontinuity,
+
+    /// A directly named VSPC chain member is not materialized.
+    #[error("VSPC chain member is not materialized: {id}")]
+    VspcMemberNotMaterialized { id: CompactId },
+
+    /// Persisted selected-parent evidence disagrees with the supplied path.
+    #[error("VSPC selected-parent path is discontinuous at {0:?}")]
+    VspcPathDiscontinuity(VspcPathConflict),
+}
+
+/// Failure while replacing processing data from one pruning-point block.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum RebuildFromPruningPointError {
+    /// The validated database operation failed.
+    #[error(transparent)]
+    Database(#[from] ProcessingDbError),
+
+    /// Database replacement prerequisites could not be established.
+    #[error("database rebuild setup failed: {0}")]
+    Setup(RebuildSetupFault),
+
+    /// Storage's replacement-control primitive became unusable.
+    #[error("database replacement control is unavailable: {diagnostic}")]
+    ReplacementControlUnavailable { diagnostic: Arc<str> },
 }
 
 /// Persisted evidence for the first selected-parent discontinuity in a VSPC path.

@@ -83,6 +83,11 @@ before and after fresh API publication, pre-commit connection loss with
 rolled-back truth, and ambiguous commit with truth-derived processing
 republication. No open architecture requirement currently blocks the remaining
 storage work.
+Validated processing operations now normalize their common failures through
+`ProcessingDbError`, while materialization, VSPC mutation, and Rebuild retain
+their operation-specific semantic wrappers. Internal and non-persisted
+representation failures remain distinct from invalid persisted-state evidence
+before crossing into processing.
 
 The imported browser still uses the v1 graph data source, models, and update
 behavior, so it is not yet compatible with the v2 HTTP, SSE, publication, and

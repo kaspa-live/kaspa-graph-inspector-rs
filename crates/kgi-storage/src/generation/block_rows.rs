@@ -83,8 +83,8 @@ pub(super) async fn insert_block_and_parents<S>(
 
 fn encode_coordinate<S>(coordinate: BlockCoordinate) -> Result<(i64, i64), TransactionAttemptError<S>> {
     let level = i64::try_from(coordinate.level())
-        .map_err(|_| TransactionAttemptError::Storage(StorageError::invalid_metadata("block level exceeds BIGINT")))?;
+        .map_err(|_| TransactionAttemptError::Storage(StorageError::internal_failure("block level exceeds BIGINT")))?;
     let slot = i64::try_from(coordinate.slot())
-        .map_err(|_| TransactionAttemptError::Storage(StorageError::invalid_metadata("block slot exceeds BIGINT")))?;
+        .map_err(|_| TransactionAttemptError::Storage(StorageError::internal_failure("block slot exceeds BIGINT")))?;
     Ok((level, slot))
 }

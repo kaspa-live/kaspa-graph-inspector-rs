@@ -17,7 +17,7 @@ use super::{
 use crate::{
     cache::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, ProcessingCacheDomains},
     database::{NO_VSPC_DAA_SCORE, daa_score_to_sql},
-    error::StorageError,
+    error::{ProcessingDbError, StorageError},
     operation::{MaterializeBlockError, MaterializeBlockOutcome, ReferencePolicy},
     transaction::{self, TransactionAttemptError},
 };
@@ -166,7 +166,9 @@ impl ValidatedDbClient {
                 }
                 Ok(MaterializationResult::Outcome(success.outcome))
             })
-            .await?;
+            .await
+            .map_err(ProcessingDbError::mutation)
+            .map_err(MaterializeBlockError::Database)?;
         match result {
             MaterializationResult::Outcome(outcome) => Ok(outcome),
             MaterializationResult::IncomingBoundaryIdentity { hash } => Err(MaterializeBlockError::IncomingBoundaryIdentity { hash }),
@@ -262,9 +264,9 @@ async fn attempt(
         .filter_map(|(_, identity)| identity.coordinate().map(BlockCoordinate::level))
         .max()
         .map_or(Some(1), |level| level.checked_add(1))
-        .ok_or_else(|| TransactionAttemptError::Storage(StorageError::invalid_metadata("derived block level overflow")))?;
+        .ok_or_else(|| TransactionAttemptError::Storage(StorageError::internal_failure("derived block level overflow")))?;
     let raw_level = i64::try_from(level)
-        .map_err(|_| TransactionAttemptError::Storage(StorageError::invalid_metadata("derived block level exceeds BIGINT")))?;
+        .map_err(|_| TransactionAttemptError::Storage(StorageError::internal_failure("derived block level exceeds BIGINT")))?;
     let raw_slot: i64 = sqlx::query_scalar(
         "INSERT INTO levels (level, size, daa_score) VALUES ($1, 1, $2)
          ON CONFLICT (level) DO UPDATE SET size = levels.size + 1
@@ -276,9 +278,9 @@ async fn attempt(
     .await
     .map_err(|error| TransactionAttemptError::database("block-coordinate allocation", error))?;
     let slot = u64::try_from(raw_slot)
-        .map_err(|_| TransactionAttemptError::Storage(StorageError::invalid_metadata("allocated block slot is negative")))?;
+        .map_err(|_| TransactionAttemptError::Storage(StorageError::internal_failure("allocated block slot is negative")))?;
     let coordinate = BlockCoordinate::new(level, slot)
-        .ok_or_else(|| TransactionAttemptError::Storage(StorageError::invalid_metadata("allocated block coordinate is invalid")))?;
+        .ok_or_else(|| TransactionAttemptError::Storage(StorageError::internal_failure("allocated block coordinate is invalid")))?;
 
     let selected_parent_id = identities.get(&prepared.selected_parent).expect("selected parent was resolved").id;
     let own = identities.get_mut(&prepared.hash).expect("the incoming block identity was interned");
@@ -460,7 +462,7 @@ async fn load_level_snapshots(
         .copied()
         .map(|level| {
             i64::try_from(level)
-                .map_err(|_| TransactionAttemptError::Storage(StorageError::invalid_metadata("snapshot level exceeds BIGINT")))
+                .map_err(|_| TransactionAttemptError::Storage(StorageError::internal_failure("snapshot level exceeds BIGINT")))
         })
         .collect::<Result<_, _>>()?;
     let rows = sqlx::query("SELECT level, size, daa_score FROM levels WHERE level = ANY($1::BIGINT[]) ORDER BY level")
@@ -549,7 +551,7 @@ mod tests {
     use crate::{
         cache::{CachedIdentity, CachedMaterializedBlock, ProcessingCacheDomains},
         database::{LockedDatabase, PreparedDatabase, open_processing_generation},
-        error::StorageError,
+        error::ProcessingDbError,
         generation::ValidatedDbClient,
         operation::{MaterializeBlockError, MaterializeBlockOutcome, ReferencePolicy},
         runtime::{RetirementReceiver, RetirementTarget, retirement_channel},
@@ -999,7 +1001,7 @@ mod tests {
                 ReferencePolicy::RequireMaterialized,
             )
             .await;
-        assert_eq!(exhausted, Err(MaterializeBlockError::Storage(StorageError::Persistence(PersistenceFault::RetryExhausted))));
+        assert_eq!(exhausted, Err(MaterializeBlockError::Database(ProcessingDbError::Persistence(PersistenceFault::RetryExhausted))));
         assert!(client.is_valid());
         assert!(!client.has_cached_identity(exhausted_hash));
         assert_eq!(client.block_presence(exhausted_hash).await, Ok(BlockPresence::Absent));
@@ -1017,7 +1019,7 @@ mod tests {
                 ReferencePolicy::RequireMaterialized,
             )
             .await;
-        assert_eq!(definite, Err(MaterializeBlockError::Storage(StorageError::Persistence(PersistenceFault::DefiniteFailure))));
+        assert_eq!(definite, Err(MaterializeBlockError::Database(ProcessingDbError::Persistence(PersistenceFault::DefiniteFailure))));
         assert!(client.is_valid());
         assert!(!client.has_cached_identity(definite_hash));
         assert_eq!(client.block_presence(definite_hash).await, Ok(BlockPresence::Absent));
@@ -1046,7 +1048,7 @@ mod tests {
         complete_processing_retirement(&mut retirements, &client).await;
         assert_eq!(
             operation.await.expect("committed ambiguous operation"),
-            Err(MaterializeBlockError::Storage(StorageError::Persistence(PersistenceFault::AmbiguousCommit)))
+            Err(MaterializeBlockError::Database(ProcessingDbError::Persistence(PersistenceFault::AmbiguousCommit)))
         );
         assert!(!client.has_cached_identity(committed_hash));
         let committed: bool = sqlx::query_scalar(
@@ -1080,7 +1082,7 @@ mod tests {
         complete_processing_retirement(&mut replacement_retirements, &replacement).await;
         assert_eq!(
             operation.await.expect("rolled-back ambiguous operation"),
-            Err(MaterializeBlockError::Storage(StorageError::Persistence(PersistenceFault::AmbiguousCommit)))
+            Err(MaterializeBlockError::Database(ProcessingDbError::Persistence(PersistenceFault::AmbiguousCommit)))
         );
         assert!(!replacement.has_cached_identity(rolled_back_hash));
         let rolled_back: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM block_identifiers WHERE hash = $1)")
@@ -1116,7 +1118,7 @@ mod tests {
             .expect("connection-loss retirement barrier");
         assert_eq!(
             operation.await.expect("connection-loss operation"),
-            Err(MaterializeBlockError::Storage(StorageError::GenerationLost))
+            Err(MaterializeBlockError::Database(ProcessingDbError::GenerationLost))
         );
         assert!(!client.has_cached_identity(own_hash));
         let persisted: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM block_identifiers WHERE hash = $1)")
