@@ -150,7 +150,7 @@ operation error.
 StorageService owns both generation lifecycles. Outside deliberate database
 replacement, retirement immediately starts autonomous reconnection and
 validation. Rebuild itself causes StorageService to create the gated API
-generation described below; Supervisor, ResyncEngine, and ApiService never
+generation described below; Supervisor, ProcessingSession, and ApiService never
 request an API pool generation. Events report transitions; they do not
 initiate them. Supervisor event handling and API forwarding belong to the
 [processing lifecycle](processing-lifecycle.md#processing-session-and-resource-acquisition--settled).
@@ -317,6 +317,17 @@ replacement contents. Publishing the generation does not open public
 historical-request admission; that remains owned by the linked ApiService
 lifecycle.
 
+Session or service cancellation observed after the replacement transaction
+has started must not drop or abort the replacement future. StorageService
+continues to a definite success, definite failure, or ambiguous outcome and
+performs the cache, generation, and replacement-gate publication or cleanup
+owned by that outcome before the method completes. A definite success still
+returns its coherent anchor even when the caller has requested cancellation;
+the processing lifecycle decides whether to initialize processors or discard
+that anchor. Definite and ambiguous failures retain their typed result rather
+than becoming ordinary cancellation. This rule does not weaken the ordinary
+cancellation behavior during setup before the transaction begins.
+
 A final definite replacement failure rolls back the transaction and retires
 the gated API generation before it can become readable. No replacement API
 generation is published merely to expose the rolled-back contents; a later
@@ -354,8 +365,9 @@ cross-worker disposition. No cache state is published before definite commit.
 
 The storage implementation provides separate sequential materialization and
 VSPC mutation lanes while allowing their transactions to overlap. Rebuild
-gets exclusive mutation access after processor deactivation. Reads remain
-concurrent. A materialization `LevelCommitted` is authoritative downstream for
+gets exclusive mutation access after the predecessor processing session has
+completed shutdown and before the Rebuild session constructs processors. Reads
+remain concurrent. A materialization `LevelCommitted` is authoritative downstream for
 its level's committed `size`; its `daa_score` is contextual evidence observed
 by that transaction. A VSPC `LevelCommitted` is authoritative downstream for
 its level's committed `daa_score`; its unchanged `size` is contextual evidence.
@@ -1079,22 +1091,25 @@ clear primitive without a pruning point.
 Before calling the method, the processing lifecycle has established all of
 these conditions:
 
-- ResyncEngine is executing `RecoveryMode::Rebuild` with one fixed
+- ProcessingSession is executing `RecoveryMode::Rebuild` with one fixed
   `Arc<ValidatedRpcClient>` and this exact `Arc<ValidatedDbClient>`;
 - the validated RPC `(network_id, genesis_hash)` equals this database
   generation's immutable binding exposed by `ValidatedDbClient`;
 - the complete pruning-point block was obtained and validated through that RPC
   generation;
-- both processors have completed Deactivate and no earlier processing session
-  retains either validated client; and
+- the predecessor ProcessingSession has completed its consuming shutdown, no
+  earlier session retains either validated client, and this Rebuild session
+  has not initialized or launched its already-constructed inert processors
+  under the
+  [processing lifecycle](processing-lifecycle.md#processor-construction); and
 - StorageService still owns the database advisory lock through its dedicated
   lock connection.
 
 The method first establishes StorageService's API-read replacement exclusion
 above. It then acquires the exclusive processing mutation guard without
-waiting. Failure to acquire that guard after completed processor deactivation
-is a lifecycle invariant violation; Rebuild must not wait behind an unexpected
-processor mutation.
+waiting. Failure to acquire that guard after completed predecessor-session
+shutdown is a lifecycle invariant violation; Rebuild must not wait behind an
+unexpected processor mutation.
 
 ### Atomic replacement
 
@@ -1212,7 +1227,7 @@ attempt publishes none of these cache changes.
 
 No database boolean records PP-boundary sealing. For a non-Genesis pruning
 point, the transaction establishes the boundary but records no seal threshold
-or processing phase. ResyncEngine owns
+or processing phase. ProcessingSession owns
 [threshold construction](processing-lifecycle.md#boundary-seal-threshold-construction),
 and the [BlockProcessor contract](block-processing.md#pp-boundary-phase-behavior--settled)
 owns local phase behavior. The Genesis transaction likewise stores no phase or
@@ -1593,9 +1608,10 @@ A Resync attempt calls `load_session_state` again and receives a fresh value;
 `ValidatedDbClient` never stores or keeps this processing state synchronized.
 
 The initialized snapshot contains only the values consumed during Resync
-preparation. ResyncEngine uses the run's exact validated RPC generation to
-enrich and validate the stored sink, distributes the resulting values through
-the processor Begin payloads, and then discards the snapshot.
+preparation. The
+[processing lifecycle](processing-lifecycle.md#resync-preparation) owns its
+node-side enrichment, component initialization, and disposal; ValidatedDbClient
+retains no copy.
 
 ## API graph projection reads — settled
 

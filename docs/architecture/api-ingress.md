@@ -89,7 +89,7 @@ impl GraphUpdateProducer {
 ```
 
 `GraphUpdateProducer` is the cloneable session-scoped producer capability that
-Supervisor supplies through ResyncEngine to both processors.
+Supervisor supplies through ProcessingSession to both processors.
 `GraphUpdateReceiver` is the corresponding single-consumer session capability
 that Supervisor supplies through `ApiService::reset` to the session's private
 publication runtime. Every producer clone shares one `GraphUpdateGate`,

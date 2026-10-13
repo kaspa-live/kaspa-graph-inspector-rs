@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 11 October 2026.
+Updated 13 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -160,27 +160,30 @@ loop, subscription failure paths, publication and retirement order, IBD gate,
 retry sequence and reset boundary, and the operation-retirement completion
 barrier.
 
-The processing-worker increment has begun with complete private OrphanManager
-and DependencyResolver child loops. OrphanManager owns bounded normalized-block
+The processing-worker increment has begun with private OrphanManager and
+DependencyResolver child loops. Their topology, scheduling, cancellation, and
+typed result behavior remain applicable, while their committed reusable
+Begin/Deactivate lifecycle implements a superseded architecture and must be
+refactored to the session-scoped ProcessingSession contract before the
+increment can complete. OrphanManager owns bounded normalized-block
 storage, reverse missing-reference topology, topology-ranked frontier
 selection, logical resolution-pending state, natural-arrival cancellation, and
 induced ready-block delivery. It owns DependencyResolver as a private child;
 that worker owns the exact session RPC generation, its local concurrency
 allowance, cancellable GetBlock tasks, and typed result delivery without
 reclassifying node outcomes. Separate prioritized command paths preempt bounded
-data backlogs. Transitive acknowledged Begin barriers discard old-session data
-before admitting new-session work; Deactivate and Shutdown clear or cancel
-transient state and join resolver tasks before acknowledging. Focused tests
+data backlogs. Existing focused tests
 cover reverse-topology release, exact threshold and capacity boundaries,
 maximum-release ordering, pending-state retention, Resolve/Cancel FIFO order,
 active and waiting RPC limits, node-outcome preservation, nested command
 priority and fault propagation, full-result-channel failure, cancellation, and
 exact RPC-generation release.
-The BlockProcessor-owned lifecycle-marker worker now provides the nonblocking
+The BlockProcessor-owned lifecycle-marker worker provides the nonblocking
 two-command local FIFO, lossless graph-ingress delivery, accepted-command drain
 after local closure, and receiver-closure termination without retaining RPC or
-database generations. BlockProcessor integration and VspcProcessor remain
-pending in this increment.
+database generations. Its ownership must be adapted so terminal
+BlockProcessor shutdown joins it. BlockProcessor integration and VspcProcessor
+remain pending in this increment.
 
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.

@@ -42,7 +42,7 @@ Legacy handoffs and earlier planning material may use these names:
 | `NodeClient` | `NodeService` |
 | `ValidatedStorageService` | `ValidatedDbClient` |
 | `Cycle 1` | `PreSeal` |
-| `Quiesce` | `Deactivate` |
+| `Quiesce` / `Deactivate` | terminal `ProcessingSession::shutdown` |
 | `check_block_materiality()` | `ValidatedDbClient::block_presence()` |
 | `load_reconciliation_state()` | `ValidatedDbClient::load_session_state()` |
 
@@ -64,7 +64,7 @@ restating it.
 | `storage.md` | Database lifecycle, schema and metadata, persistent identities, transactions, caches, and PostgreSQL behavior. |
 | `block-processing.md` | BlockProcessor, OrphanManager, DependencyResolver, block admission, and PP-boundary sealing behavior. |
 | `vspc-processing.md` | VSPC normalization, readiness, sequencing, coloring, and VSPC-specific behavior during recovery and Live. |
-| `processing-lifecycle.md` | Supervisor, recovery intent, ResyncEngine, Resync/Rebuild preparation, the common pump, Catchup and Live admission, fault policy, retries, and teardown. |
+| `processing-lifecycle.md` | Supervisor, recovery intent, session-scoped ProcessingSession ownership, Resync/Rebuild preparation, the common pump, Catchup and Live admission, fault policy, retries, and teardown. |
 | `api-ingress.md` | Per-session graph-update channel, producer and receiver capabilities, pre-seal gate, lifecycle markers, and gap reporting. |
 | `api-graph.md` | Graph values, views, tracking policies, revisions, deltas, history, mutation and extraction behavior, composition, and retention. |
 | `api-publication.md` | Private publication runtime, graph publication identity, lifecycle and synchronization, immutable request capture, database seed construction, stream alignment, activation, reconstruction, replacement, and publication-scoped response-reuse lifetime. |
@@ -115,7 +115,7 @@ behavior.
 | §7, Block materialization and PP boundary | `storage.md` owns materialization transactions, schema invariants, and cache publication; `block-processing.md` owns when BlockProcessor requests those operations and reacts to PP sealing. | Verified and cut over |
 | §8, BlockProcessor, orphan topology, dependency resolution | `block-processing.md`. Cross-worker recovery dispositions link to `processing-lifecycle.md`. | Verified and cut over |
 | §9, VSPC changes, readiness, history, and atomic coloring | `vspc-processing.md` owns sequencing and readiness; `storage.md` owns the atomic coloring transaction; shared VSPC value definitions go to `domain-model.md`. | Verified and cut over |
-| §10, ResyncEngine preparation and common pump | `processing-lifecycle.md`. Node RPC normalization used by the pump links to `node-service.md`; component-local admission behavior links to `block-processing.md` and `vspc-processing.md`. | Verified and cut over |
+| §10, Processing-session preparation and common pump | `processing-lifecycle.md`. Node RPC normalization used by the pump links to `node-service.md`; component-local admission behavior links to `block-processing.md` and `vspc-processing.md`. | Verified and cut over |
 | §11, Catchup, overlap, Live, and late transport messages | `processing-lifecycle.md` owns phase transitions, overlap-based admission, timing, and global Live entry. `block-processing.md` and `vspc-processing.md` own their local phase behavior. `node-service.md` owns routing and transport-message handling. | Verified and cut over |
 | §12, Teardown and delivery/failure semantics | `processing-lifecycle.md` owns teardown order, barriers, owner-directed faults, and session completion. Component-specific draining duties remain in the relevant component document. | Verified and cut over |
 | §13, In-process API and graph-update feed | `api-ingress.md`. Producer-side graph-update delivery guarantees remain in the relevant processor document and are referenced by `api-ingress.md`. | Verified and cut over |

@@ -646,7 +646,7 @@ connecting | awaiting-initialization | ready | unavailable | rejected | stopped
 
 ProcessingStateName:
 idle | reconciling | rebuilding-database | resyncing-dag |
-catching-up | live | deactivating | stopped
+catching-up | live | stopping | stopped
 
 NetworkType:
 mainnet | testnet | devnet | simnet

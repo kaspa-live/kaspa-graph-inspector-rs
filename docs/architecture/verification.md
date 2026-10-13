@@ -219,21 +219,25 @@ Verify the [NodeService contract](node-service.md#nodeservice--settled) and
    and requires Resync;
    `ValidatedRpcClient` rejects a synthetic response as
    `MalformedVspcResponse(RemovedChainWithoutAddedPath)` without returning a
-   normalized change, and ResyncEngine follows the shared malformed
+   normalized change, and ProcessingSession follows the shared malformed
    recovery-response policy without dispatch or cursor advancement.
 8. The subscription activation order across the
    [processing lifecycle](processing-lifecycle.md#entering-recovery-phases) and
-   [NotificationRouter](node-service.md#notificationrouter): ResyncEngine alone
-   sends both processor Catchup commands before invoking NodeService activation;
+   [NotificationRouter](node-service.md#notificationrouter): ProcessingSession alone
+   sends both processor Catchup commands before invoking NodeService activation
+   with that session's fresh block, VSPC, and reliable fault endpoints;
    NodeService sends no processor command; routing remains Disabled until both
    remote starts succeed; and callbacks received during that interval are
-   dropped without overlap credit or immediate recovery. Cover a failed first
-   start and a failed second start with successful rollback: both return
-   `SubscriptionControlFailed`, retain the exact generation, emit no
-   `RpcRetired`, and permit a fresh activation. A failed rollback and a failure
-   of either remote stop disable routing, retire the exact generation, enqueue
-   `RpcRetired` before returning `GenerationLost`, and never expose a partial
-   subscription. Verify that both remote stops are attempted.
+   dropped without overlap credit or immediate recovery. Disabling clears all
+   three endpoints. Reuse the same healthy validated generation in a later
+   session and prove a callback or router fault can reach only the newly
+   installed endpoints. Cover a failed first start and a failed second start
+   with successful rollback: both return `SubscriptionControlFailed`, retain
+   the exact generation, emit no `RpcRetired`, and permit a fresh activation.
+   A failed rollback and a failure of either remote stop disable routing, clear
+   the endpoints, retire the exact generation, enqueue `RpcRetired` before
+   returning `GenerationLost`, and never expose a partial subscription. Verify
+   that both remote stops are attempted.
 9. Verify the
    [current pruning-point block contract](node-service.md#current-pruning-point-block)
    with success, canonical Genesis construction, non-Genesis selected-parent
@@ -458,9 +462,9 @@ before BlockProcessor enters PostSeal, enqueues `PublishPostSeal` to its
 lifecycle-marker worker, or emits `PpBoundarySealed`. The sealing block's graph
 offer returns `SuppressedPreSeal` before the marker-command enqueue, which
 precedes the milestone. For Genesis, verify that the rebuild transaction
-establishes an intrinsically sealed boundary, `BeginRebuild` enters PostSeal
-directly, enqueues `PublishPostSeal` to the worker, and then emits the same
-exact-once milestone without ordinary Genesis materialization. Inject crash and
+establishes an intrinsically sealed boundary, Rebuild construction creates
+BlockProcessor in PostSeal, enqueues `PublishPostSeal` to the worker, and then
+emits the same exact-once milestone without ordinary Genesis materialization. Inject crash and
 ambiguous-commit outcomes around both paths; an unproven non-Genesis seal emits
 no marker or milestone, while restart after a committed Genesis rebuild derives
 PostSeal from storage and proceeds through ordinary Resync.
@@ -578,21 +582,25 @@ header. Cover:
 - successful `MaterializedSyncAnchor` construction from
   `ValidatedRecoveryHeader` and a coherent committed Materialized sink,
   including exact Genesis with normalized blue score zero;
-- exact RPC and DB generation propagation into both processor Begin payloads,
-  including VspcProcessor initialization of its committed sink and history
+- exact RPC and DB generation propagation through direct arguments into the
+  complete inert component graph, followed by initialization of both processors
+  from one `PreparedSync`, including VspcProcessor's committed sink and history
   seed;
 - a definitively absent sink, incoherent stored sink, and a DAA mismatch
   requiring Rebuild;
 - a Resync preparation result of `Require(Rebuild)` causing complete teardown
   before Supervisor creates a fresh Rebuild session, without any in-place mode
-  change, reused session channel, or Rebuild processor command from the
-  retiring Resync attempt;
+  change, reused session channel, or Rebuild component initialization or task
+  launch from the retiring Resync attempt;
+- proof that a Rebuild session never produces `RequireRebuild`, and that its
+  startup can only complete as `Started`, `Failed` with its typed disposition,
+  or `Cancelled` after an existing teardown request;
 - `RpcRequestFailed` or another session failure without inferring Rebuild; and
 - a response carrying the wrong trusted header hash or missing required header
   DAA score or blue work, plus an ordinary response missing blue score, as
   `MalformedGetBlock`, retiring the exact RPC generation without inferring
   Rebuild; and
-- proof that ResyncEngine uses the normalized hash, DAA score, blue work, and
+- proof that ProcessingSession uses the normalized hash, DAA score, blue work, and
   blue score without reading or reinterpreting the raw RPC header.
 
 Verify the common
@@ -601,7 +609,8 @@ through both preparation modes. Cover a zero Genesis threshold, a non-Genesis
 result exactly at `MAX_BLUE_SCORE`, checked-add overflow, and an otherwise
 representable sum above that maximum. Both failures report
 `ScoreOutOfRange(BoundarySealThreshold)` without wrapping or saturation and
-produce no `PreparedSync` or processor Begin. Resync uses the stored DB PP
+produce no `PreparedSync`, component initialization, or component-task launch.
+Resync uses the stored DB PP
 hash and score. Rebuild uses the normalized node PP hash and score and performs
 this check before database replacement. The Genesis branch returns the
 constant zero from NodeService's canonical Genesis representation or
@@ -611,10 +620,21 @@ raw node blue score.
 Verify Rebuild obtains one normalized current pruning-point block, completes
 StorageService's API-read replacement gate, and passes that same
 `ValidatedNodeBlock` to `rebuild_from_pruning_point` rather than rediscovering
-it or mixing RPC generations. Its successful threshold and returned anchor populate the same
-`PreparedSync` and exact BlockProcessor Begin payload. Malformed pruning-point
+it or mixing RPC generations. Its successful threshold and returned anchor
+populate the same `PreparedSync` used to initialize BlockProcessor. Malformed pruning-point
 responses use the shared malformed-input budget; `RpcRequestFailed` and
 generation loss retain their session-fault disposition.
+Under the
+[storage-owned post-start cancellation contract](storage.md#api-read-exclusion-during-database-replacement--settled),
+request session and service cancellation immediately before and at every
+observable replacement-transaction boundary. Before transaction start,
+ordinary cancellation may complete without running replacement. After start,
+verify the storage future is never dropped: definite success publishes caches,
+opens the gate, returns the anchor, and causes the session startup barrier to
+return `Cancelled` without processor initialization; definite failure and
+ambiguous outcome complete their owner-defined cleanup and retain their typed
+`Failed` disposition. Supervisor must remain responsive while awaiting each
+outcome and invoke consuming session shutdown only afterward.
 
 Also cover a coherent Genesis-anchored database below anticone finalization
 depth, Empty-versus-Genesis discrimination, exact node/database
@@ -643,9 +663,9 @@ Verify the [Catchup trigger](processing-lifecycle.md#catchup-trigger) with:
    GetBlocks length below three, and empty VSPC V2 page.
 5. A material pre-Catchup omission using the existing strict-processing
    `Require(Resync)` path.
-6. The upward seal milestone path from BlockProcessor through ResyncEngine to
+6. The upward seal milestone path from BlockProcessor through ProcessingSession to
    Supervisor. It never returns to BlockProcessor as a command, and no Catchup
-   path is admitted before ResyncEngine observes it; global Live still requires
+   path is admitted before ProcessingSession observes it; global Live still requires
    PostSeal.
 
 Verify [phase entry](processing-lifecycle.md#entering-recovery-phases),
@@ -654,11 +674,34 @@ Verify [phase entry](processing-lifecycle.md#entering-recovery-phases),
 and [global Live admission](processing-lifecycle.md#live-admission)
 together. Required cases are:
 
-1. Command priority, independently issued acknowledged processor Begin
-   barriers with acknowledgements completing in either order, no
-   synchronization producer or new-session data before both acknowledgements,
-   the Begin gate and immediate closed-gate drop, objective lower-bound
-   filtering, both overlap flags, observation only at full-page boundaries,
+1. Synchronous, infallible construction of the complete inert component graph;
+   installation in the Supervisor's `Active` slot before exact-once `start`;
+   and no yield, component task, producer, notification destination, marker,
+   milestone, fault, or processing result between installation and the first
+   poll of `start`. Cover the asynchronous startup outcomes `Started`,
+   `RequireRebuild`, `Failed`, and `Cancelled`. Preparation failure and
+   `RequireRebuild` leave the graph inert until consuming shutdown. `Started`
+   proves complete initialization and task launch plus acceptance of every
+   mode-specific initial local handoff. A failure during final launch or
+   handoff joins any tasks already launched and never exposes a partial pump.
+   While `start` is pending, verify Supervisor continues handling termination,
+   service-generation events, ordered API database-generation forwarding, and
+   stronger recovery requirements. Retire the exact RPC generation and the
+   exact processing DB generation independently after `new` but before the
+   first `start` poll, during preparation, during final task launch and local
+   handoff, and immediately around `Started`. At every boundary exercise both
+   observable orderings. Loss observed before `Started` must produce the
+   operation-level `Failed` outcome carrying
+   `FaultKind::ServiceGenerationLost(service)` or the retirement-driven
+   `Cancelled` outcome, coalesce both observations, and complete shutdown
+   without rebinding. `Started` observed first must use the ordinary
+   active-session generation-loss path. Request shutdown at every preparation
+   await boundary and verify that cancellation is signalled without dropping
+   the startup future, the invoked operation owner completes its required
+   outcome and cleanup, and consuming shutdown then joins the session.
+   Then cover command priority, the initially closed
+   notification gate and immediate closed-gate drop, objective
+   lower-bound filtering, both overlap flags, observation only at full-page boundaries,
    and Live entry while valid ordinary orphans remain.
 2. Cross-response synthetic block repeats; add to the Catchup-only sent-hash
    set only after a successful enqueue and grant no overlap credit to a
@@ -686,25 +729,25 @@ with injected clocks and deterministic jitter:
 
 - `RpcPublished(R1)` supplies the exact RPC client for a new session but never
   rebinds an existing one; `RpcRetired(R1)` clears only the matching Supervisor
-  binding and requests at most one deactivation when an operation fault reports
-  the same loss concurrently; a later `RpcPublished(R2)` is retained until the
-  engine is Idle;
+  binding and requests at most one session shutdown when an operation fault
+  reports the same loss concurrently; a later `RpcPublished(R2)` is retained
+  for the next session;
 - a generation-preserving `SubscriptionControlFailed` aborts active recovery
   with `Retry`, retains its recovery obligation and RPC generation, uses the
   general backoff, and consumes no malformed-input budget; a rollback or
   unsubscription failure instead races its returned `GenerationLost` against
   the already-enqueued exact `RpcRetired`, and either observation order
-  requests at most one deactivation and cannot reuse the retired generation;
+  requests at most one session shutdown and cannot reuse the retired generation;
 - when a malformed-response retirement arrives before its owner-directed
-  fault, deactivation begins but preserves delivery of the already-produced
-  result; the later fault is accepted before `Deactivated`, consumes the shared
-  malformed-input budget, preserves any stronger recovery obligation, and
+  fault, session shutdown begins but preserves delivery of the already-produced
+  result; the later fault is accepted before the shutdown barrier completes,
+  consumes the shared malformed-input budget, preserves any stronger recovery obligation, and
   reaches Fatal on the fourth occurrence;
 - `ProcessingDbPublished(G1)` supplies the exact DB client for a new session
   but never rebinds an existing one; `ProcessingDbRetired(G1)` clears only the
-  matching Supervisor binding and requests at most one deactivation when an
+  matching Supervisor binding and requests at most one session shutdown when an
   operation fault reports the same loss concurrently; a later
-  `ProcessingDbPublished(G2)` is retained until the engine is Idle;
+  `ProcessingDbPublished(G2)` is retained for the next session;
 - every persistence-fault row in recovery and Live, including Fatal
   `DefiniteFailure`, retained Resync and Rebuild obligations, DB-generation
   retention versus retirement, complete session teardown, and the prohibition
@@ -714,9 +757,10 @@ with injected clocks and deterministic jitter:
   using the general backoff, and waiting for no replacement processing
   generation; reject either fault outside Rebuild as an invalid lifecycle
   condition;
-- a recoverable failure after `reset` sends no API invalidation control; only
-  the next processing attempt's `reset` call supersedes the installed
-  ApiService session;
+- replacement initiates consuming session shutdown and ApiService reset without
+  awaiting either first; reset releases a marker blocked on the old receiver,
+  the old actor tree is fully joined before its successor starts, and the fresh
+  producer can wait in Supervisor while service generations are unavailable;
 - whole-attempt recovery Retry rather than in-place page/RPC retry;
 - the general delay sequence and 30-second cap;
 - no second delay while awaiting a replacement service generation;
@@ -769,8 +813,14 @@ validated client's larger total RPC allowance still admits recovery and VSPC
 work; cancellation must release both allowances.
 
 Verify [teardown](processing-lifecycle.md#teardown-and-delivery-semantics--settled)
-by asserting that both processors' session-scoped RPC and DB clones are
-released before `Deactivated` and cancellation races finish.
+by asserting that Supervisor changes its unique slot from `Active` to
+`Stopping`, both
+processors and every descendant release their session-scoped RPC and DB clones,
+all actor tasks and channel endpoints are joined or dropped, and only then may
+the slot become `Empty` and a successor start. Reuse the same still-valid
+service-generation `Arc` values
+in a later session and prove that no old message, task, buffer, or actor state
+crosses the session boundary.
 
 ## Block processing and dependency resolution
 
@@ -779,17 +829,19 @@ Verify [block admission](block-processing.md#admission-and-materialization),
 [OrphanManager](block-processing.md#orphanmanager--settled), and
 [DependencyResolver](block-processing.md#dependencyresolver--settled) with:
 
-1. BlockProcessor Begin awaits OrphanManager's transitive barrier. Hold an old
-   OrphanManager data handler across Begin and verify OrphanManager quiesces it
-   before beginning DependencyResolver; the resolver then drains that final old
-   work before either child enters the new session. Neither child nor
-   BlockProcessor may reinterpret old queued data under the new session. Submit
-   the first new-session value only after the processor acknowledgement and
-   verify it is retained. Cover invalid lifecycle control and closed child
-   command or acknowledgement paths through their existing ownership faults.
+1. `ProcessingSession::new` constructs an inert BlockProcessor, OrphanManager,
+   marker worker, and private DependencyResolver bound to the exact session RPC
+   generation before any component task or data sender exists. Successful
+   preparation initializes the complete tree before its tasks launch. Shut that
+   tree down with handlers and resolver
+   work active, then construct another session and verify no queued value,
+   pending set, task, channel endpoint, or client clone from the predecessor is
+   reachable. Cover preparation failure before task launch and closed child
+   command or acknowledgement paths both before and after the startup barrier,
+   using the startup result and reliable upward fault path respectively.
 2. Reverse orphan topology releases every newly ready child.
 3. Resolver pending state remains until `AddOrphan` or `BlockPersisted`.
-4. Resolver cancellation and transitive Deactivate and Shutdown are safe with
+4. Resolver cancellation and transitive Shutdown are safe with
    full child-result channels, release the resolver's exact RPC-generation
    clone, and propagate resolver control-path faults through OrphanManager.
 5. A resolver-confirmed unavailable dependency requires Rebuild, whereas RPC
@@ -814,10 +866,10 @@ Verify [block admission](block-processing.md#admission-and-materialization),
    notification still establishes ordinary overlap.
 11. Fill orphan storage with distinct hashes, then verify that another distinct
     orphan reports `BoundedStateExhausted(Orphans)` without partial topology,
-    reverse-index, or pending-resolution mutation and accepts only lifecycle
-    commands until Deactivate. Its resolver child immediately stops admitting
-    work, cancels and joins its tasks, and remains stopped through the later
-    transitive Deactivate barrier. Re-admitting an existing orphan at capacity
+    reverse-index, or pending-resolution mutation and accepts only terminal
+    shutdown. Its resolver child immediately stops admitting work, cancels and
+    joins its tasks, and remains stopped through that transitive barrier.
+    Re-admitting an existing orphan at capacity
     consumes no new slot and does not report exhaustion.
 12. At the focused owner's exact orphan threshold and capacity, verify
     dependency selection begins at the threshold and admission remains valid
@@ -833,10 +885,10 @@ Verify [change semantics](vspc-processing.md#change-semantics--settled),
 [Catchup crossing](vspc-processing.md#catchup-filtering-crossing-and-overlap--settled)
 with:
 
-- prefilled old-session synthetic, notification, and persisted-block inputs
-  discarded before the Begin acknowledgement; anchor-derived state and exact
-  generations installed at acknowledgement; and the first data submitted after
-  both processor barriers retained as new-session input;
+- construction from anchor-derived state and exact generations before any
+  input sender is exposed; after shutdown and reconstruction, no predecessor
+  synthetic, notification, persisted-block, pending, or history value is
+  observable and the first new-session input is retained;
 - removed/added source and destination derivation;
 - the added-only path with no database source;
 - an actionable reorg resolving `removed` followed by `added` through one
@@ -850,7 +902,7 @@ with:
   an existing collision keeps its notification fault, while a distinct
   synthetic or notification candidate reports
   `BoundedStateExhausted(VspcPending)` without partial index mutation, eviction,
-  or coalescing and accepts only lifecycle commands until Deactivate;
+  or coalescing and accepts only terminal shutdown;
 - exercise the exact focused-owner pending capacity at its below, equal, and
   over-capacity boundaries and record its high-water measurement;
 - repeated `PersistedBlock` delivery for one hash reuses the first history
@@ -888,8 +940,8 @@ opens the gate without a racing ordinary offer; and later `Full` outcomes
 advance the gap. Verify BlockProcessor's dedicated marker worker absorbs Live
 marker backpressure without blocking its main loop, preserves PostSeal before
 Live, and permits unrelated open-gate graph updates to interleave before Live.
-`BeginResync` enqueues `PublishPostSeal`, a Rebuild seal enqueues it before the
-upward milestone, and handling BlockProcessor's Live command enqueues `Live`
+Initial Resync task startup enqueues `PublishPostSeal`; a Rebuild seal enqueues it
+before the upward milestone; and handling BlockProcessor's Live command enqueues `Live`
 without using `EnteredLive` as an API trigger. After the gate opens, a causal
 graph offer must complete before its dependent processing delivery; on `Full`,
 the gap generation must advance first. Cover complete view levels, external
@@ -1839,9 +1891,10 @@ and no request observes a partial or mixed generation, including with
 PostgreSQL `TRUNCATE`. Verify ordinary sender teardown may close the installed
 receiver. The runtime then becomes quiescent, does not reconstruct or change
 publication state, and remains owned until its later `shutdown()`. A marker
-worker with an accepted delivery may outlive BlockProcessor Deactivate without
-retaining an RPC or DB client, then exits after delivery or receiver
-replacement.
+worker with an accepted delivery retains no RPC or DB client. During session
+replacement, run ProcessingSession shutdown and ApiService reset concurrently;
+receiver replacement releases a blocked marker, BlockProcessor joins the
+worker, and the session barrier completes before its successor starts.
 
 Exercise the
 [publication-runtime worker](api-publication.md#publication-runtime--settled)
@@ -1912,9 +1965,15 @@ and shutting down the encoding scheduler leave no API task or database
 resource at method completion; no graph revision is emitted, and repeated
 `shutdown` is idempotent. Verify ApiDbState becomes `Stopped`, wakes a pending
 `current()`, and rejects later generation updates.
-Supervisor signals Axum graceful shutdown, then starts ApiService and
-ResyncEngine shutdown without waiting for one to complete before starting the
-other. The listener accepts no new connection, existing connections remain
+Supervisor signals Axum graceful shutdown, then starts ApiService shutdown. A
+pending processing startup is cancelled and polled to its outcome while the
+slot remains `Active`; only afterward does Supervisor move that session to
+`Stopping` and start consuming shutdown. An `Active` session whose startup has
+completed moves directly to `Stopping`; an existing `Stopping` future resumes;
+and an `Empty` slot needs no processing barrier. Startup, processing shutdown,
+API shutdown, and Axum completion are polled concurrently wherever they
+coexist.
+The listener accepts no new connection, existing connections remain
 available for final SSE buffering, and ordinary static responses may finish.
 Supervisor awaits both method barriers and the Axum server task, then calls
 NodeService shutdown followed by StorageService shutdown. Unexpected Axum

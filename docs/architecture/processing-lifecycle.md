@@ -3,8 +3,8 @@
 ## Scope and ownership
 
 This document owns Supervisor recovery intent, cross-worker commands and
-faults, ResyncEngine preparation and pumping, recovery phase transitions,
-Catchup admission, overlap-based Live entry, and teardown order.
+faults, ProcessingSession construction, preparation, pumping, recovery phase
+transitions, Catchup admission, overlap-based Live entry, and teardown order.
 
 It coordinates component behavior without redefining it. Node connection,
 subscription, and normalization rules belong to
@@ -19,12 +19,6 @@ subscription, and normalization rules belong to
 ## Processing session and resource acquisition — settled
 
 ```rust
-struct ProcessingSession {
-    rpc: Arc<ValidatedRpcClient>,
-    db: Arc<ValidatedDbClient>,
-    graph_updates: GraphUpdateProducer,
-}
-
 struct SupervisorResourceState {
     rpc: Option<Arc<ValidatedRpcClient>>,
     db: Option<Arc<ValidatedDbClient>>,
@@ -66,9 +60,9 @@ while Supervisor is Running reports
 `Ownership(UnexpectedWorkerTermination)` and enters the Fatal lifecycle;
 completion after Supervisor has initiated terminal shutdown is expected.
 
-When recovery is desired and the engine is Idle, Supervisor may retain either
-resource while the other is absent. It starts no run until both exact
-generations are present.
+When recovery is desired and the private processing-session slot is `Empty`,
+Supervisor may retain either resource while the other is absent. It starts no
+run until both exact generations are present.
 StorageService can open, lock, and inspect an Uninitialized database while the
 RPC generation is absent. Once an RPC generation is published,
 Supervisor supplies its `(network_id, genesis_hash)` through the idempotent
@@ -76,33 +70,56 @@ Supervisor supplies its `(network_id, genesis_hash)` through the idempotent
 StorageService alone performs any required `Uninitialized -> Empty` transition
 and later publishes the resulting DB generations through its event stream.
 Before starting, recheck that the captured recovery obligation is still the
-latest `desired_recovery`, the engine is Idle, and `SupervisorResourceState`
-still holds both exact `Arc` values selected for the run.
+latest `desired_recovery`, the session slot is still `Empty`, and
+`SupervisorResourceState` still holds both exact `Arc` values selected for the
+run.
 
-The exact `Arc<ValidatedRpcClient>`, `Arc<ValidatedDbClient>`, and session
-`GraphUpdateProducer` are passed through `ResyncEngine::start` and then through the session to
-their consumers, including DependencyResolver for the validated clients and
-both processors for graph updates. This guarantees one resource and update
-generation per run.
-Before calling `start`, require the validated node's `(network_id,
+Supervisor passes the exact `Arc<ValidatedRpcClient>`,
+`Arc<ValidatedDbClient>`, and session `GraphUpdateProducer` as direct
+arguments to `ProcessingSession::new`. The new session passes those fixed
+capabilities to its consumers, including DependencyResolver for the RPC
+client and both processors for graph updates. This guarantees one resource
+and update generation per run; no passive resource-container struct exists.
+Before calling `new`, require the validated node's `(network_id,
 genesis_hash)` to equal the immutable binding exposed by that DB generation.
 A mismatch is terminal pairing rejection: never rebind the database or infer
 that Rebuild can repair it.
 
+The synchronous `new` call and the no-yield interval through the first poll of
+`start` do not pin either generation. The exact validated clients remain
+revocable under the [NodeService generation lifecycle](node-service.md#nodeservice--settled)
+and [Storage processing-operation boundary](storage.md#validated-processing-operation-errors--settled).
+Every startup operation therefore uses those capabilities' ordinary admission
+checks. An operation-level generation loss observed before the startup barrier
+completes returns `Failed` carrying
+`FaultKind::ServiceGenerationLost(service)`. If Supervisor instead observes
+retirement of either exact generation while `start` is pending, it retains the
+applicable recovery obligation, signals startup cancellation, and awaits the
+startup outcome. A concurrent operation fault and retirement event coalesce by
+exact generation under the rule below.
+
+There is no cross-service atomic validity snapshot and none is required. The
+race is ordered by Supervisor's observations: if exact-generation loss or
+retirement is observed before `Started`, the attempt cannot enter started
+operation and is completely shut down; if `Started` is observed first, a later
+retirement follows the ordinary active-session generation-loss path. Neither
+ordering injects a replacement client into the existing session.
+
 When `RpcRetired(client)` or `ProcessingDbRetired(client)` names a generation
 used by the active session, Supervisor applies the corresponding
 generation-loss disposition exactly once: active recovery retains its current
-obligation and retries after deactivation; Live establishes `Require(Resync)`.
+obligation and retries after session shutdown; Live establishes `Require(Resync)`.
 A concurrent operation may report the same loss first. The operation fault and
-retirement event coalesce, request at most one deactivation, and never weaken
+retirement event coalesce, request at most one session shutdown, and never weaken
 `desired_recovery`. An owner-directed malformed-response fault remains
-admissible after its `RpcRetired` event has requested deactivation: Supervisor
+admissible after its `RpcRetired` event has requested session shutdown: Supervisor
 must still count it, apply any stronger recovery obligation, and preserve a
 fourth-occurrence Fatal disposition. Once the run's `ValidatedRpcClient` has
 classified that malformed response, the result is already produced for this
-purpose. ResyncEngine's deactivation barrier must allow its caller to report
+purpose. ProcessingSession's shutdown barrier must allow its caller to report
 the corresponding typed fault before that caller is joined, and Supervisor
-continues accepting such a fault from the retiring session until `Deactivated`.
+continues accepting such a fault from the retiring session until shutdown
+completes.
 
 ## Supervisor and recovery intent — settled
 
@@ -135,25 +152,25 @@ Startup behavior:
 The storage-owned
 [session-state classification](storage.md#stored-session-state--settled)
 determines whether the database can prepare Resync. For either `Empty` or
-`Inconsistent`, ResyncEngine reports `Require(Rebuild)` and Supervisor starts a
-distinct Rebuild run.
+`Inconsistent`, ProcessingSession returns the `RequireRebuild` startup outcome
+and Supervisor starts a distinct Rebuild run.
 
 `RecoveryMode` is immutable for the complete lifetime of one processing
-session, including its preparation phase. ResyncEngine may report
-`Require(Rebuild)` from a Resync attempt, but it must never change that
+session, including its preparation phase. ProcessingSession may report
+the `RequireRebuild` startup outcome from a Resync attempt, but it must never change that
 session's mode, continue preparation as Rebuild, reuse its channels, or send
 Rebuild processor commands. Supervisor must completely tear down that Resync
 attempt and create a distinct Rebuild session with fresh session resources and
 the ordinary Rebuild API reset. This rule applies even when escalation occurs
-before either processor receives `BeginResync`.
+before either already-constructed inert processor is initialized or launched.
 
 `desired_recovery` is the strongest recovery requirement the Supervisor must
-eventually satisfy. Calling `start` does not consume it. `active_recovery` is
+eventually satisfy. Constructing a session does not consume it. `active_recovery` is
 the recovery currently executing.
 
 Repeated requirements coalesce with `max`. If a stronger requirement arrives
-during an active run, request deactivation once, wait for `Idle`, then start
-the stronger mode.
+during an active run, request session shutdown once and await the slot's
+`Stopping -> Empty` transition before starting the stronger mode.
 
 ```rust
 enum FaultDisposition {
@@ -166,7 +183,7 @@ enum Component {
     Supervisor,
     NodeService,
     StorageService,
-    ResyncEngine,
+    ProcessingSession,
     BlockProcessor,
     OrphanManager,
     DependencyResolver,
@@ -266,7 +283,7 @@ enum ProcessingState {
     ResyncingDag,
     CatchingUp,
     Live,
-    Deactivating,
+    Stopping,
     Stopped,
 }
 
@@ -275,8 +292,11 @@ struct ProcessingStatus {
 }
 ```
 
-`deactivation_requested` is internal and absent from public status.
-Supervisor and ResyncEngine publish their respective status values under the
+`session_shutdown_requested` is internal and absent from public status.
+The current ProcessingSession publishes its active status values. Supervisor
+publishes `Stopping` after moving the session slot into `Stopping`, publishes
+`Idle` only after the shutdown barrier has completed and the slot is `Empty`,
+and owns the terminal `Stopped` observation. Both use the
 shared delivery contract below. The
 [API status-observation contract](api-service.md#status-observation--settled) owns only
 their composite public projection.
@@ -296,7 +316,8 @@ diagnostic strings never do. NodeService performs its upstream GetBlock
 compatibility classification before constructing this envelope.
 
 - `Retry` is meaningful only while a recovery is active. It aborts and fully
-  deactivates the current attempt; after Idle and backoff, Supervisor reruns
+  shuts down the current attempt; after the completed barrier and backoff,
+  Supervisor reruns
   fresh preparation for the strongest unsatisfied recovery obligation. It
   never retries one RPC or page in place.
 - A recoverable fault in Live must require at least `Resync`.
@@ -331,7 +352,7 @@ compatibility classification before constructing this envelope.
   maps to `StorageInvariantViolation` and requires Rebuild from every active
   recovery mode and from Live while retaining the current database generation
   for replacement. This always tears down the complete current session and
-  lets Supervisor create a distinct Rebuild session; ResyncEngine never changes
+  lets Supervisor create a distinct Rebuild session; the current ProcessingSession never changes
   session intent in place. Rebuild encountering the same fault likewise starts
   no in-place repair or partial retry.
 - `ProcessingDbError::GenerationLost` maps to
@@ -374,7 +395,7 @@ compatibility classification before constructing this envelope.
   notification-source policy. It neither retires the validated RPC generation
   nor consumes the malformed recovery-response budget.
 - `BoundedStateExhausted(Orphans)` and
-  `BoundedStateExhausted(VspcPending)` each require Resync. ResyncEngine closes
+  `BoundedStateExhausted(VspcPending)` each require Resync. The current session closes
   both routed notification streams and begins ordinary complete session
   teardown. Neither fault retires an RPC generation or consumes the malformed
   recovery-response budget, and a retained Rebuild obligation is never
@@ -498,10 +519,11 @@ shutdown without first inventing a new recovery obligation.
 Fault ownership:
 
 ```text
+NotificationRouter  -> ProcessingSession
 DependencyResolver -> OrphanManager
 OrphanManager       -> BlockProcessor
-BlockProcessor / VspcProcessor -> ResyncEngine
-ResyncEngine                   -> Supervisor
+BlockProcessor / VspcProcessor -> ProcessingSession
+ProcessingSession                   -> Supervisor
 ```
 
 Faults and milestones use reliable owner-directed events. Each run retains its
@@ -552,7 +574,7 @@ therefore Fatal. Cancellation or closure caused by the expected teardown path
 produces no `ComponentFault`.
 
 The Fatal ownership rows apply whenever Supervisor is Running, including while
-it is Idle or attempting to start a session; the Active-recovery and Live
+it has no current session or is attempting to start one; the Active-recovery and Live
 columns do not limit them to an installed processing run.
 
 The graph-update feed is the exception: the
@@ -567,34 +589,43 @@ the local processing work that follows its already-definite database commit.
 The receiver belongs to ApiService; an unexpected publication-runtime exit is
 reported through the separately installed `ApiServiceEvent::Failed` path and
 therefore reaches the Fatal disposition owned above. During session
-replacement, Deactivate, or shutdown, receiver closure is expected
+replacement or shutdown, receiver closure is expected
 cancellation and has the same no-fault producer disposition. No
 `ReceiverClosed` outcome advances the graph-update gap or requests API
 reconstruction, because no receiver remains to consume that reconstruction.
 Detailed Tokio fairness and drain mechanics remain deferred in the
 [decision register](../decisions/deferred.md).
 
-`ResyncEngine::start` and the processor `Begin`, `Catchup`, and `Live` commands
-are exact-once and state-specific. Duplicate or invalid-state delivery reports
-`Ownership(InvalidLifecycleControl)`. Successful `start` means the operation
-was accepted; later milestones or faults report the run's outcome. Processor
-Begin is an acknowledged readiness barrier under the contract owned below;
-`Catchup` and `Live` remain ordered command sends rather than completion
-barriers. The two processor `Live` sends need not be simultaneous; enqueue is
-not completion. `ResyncEngine::deactivate` completes only at Idle and is
-idempotent there. `ResyncEngine::shutdown` is terminal, idempotent from every
-state, supersedes an in-progress `deactivate`, and completes only after full
-shutdown. Processor Deactivate and Shutdown commands retain their corresponding
-completed-barrier acknowledgements. Unexpected internal command-channel or
-acknowledgement closure while its worker is meant to live reports
-`Ownership(InternalControlPathLost)`.
+`ProcessingSession::new` creates one non-reusable, inert session and its
+complete privately owned component graph. `ProcessingSession::start` and the
+`Catchup` and `Live` commands within it are exact-once and state-specific.
+Duplicate or invalid-state delivery reports
+`Ownership(InvalidLifecycleControl)`. Supervisor installs the new session in
+its `Active` slot before invoking `start`; it performs those two synchronous
+steps without yielding to another Supervisor event. `start` is an asynchronous
+startup barrier. It returns only after the complete component graph has been
+prepared, initialized, and launched and every mode-specific initial local
+handoff has been accepted, or after startup has concluded with
+`RequireRebuild`, a typed fault, or cancellation. Only successful preparation
+initializes the component values and launches their tasks. Faults that arise
+after `Started` use the reliable upward path. `Catchup` and `Live` remain
+ordered command sends rather than completion barriers. The two processor
+`Live` sends need not
+be simultaneous; enqueue is not completion. `ProcessingSession::shutdown`
+consumes the session, is its only termination operation, and completes only
+after the complete actor tree has stopped and been joined. Terminal processor
+and child shutdown commands retain completed-barrier acknowledgements.
+Unexpected internal command-channel or acknowledgement closure while a worker
+is meant to live reports `Ownership(InternalControlPathLost)`. Teardown
+continues after reporting a fault, so the consuming shutdown operation has no
+second error result competing with that reliable event path.
 
 `Rebuild` intent must not outlive successful PP-boundary sealing.
 `PpBoundarySealed` is an exact-once upward milestone event, never a command to
 BlockProcessor. BlockProcessor emits it under its
 [PP-boundary contract](block-processing.md#pp-boundary-phase-behavior--settled).
-ResyncEngine observes it before permitting Catchup and propagates the milestone
-to Supervisor. BlockProcessor has already enqueued `PublishPostSeal` to its
+ProcessingSession observes it before permitting Catchup and propagates the
+milestone to Supervisor. BlockProcessor has already enqueued `PublishPostSeal` to its
 lifecycle-marker worker under its
 [marker-delivery contract](block-processing.md#graph-lifecycle-marker-delivery--settled).
 Supervisor only downgrades both desired and active recovery to `Resync`.
@@ -602,29 +633,88 @@ Duplicate or invalid-state milestone delivery reports
 `Ownership(InvalidLifecycleControl)`. Entering Live satisfies
 and clears the remaining recovery requirement.
 
-## ResyncEngine — settled
+## ProcessingSession — settled
 
-Supervisor owns `Arc<ResyncEngine>` and uses this public control surface:
+Supervisor owns at most one private `ProcessingSession` and uses this public
+control surface:
 
 ```rust
-impl ResyncEngine {
-    async fn start(
-        &self,
+impl ProcessingSession {
+    fn new(
         mode: RecoveryMode,
-        session: ProcessingSession,
-    ) -> Result<(), ResyncEngineError>;
+        rpc: Arc<ValidatedRpcClient>,
+        db: Arc<ValidatedDbClient>,
+        graph_updates: GraphUpdateProducer,
+    ) -> Self;
 
-    async fn deactivate(&self) -> Result<(), ResyncEngineError>;
+    async fn start(&mut self) -> ProcessingSessionStartOutcome;
 
-    async fn shutdown(&self) -> Result<(), ResyncEngineError>;
+    async fn shutdown(self);
+}
+
+enum ProcessingSessionStartOutcome {
+    Started,
+    RequireRebuild,
+    Failed(ComponentFault),
+    Cancelled,
 }
 ```
 
-These methods are the complete Supervisor-facing ResyncEngine control
-interface. Private mailbox or event-loop mechanics remain internal to
-`kgi-processing`.
+These methods are the complete downward Supervisor-facing ProcessingSession
+lifecycle interface. `Failed` carries a startup fault exactly once; faults
+produced after `Started` use the reliable upward path. Milestones and active
+status always use their reliable upward paths, including a mode-specific
+milestone accepted during the startup barrier. Their concrete transport
+remains private to `kgi-processing` rather than becoming another control
+surface. There is no
+passive session-resource struct, public mailbox, restart operation,
+`Deactivate` operation, or reusable Idle session.
+Supervisor's sole private slot is conceptually:
 
-The engine prepares one common structure for Resync and Rebuild:
+```rust
+enum ProcessingSessionSlot {
+    Empty,
+    Active(ProcessingSession),
+    Stopping(ProcessingSessionShutdown),
+}
+```
+
+The consuming shutdown future owns the retiring session. A successor cannot
+start until the slot returns to `Empty`.
+
+`Started` leaves the session in `Active` and transfers outcome reporting to
+the ordinary reliable upward paths. `RequireRebuild` is a normal startup
+conclusion only for a Resync session: Supervisor records Rebuild as the desired
+recovery, consumes the complete Resync session through `shutdown`, performs the
+ordinary Rebuild API reset, and constructs a fresh Rebuild session. A Rebuild
+session never returns `RequireRebuild`; doing so is
+`Ownership(InvalidLifecycleControl)`. `Failed` is processed through its
+contained disposition before Supervisor consumes the session. `Cancelled`
+means Supervisor had already requested replacement or terminal shutdown; it
+adds no recovery requirement. Every outcome other than `Started` is followed
+by the consuming session shutdown barrier before any successor starts.
+
+Supervisor polls a pending `start` barrier concurrently with termination,
+service-generation events, ordered API database-generation forwarding, and
+stronger recovery requirements. A private startup-cancellation signal is
+captured before `start` borrows the installed session; signalling it is not a
+fourth public lifecycle operation. Supervisor never drops the startup future
+as a cancellation mechanism. After requesting cancellation it continues
+polling the barrier until the invoked operation owner has completed its
+required outcome and cleanup, then consumes the session through `shutdown`.
+
+The session boundary is deliberately narrower than a service-generation
+boundary. Every attempt gets fresh processors, descendants, pumps, channels,
+buffers, and cancellation/join state, which makes cross-session messages and
+actor reset races structurally impossible. NodeService and StorageService may
+retain healthy validated generations and their connection pools or caches;
+Supervisor may pass those same exact `Arc` values to a later session. Rotating
+a healthy service generation merely to start a session would add connection,
+pool, cache, event, and replacement-gate churn without strengthening session
+isolation. ApiService's database generation remains independent of processing
+sessions under its focused lifecycle.
+
+The session prepares one common structure for Resync and Rebuild:
 
 ```rust
 struct PreparedSync {
@@ -635,52 +725,52 @@ struct PreparedSync {
 }
 ```
 
-### Processor Begin payloads
+### Processor construction
 
-```rust
-struct BlockProcessorBegin {
-    rpc: Arc<ValidatedRpcClient>,
-    db: Arc<ValidatedDbClient>,
-    anchor: MaterializedSyncAnchor,
-    boundary_seal_blue_score: u64,
-    graph_updates: GraphUpdateProducer,
-}
+`ProcessingSession::new` constructs the complete inert component graph:
+BlockProcessor, VspcProcessor, OrphanManager, DependencyResolver, the marker
+worker, every private channel endpoint, and the session's cancellation and task
+ownership state. It supplies the immutable recovery mode, exact RPC and DB
+generations, graph-update producer handles, and private wiring as direct
+arguments. VspcProcessor uses its RPC client only for its selected-parent
+attribution contract. Construction starts no task or producer, installs no
+notification destination, and emits no marker, milestone, fault, or processing
+result. In-process construction and wiring are infallible; allocation failure
+follows the process's ordinary panic behavior rather than defining a recovery
+outcome.
 
-struct VspcProcessorBegin {
-    rpc: Arc<ValidatedRpcClient>,
-    db: Arc<ValidatedDbClient>,
-    anchor: MaterializedSyncAnchor,
-    graph_updates: GraphUpdateProducer,
-}
-```
+After Supervisor installs the session and invokes `start`, the startup barrier
+performs asynchronous preparation. A preparation failure returns `Failed`; a
+Resync conclusion that Rebuild is required returns `RequireRebuild`. In both
+cases the component graph remains inert until Supervisor consumes the session
+through `shutdown`. Successful preparation initializes BlockProcessor and
+VspcProcessor from the same `PreparedSync`: BlockProcessor receives the
+committed anchor and seal threshold, while VspcProcessor receives the same
+anchor. Only after both
+initializations complete does ProcessingSession launch the processor tasks and
+their descendants. It completes the mode-specific initial marker and milestone
+handoffs described by the processor owners before returning `Started`.
+Failure during that final launch and handoff interval returns `Failed`; the
+consuming shutdown barrier joins any tasks already launched. The components
+need no pre-start admission gate, Begin
+command, activation protocol, or readiness acknowledgement because their values
+and channel endpoints remain private and no component task or producer exists
+before this launch point.
 
-After preparation, ResyncEngine constructs both Begin payloads from the same
-`PreparedSync` and the `GraphUpdateProducer` received by `start`, and
-sends the mode-specific `BeginResync` or `BeginRebuild` command independently
-to both processors and awaits both successful readiness acknowledgements.
-There is no required issue or acknowledgement order between the processors.
-BlockProcessor receives the exact RPC and DB generations, the committed
-anchor, the seal threshold, and its producer handle for the run's fresh
-graph-update channel. VspcProcessor receives the same RPC and DB generations,
-anchor, and another producer handle for that channel; it uses the RPC client
-only for the selected-parent attribution contract owned by VspcProcessor.
-
-Except for BlockProcessor's Begin-owned marker and milestone actions, no
-synchronization producer, ordinary processor data sender, Catchup command, or
-notification activation may start before both Begin acknowledgements succeed.
-Only then may the common pump start. A Begin barrier failure follows its
-existing typed ownership-fault disposition and the applicable complete
-teardown; it never starts a partial pump or continues with only one active
-processor. Teardown includes every processor that accepted Begin, regardless
-of whether its acknowledgement had completed when the failure was observed.
+No synchronization producer, ordinary processor data sender, Catchup command,
+or notification installation may start before the complete component graph has
+been initialized and launched. An unexpected task or control-path loss before
+the startup barrier completes returns the corresponding `Failed` outcome; the
+same condition after `Started` uses the reliable upward fault path. The session
+never returns `Started` with a partial pump or only one processor.
 
 Once prepared, both modes use the same block/VSPC synchronization pump. Their
 only material difference is storage policy before PP-boundary sealing.
 
 ### Boundary seal threshold construction
 
-ResyncEngine is the sole constructor of the boundary seal threshold for both
-recovery modes:
+ProcessingSession is the sole constructor of the boundary seal threshold for
+both recovery modes:
 
 ```rust
 enum BoundarySealThresholdError {
@@ -722,32 +812,35 @@ For Resync, invoke the function with the database PP hash and persisted
 `db_pp_blue_score` returned by the stored session snapshot. For Rebuild, invoke
 it with the normalized current node pruning-point hash and blue score before
 any storage replacement. Only a successful result may populate
-`PreparedSync.boundary_seal_blue_score` and the BlockProcessor Begin payload.
+`PreparedSync.boundary_seal_blue_score` and initialize BlockProcessor's seal
+threshold.
 The valid Genesis boundary score is zero under the storage invariants, so its
 threshold is zero and requires no addition.
 
 ### Resync preparation
 
-ResyncEngine first calls `ValidatedDbClient::load_session_state()` on the run's
-exact DB generation. The
+ProcessingSession first calls `ValidatedDbClient::load_session_state()` on the
+run's exact DB generation. The
 [storage contract](storage.md#stored-session-state--settled) solely owns the
 returned state and snapshot shapes, bounded database reads, and committed-sink
-derivation. ResyncEngine owns the result dispositions and node-side validation
+derivation. ProcessingSession owns the result dispositions and node-side validation
 below; it neither reconstructs storage materiality nor requests the current
 node pruning point during Resync preparation.
 
-For either `Empty` or `Inconsistent`, ResyncEngine reports `Require(Rebuild)`
-without sending processor Begin commands. Supervisor owns complete teardown
+For either `Empty` or `Inconsistent`, ProcessingSession reports the
+`RequireRebuild` startup outcome without initializing or launching any
+component task.
+Supervisor owns complete teardown
 and creation of the distinct Rebuild session under the session-immutable
 recovery-mode rule above. The storage owner defines both semantic states and
 distinguishes them from operational storage failures.
 
-ResyncEngine uses the run's exact `Arc<ValidatedRpcClient>` and the normalized
+ProcessingSession uses the run's exact `Arc<ValidatedRpcClient>` and the normalized
 [individual recovery GetBlock](node-service.md#individual-recovery-getblock)
 contract to obtain `ValidatedRecoveryHeader`. It compares the normalized DAA
 score with the stored sink DAA score, then constructs `MaterializedSyncAnchor`
 from the stored ID and selected-parent hash plus the normalized hash, blue work,
-and blue score. ResyncEngine never reads the raw RPC header or applies a second
+and blue score. ProcessingSession never reads the raw RPC header or applies a second
 Genesis branch. A header-only node block is sufficient because no body or
 transactions are needed. KGI relies on successful GetBlock enrichment also
 establishing the recognition required to use the sink as a GetBlocks
@@ -770,17 +863,17 @@ younger than `anticone_finalization_depth`; every other Resync check above
 still applies.
 
 A definitive absent response from the node, a stored/returned DAA-score
-mismatch, or a sink blue score below the boundary seal threshold reports
-`Require(Rebuild)` to Supervisor. An opaque
+mismatch, or a sink blue score below the boundary seal threshold reports the
+`RequireRebuild` startup outcome to Supervisor. An opaque
 `RpcRequestFailed`, cancellation, connection loss, or validated-client loss is
 instead a session fault/retry and does not prove that Rebuild is required.
 NodeService owns classification of a malformed GetBlock response as
-`RecoveryInputInvalid(MalformedGetBlock)`; ResyncEngine applies the bounded
+`RecoveryInputInvalid(MalformedGetBlock)`; ProcessingSession applies the bounded
 malformed-recovery-input policy above. Rebuild occurs as a separate run.
 
 ### Rebuild preparation
 
-ResyncEngine obtains the mandatory current pruning-point block once through
+ProcessingSession obtains the mandatory current pruning-point block once through
 `ValidatedRpcClient::current_pruning_point_block()` on the Rebuild run's exact
 validated RPC generation. It constructs the boundary seal threshold from that
 block under the common contract above. Only after successful construction does
@@ -795,7 +888,7 @@ let anchor = db.rebuild_from_pruning_point(pp).await?;
 The pruning point is mandatory. Storage owns the transaction, retained network
 binding, PP-boundary representation, metadata replacement, cache publication,
 and returned anchor, including the pruning point's selected-parent hash; see
-[storage.md](storage.md#rebuild-transaction--settled). ResyncEngine must not
+[storage.md](storage.md#rebuild-transaction--settled). ProcessingSession must not
 expose or use a general clear-without-PP primitive. It combines the returned
 anchor with the already constructed threshold and exact clients to publish
 `PreparedSync`; it does not derive the threshold from the returned sink.
@@ -830,18 +923,20 @@ the drain-and-discard rule below.
 
 For every processing run, Supervisor creates one fresh paired
 `GraphUpdateProducer` and `GraphUpdateReceiver`. It calls `ApiService::reset`
-with the receiver and current `RecoveryMode`, then calls
-`ResyncEngine::start` with the producer in `ProcessingSession`. ResyncEngine
-only clones that producer
-into both processor Begin payloads; it never invokes ApiService or produces
-lifecycle markers. BlockProcessor consumes its clone under the linked marker
-contract.
+with the receiver and current `RecoveryMode`, then passes the producer as a
+direct `ProcessingSession::new` argument. ProcessingSession retains that
+producer within its inert component graph; it never invokes ApiService or
+produces lifecycle markers. BlockProcessor consumes its clone under the linked
+marker contract.
 
 The session order is:
 
 ```text
 ApiService::reset(graph_updates, recovery_mode)
-    -> ResyncEngine::start(mode, session)
+    -> ProcessingSession::new(mode, rpc, db, graph_updates)
+    -> install Active(session)
+    -> await session.start()
+    -> Started
     -> GraphUpdate::PublishPostSeal
     -> GraphUpdate::Live
 ```
@@ -855,31 +950,49 @@ owns the reaction to a reported gap. This document owns Supervisor's `reset`
 call point and processor command ordering;
 [BlockProcessor](block-processing.md#graph-lifecycle-marker-delivery--settled)
 owns marker-command enqueue points. `reset` returns after runtime replacement
-and predecessor-runtime shutdown; processing never waits
-for construction or publication completion. A
-recoverably aborted session sends no invalidation control; the next processing
-attempt's `reset` call is the sole
-ApiService session-supersession event. Resync-to-Rebuild escalation therefore
-legitimately calls `reset` again with a fresh ingress.
+and predecessor-runtime shutdown; processing never waits for construction or
+publication completion.
+
+When replacing a current processing session, Supervisor initiates its
+consuming shutdown, creates the successor graph-update pair, and starts
+`ApiService::reset` before awaiting the old session's completed join barrier.
+Reset drops the predecessor receiver and thereby releases any accepted marker
+delivery blocked on the old feed. Supervisor awaits both operations, retains
+the fresh producer while resource generations are unavailable, and starts no
+successor ProcessingSession until the predecessor is fully joined. This reset
+is the sole ApiService session-supersession event. If recovery strength changes
+before the successor starts, Supervisor repeats reset with another fresh pair
+for the stronger mode and drops the unused producer. Startup with no
+predecessor simply performs reset before constructing and starting the new
+ProcessingSession.
 
 For ordinary Resync, Supervisor calls `reset(Resync)` and then
-`start(Resync, ...)`. After successful reconciliation, `BeginResync` starts
-BlockProcessor in PostSeal; its
-[Begin behavior](block-processing.md#graph-lifecycle-marker-delivery--settled)
-owns the `PublishPostSeal` command enqueue. If reconciliation instead requests
-Rebuild, complete teardown and start the distinct Rebuild attempt with another
+constructs, installs, and starts a Resync ProcessingSession. After successful
+reconciliation, ProcessingSession initializes BlockProcessor in PostSeal and
+launches the complete component graph; only after its
+[marker behavior](block-processing.md#graph-lifecycle-marker-delivery--settled)
+has accepted the `PublishPostSeal` command does `start` return `Started`. If
+reconciliation instead returns `RequireRebuild`, Supervisor completely shuts
+down that Resync session and starts the distinct Rebuild attempt with another
 `reset` call; no special API invalidation is required.
 
-For Rebuild, Supervisor awaits `reset(Rebuild)` and then calls
-`start(Rebuild, ...)`. StorageService's replacement gate, rather than `reset`,
+For Rebuild, Supervisor awaits `reset(Rebuild)`, then constructs, installs, and
+awaits startup of a Rebuild ProcessingSession. A
+Rebuild startup never returns `RequireRebuild`: it either returns `Started`,
+returns `Failed` with the typed disposition that selects a fresh attempt,
+replacement-generation wait, or Fatal handling, or returns `Cancelled` after
+Supervisor has requested teardown. StorageService's
+replacement gate, rather than `reset`,
 excludes API database phases before `rebuild_from_pruning_point` changes data.
-After processor Begin, ResyncEngine permits no Catchup until it observes
-BlockProcessor's definitely committed `PpBoundarySealed` event and forwards it
+After component initialization and task launch, ProcessingSession permits no
+Catchup until it
+observes BlockProcessor's definitely committed `PpBoundarySealed` event and forwards it
 to Supervisor. The BlockProcessor seal contract owns its preceding marker
 command enqueue.
-For Genesis, BlockProcessor emits that milestone while handling `BeginRebuild`
-under its [PP-boundary contract](block-processing.md#pp-boundary-phase-behavior--settled).
-ResyncEngine handles it through the same forwarding path, including
+For Genesis, BlockProcessor emits that milestone during its initial task startup
+under its
+[PP-boundary contract](block-processing.md#pp-boundary-phase-behavior--settled).
+ProcessingSession handles it through the same forwarding path, including
 Supervisor's `Rebuild -> Resync` downgrade.
 
 `PpBoundarySealed` has no API database-generation role. StorageService
@@ -890,7 +1003,7 @@ construction pending until a current generation is available. The API owner
 alone opens public database-backed reads when the replacement graph publication
 becomes Active.
 
-When the global Live conditions are satisfied, ResyncEngine sends the existing
+When the global Live conditions are satisfied, ProcessingSession sends the existing
 processor Live commands and emits `EnteredLive`. The BlockProcessor marker
 contract owns the effect of its Live command; Supervisor does not produce the
 marker.
@@ -902,7 +1015,7 @@ response. It obtains both through the exact
 [NodeService RPC contract](node-service.md#rpc-normalization), including the
 pinned VSPC request arguments and advancing-cursor assumption. An empty V2
 page is a pump/Catchup hint, not a VSPC change.
-When NodeService rejects a VSPC response as malformed, ResyncEngine dispatches
+When NodeService rejects a VSPC response as malformed, ProcessingSession dispatches
 nothing, does not advance the cursor, and follows the shared malformed
 recovery-response policy above.
 
@@ -939,31 +1052,39 @@ typed failure aborts the run and discards this in-memory cursor and every later
 queued synthetic response. Only definitely committed transitions establish the
 ordered, gapless synthetic VSPC stream.
 
-Notifications go directly to processors; the engine never journals or
+Notifications go directly to processors; ProcessingSession never journals or
 redispatches them.
 
 ### Entering recovery phases
 
-Before a fresh Begin:
+Before starting a session:
 
 1. disable/unsubscribe processing notifications;
 2. ensure Supervisor has installed the fresh graph-update topology through
-   `reset` and passed its producer through `start`; and
-3. send Begin independently to both processors and await both readiness
-   acknowledgements. `BeginResync` enqueues the `PublishPostSeal` worker
-   command, while Rebuild waits for the post-Begin seal point.
+   `reset` and passed its producer through `ProcessingSession::new`;
+3. construct the complete inert component graph, install the session in the
+   `Active` slot, and begin polling `start` without yielding between
+   installation and that first poll; and
+4. await the startup outcome while continuing to service Supervisor-owned
+   lifecycle inputs. `Started` proves that the complete component graph was
+   initialized and launched before any synchronization or session-data
+   producer. Initial Resync startup accepts the `PublishPostSeal` worker
+   command before returning `Started`, while non-Genesis Rebuild waits for its
+   later seal point.
 
 Before Catchup:
 
 1. send Catchup commands, including lower bounds, to both processors;
-2. invoke the run's exact `ValidatedRpcClient` subscription activation.
+2. invoke the run's exact `ValidatedRpcClient` subscription activation with
+   the fresh BlockProcessor and VspcProcessor notification senders and the
+   current session's reliable fault endpoint as direct arguments.
 
 The [NodeService activation contract](node-service.md#notificationrouter) owns
 remote subscription starts, router enablement, subscription-state publication,
 rollback, and callback handling during activation.
 
 If activation returns the generation-preserving `SubscriptionControlFailed`,
-ResyncEngine reports that fault with `Retry` and dispatches no Catchup
+ProcessingSession reports that fault with `Retry` and dispatches no Catchup
 notification input. A generation-ending activation result follows the existing
 generation-loss path.
 
@@ -1037,7 +1158,7 @@ fallback. The rolling marker is the normal path and these fallbacks cover an
 exceptional failure to transition through it. A material omission exposed
 under strict pre-Catchup processing uses the existing `Require(Resync)` fault
 path. The synthetic pump continues through Catchup and observes later reorgs.
-ResyncEngine must have
+ProcessingSession must have
 observed BlockProcessor's definitely committed `PpBoundarySealed` event before
 the primary path or a fallback can enter Catchup. Eligibility while still
 PreSeal fails the current recovery.
@@ -1049,16 +1170,18 @@ Transport delivery cannot reliably distinguish a late message after
 unsubscribe from an early message after resubscribe. Processor-local state and
 objective session bounds therefore govern admission.
 
-Begin resets processor-local state and closes notification gates. Catchup
-supplies the objective block and VSPC lower bounds derived from the current
-session anchors. Their exact filtering and credit rules belong to
+Successful preparation initializes processor-local state and closed
+notification gates.
+Catchup supplies the objective block and VSPC lower bounds derived from the
+current session anchors. Their exact filtering and credit rules belong to
 [block-processing.md](block-processing.md#catchup-filtering-and-overlap) and
 [vspc-processing.md](vspc-processing.md#catchup-filtering-crossing-and-overlap--settled).
 
 ## Catchup overlap and transition to Live — settled
 
 Each processor owns an `AtomicBool` overlap flag shared read-only with the
-engine. Begin resets it and Catchup begins measurement. ResyncEngine reads
+session coordinator. Successful preparation initializes it to false and Catchup begins
+measurement. ProcessingSession reads
 both flags only at a fully dispatched GetBlocks-page boundary.
 
 ### Blocks
@@ -1067,12 +1190,12 @@ BlockProcessor owns source accounting, late filtering, overlap proof, and the
 rule that valid orphans do not prevent Live; see
 [block-processing.md](block-processing.md#catchup-filtering-and-overlap).
 
-ResyncEngine owns an exact Catchup-only `catchup_sent` set. Initialize it on
+ProcessingSession owns an exact Catchup-only `catchup_sent` set. Initialize it on
 Catchup, insert a hash only after successful synthetic-channel enqueue, and
 filter later synthetic repeats before dispatch without granting overlap
-credit. Clear it on a new Begin, successful global Live entry, or Deactivate.
-A returned GetBlocks page must be fully dispatched before the engine observes
-overlap or abandons its suffix.
+credit. Clear it on successful global Live entry or session shutdown.
+A returned GetBlocks page must be fully dispatched before ProcessingSession
+observes overlap or abandons its suffix.
 
 ### VSPC
 
@@ -1081,7 +1204,7 @@ filtering, structural crossing, overlap proof, and its component-local Live
 behavior; see
 [vspc-processing.md](vspc-processing.md#catchup-filtering-crossing-and-overlap--settled)
 and [vspc-processing.md](vspc-processing.md#component-local-live-transition--settled).
-ResyncEngine only decides when to end synthetic production and enqueue that
+ProcessingSession only decides when to end synthetic production and enqueue that
 component's Live command.
 
 ### Live admission
@@ -1163,36 +1286,68 @@ than defining another teardown path. Further signals follow the
 [adapter-owned policy](overview.md#process-termination-signal-adapter--settled).
 If the shutdown barriers complete, the process returns normally.
 
-On Deactivate, ResyncEngine performs this barrier in order:
+ProcessingSession's consuming `shutdown` performs this barrier in order:
 
-1. close local routing gates and disable notifications;
-2. cancel and join synchronization producers under the already-produced RPC
-   fault-delivery rule above;
-3. clear engine-local buffers;
-4. send `Deactivate` to processors;
-5. await processor acknowledgements, including their teardown-barrier
-   descendants; BlockProcessor's already accepted marker delivery follows its
-   [separate drain rule](block-processing.md#graph-lifecycle-marker-delivery--settled)
-   and is not part of this barrier;
+1. close local routing gates and disable notifications, which removes every
+   session endpoint from NotificationRouter;
+2. request cancellation of and join active synchronization work under the
+   applicable operation-owned completion and already-produced RPC
+   fault-delivery rules;
+3. clear session-local buffers;
+4. if component tasks were launched, send terminal `Shutdown` to both
+   processors; otherwise drop the complete inert component graph;
+5. await every launched processor acknowledgement, including its
+   teardown-barrier descendants and BlockProcessor's marker worker; the
+   concurrent ApiService reset or shutdown drops the old graph receiver if an
+   accepted lossless marker has not completed;
 6. release every processing-session clone of the validated RPC and DB handles;
-7. drop `ProcessingSession`; and
-8. emit `Deactivated` and enter Idle.
+7. drop the remaining session-owned channels and state; and
+8. complete the barrier, after which Supervisor publishes `Idle` unless it is
+   terminating.
+
+If `start` is pending when replacement or terminal shutdown is requested,
+Supervisor keeps the session in `Active`, signals startup cancellation, and
+continues polling `start` to an outcome before invoking `shutdown(self)`.
+Preparation that has not begun a storage replacement may return `Cancelled`
+promptly. If `start` is awaiting `rebuild_from_pruning_point` after the
+storage-owned cancellation boundary, it remains pending until that operation
+completes under the
+[replacement contract](storage.md#api-read-exclusion-during-database-replacement--settled).
+A successful anchor returned after cancellation activates no processor and
+produces `Cancelled`; an operation error retains its typed `Failed`
+disposition. Supervisor remains responsive while polling this completion. Only
+then does it atomically move the session to `Stopping` and invoke the consuming
+`shutdown` barrier.
+
+Supervisor atomically replaces `Active(session)` with
+`Stopping(session.shutdown())`; the slot then prevents another control path
+from addressing the retiring session. Supervisor polls that consuming future
+as the sole retiring-session authority and starts no successor until the
+barrier completes and changes the slot to `Empty`.
 
 If step 1 returns `GenerationLost` under the NodeService-owned
 [subscription contract](node-service.md#notificationrouter), the local
-notification cutoff is complete, so ResyncEngine continues the remaining
+notification cutoff is complete, so ProcessingSession continues the remaining
 barrier. During ordinary operation the resulting fault and `RpcRetired` event
 coalesce under the exact-generation rule; during terminal shutdown the event
 is drained and discarded and no recovery starts.
 
-The owning services may retain their validated generations after Deactivate.
+The owning services may retain their validated generations after session
+shutdown and Supervisor may pass those same still-valid generations to a
+later session.
 For global shutdown, Supervisor first enters terminal shutdown and starts no
 new recovery attempt. It signals graceful shutdown to its Axum server task,
 which stops accepting new connections while allowing existing connections to
 remain available for ApiService's final SSE delivery. Supervisor then starts
-`ApiService::shutdown` and `ResyncEngine::shutdown` without waiting for either
-method to complete before starting the other. It awaits both completed method
-barriers and the Axum server task before calling `NodeService::shutdown` and
+`ApiService::shutdown`. If the session slot is `Active` with a pending startup
+barrier, it signals cancellation and continues polling that barrier before
+changing the slot to `Stopping`; otherwise an `Active` slot changes directly
+to `Stopping`. If already `Stopping`, Supervisor continues polling that
+existing future; if `Empty`, no processing barrier exists. Startup completion,
+the processing barrier, the API barrier, and the Axum task are polled
+concurrently wherever they coexist. Supervisor awaits all applicable barriers
+before calling
+`NodeService::shutdown` and
 then `StorageService::shutdown`. This releases every processing and API client
 before their owning services stop and keeps StorageService last. Existing
 non-API static responses may complete through Axum's graceful server shutdown;

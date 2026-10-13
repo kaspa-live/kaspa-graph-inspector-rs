@@ -548,7 +548,7 @@ Use one generation-local `tokio::sync::RwLock` as the shared processing
 mutation guard. Materialization and VSPC mutations hold read permits in
 addition to their independent lane mutexes, so those lanes retain their
 permitted overlap. Rebuild will acquire the write permit with `try_write`; it
-will not wait behind an unexpected mutation after processor deactivation.
+will not wait behind an unexpected mutation after predecessor-session shutdown.
 
 Group the four independent Moka domains in one `ProcessingCacheDomains` value
 and hold the current value through `ArcSwap`. Short synchronous interactions
@@ -607,11 +607,11 @@ Use separate `tokio::sync::mpsc::unbounded_channel` command mailboxes and
 bounded Tokio data mailboxes. Explicit command draining precedes every lower
 priority receive. Size every processing data mailbox with the capacity owned
 by the [processing lifecycle](../architecture/processing-lifecycle.md#supervisor-and-recovery-intent--settled).
-Lifecycle acknowledgements use Tokio one-shots.
+Terminal shutdown acknowledgements use Tokio one-shots.
 
 The DependencyResolver worker is private and generic over a minimal async RPC
-operation adapter. OrphanManager constructs that child and installs the exact
-`Arc<ValidatedRpcClient>` received through its Begin barrier; tests instantiate
+operation adapter. OrphanManager constructs that child with the exact
+`Arc<ValidatedRpcClient>` supplied to the session; tests instantiate
 the same nested workers with deterministic RPC behavior. The adapter uses
 static dispatch and does not create a public mock surface or boxed futures.
 
@@ -631,8 +631,8 @@ mailbox, preserving their single-producer causal order.
 DependencyResolver enforces the
 [architecture-owned local allowance](../architecture/block-processing.md#dependencyresolver--settled)
 with a Tokio semaphore. Tasks waiting for a local permit and tasks holding one
-are measured separately. Per-hash cancellation aborts either state;
-Deactivate and Shutdown abort and join all tasks before acknowledging.
+are measured separately. Per-hash cancellation aborts either state. Terminal
+Shutdown aborts and joins all tasks before acknowledging.
 
 ### Lifecycle-marker worker primitive
 
@@ -640,6 +640,7 @@ Use a Tokio unbounded MPSC channel for the BlockProcessor-owned marker worker.
 Its architecture-owned protocol admits at most the two ordered commands for
 one session, so the channel is intrinsically bounded by the producer protocol
 while keeping command handoff independent of graph-update-channel capacity.
-Dropping the sole command sender closes the input and detaches the worker to
-drain accepted commands; the graph-update producer remains the sole owner of
-lossless marker backpressure and receiver-closure classification.
+Dropping the sole command sender closes the input and the worker drains
+accepted commands. The graph-update producer remains the sole owner of
+lossless marker backpressure and receiver-closure classification, and
+BlockProcessor joins the worker during terminal session shutdown.

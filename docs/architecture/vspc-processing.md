@@ -49,35 +49,30 @@ Genesis; a derived source can be Genesis for the first transition.
 
 ## Processor lifecycle and gates — settled
 
-The Begin variants use the
-[`VspcProcessorBegin`](processing-lifecycle.md#processor-begin-payloads)
-payload owned by the processing lifecycle. Conceptual commands are
-`BeginRebuild(VspcProcessorBegin)`, `BeginResync(VspcProcessorBegin)`,
-`Catchup`, `Live`, `Deactivate`, and `Shutdown`. Commands have priority over
-data inputs. VspcProcessor receives the processing session's exact validated
-RPC and DB generations.
+The [session construction](processing-lifecycle.md#processor-construction)
+supplies one inert VspcProcessor with direct inputs for the immutable recovery
+mode, exact RPC and DB generations, graph-update producer, and private
+session-channel endpoints. The processor starts no task or producer during
+construction. Its conceptual commands after task startup are `Catchup`,
+`Live`, and `Shutdown`. Commands have priority over data inputs.
 
-A Begin command resets all run-local pending state, history, overlap, and
-phase state, installs the supplied RPC and DB generations, and closes the local
-notification gate. It sets `committed_vspc_sink = anchor.point` and seeds the
-new history from the same anchor as defined below, then enters the pre-Catchup
-synthetic-priority phase. Continue polling the
-notification receiver while the gate is closed and discard notifications
-immediately rather than accumulating them. Catchup opens the gate with its
-objective synthetic-sink lower bound.
+After successful session preparation, ProcessingSession initializes empty
+pending state, history, overlap, phase state, and a closed notification gate.
+It sets `committed_vspc_sink = anchor.point`, seeds history from the same anchor
+as defined below, and starts the task in the pre-Catchup synthetic-priority
+phase. Continue polling the notification receiver while the gate is closed and
+discard notifications immediately rather than accumulating them. Catchup opens
+the gate with its objective synthetic-sink lower bound.
 
-Begin is an acknowledged readiness barrier. VspcProcessor does not consume
-ordinary session data while applying it. Before acknowledging, it clears the
-prior run state, drains every previously queued session-data input, installs
-the supplied generations and anchor-derived state, closes the notification
-gate, and enters the pre-Catchup phase. The
-[processing lifecycle](processing-lifecycle.md#processor-begin-payloads) owns
-the rule that no producer may submit new-session data before this
-acknowledgement. An invalid Begin state or payload fails the barrier with
-`Ownership(InvalidLifecycleControl)`; command or acknowledgement loss while the
-worker is meant to live is `Ownership(InternalControlPathLost)`. Deactivate
-clears run-local state, releases both processing-session client clones, and
-acknowledges only after the local barrier is complete.
+Private ownership and task-launch order ensure that no producer can submit
+session data before initialization; no component-specific admission gate or
+activation protocol exists. A preparation failure leaves the inert processor
+owned by ProcessingSession and launches no task. Invalid phase commands and
+command or acknowledgement loss follow the
+[processing-lifecycle-owned](processing-lifecycle.md#processingsession--settled)
+startup or post-start fault path. Shutdown is terminal and acknowledges only
+after run-local state is dropped and both processing-session client clones are
+released.
 
 ## Pending state and history — settled
 
@@ -100,8 +95,7 @@ struct MaterializedHistory {
 }
 ```
 
-After clearing the prior run's history, either Begin command constructs and
-inserts this seed into both indexes:
+Construction inserts this seed into both indexes:
 
 ```rust
 PersistedBlock {
@@ -111,7 +105,7 @@ PersistedBlock {
 ```
 
 For a Genesis anchor the selected parent is synthetic ORIGIN. This history
-record is constructed locally from Begin; Genesis is never received through
+record is constructed locally; Genesis is never received through
 the ordinary `BlockPersisted` data path. For every later block, the history
 record comes from BlockProcessor's `PersistedBlock` delivery. The anchor seed
 and later records provide the same non-null point and selected-parent shape.
@@ -147,8 +141,8 @@ below precede capacity admission because an existing-destination collision does
 not consume a new slot. If a distinct synthetic or notification candidate
 would exceed capacity, reject it before changing any pending index and do not
 evict or coalesce existing state. VspcProcessor reports
-`BoundedStateExhausted(VspcPending)`, then admits only lifecycle commands until
-Deactivate clears the retained run-local state. The
+`BoundedStateExhausted(VspcPending)`, then admits only terminal shutdown until
+that shutdown clears the retained run-local state. The
 [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
 owns routing shutdown and recovery disposition.
 
@@ -316,8 +310,8 @@ struct VspcCatchup {
 }
 ```
 
-Begin resets VspcProcessor's overlap flag and all run-local pending/history
-state. Catchup begins overlap accounting. A notification destination below
+Construction initializes VspcProcessor's overlap flag and all run-local
+pending/history state. Catchup begins overlap accounting. A notification destination below
 the lower bound is a latecomer and is discarded without overlap credit.
 Unresolved raw destinations and consensus-order comparisons alone never earn
 credit.
@@ -350,7 +344,7 @@ actionable change before readiness.
 
 A notification proved by accepted history to meet the committed synthetic
 stream sets VspcProcessor's `AtomicBool` overlap flag. Filtered older
-latecomers receive no credit. ResyncEngine owns observation of the overlap
+latecomers receive no credit. ProcessingSession owns observation of the overlap
 flag and the global ordinary eligibility predicate.
 
 ## Component-local Live transition — settled
