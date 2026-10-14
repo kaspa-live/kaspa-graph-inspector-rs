@@ -7,6 +7,7 @@ use std::{
 };
 
 use kgi_api_ingress::channel::{GraphUpdateOfferOutcome, GraphUpdateProducer, GraphUpdateProducerError};
+use kgi_core::channel::{BoundedChannelMetrics, BoundedChannelMetricsSnapshot, BoundedReceiver, BoundedSender, bounded_channel};
 use kgi_model::{
     block::{BlockHash, BlockPresence, CompactId, ConsensusOrder, PersistedBlock, ValidatedNodeBlock, VspcPoint},
     lifecycle::{
@@ -23,6 +24,7 @@ use tokio::{
 
 use super::{
     BlockDatabase, BlockProcessorInitialization, BlockResolutionEvent, BlockRpc,
+    dependency::{DependencyResolverMetrics, DependencyResolverMetricsSnapshot},
     error::{ChildControlError, ChildFault, ChildFaultKind},
     marker::{LifecycleMarkerWorker, MarkerHandoffError},
     orphan::OrphanManager,
@@ -51,6 +53,36 @@ impl BlockOverlap {
 
     fn observe(&self) {
         self.0.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BlockProcessorMetricsSnapshot {
+    pub notification_input: BoundedChannelMetricsSnapshot,
+    pub synthetic_input: BoundedChannelMetricsSnapshot,
+    pub resolution_input: BoundedChannelMetricsSnapshot,
+    pub orphan_input: BoundedChannelMetricsSnapshot,
+    pub dependency: DependencyResolverMetricsSnapshot,
+}
+
+#[derive(Clone, Debug)]
+struct BlockProcessorMetrics {
+    notification_input: BoundedChannelMetrics,
+    synthetic_input: BoundedChannelMetrics,
+    resolution_input: BoundedChannelMetrics,
+    orphan_input: BoundedChannelMetrics,
+    dependency: Arc<DependencyResolverMetrics>,
+}
+
+impl BlockProcessorMetrics {
+    fn snapshot(&self) -> BlockProcessorMetricsSnapshot {
+        BlockProcessorMetricsSnapshot {
+            notification_input: self.notification_input.snapshot(),
+            synthetic_input: self.synthetic_input.snapshot(),
+            resolution_input: self.resolution_input.snapshot(),
+            orphan_input: self.orphan_input.snapshot(),
+            dependency: self.dependency.snapshot(),
+        }
     }
 }
 
@@ -90,9 +122,10 @@ pub(crate) struct BlockProcessor<
     R: BlockRpc = kgi_node::rpc::ValidatedRpcClient,
 > {
     commands: mpsc::UnboundedSender<BlockProcessorCommand>,
-    notifications: mpsc::Sender<ValidatedNodeBlock>,
-    synthetic: mpsc::Sender<ValidatedNodeBlock>,
+    notifications: BoundedSender<ValidatedNodeBlock>,
+    synthetic: BoundedSender<ValidatedNodeBlock>,
     overlap: BlockOverlap,
+    metrics: BlockProcessorMetrics,
     worker: Option<BlockProcessorWorker<D, R>>,
     join: Option<JoinHandle<()>>,
 }
@@ -103,16 +136,23 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessor<D, R> {
         rpc: Arc<R>,
         db: Arc<D>,
         graph_updates: GraphUpdateProducer,
-        persisted: mpsc::Sender<PersistedBlock>,
+        persisted: BoundedSender<PersistedBlock>,
     ) -> (Self, mpsc::UnboundedReceiver<BlockProcessorEvent>) {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (notification_tx, notification_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
-        let (synthetic_tx, synthetic_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
-        let (resolution_tx, resolution_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (notification_tx, notification_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (synthetic_tx, synthetic_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (resolution_tx, resolution_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (child_fault_tx, child_fault_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let overlap = BlockOverlap::new();
         let orphan = OrphanManager::new(rpc.clone(), resolution_tx, child_fault_tx);
+        let metrics = BlockProcessorMetrics {
+            notification_input: notification_tx.metrics_source(),
+            synthetic_input: synthetic_tx.metrics_source(),
+            resolution_input: resolution_rx.metrics_source(),
+            orphan_input: orphan.input_metrics_source(),
+            dependency: orphan.resolver_metrics_source(),
+        };
         let worker = BlockProcessorWorker {
             commands: command_rx,
             notifications: notification_rx,
@@ -135,6 +175,7 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessor<D, R> {
             notifications: notification_tx,
             synthetic: synthetic_tx,
             overlap,
+            metrics,
             worker: Some(worker),
             join: None,
         };
@@ -156,7 +197,7 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessor<D, R> {
         result
     }
 
-    pub(crate) fn block_notification_sender(&self) -> mpsc::Sender<ValidatedNodeBlock> {
+    pub(crate) fn block_notification_sender(&self) -> BoundedSender<ValidatedNodeBlock> {
         self.notifications.clone()
     }
 
@@ -166,6 +207,10 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessor<D, R> {
 
     pub(crate) fn overlap(&self) -> BlockOverlap {
         self.overlap.clone()
+    }
+
+    pub(crate) fn metrics(&self) -> BlockProcessorMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     pub(crate) fn catchup(&self, known_id_lower_bound: CompactId) -> Result<(), BlockProcessorControlError> {
@@ -278,12 +323,12 @@ impl From<BlockSource> for SourceBits {
 
 struct BlockProcessorWorker<D: BlockDatabase, R: BlockRpc> {
     commands: mpsc::UnboundedReceiver<BlockProcessorCommand>,
-    notifications: mpsc::Receiver<ValidatedNodeBlock>,
-    synthetic: mpsc::Receiver<ValidatedNodeBlock>,
-    resolution: mpsc::Receiver<BlockResolutionEvent>,
+    notifications: BoundedReceiver<ValidatedNodeBlock>,
+    synthetic: BoundedReceiver<ValidatedNodeBlock>,
+    resolution: BoundedReceiver<BlockResolutionEvent>,
     child_faults: mpsc::UnboundedReceiver<ChildFault>,
     events: mpsc::UnboundedSender<BlockProcessorEvent>,
-    persisted: mpsc::Sender<PersistedBlock>,
+    persisted: BoundedSender<PersistedBlock>,
     orphan: Option<OrphanManager<R>>,
     overlap: BlockOverlap,
     rpc: Arc<R>,
@@ -1039,7 +1084,7 @@ mod tests {
     struct ProcessorFixture {
         processor: BlockProcessor<MockDb, MockRpc>,
         events: mpsc::UnboundedReceiver<BlockProcessorEvent>,
-        persisted: mpsc::Receiver<PersistedBlock>,
+        persisted: BoundedReceiver<PersistedBlock>,
         db: Arc<MockDb>,
         rpc: Arc<MockRpc>,
     }
@@ -1053,7 +1098,7 @@ mod tests {
     ) -> ProcessorFixture {
         let db = MockDb::new(genesis_hash);
         let rpc = Arc::new(MockRpc { network_id: db.network_id, genesis_hash: db.genesis_hash });
-        let (persisted_tx, persisted_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (persisted_tx, persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (mut processor, events) = BlockProcessor::new(mode, rpc.clone(), db.clone(), graph_updates, persisted_tx);
         processor
             .initialize(BlockProcessorInitialization { anchor: sync_anchor, boundary_seal_blue_score })
@@ -1068,7 +1113,7 @@ mod tests {
         let db = MockDb::new(genesis);
         let rpc = Arc::new(MockRpc { network_id: db.network_id, genesis_hash: db.genesis_hash });
         let (graph, mut graph_rx) = graph_update_channel();
-        let (persisted, _persisted_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (persisted, _persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (mut processor, mut events) = BlockProcessor::new(RecoveryMode::Resync, rpc, db, graph, persisted);
 
         assert!(graph_rx.try_recv_update().is_err());
@@ -1085,6 +1130,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_input_channels_report_exact_capacity_and_high_water() {
+        let genesis = hash(1);
+        let db = MockDb::new(genesis);
+        let rpc = Arc::new(MockRpc { network_id: db.network_id, genesis_hash: db.genesis_hash });
+        let (graph, _graph_rx) = graph_update_channel();
+        let (persisted, _persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (processor, _events) = BlockProcessor::new(RecoveryMode::Resync, rpc, db, graph, persisted);
+        let notification = processor.block_notification_sender();
+        let sample = block(hash(3), 1);
+
+        for _ in 0..PROCESSING_DATA_CHANNEL_CAPACITY {
+            notification.try_send(sample.clone()).expect("notification within channel capacity");
+            processor.synthetic.try_send(sample.clone()).expect("synthetic input within channel capacity");
+        }
+        assert!(matches!(notification.try_send(sample.clone()), Err(mpsc::error::TrySendError::Full(_))));
+        assert!(matches!(processor.synthetic.try_send(sample), Err(mpsc::error::TrySendError::Full(_))));
+
+        let expected = BoundedChannelMetricsSnapshot {
+            current_occupancy: PROCESSING_DATA_CHANNEL_CAPACITY,
+            high_water_mark: PROCESSING_DATA_CHANNEL_CAPACITY,
+        };
+        let metrics = processor.metrics();
+        assert_eq!(metrics.notification_input, expected);
+        assert_eq!(metrics.synthetic_input, expected);
+
+        processor.shutdown().await.expect("inert shutdown");
+    }
+
+    #[tokio::test]
     async fn final_startup_handoff_failure_remains_joinable() {
         let genesis = hash(1);
         let db = MockDb::new(genesis);
@@ -1092,7 +1166,7 @@ mod tests {
         let weak_db = Arc::downgrade(&db);
         let weak_rpc = Arc::downgrade(&rpc);
         let (graph, _graph_rx) = graph_update_channel();
-        let (persisted, _persisted_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (persisted, _persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (mut processor, events) = BlockProcessor::new(RecoveryMode::Rebuild, rpc, db, graph, persisted);
         processor
             .initialize(BlockProcessorInitialization { anchor: anchor(genesis, 0), boundary_seal_blue_score: 0 })
@@ -1405,7 +1479,7 @@ mod tests {
         let db = MockDb::new(genesis);
         let wrong_rpc = Arc::new(MockRpc { network_id: db.network_id, genesis_hash: hash(99) });
         let (graph, _graph_rx) = graph_update_channel();
-        let (persisted, _persisted_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (persisted, _persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (mut processor, _events) = BlockProcessor::new(RecoveryMode::Resync, wrong_rpc, db, graph, persisted);
 
         assert!(matches!(
@@ -1462,7 +1536,7 @@ mod tests {
         let rpc = Arc::new(MockRpc { network_id: db.network_id, genesis_hash: db.genesis_hash });
         db.push_presence(Ok(BlockPresence::Absent));
         db.push_materialization(Ok(MaterializeBlockOutcome::Inserted { committed: committed(&inserted, id(4)) }));
-        let (persisted_tx, mut persisted_rx) = mpsc::channel(1);
+        let (persisted_tx, mut persisted_rx) = bounded_channel(1);
         persisted_tx
             .send(PersistedBlock {
                 point: VspcPoint::new(ConsensusOrder::new(BlueWork::from_u64(1), hash(9)), id(9)),

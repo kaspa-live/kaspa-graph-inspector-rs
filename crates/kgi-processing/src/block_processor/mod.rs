@@ -17,7 +17,9 @@ mod orphan;
 mod processor;
 
 #[allow(unused_imports, reason = "consumed by the upcoming ProcessingSession integration point")]
-pub(crate) use processor::{BlockOverlap, BlockProcessor, BlockProcessorControlError, BlockProcessorEvent, BlockSubmissionError};
+pub(crate) use processor::{
+    BlockOverlap, BlockProcessor, BlockProcessorControlError, BlockProcessorEvent, BlockProcessorMetricsSnapshot, BlockSubmissionError,
+};
 
 #[derive(Debug)]
 pub(crate) enum BlockResolutionEvent {

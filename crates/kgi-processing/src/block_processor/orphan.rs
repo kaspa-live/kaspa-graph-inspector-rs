@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use kgi_core::channel::{BoundedChannelMetrics, BoundedReceiver, BoundedSender, bounded_channel};
 use kgi_model::{
     block::{BlockHash, ValidatedNodeBlock},
     lifecycle::{Component, OwnershipFault},
@@ -69,7 +70,7 @@ enum OrphanMessage {
 
 pub(crate) struct OrphanManager<R: DependencyRpc = ValidatedRpcClient> {
     commands: mpsc::UnboundedSender<OrphanCommand>,
-    messages: mpsc::Sender<OrphanMessage>,
+    messages: BoundedSender<OrphanMessage>,
     metrics: OrphanManagerMetrics,
     resolver_metrics: Arc<DependencyResolverMetrics>,
     worker: Option<OrphanManagerWorker<R>>,
@@ -77,9 +78,13 @@ pub(crate) struct OrphanManager<R: DependencyRpc = ValidatedRpcClient> {
 }
 
 impl<R: DependencyRpc> OrphanManager<R> {
-    pub(crate) fn new(rpc: Arc<R>, resolution: mpsc::Sender<BlockResolutionEvent>, faults: mpsc::UnboundedSender<ChildFault>) -> Self {
+    pub(crate) fn new(
+        rpc: Arc<R>,
+        resolution: BoundedSender<BlockResolutionEvent>,
+        faults: mpsc::UnboundedSender<ChildFault>,
+    ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (message_tx, message_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (message_tx, message_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (resolver_fault_tx, resolver_fault_rx) = mpsc::unbounded_channel();
         let metrics = OrphanManagerMetrics::default();
         let resolver = DependencyResolver::new(rpc, resolution.clone(), resolver_fault_tx);
@@ -139,8 +144,16 @@ impl<R: DependencyRpc> OrphanManager<R> {
         self.metrics.snapshot()
     }
 
+    pub(super) fn input_metrics_source(&self) -> BoundedChannelMetrics {
+        self.messages.metrics_source()
+    }
+
     pub(crate) fn resolver_metrics(&self) -> DependencyResolverMetricsSnapshot {
         self.resolver_metrics.snapshot()
+    }
+
+    pub(super) fn resolver_metrics_source(&self) -> Arc<DependencyResolverMetrics> {
+        self.resolver_metrics.clone()
     }
 }
 
@@ -152,9 +165,9 @@ enum OrphanManagerState {
 
 struct OrphanManagerWorker<R: DependencyRpc> {
     commands: mpsc::UnboundedReceiver<OrphanCommand>,
-    messages: mpsc::Receiver<OrphanMessage>,
+    messages: BoundedReceiver<OrphanMessage>,
     resolver: Option<DependencyResolver<R>>,
-    resolution: mpsc::Sender<BlockResolutionEvent>,
+    resolution: BoundedSender<BlockResolutionEvent>,
     resolver_faults: mpsc::UnboundedReceiver<ChildFault>,
     faults: mpsc::UnboundedSender<ChildFault>,
     metrics: OrphanManagerMetrics,
@@ -560,7 +573,7 @@ mod tests {
 
     struct ManagerFixture {
         manager: OrphanManager<GatedRpc>,
-        resolution: mpsc::Receiver<BlockResolutionEvent>,
+        resolution: BoundedReceiver<BlockResolutionEvent>,
         faults: mpsc::UnboundedReceiver<ChildFault>,
         started: mpsc::UnboundedReceiver<BlockHash>,
         releases: Arc<Semaphore>,
@@ -568,7 +581,7 @@ mod tests {
     }
 
     fn manager_fixture() -> ManagerFixture {
-        let (resolution_tx, resolution_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (resolution_tx, resolution_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (fault_tx, fault_rx) = mpsc::unbounded_channel();
         let (started_tx, started_rx) = mpsc::unbounded_channel();
         let releases = Arc::new(Semaphore::new(0));
@@ -688,6 +701,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_channel_reports_exact_capacity_and_high_water() {
+        let (resolution_tx, _resolution_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (fault_tx, _fault_rx) = mpsc::unbounded_channel();
+        let (started_tx, _started_rx) = mpsc::unbounded_channel();
+        let rpc = Arc::new(GatedRpc { started: started_tx, releases: Arc::new(Semaphore::new(0)) });
+        let manager = OrphanManager::new(rpc, resolution_tx, fault_tx);
+        let input_metrics = manager.input_metrics_source();
+        let dependency = hash(20_000);
+
+        for value in 0..PROCESSING_DATA_CHANNEL_CAPACITY {
+            manager.add_orphan(block(value), Arc::from([dependency])).expect("message within channel capacity");
+        }
+        assert!(matches!(
+            manager.add_orphan(block(PROCESSING_DATA_CHANNEL_CAPACITY), Arc::from([dependency])),
+            Err(mpsc::error::TrySendError::Full(()))
+        ));
+        assert_eq!(
+            input_metrics.snapshot(),
+            kgi_core::channel::BoundedChannelMetricsSnapshot {
+                current_occupancy: PROCESSING_DATA_CHANNEL_CAPACITY,
+                high_water_mark: PROCESSING_DATA_CHANNEL_CAPACITY,
+            }
+        );
+
+        manager.shutdown().await.expect("inert shutdown");
+    }
+
+    #[tokio::test]
     async fn natural_body_admission_orders_cancel_before_replacement_resolution() {
         let ManagerFixture { manager, mut resolution, mut faults, mut started, releases, .. } = manager_fixture();
         let dependency = hash(20_000);
@@ -704,8 +745,11 @@ mod tests {
             resolution.recv().await,
             Some(BlockResolutionEvent::DependencyResolved { requested_hash, result: Ok(_) }) if requested_hash == replacement
         ));
-        wait_until(|| manager.resolver_metrics() == DependencyResolverMetricsSnapshot { active_operations: 0, waiting_operations: 0 })
-            .await;
+        wait_until(|| {
+            let snapshot = manager.resolver_metrics();
+            snapshot.active_operations == 0 && snapshot.waiting_operations == 0
+        })
+        .await;
         assert!(resolution.try_recv().is_err());
         assert!(faults.try_recv().is_err());
 
@@ -724,7 +768,10 @@ mod tests {
         manager.shutdown().await.expect("shutdown barrier");
         assert_eq!(metrics.snapshot().current_occupancy, 0);
         assert_eq!(metrics.snapshot().resolution_pending, 0);
-        assert_eq!(resolver_metrics.snapshot(), DependencyResolverMetricsSnapshot { active_operations: 0, waiting_operations: 0 });
+        let snapshot = resolver_metrics.snapshot();
+        assert_eq!(snapshot.active_operations, 0);
+        assert_eq!(snapshot.waiting_operations, 0);
+        assert_eq!(snapshot.work_channel.current_occupancy, 0);
         assert!(faults.try_recv().is_err());
     }
 
@@ -776,8 +823,11 @@ mod tests {
 
         manager.add_orphan(block(MAX_ORPHAN_BLOCKS), Arc::from([dependency])).expect("capacity-triggering input");
         assert_eq!(faults.recv().await, Some(ChildFault::new(Component::OrphanManager, ChildFaultKind::OrphanCapacityExhausted)));
-        wait_until(|| manager.resolver_metrics() == DependencyResolverMetricsSnapshot { active_operations: 0, waiting_operations: 0 })
-            .await;
+        wait_until(|| {
+            let snapshot = manager.resolver_metrics();
+            snapshot.active_operations == 0 && snapshot.waiting_operations == 0
+        })
+        .await;
         assert!(weak_rpc.upgrade().is_none());
 
         manager.shutdown().await.expect("shutdown barrier");
@@ -785,7 +835,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_fault_propagates_through_orphan_manager_and_stops_the_child() {
-        let (resolution_tx, _resolution_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (resolution_tx, _resolution_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         for value in 0..PROCESSING_DATA_CHANNEL_CAPACITY {
             resolution_tx.try_send(BlockResolutionEvent::OrphanReady(block(value))).expect("fill resolution channel");
         }
@@ -807,8 +857,11 @@ mod tests {
             fault_rx.recv().await,
             Some(ChildFault::new(Component::DependencyResolver, ChildFaultKind::SessionDataFull(SessionDataPath::Resolution)))
         );
-        wait_until(|| manager.resolver_metrics() == DependencyResolverMetricsSnapshot { active_operations: 0, waiting_operations: 0 })
-            .await;
+        wait_until(|| {
+            let snapshot = manager.resolver_metrics();
+            snapshot.active_operations == 0 && snapshot.waiting_operations == 0
+        })
+        .await;
         assert!(weak_rpc.upgrade().is_none());
 
         manager.shutdown().await.expect("shutdown barrier");

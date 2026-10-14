@@ -7,6 +7,7 @@ use std::{
     },
 };
 
+use kgi_core::channel::{BoundedChannelMetrics, BoundedChannelMetricsSnapshot, BoundedSender, bounded_channel};
 use kgi_model::{
     block::{BlockHash, ValidatedNodeBlock},
     lifecycle::{Component, OwnershipFault},
@@ -41,16 +42,18 @@ enum ResolverWork {
     Cancel(BlockHash),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DependencyResolverMetricsSnapshot {
     pub active_operations: usize,
     pub waiting_operations: usize,
+    pub work_channel: BoundedChannelMetricsSnapshot,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct DependencyResolverMetrics {
     active: Arc<AtomicUsize>,
     waiting: Arc<AtomicUsize>,
+    work_channel: BoundedChannelMetrics,
 }
 
 impl DependencyResolverMetrics {
@@ -58,6 +61,7 @@ impl DependencyResolverMetrics {
         DependencyResolverMetricsSnapshot {
             active_operations: self.active.load(Ordering::Relaxed),
             waiting_operations: self.waiting.load(Ordering::Relaxed),
+            work_channel: self.work_channel.snapshot(),
         }
     }
 }
@@ -85,17 +89,25 @@ enum ResolverCommand {
 
 pub(crate) struct DependencyResolver<R: DependencyRpc = ValidatedRpcClient> {
     commands: mpsc::UnboundedSender<ResolverCommand>,
-    work: mpsc::Sender<ResolverWork>,
+    work: BoundedSender<ResolverWork>,
     metrics: Arc<DependencyResolverMetrics>,
     worker: Option<DependencyResolverWorker<R>>,
     join: Option<JoinHandle<()>>,
 }
 
 impl<R: DependencyRpc> DependencyResolver<R> {
-    pub(crate) fn new(rpc: Arc<R>, resolution: mpsc::Sender<BlockResolutionEvent>, faults: mpsc::UnboundedSender<ChildFault>) -> Self {
+    pub(crate) fn new(
+        rpc: Arc<R>,
+        resolution: BoundedSender<BlockResolutionEvent>,
+        faults: mpsc::UnboundedSender<ChildFault>,
+    ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (work_tx, work_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
-        let metrics = Arc::new(DependencyResolverMetrics::default());
+        let (work_tx, work_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let metrics = Arc::new(DependencyResolverMetrics {
+            active: Arc::new(AtomicUsize::new(0)),
+            waiting: Arc::new(AtomicUsize::new(0)),
+            work_channel: work_tx.metrics_source(),
+        });
         let worker = DependencyResolverWorker {
             commands: command_rx,
             work: work_rx,
@@ -161,8 +173,8 @@ fn map_work_send_error(error: mpsc::error::TrySendError<ResolverWork>) -> mpsc::
 
 struct DependencyResolverWorker<R> {
     commands: mpsc::UnboundedReceiver<ResolverCommand>,
-    work: mpsc::Receiver<ResolverWork>,
-    resolution: mpsc::Sender<BlockResolutionEvent>,
+    work: kgi_core::channel::BoundedReceiver<ResolverWork>,
+    resolution: BoundedSender<BlockResolutionEvent>,
     faults: mpsc::UnboundedSender<ChildFault>,
     metrics: Arc<DependencyResolverMetrics>,
     permits: Arc<Semaphore>,
@@ -389,7 +401,7 @@ mod tests {
 
     struct ResolverFixture {
         resolver: DependencyResolver<GatedRpc>,
-        resolution: mpsc::Receiver<BlockResolutionEvent>,
+        resolution: kgi_core::channel::BoundedReceiver<BlockResolutionEvent>,
         faults: mpsc::UnboundedReceiver<ChildFault>,
         started: mpsc::UnboundedReceiver<BlockHash>,
         releases: Arc<Semaphore>,
@@ -397,7 +409,7 @@ mod tests {
     }
 
     async fn resolver() -> ResolverFixture {
-        let (resolution_tx, resolution_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (resolution_tx, resolution_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (fault_tx, fault_rx) = mpsc::unbounded_channel();
         let (started_tx, started_rx) = mpsc::unbounded_channel();
         let releases = Arc::new(Semaphore::new(0));
@@ -431,7 +443,11 @@ mod tests {
         assert_eq!(started.recv().await, Some(hash(MAX_DEPENDENCY_RPC_CONCURRENCY)));
         releases.add_permits(1);
         assert!(matches!(resolution.recv().await, Some(BlockResolutionEvent::DependencyResolved { result: Ok(_), .. })));
-        wait_until(|| resolver.metrics() == DependencyResolverMetricsSnapshot { active_operations: 0, waiting_operations: 0 }).await;
+        wait_until(|| {
+            let snapshot = resolver.metrics();
+            snapshot.active_operations == 0 && snapshot.waiting_operations == 0
+        })
+        .await;
         assert!(faults.try_recv().is_err());
         resolver.shutdown().await.expect("shutdown barrier");
     }
@@ -444,7 +460,11 @@ mod tests {
         assert_eq!(started.recv().await, Some(requested));
         resolver.cancel(requested).expect("cancel request");
 
-        wait_until(|| resolver.metrics() == DependencyResolverMetricsSnapshot { active_operations: 0, waiting_operations: 0 }).await;
+        wait_until(|| {
+            let snapshot = resolver.metrics();
+            snapshot.active_operations == 0 && snapshot.waiting_operations == 0
+        })
+        .await;
         assert!(resolution.try_recv().is_err());
         assert!(faults.try_recv().is_err());
         resolver.shutdown().await.expect("shutdown barrier");
@@ -452,10 +472,22 @@ mod tests {
 
     #[tokio::test]
     async fn full_parent_result_channel_faults_without_blocking_shutdown() {
-        let (resolution_tx, _resolution_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (resolution_tx, _resolution_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let resolution_metrics = resolution_tx.metrics_source();
         for value in 0..PROCESSING_DATA_CHANNEL_CAPACITY {
             resolution_tx.try_send(BlockResolutionEvent::OrphanReady(block(hash(value)))).expect("fill resolution channel");
         }
+        assert_eq!(
+            resolution_metrics.snapshot(),
+            BoundedChannelMetricsSnapshot {
+                current_occupancy: PROCESSING_DATA_CHANNEL_CAPACITY,
+                high_water_mark: PROCESSING_DATA_CHANNEL_CAPACITY,
+            }
+        );
+        assert!(matches!(
+            resolution_tx.try_send(BlockResolutionEvent::OrphanReady(block(hash(PROCESSING_DATA_CHANNEL_CAPACITY)))),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
         let (fault_tx, mut fault_rx) = mpsc::unbounded_channel();
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let releases = Arc::new(Semaphore::new(0));
@@ -471,6 +503,29 @@ mod tests {
         );
 
         resolver.shutdown().await.expect("shutdown barrier");
+    }
+
+    #[tokio::test]
+    async fn work_channel_reports_exact_capacity_and_high_water() {
+        let (resolution_tx, _resolution_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (fault_tx, _fault_rx) = mpsc::unbounded_channel();
+        let (started_tx, _started_rx) = mpsc::unbounded_channel();
+        let rpc = Arc::new(GatedRpc { started: started_tx, releases: Arc::new(Semaphore::new(0)) });
+        let resolver = DependencyResolver::new(rpc, resolution_tx, fault_tx);
+
+        for value in 0..PROCESSING_DATA_CHANNEL_CAPACITY {
+            resolver.resolve(hash(value)).expect("work within channel capacity");
+        }
+        assert!(matches!(resolver.resolve(hash(PROCESSING_DATA_CHANNEL_CAPACITY)), Err(mpsc::error::TrySendError::Full(()))));
+        assert_eq!(
+            resolver.metrics().work_channel,
+            BoundedChannelMetricsSnapshot {
+                current_occupancy: PROCESSING_DATA_CHANNEL_CAPACITY,
+                high_water_mark: PROCESSING_DATA_CHANNEL_CAPACITY,
+            }
+        );
+
+        resolver.shutdown().await.expect("inert shutdown");
     }
 
     #[tokio::test]
@@ -496,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_preserves_unavailable_and_opaque_node_outcomes() {
-        let (resolution_tx, mut resolution_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (resolution_tx, mut resolution_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (fault_tx, mut fault_rx) = mpsc::unbounded_channel();
         let mut resolver = DependencyResolver::new(Arc::new(FailingRpc), resolution_tx, fault_tx);
         resolver.start();
@@ -532,7 +587,10 @@ mod tests {
         }
 
         resolver.shutdown().await.expect("shutdown barrier");
-        assert_eq!(metrics.snapshot(), DependencyResolverMetricsSnapshot { active_operations: 0, waiting_operations: 0 });
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.active_operations, 0);
+        assert_eq!(snapshot.waiting_operations, 0);
+        assert_eq!(snapshot.work_channel.current_occupancy, 0);
         assert!(started.try_recv().is_err());
         assert!(resolution.try_recv().is_err());
         assert!(faults.try_recv().is_err());
@@ -540,7 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn inert_construction_starts_no_rpc_before_single_launch() {
-        let (resolution_tx, mut resolution_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (resolution_tx, mut resolution_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (fault_tx, mut fault_rx) = mpsc::unbounded_channel();
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let releases = Arc::new(Semaphore::new(0));

@@ -2990,6 +2990,7 @@ version = "0.1.0"
 dependencies = [
  "kaspa-consensus-core",
  "kgi-api-ingress",
+ "kgi-core",
  "kgi-model",
  "kgi-node",
  "kgi-storage",

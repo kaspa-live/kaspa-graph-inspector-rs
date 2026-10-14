@@ -195,6 +195,7 @@ mod tests {
     use kaspa_rpc_core::{
         BlockAddedNotification, Notification, RpcBlock, RpcBlockVerboseData, RpcHeader, VirtualChainChangedNotification,
     };
+    use kgi_core::channel::{BoundedReceiver, bounded_channel};
     use kgi_model::{
         block::{BlockHash, MAX_DAA_SCORE, ValidatedNodeBlock},
         lifecycle::{FaultKind, MalformedVspcNotificationReason, NotificationInputKind, OwnershipFault, ScoreRangeFault},
@@ -349,10 +350,14 @@ mod tests {
 
     fn router(
         capacity: usize,
-    ) -> (NotificationRouter, mpsc::Receiver<ValidatedNodeBlock>, mpsc::Receiver<VspcChange>, mpsc::UnboundedReceiver<NotificationFault>)
-    {
-        let (block_tx, block_rx) = mpsc::channel(capacity);
-        let (vspc_tx, vspc_rx) = mpsc::channel(capacity);
+    ) -> (
+        NotificationRouter,
+        BoundedReceiver<ValidatedNodeBlock>,
+        BoundedReceiver<VspcChange>,
+        mpsc::UnboundedReceiver<NotificationFault>,
+    ) {
+        let (block_tx, block_rx) = bounded_channel(capacity);
+        let (vspc_tx, vspc_rx) = bounded_channel(capacity);
         let (fault_tx, fault_rx) = mpsc::unbounded_channel();
         let router = NotificationRouter::new(Arc::new(ResponseNormalizer::new(hash(0))));
         assert!(router.install(NotificationChannels::new(block_tx, vspc_tx, fault_tx)));

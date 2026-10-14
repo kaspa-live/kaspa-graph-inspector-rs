@@ -8,6 +8,7 @@ use std::{
 };
 
 use kgi_api_ingress::channel::GraphUpdateProducer;
+use kgi_core::channel::{BoundedChannelMetrics, BoundedChannelMetricsSnapshot, BoundedReceiver, BoundedSender, bounded_channel};
 use kgi_model::{
     block::{BlockHash, CompactId, ConsensusOrder, MaterializedSyncAnchor, PersistedBlock, VspcPoint},
     graph_update::VspcCommitted,
@@ -61,20 +62,32 @@ impl VspcOverlap {
 pub(crate) struct VspcProcessorMetricsSnapshot {
     pub pending_occupancy: usize,
     pub pending_high_water_mark: usize,
+    pub notification_input: BoundedChannelMetricsSnapshot,
+    pub synthetic_input: BoundedChannelMetricsSnapshot,
+    pub persisted_input: BoundedChannelMetricsSnapshot,
 }
 
-#[derive(Clone, Debug, Default)]
-struct VspcProcessorMetrics(Arc<Mutex<VspcProcessorMetricsSnapshot>>);
+#[derive(Clone, Debug)]
+struct VspcProcessorMetrics {
+    pending: Arc<Mutex<VspcProcessorMetricsSnapshot>>,
+    notification_input: BoundedChannelMetrics,
+    synthetic_input: BoundedChannelMetrics,
+    persisted_input: BoundedChannelMetrics,
+}
 
 impl VspcProcessorMetrics {
     fn update(&self, occupancy: usize) {
-        let mut metrics = self.0.lock().expect("VSPC metrics mutex poisoned");
+        let mut metrics = self.pending.lock().expect("VSPC metrics mutex poisoned");
         metrics.pending_occupancy = occupancy;
         metrics.pending_high_water_mark = metrics.pending_high_water_mark.max(occupancy);
     }
 
     fn snapshot(&self) -> VspcProcessorMetricsSnapshot {
-        *self.0.lock().expect("VSPC metrics mutex poisoned")
+        let mut snapshot = *self.pending.lock().expect("VSPC metrics mutex poisoned");
+        snapshot.notification_input = self.notification_input.snapshot();
+        snapshot.synthetic_input = self.synthetic_input.snapshot();
+        snapshot.persisted_input = self.persisted_input.snapshot();
+        snapshot
     }
 }
 
@@ -142,8 +155,8 @@ impl VspcDatabase for ValidatedDbClient {
 
 pub(crate) struct VspcProcessor<D: VspcDatabase = ValidatedDbClient, R: VspcRpc = ValidatedRpcClient> {
     commands: mpsc::UnboundedSender<VspcProcessorCommand>,
-    notifications: mpsc::Sender<VspcChange>,
-    synthetic: mpsc::Sender<VspcChange>,
+    notifications: BoundedSender<VspcChange>,
+    synthetic: BoundedSender<VspcChange>,
     overlap: VspcOverlap,
     metrics: VspcProcessorMetrics,
     worker: Option<VspcProcessorWorker<D, R>>,
@@ -156,14 +169,19 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessor<D, R> {
         rpc: Arc<R>,
         db: Arc<D>,
         graph_updates: GraphUpdateProducer,
-        persisted: mpsc::Receiver<PersistedBlock>,
+        persisted: BoundedReceiver<PersistedBlock>,
     ) -> (Self, mpsc::UnboundedReceiver<VspcProcessorEvent>) {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (notification_tx, notification_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
-        let (synthetic_tx, synthetic_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (notification_tx, notification_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (synthetic_tx, synthetic_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let overlap = VspcOverlap::new();
-        let metrics = VspcProcessorMetrics::default();
+        let metrics = VspcProcessorMetrics {
+            pending: Arc::new(Mutex::new(VspcProcessorMetricsSnapshot::default())),
+            notification_input: notification_tx.metrics_source(),
+            synthetic_input: synthetic_tx.metrics_source(),
+            persisted_input: persisted.metrics_source(),
+        };
         let worker = VspcProcessorWorker {
             commands: command_rx,
             notifications: notification_rx,
@@ -207,7 +225,7 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessor<D, R> {
         result
     }
 
-    pub(crate) fn notification_sender(&self) -> mpsc::Sender<VspcChange> {
+    pub(crate) fn notification_sender(&self) -> BoundedSender<VspcChange> {
         self.notifications.clone()
     }
 
@@ -462,9 +480,9 @@ impl VspcState {
 
 struct VspcProcessorWorker<D: VspcDatabase, R: VspcRpc> {
     commands: mpsc::UnboundedReceiver<VspcProcessorCommand>,
-    notifications: mpsc::Receiver<VspcChange>,
-    synthetic: mpsc::Receiver<VspcChange>,
-    persisted: mpsc::Receiver<PersistedBlock>,
+    notifications: BoundedReceiver<VspcChange>,
+    synthetic: BoundedReceiver<VspcChange>,
+    persisted: BoundedReceiver<PersistedBlock>,
     events: mpsc::UnboundedSender<VspcProcessorEvent>,
     rpc: Arc<R>,
     db: Arc<D>,
@@ -1214,7 +1232,7 @@ mod tests {
     struct Fixture {
         processor: VspcProcessor<MockDb, MockRpc>,
         events: mpsc::UnboundedReceiver<VspcProcessorEvent>,
-        persisted: mpsc::Sender<PersistedBlock>,
+        persisted: BoundedSender<PersistedBlock>,
         graph: kgi_api_ingress::channel::GraphUpdateReceiver,
         db: Arc<MockDb>,
         rpc: Arc<MockRpc>,
@@ -1223,7 +1241,7 @@ mod tests {
     fn fixture(anchor: MaterializedSyncAnchor) -> Fixture {
         let db = Arc::new(MockDb::default());
         let rpc = MockRpc::new();
-        let (persisted_tx, persisted_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (persisted_tx, persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (graph_tx, mut graph_rx) = graph_update_channel();
         graph_tx.publish_post_seal().expect("open graph producer gate");
         assert_eq!(graph_rx.try_recv_update(), Ok(GraphUpdate::PublishPostSeal));
@@ -1239,7 +1257,7 @@ mod tests {
         let rpc = MockRpc::new();
         let weak_db: Weak<MockDb> = Arc::downgrade(&db);
         let weak_rpc: Weak<MockRpc> = Arc::downgrade(&rpc);
-        let (_persisted_tx, persisted_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (_persisted_tx, persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (graph, _graph_rx) = graph_update_channel();
         let (mut processor, mut events) = VspcProcessor::new(RecoveryMode::Resync, rpc.clone(), db.clone(), graph, persisted_rx);
         processor.initialize(anchor(1)).expect("initialization");
@@ -1253,12 +1271,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn input_channels_report_exact_capacity_and_high_water() {
+        let db = Arc::new(MockDb::default());
+        let rpc = MockRpc::new();
+        let (persisted_tx, persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (graph, _graph_rx) = graph_update_channel();
+        let (processor, _events) = VspcProcessor::new(RecoveryMode::Resync, rpc, db, graph, persisted_rx);
+        let notifications = processor.notification_sender();
+        let sample = added(&[2]);
+        let persisted_sample = persisted_block(2, 1);
+
+        for _ in 0..PROCESSING_DATA_CHANNEL_CAPACITY {
+            notifications.try_send(sample.clone()).expect("notification within channel capacity");
+            processor.synthetic.try_send(sample.clone()).expect("synthetic input within channel capacity");
+            persisted_tx.try_send(persisted_sample).expect("persisted input within channel capacity");
+        }
+        assert!(matches!(notifications.try_send(sample.clone()), Err(mpsc::error::TrySendError::Full(_))));
+        assert!(matches!(processor.synthetic.try_send(sample), Err(mpsc::error::TrySendError::Full(_))));
+        assert!(matches!(persisted_tx.try_send(persisted_sample), Err(mpsc::error::TrySendError::Full(_))));
+
+        let expected = BoundedChannelMetricsSnapshot {
+            current_occupancy: PROCESSING_DATA_CHANNEL_CAPACITY,
+            high_water_mark: PROCESSING_DATA_CHANNEL_CAPACITY,
+        };
+        let metrics = processor.metrics();
+        assert_eq!(metrics.notification_input, expected);
+        assert_eq!(metrics.synthetic_input, expected);
+        assert_eq!(metrics.persisted_input, expected);
+
+        processor.shutdown().await.expect("inert shutdown");
+    }
+
+    #[tokio::test]
     async fn consuming_shutdown_releases_exact_session_generations() {
         let db = Arc::new(MockDb::default());
         let rpc = MockRpc::new();
         let weak_db = Arc::downgrade(&db);
         let weak_rpc = Arc::downgrade(&rpc);
-        let (_persisted_tx, persisted_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (_persisted_tx, persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (graph, _graph_rx) = graph_update_channel();
         let (mut processor, _events) = VspcProcessor::new(RecoveryMode::Resync, rpc.clone(), db.clone(), graph, persisted_rx);
         processor.initialize(anchor(1)).expect("initialization");
@@ -1294,7 +1344,7 @@ mod tests {
     async fn failed_start_before_initialization_remains_joinable() {
         let db = Arc::new(MockDb::default());
         let rpc = MockRpc::new();
-        let (_persisted_tx, persisted_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
+        let (_persisted_tx, persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (graph, _graph_rx) = graph_update_channel();
         let (mut processor, _events) = VspcProcessor::new(RecoveryMode::Resync, rpc, db, graph, persisted_rx);
 
