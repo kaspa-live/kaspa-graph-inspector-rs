@@ -33,7 +33,7 @@ use crate::{
     fault::{active_or_live, storage_fault},
 };
 
-pub(crate) const MAX_PENDING_VSPC_CHANGES: usize = 1024;
+const MAX_PENDING_VSPC_CHANGES: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct VspcOverlap(Arc<AtomicBool>);
@@ -102,13 +102,8 @@ pub(crate) enum VspcProcessorControlError {
 #[error("VspcProcessor synthetic input endpoint is closed")]
 pub(crate) struct VspcSubmissionError;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct VspcCatchup {
-    pub synthetic_sink_lower_bound: VspcPoint,
-}
-
 enum VspcProcessorCommand {
-    Catchup(VspcCatchup),
+    Catchup { synthetic_sink_lower_bound: VspcPoint },
     Live,
     Shutdown(oneshot::Sender<Result<(), ComponentFault>>),
 }
@@ -228,8 +223,10 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessor<D, R> {
         self.metrics.snapshot()
     }
 
-    pub(crate) fn catchup(&self, catchup: VspcCatchup) -> Result<(), VspcProcessorControlError> {
-        self.commands.send(VspcProcessorCommand::Catchup(catchup)).map_err(|_| VspcProcessorControlError::ControlUnavailable)
+    pub(crate) fn catchup(&self, synthetic_sink_lower_bound: VspcPoint) -> Result<(), VspcProcessorControlError> {
+        self.commands
+            .send(VspcProcessorCommand::Catchup { synthetic_sink_lower_bound })
+            .map_err(|_| VspcProcessorControlError::ControlUnavailable)
     }
 
     pub(crate) fn live(&self) -> Result<(), VspcProcessorControlError> {
@@ -558,11 +555,11 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessorWorker<D, R> {
     /// Returns `true` when the command completes the worker lifecycle.
     async fn handle_command(&mut self, command: VspcProcessorCommand) -> bool {
         match command {
-            VspcProcessorCommand::Catchup(catchup) => {
+            VspcProcessorCommand::Catchup { synthetic_sink_lower_bound } => {
                 if let VspcProcessorRun::Active(state) = &mut self.run
                     && state.phase == VspcPhase::Synchronizing
                 {
-                    state.phase = VspcPhase::Catchup { synthetic_sink_lower_bound: catchup.synthetic_sink_lower_bound };
+                    state.phase = VspcPhase::Catchup { synthetic_sink_lower_bound };
                     self.overlap.reset();
                     self.drive().await;
                 } else {
@@ -1282,7 +1279,7 @@ mod tests {
     async fn catchup_overlap_retains_notification_until_live() {
         let Fixture { processor, mut events, persisted, mut graph, db, .. } = fixture(anchor(1));
         persisted.send(persisted_block(2, 1)).await.expect("persisted destination");
-        processor.catchup(VspcCatchup { synthetic_sink_lower_bound: point(1) }).expect("Catchup");
+        processor.catchup(point(1)).expect("Catchup");
         processor.notification_sender().send(added(&[2])).await.expect("notification");
         for _ in 0..20 {
             if processor.overlap().observed() {
@@ -1308,7 +1305,7 @@ mod tests {
     async fn exact_replay_after_commit_is_an_obsolete_live_discard() {
         let Fixture { processor, mut events, persisted, mut graph, db, .. } = fixture(anchor(1));
         persisted.send(persisted_block(2, 1)).await.expect("persisted destination");
-        processor.catchup(VspcCatchup { synthetic_sink_lower_bound: point(1) }).expect("Catchup");
+        processor.catchup(point(1)).expect("Catchup");
         let notifications = processor.notification_sender();
         notifications.send(added(&[2])).await.expect("notification");
         for _ in 0..20 {
@@ -1336,7 +1333,7 @@ mod tests {
     #[tokio::test]
     async fn unresolved_older_notification_does_not_block_a_later_actionable_one() {
         let Fixture { processor, mut events, persisted, mut graph, db, .. } = fixture(anchor(1));
-        processor.catchup(VspcCatchup { synthetic_sink_lower_bound: point(1) }).expect("Catchup");
+        processor.catchup(point(1)).expect("Catchup");
         processor.live().expect("Live");
         let notifications = processor.notification_sender();
         notifications.send(added(&[9])).await.expect("unresolved notification");
@@ -1357,7 +1354,7 @@ mod tests {
     #[tokio::test]
     async fn notification_collision_precedes_endpoint_readiness() {
         let Fixture { processor, mut events, persisted: _persisted, graph: _graph, db, .. } = fixture(anchor(1));
-        processor.catchup(VspcCatchup { synthetic_sink_lower_bound: point(1) }).expect("Catchup");
+        processor.catchup(point(1)).expect("Catchup");
         let notification = processor.notification_sender();
         notification.send(added(&[2])).await.expect("first notification");
         notification.send(added(&[2])).await.expect("duplicate notification");
@@ -1380,7 +1377,7 @@ mod tests {
     #[tokio::test]
     async fn contradictory_destination_faults_before_endpoint_readiness() {
         let Fixture { processor, mut events, persisted: _persisted, graph: _graph, db, .. } = fixture(anchor(1));
-        processor.catchup(VspcCatchup { synthetic_sink_lower_bound: point(1) }).expect("Catchup");
+        processor.catchup(point(1)).expect("Catchup");
         let notifications = processor.notification_sender();
         notifications.send(added(&[2])).await.expect("first notification");
         notifications.send(reorg(&[9], &[2])).await.expect("contradictory notification");
@@ -1403,7 +1400,7 @@ mod tests {
     async fn destination_below_catchup_lower_bound_is_discarded_without_overlap() {
         let Fixture { processor, mut events, persisted, graph: _graph, db, .. } = fixture(anchor(5));
         persisted.send(persisted_block(3, 2)).await.expect("old destination");
-        processor.catchup(VspcCatchup { synthetic_sink_lower_bound: point(4) }).expect("Catchup");
+        processor.catchup(point(4)).expect("Catchup");
         processor.notification_sender().send(added(&[3])).await.expect("late notification");
         for _ in 0..20 {
             if processor.metrics().pending_occupancy == 0 {
@@ -1423,7 +1420,7 @@ mod tests {
         let Fixture { processor, mut events, persisted, mut graph, db, .. } = fixture(anchor(3));
         persisted.send(persisted_block(4, 3)).await.expect("crossing child");
         persisted.send(persisted_block(5, 4)).await.expect("destination");
-        processor.catchup(VspcCatchup { synthetic_sink_lower_bound: point(1) }).expect("Catchup");
+        processor.catchup(point(1)).expect("Catchup");
         processor.notification_sender().send(reorg(&[2], &[2, 3, 4, 5])).await.expect("crossing notification");
         for _ in 0..20 {
             if processor.overlap().observed() {
@@ -1452,7 +1449,7 @@ mod tests {
         let Fixture { processor, mut events, persisted, graph: _graph, db, .. } = fixture(anchor(1));
         persisted.send(persisted_block(2, 1)).await.expect("first destination");
         persisted.send(persisted_block(3, 1)).await.expect("second destination");
-        processor.catchup(VspcCatchup { synthetic_sink_lower_bound: point(1) }).expect("Catchup");
+        processor.catchup(point(1)).expect("Catchup");
         let notifications = processor.notification_sender();
         notifications.send(added(&[2])).await.expect("first notification");
         notifications.send(added(&[3])).await.expect("second notification");
@@ -1568,7 +1565,7 @@ mod tests {
     #[tokio::test]
     async fn pending_capacity_rejects_without_partial_admission() {
         let Fixture { processor, mut events, persisted: _persisted, graph: _graph, db, .. } = fixture(anchor(1));
-        processor.catchup(VspcCatchup { synthetic_sink_lower_bound: point(1) }).expect("Catchup");
+        processor.catchup(point(1)).expect("Catchup");
         let notifications = processor.notification_sender();
         for value in 1..=MAX_PENDING_VSPC_CHANGES {
             notifications
