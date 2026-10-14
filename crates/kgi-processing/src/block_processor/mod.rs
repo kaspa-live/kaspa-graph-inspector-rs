@@ -16,11 +16,8 @@ mod marker;
 mod orphan;
 mod processor;
 
-pub(crate) use processor::storage_fault;
 #[allow(unused_imports, reason = "consumed by the upcoming ProcessingSession integration point")]
 pub(crate) use processor::{BlockOverlap, BlockProcessor, BlockProcessorControlError, BlockProcessorEvent, BlockSubmissionError};
-
-pub(crate) const PROCESSING_DATA_CHANNEL_CAPACITY: usize = 1024;
 
 #[derive(Debug)]
 pub(crate) enum BlockResolutionEvent {

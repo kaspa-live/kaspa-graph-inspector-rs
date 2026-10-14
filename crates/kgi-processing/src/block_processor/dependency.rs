@@ -18,9 +18,10 @@ use tokio::{
 };
 
 use super::{
-    BlockResolutionEvent, PROCESSING_DATA_CHANNEL_CAPACITY,
+    BlockResolutionEvent,
     error::{ChildControlError, ChildFault, ChildFaultKind, SessionDataPath},
 };
+use crate::PROCESSING_DATA_CHANNEL_CAPACITY;
 
 pub(crate) const MAX_DEPENDENCY_RPC_CONCURRENCY: usize = 8;
 

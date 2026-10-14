@@ -28,7 +28,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::block_processor::{PROCESSING_DATA_CHANNEL_CAPACITY, storage_fault};
+use crate::{
+    PROCESSING_DATA_CHANNEL_CAPACITY,
+    fault::{active_or_live, storage_fault},
+};
 
 pub(crate) const MAX_PENDING_VSPC_CHANGES: usize = 1024;
 
@@ -1028,16 +1031,21 @@ fn attribution_fault(source: CandidateSource, attribution: VspcPathAttribution) 
 
 fn node_operation_fault(error: NodeError, is_live: bool, hash: BlockHash) -> ComponentFault {
     let diagnostic = Arc::from(format!("VSPC attribution block {hash}: {error}"));
-    let active_or_live = |active| if is_live { FaultDisposition::Require(RecoveryMode::Resync) } else { active };
     let (disposition, kind) = match error {
-        NodeError::GenerationLost => (active_or_live(FaultDisposition::Retry), FaultKind::ServiceGenerationLost(ServiceKind::Node)),
-        NodeError::RpcRequestFailed { .. } => (active_or_live(FaultDisposition::Retry), FaultKind::RpcRequestFailed),
-        NodeError::RecoveryInputInvalid(kind) => (active_or_live(FaultDisposition::Retry), FaultKind::RecoveryInputInvalid(kind)),
+        NodeError::GenerationLost => {
+            (active_or_live(is_live, FaultDisposition::Retry), FaultKind::ServiceGenerationLost(ServiceKind::Node))
+        }
+        NodeError::RpcRequestFailed { .. } => (active_or_live(is_live, FaultDisposition::Retry), FaultKind::RpcRequestFailed),
+        NodeError::RecoveryInputInvalid(kind) => {
+            (active_or_live(is_live, FaultDisposition::Retry), FaultKind::RecoveryInputInvalid(kind))
+        }
         NodeError::ScoreOutOfRange(reason) => (FaultDisposition::Fatal, FaultKind::ScoreOutOfRange(reason)),
         NodeError::RetirementControlUnavailable => {
             (FaultDisposition::Fatal, FaultKind::Ownership(OwnershipFault::ManagedComponentUnavailable))
         }
-        NodeError::SubscriptionControlFailed { .. } => (active_or_live(FaultDisposition::Retry), FaultKind::SubscriptionControlFailed),
+        NodeError::SubscriptionControlFailed { .. } => {
+            (active_or_live(is_live, FaultDisposition::Retry), FaultKind::SubscriptionControlFailed)
+        }
         NodeError::InvalidSubscriptionState => {
             (FaultDisposition::Fatal, FaultKind::Ownership(OwnershipFault::InvalidLifecycleControl))
         }

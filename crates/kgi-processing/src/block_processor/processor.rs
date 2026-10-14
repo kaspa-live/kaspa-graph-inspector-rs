@@ -10,15 +10,11 @@ use kgi_api_ingress::channel::{GraphUpdateOfferOutcome, GraphUpdateProducer, Gra
 use kgi_model::{
     block::{BlockHash, BlockPresence, CompactId, ConsensusOrder, PersistedBlock, ValidatedNodeBlock, VspcPoint},
     lifecycle::{
-        BoundedProcessingState, Component, ComponentFault, FaultDisposition, FaultKind, OwnershipFault, PersistenceFault,
-        RecoveryMode, ServiceKind,
+        BoundedProcessingState, Component, ComponentFault, FaultDisposition, FaultKind, OwnershipFault, RecoveryMode, ServiceKind,
     },
 };
 use kgi_node::error::NodeError;
-use kgi_storage::{
-    error::ProcessingDbError,
-    operation::{MaterializeBlockError, MaterializeBlockOutcome, ReferencePolicy},
-};
+use kgi_storage::operation::{MaterializeBlockError, MaterializeBlockOutcome, ReferencePolicy};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot},
@@ -26,10 +22,14 @@ use tokio::{
 };
 
 use super::{
-    BlockDatabase, BlockProcessorInitialization, BlockResolutionEvent, BlockRpc, PROCESSING_DATA_CHANNEL_CAPACITY,
+    BlockDatabase, BlockProcessorInitialization, BlockResolutionEvent, BlockRpc,
     error::{ChildControlError, ChildFault, ChildFaultKind},
     marker::{LifecycleMarkerWorker, MarkerHandoffError},
     orphan::OrphanManager,
+};
+use crate::{
+    PROCESSING_DATA_CHANNEL_CAPACITY,
+    fault::{active_or_live, storage_fault},
 };
 
 #[derive(Clone, Debug)]
@@ -770,37 +770,6 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessorWorker<D, R> {
 enum BlockDisposition {
     Persisted,
     Orphaned,
-}
-
-fn active_or_live(is_live: bool, active: FaultDisposition) -> FaultDisposition {
-    if is_live { FaultDisposition::Require(RecoveryMode::Resync) } else { active }
-}
-
-pub(crate) fn storage_fault(error: ProcessingDbError, is_live: bool) -> ComponentFault {
-    let diagnostic: Arc<str> = Arc::from(error.to_string());
-    let (disposition, kind) = match error {
-        ProcessingDbError::GenerationLost => {
-            (active_or_live(is_live, FaultDisposition::Retry), FaultKind::ServiceGenerationLost(ServiceKind::Storage))
-        }
-        ProcessingDbError::QueryFailed { .. } => (active_or_live(is_live, FaultDisposition::Retry), FaultKind::StorageQueryFailed),
-        ProcessingDbError::InvalidStoredState { .. } => {
-            (FaultDisposition::Require(RecoveryMode::Rebuild), FaultKind::StorageInvariantViolation)
-        }
-        ProcessingDbError::Persistence(reason) => {
-            let disposition = match reason {
-                PersistenceFault::DefiniteFailure => FaultDisposition::Fatal,
-                PersistenceFault::RetryExhausted | PersistenceFault::AmbiguousCommit => {
-                    active_or_live(is_live, FaultDisposition::Retry)
-                }
-            };
-            (disposition, FaultKind::Persistence(reason))
-        }
-        ProcessingDbError::ScoreOutOfRange(reason) => (FaultDisposition::Fatal, FaultKind::ScoreOutOfRange(reason)),
-        ProcessingDbError::ServiceUnavailable { .. } => {
-            (FaultDisposition::Fatal, FaultKind::Ownership(OwnershipFault::ManagedComponentUnavailable))
-        }
-    };
-    ComponentFault { source: Component::StorageService, disposition, kind, diagnostic }
 }
 
 fn node_fault(error: NodeError, is_live: bool, requested_hash: BlockHash) -> Option<ComponentFault> {

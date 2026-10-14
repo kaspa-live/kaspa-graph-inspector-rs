@@ -14,10 +14,11 @@ use tokio::{
 };
 
 use super::{
-    BlockResolutionEvent, PROCESSING_DATA_CHANNEL_CAPACITY,
+    BlockResolutionEvent,
     dependency::{DependencyResolver, DependencyResolverMetrics, DependencyResolverMetricsSnapshot, DependencyRpc},
     error::{ChildControlError, ChildFault, ChildFaultKind, SessionDataPath},
 };
+use crate::PROCESSING_DATA_CHANNEL_CAPACITY;
 
 pub(crate) const MAX_ORPHAN_BLOCKS: usize = 1024;
 pub(crate) const ORPHAN_RESOLUTION_THRESHOLD: usize = 256;
