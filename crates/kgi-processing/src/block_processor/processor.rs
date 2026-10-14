@@ -776,7 +776,7 @@ fn active_or_live(is_live: bool, active: FaultDisposition) -> FaultDisposition {
     if is_live { FaultDisposition::Require(RecoveryMode::Resync) } else { active }
 }
 
-fn storage_fault(error: ProcessingDbError, is_live: bool) -> ComponentFault {
+pub(crate) fn storage_fault(error: ProcessingDbError, is_live: bool) -> ComponentFault {
     let diagnostic: Arc<str> = Arc::from(error.to_string());
     let (disposition, kind) = match error {
         ProcessingDbError::GenerationLost => {

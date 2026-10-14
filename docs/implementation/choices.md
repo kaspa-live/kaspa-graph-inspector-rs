@@ -664,3 +664,28 @@ Keep marker-worker receiver closure in a shared atomic flag so a later local
 handoff failure can remain distinct from an internal command-path failure. The
 flag is diagnostic coordination inside the worker primitive; graph-update gate
 state and delivery semantics remain owned by the ingress capability.
+
+## 14 October 2026: VspcProcessor owner loop
+
+Keep the one-session VspcProcessor in the private `vspc_processor` module. Use
+an unbounded Tokio command mailbox and separate bounded mailboxes for
+notification and synthetic changes; receive BlockProcessor's persisted-block
+stream through its separately bounded channel. Drain commands before data and
+use one consuming one-shot acknowledgement for terminal shutdown.
+
+Represent pending candidates with monotonically allocated local `u64` keys.
+Use hash maps for candidate, missing-hash, and notification-destination
+indexes, a `BTreeMap<ConsensusOrder, PendingId>` for resolved notification
+selection, and a `VecDeque<PendingId>` for the synthetic FIFO. Keep the two
+materialization-history indexes in private hash and ordered maps and update
+them within one synchronous worker transition. This is the concrete
+implementation of the structures owned by the
+[VSPC processing contract](../architecture/vspc-processing.md#pending-state-and-history--settled),
+not an additional protocol.
+
+Expose overlap through a cloneable read-only wrapper around `Arc<AtomicBool>`
+and pending occupancy through a small mutex-protected metrics snapshot. Use
+private statically dispatched database and RPC adapters for focused tests; the
+production adapters delegate to the exact `ValidatedDbClient` and
+`ValidatedRpcClient` retained by the worker and add no public mock surface or
+boxed futures.

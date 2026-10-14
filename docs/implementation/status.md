@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 13 October 2026.
+Updated 14 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -21,7 +21,8 @@ the selected rusty-kaspa `v2.1.0` value crates. The session-scoped graph-update
 ingress implements the shared pre-seal gate, nonblocking ordinary offers,
 lossless lifecycle markers, coalescing gap observation, and ingress metrics.
 The API service crate remains behavior-free scaffolding. The processing crate
-contains the first BlockProcessor-owned child-worker slice described below.
+contains the session-scoped BlockProcessor and VspcProcessor slices described
+below.
 The first
 StorageService implementation slice selects SQLx with PostgreSQL and Rustls,
 embeds the forward-only metadata and processing-schema migrations, acquires the
@@ -190,7 +191,18 @@ single launch, final startup-handoff failure, Genesis and non-Genesis marker
 paths, strict sealing, closed-gate discard, late notification filtering, exact
 overlap, post-commit delivery loss, API receiver closure, terminal input
 preemption, complete descendant joining, and session-generation release.
-VspcProcessor remains pending in this increment.
+The VspcProcessor owner loop now retains its exact session RPC and processing
+database generations, anchor-derived sink and materialization history,
+multi-index pending state, synthetic FIFO, ordered resolved notifications,
+overlap flag, and pending metrics. Its inert construction and single launch,
+command priority, event-before-block resolution, notification collision and
+capacity handling, synthetic priority, Catchup filtering and crossing,
+component-local Live transition, one-batch member resolution, typed path
+attribution, definite-commit graph publication, terminal state clearing, and
+generation release have focused coverage. ProcessingSession construction,
+synthetic pump ownership, notification-router endpoint installation, global
+Live coordination, and Supervisor event handling remain for the integration
+point.
 
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.
