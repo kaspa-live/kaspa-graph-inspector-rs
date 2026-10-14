@@ -161,8 +161,9 @@ loop, subscription failure paths, publication and retirement order, IBD gate,
 retry sequence and reset boundary, and the operation-retirement completion
 barrier.
 
-The processing-worker increment has begun with private OrphanManager and
-DependencyResolver child loops. Each worker tree is now constructed inert with
+The processing-worker increment is complete through its standalone processor
+boundary. Private OrphanManager and DependencyResolver child loops are
+implemented. Each worker tree is constructed inert with
 its exact session resources, launched once after initialization, and consumed
 through terminal shutdown; no reusable Begin, Deactivate, or generation-rebind
 path remains. OrphanManager owns bounded normalized-block storage, reverse
@@ -199,7 +200,9 @@ command priority, event-before-block resolution, notification collision and
 capacity handling, synthetic priority, Catchup filtering and crossing,
 component-local Live transition, one-batch member resolution, typed path
 attribution, definite-commit graph publication, terminal state clearing, and
-generation release have focused coverage. ProcessingSession construction,
+generation release have focused coverage. Together with the previously
+completed session-scoped graph-update ingress, these workers complete
+implementation-sequence step 5. ProcessingSession construction,
 synthetic pump ownership, notification-router endpoint installation, global
 Live coordination, and Supervisor event handling remain for the integration
 point.
