@@ -1,10 +1,15 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     sync::Arc,
 };
 
-use kgi_model::block::{BlockColor, BlockCoordinate, BlockHash, Timestamp};
+use kgi_model::{
+    block::{BlockColor, BlockCoordinate, BlockHash, Timestamp},
+    graph_update::{BlockCommitted, LevelCommitted},
+};
 use thiserror::Error;
+
+use crate::delta::{GraphDelta, LevelChange};
 
 /// Complete retained level depth of the canonical Head graph.
 pub const MAX_CACHE_DEPTH: u64 = 1_000;
@@ -155,6 +160,14 @@ pub enum GraphViewExtractError {
     OutsideSourceExtent,
 }
 
+/// Failure to mutate a canonical graph view.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum GraphViewUpdateError {
+    /// Frozen views refuse every mutation.
+    #[error("frozen graph views cannot be mutated")]
+    Frozen,
+}
+
 /// One complete canonical graph projection and its revision lineage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphView {
@@ -166,6 +179,8 @@ pub struct GraphView {
     levels: BTreeMap<u64, StoredLevel>,
     blocks: HashMap<BlockHash, GraphBlock>,
     edges: HashMap<EdgeId, GraphEdge>,
+    block_hashes_by_level: BTreeMap<u64, HashSet<BlockHash>>,
+    edge_parents_by_child: HashMap<BlockHash, HashSet<BlockHash>>,
 }
 
 impl GraphView {
@@ -191,13 +206,27 @@ impl GraphView {
         assert!(max_depth > 0, "a graph view has positive maximum depth");
         assert!(extent.depth() <= max_depth, "a graph view extent fits its maximum depth");
 
-        let mut levels: BTreeMap<_, _> =
-            levels.into_iter().map(|(level, value)| (level, StoredLevel { value, usage_count: 0 })).collect();
-        for edge in edges.values() {
-            increment_parent_usage(&mut levels, edge.parent_coordinate.level());
-        }
+        let levels: BTreeMap<_, _> = levels.into_iter().map(|(level, value)| (level, StoredLevel { value, usage_count: 0 })).collect();
+        let block_hashes_by_level = index_blocks_by_level(&blocks);
+        let edge_parents_by_child = index_edge_parents_by_child(&edges);
 
-        Self { max_depth, extent, current_revision_id: 0, current_revision_timestamp_us: 0, tracking_policy, levels, blocks, edges }
+        let mut view = Self {
+            max_depth,
+            extent,
+            current_revision_id: 0,
+            current_revision_timestamp_us: 0,
+            tracking_policy,
+            levels,
+            blocks,
+            edges,
+            block_hashes_by_level,
+            edge_parents_by_child,
+        };
+        let parent_levels: Vec<_> = view.edges.values().map(|edge| edge.parent_coordinate.level()).collect();
+        for parent_level in parent_levels {
+            view.increment_parent_usage(parent_level);
+        }
+        view
     }
 
     /// Returns the configured maximum nominal depth.
@@ -275,6 +304,174 @@ impl GraphView {
         self.edges.values()
     }
 
+    /// Applies one committed block to a head-tracking view.
+    ///
+    /// Returns the exact visible delta, or `None` when the committed value has
+    /// no retained effect. A visible mutation advances the view by one
+    /// revision using `revision_timestamp_us`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called on a Fixed view or when the committed payload
+    /// violates Storage's coherent projection invariants.
+    pub fn apply_head_block_committed(
+        &mut self,
+        committed: &BlockCommitted,
+        revision_timestamp_us: u64,
+    ) -> Result<Option<GraphDelta>, GraphViewUpdateError> {
+        if self.tracking_policy == TrackingPolicy::Frozen {
+            return Err(GraphViewUpdateError::Frozen);
+        }
+        assert_eq!(self.tracking_policy, TrackingPolicy::Head, "head mutation requires a Head graph view");
+
+        let target_high = self.high_level().max(committed.coordinate.level());
+        let target_low = target_high.saturating_sub(self.max_depth - 1).max(1);
+        let target_extent = LevelExtent::new(target_low, target_high).expect("derived Head extent is positive and ordered");
+        let mut mutation = GraphMutation::default();
+
+        let graph_block = graph_block_from_committed(committed);
+        if target_extent.contains_level(graph_block.coordinate.level()) {
+            mutation.capture_block(&self.blocks, graph_block.hash);
+            self.insert_block(graph_block);
+        }
+
+        let retained_edges: Vec<_> = committed
+            .direct_parents
+            .iter()
+            .filter_map(|parent| {
+                parent.coordinate.map(|parent_coordinate| GraphEdge {
+                    id: EdgeId { parent: parent.hash, child: committed.hash },
+                    parent_coordinate,
+                    child_coordinate: committed.coordinate,
+                })
+            })
+            .filter(|edge| target_extent.intersects_span(edge.parent_coordinate.level(), edge.child_coordinate.level()))
+            .collect();
+        let retained_parent_levels: HashSet<_> = retained_edges.iter().map(|edge| edge.parent_coordinate.level()).collect();
+
+        for snapshot in committed.level_snapshots.iter() {
+            let retained_external = self.levels.get(&snapshot.level).is_some_and(|level| level.usage_count > 0);
+            if target_extent.contains_level(snapshot.level) || retained_external || retained_parent_levels.contains(&snapshot.level) {
+                mutation.capture_level(&self.levels, snapshot.level);
+                self.apply_materialization_snapshot(snapshot);
+            }
+        }
+
+        for edge in retained_edges {
+            mutation.capture_edge(&self.edges, edge.id);
+            let inserted = match self.edges.entry(edge.id) {
+                Entry::Vacant(entry) => {
+                    entry.insert(edge);
+                    true
+                }
+                Entry::Occupied(entry) => {
+                    assert_eq!(entry.get(), &edge, "one edge identity has immutable endpoint coordinates");
+                    false
+                }
+            };
+            if inserted {
+                self.edge_parents_by_child.entry(edge.id.child).or_default().insert(edge.id.parent);
+                self.increment_parent_usage(edge.parent_coordinate.level());
+            }
+        }
+
+        let pruned_block_levels: Vec<_> =
+            self.block_hashes_by_level.range(..target_extent.low_level()).map(|(&level, _)| level).collect();
+        let mut pruned_blocks = Vec::new();
+        for level in pruned_block_levels {
+            pruned_blocks.extend(self.block_hashes_by_level.remove(&level).expect("a selected block level exists"));
+        }
+        for &hash in &pruned_blocks {
+            let block = self.blocks.remove(&hash).expect("an indexed block exists");
+            mutation.capture_removed_block(hash, block);
+        }
+
+        let mut pruned_edges = Vec::new();
+        for child in pruned_blocks {
+            if let Some(parents) = self.edge_parents_by_child.remove(&child) {
+                pruned_edges.extend(parents.into_iter().map(|parent| EdgeId { parent, child }));
+            }
+        }
+        for id in pruned_edges {
+            let edge = self.edges.remove(&id).expect("a selected retained edge exists");
+            mutation.capture_removed_edge(id, edge);
+            self.decrement_parent_usage(edge.parent_coordinate.level());
+        }
+
+        let pruned_levels: Vec<_> = self
+            .levels
+            .range(..target_extent.low_level())
+            .filter(|(_, stored)| stored.usage_count == 0)
+            .map(|(&level, _)| level)
+            .collect();
+        for level in pruned_levels {
+            let stored = self.levels.remove(&level).expect("a selected retained level exists");
+            mutation.capture_removed_level(level, stored.value);
+        }
+
+        self.extent = target_extent;
+        let changes = mutation.finish(self);
+        if changes.is_empty() {
+            return Ok(None);
+        }
+
+        let next_revision = self.current_revision_id.checked_add(1).expect("graph revision fits u64");
+        let delta = GraphDelta::new(
+            self.current_revision_id,
+            next_revision,
+            revision_timestamp_us,
+            target_high,
+            changes.blocks,
+            changes.edges,
+            changes.levels,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .expect("Head mutation constructs a forward delta with a positive high level");
+        self.current_revision_id = next_revision;
+        self.current_revision_timestamp_us = revision_timestamp_us;
+
+        Ok(Some(delta))
+    }
+
+    fn insert_block(&mut self, block: GraphBlock) {
+        let hash = block.hash;
+        let level = block.coordinate.level();
+        match self.blocks.entry(hash) {
+            Entry::Vacant(entry) => {
+                entry.insert(block);
+            }
+            Entry::Occupied(_) => {
+                panic!("BlockCommitted is emitted only for a newly materialized block");
+            }
+        }
+        self.block_hashes_by_level.entry(level).or_default().insert(hash);
+    }
+
+    fn insert_source_level(&self, target: &mut BTreeMap<u64, StoredLevel>, level: u64) {
+        target.entry(level).or_insert_with(|| StoredLevel {
+            value: self.levels.get(&level).expect("a coherent graph contains every nominal and edge endpoint level").value,
+            usage_count: 0,
+        });
+    }
+
+    fn apply_materialization_snapshot(&mut self, snapshot: &LevelCommitted) {
+        self.levels
+            .entry(snapshot.level)
+            .and_modify(|stored| stored.value.size = snapshot.size)
+            .or_insert(StoredLevel { value: Level { size: snapshot.size, daa_score: snapshot.daa_score }, usage_count: 0 });
+    }
+
+    fn increment_parent_usage(&mut self, parent_level: u64) {
+        let stored = self.levels.get_mut(&parent_level).expect("a coherent graph contains every edge parent level");
+        stored.usage_count = stored.usage_count.checked_add(1).expect("retained edge usage fits u64");
+    }
+
+    fn decrement_parent_usage(&mut self, parent_level: u64) {
+        let stored = self.levels.get_mut(&parent_level).expect("a coherent graph contains every edge parent level");
+        stored.usage_count = stored.usage_count.checked_sub(1).expect("retained parent usage is positive");
+    }
+
     /// Extracts a coherent frozen view over a contained nominal extent.
     pub fn extract_subview(&self, extent: LevelExtent) -> Result<Self, GraphViewExtractError> {
         if !self.extent.contains_extent(extent) {
@@ -296,17 +493,16 @@ impl GraphView {
 
         let mut selected_levels = BTreeMap::new();
         for level in extent.low_level()..=extent.high_level() {
-            insert_source_level(&mut selected_levels, &self.levels, level);
+            self.insert_source_level(&mut selected_levels, level);
         }
         for edge in edges.values() {
-            insert_source_level(&mut selected_levels, &self.levels, edge.parent_coordinate.level());
-            insert_source_level(&mut selected_levels, &self.levels, edge.child_coordinate.level());
+            self.insert_source_level(&mut selected_levels, edge.parent_coordinate.level());
+            self.insert_source_level(&mut selected_levels, edge.child_coordinate.level());
         }
-        for edge in edges.values() {
-            increment_parent_usage(&mut selected_levels, edge.parent_coordinate.level());
-        }
+        let block_hashes_by_level = index_blocks_by_level(&blocks);
+        let edge_parents_by_child = index_edge_parents_by_child(&edges);
 
-        Ok(Self {
+        let mut extracted = Self {
             max_depth: extent.depth(),
             extent,
             current_revision_id: self.current_revision_id,
@@ -315,25 +511,128 @@ impl GraphView {
             levels: selected_levels,
             blocks,
             edges,
-        })
+            block_hashes_by_level,
+            edge_parents_by_child,
+        };
+        let parent_levels: Vec<_> = extracted.edges.values().map(|edge| edge.parent_coordinate.level()).collect();
+        for parent_level in parent_levels {
+            extracted.increment_parent_usage(parent_level);
+        }
+        Ok(extracted)
     }
 }
 
-fn insert_source_level(target: &mut BTreeMap<u64, StoredLevel>, source: &BTreeMap<u64, StoredLevel>, level: u64) {
-    target.entry(level).or_insert_with(|| StoredLevel {
-        value: source.get(&level).expect("a coherent graph contains every nominal and edge endpoint level").value,
-        usage_count: 0,
-    });
+fn index_blocks_by_level(blocks: &HashMap<BlockHash, GraphBlock>) -> BTreeMap<u64, HashSet<BlockHash>> {
+    let mut index: BTreeMap<u64, HashSet<BlockHash>> = BTreeMap::new();
+    for (&hash, block) in blocks {
+        index.entry(block.coordinate.level()).or_default().insert(hash);
+    }
+    index
 }
 
-fn increment_parent_usage(levels: &mut BTreeMap<u64, StoredLevel>, parent_level: u64) {
-    let stored = levels.get_mut(&parent_level).expect("a coherent graph contains every edge parent level");
-    stored.usage_count = stored.usage_count.checked_add(1).expect("retained edge usage fits u64");
+fn index_edge_parents_by_child(edges: &HashMap<EdgeId, GraphEdge>) -> HashMap<BlockHash, HashSet<BlockHash>> {
+    let mut index: HashMap<BlockHash, HashSet<BlockHash>> = HashMap::new();
+    for &id in edges.keys() {
+        index.entry(id.child).or_default().insert(id.parent);
+    }
+    index
+}
+
+fn graph_block_from_committed(committed: &BlockCommitted) -> GraphBlock {
+    GraphBlock {
+        hash: committed.hash,
+        coordinate: committed.coordinate,
+        timestamp: committed.timestamp,
+        daa_score: committed.daa_score,
+        selected_parent_index: committed.selected_parent_index,
+        direct_parents: committed.direct_parents.iter().map(|parent| parent.hash).collect(),
+        blue_merge_set: Arc::clone(&committed.blue_merge_set),
+        red_merge_set: Arc::clone(&committed.red_merge_set),
+        color: committed.color,
+        is_in_vspc: committed.is_in_vspc,
+    }
+}
+
+#[derive(Default)]
+struct GraphMutation {
+    blocks: HashMap<BlockHash, Option<GraphBlock>>,
+    edges: HashMap<EdgeId, Option<GraphEdge>>,
+    levels: BTreeMap<u64, Option<Level>>,
+}
+
+impl GraphMutation {
+    fn capture_block(&mut self, blocks: &HashMap<BlockHash, GraphBlock>, hash: BlockHash) {
+        self.blocks.entry(hash).or_insert_with(|| blocks.get(&hash).cloned());
+    }
+
+    fn capture_removed_block(&mut self, hash: BlockHash, block: GraphBlock) {
+        self.blocks.entry(hash).or_insert(Some(block));
+    }
+
+    fn capture_edge(&mut self, edges: &HashMap<EdgeId, GraphEdge>, id: EdgeId) {
+        self.edges.entry(id).or_insert_with(|| edges.get(&id).copied());
+    }
+
+    fn capture_removed_edge(&mut self, id: EdgeId, edge: GraphEdge) {
+        self.edges.entry(id).or_insert(Some(edge));
+    }
+
+    fn capture_level(&mut self, levels: &BTreeMap<u64, StoredLevel>, level: u64) {
+        self.levels.entry(level).or_insert_with(|| levels.get(&level).map(|stored| stored.value));
+    }
+
+    fn capture_removed_level(&mut self, level: u64, value: Level) {
+        self.levels.entry(level).or_insert(Some(value));
+    }
+
+    fn finish(self, view: &GraphView) -> GraphChanges {
+        let blocks = self
+            .blocks
+            .into_iter()
+            .filter_map(|(hash, before)| {
+                let after = view.blocks.get(&hash);
+                (before.as_ref() != after).then(|| (hash, after.cloned()))
+            })
+            .collect();
+        let edges = self
+            .edges
+            .into_iter()
+            .filter_map(|(id, before)| {
+                let after = view.edges.get(&id);
+                (before.as_ref() != after).then(|| (id, after.copied()))
+            })
+            .collect();
+        let levels = self
+            .levels
+            .into_iter()
+            .filter_map(|(level, before)| {
+                let after = view.levels.get(&level).map(|stored| stored.value);
+                (before != after).then_some(LevelChange { level, before, after })
+            })
+            .collect();
+
+        GraphChanges { blocks, edges, levels }
+    }
+}
+
+struct GraphChanges {
+    blocks: HashMap<BlockHash, Option<GraphBlock>>,
+    edges: HashMap<EdgeId, Option<GraphEdge>>,
+    levels: Vec<LevelChange>,
+}
+
+impl GraphChanges {
+    fn is_empty(&self) -> bool {
+        self.blocks.is_empty() && self.edges.is_empty() && self.levels.is_empty()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use kgi_model::block::MAX_DAA_SCORE;
+    use kgi_model::{
+        block::{CompactId, MAX_DAA_SCORE},
+        graph_update::ParentCommitted,
+    };
 
     use super::*;
 
@@ -349,10 +648,10 @@ mod tests {
         LevelExtent::new(low_level, high_level).expect("valid extent")
     }
 
-    fn graph_block(byte: u8, level: u64) -> GraphBlock {
+    fn graph_block_at(byte: u8, level: u64, slot: u64) -> GraphBlock {
         GraphBlock {
             hash: hash(byte),
-            coordinate: coordinate(level, 0),
+            coordinate: coordinate(level, slot),
             timestamp: u64::from(byte),
             daa_score: u64::from(byte),
             selected_parent_index: None,
@@ -364,12 +663,53 @@ mod tests {
         }
     }
 
+    fn graph_block(byte: u8, level: u64) -> GraphBlock {
+        graph_block_at(byte, level, 0)
+    }
+
     fn graph_edge(parent_byte: u8, parent_level: u64, child_byte: u8, child_level: u64) -> GraphEdge {
         GraphEdge {
             id: EdgeId { parent: hash(parent_byte), child: hash(child_byte) },
             parent_coordinate: coordinate(parent_level, 0),
             child_coordinate: coordinate(child_level, 0),
         }
+    }
+
+    fn committed_block(
+        byte: u8,
+        level: u64,
+        slot: u64,
+        direct_parents: impl Into<Arc<[ParentCommitted]>>,
+        level_snapshots: impl Into<Arc<[LevelCommitted]>>,
+    ) -> BlockCommitted {
+        let direct_parents = direct_parents.into();
+        BlockCommitted {
+            id: CompactId::new(i64::from(byte)).expect("positive fixture ID"),
+            hash: hash(byte),
+            coordinate: coordinate(level, slot),
+            timestamp: u64::from(byte) * 10,
+            daa_score: u64::from(byte) * 100,
+            selected_parent_index: (!direct_parents.is_empty()).then_some(0),
+            direct_parents,
+            blue_merge_set: Arc::from([hash(20)]),
+            red_merge_set: Arc::from([hash(21)]),
+            color: BlockColor::Blue,
+            is_in_vspc: true,
+            level_snapshots: level_snapshots.into(),
+        }
+    }
+
+    fn pruning_view() -> GraphView {
+        let levels = BTreeMap::from([
+            (1, Level { size: 1, daa_score: Some(10) }),
+            (2, Level { size: 1, daa_score: Some(20) }),
+            (3, Level { size: 1, daa_score: Some(30) }),
+        ]);
+        let blocks = HashMap::from([(hash(2), graph_block(2, 2)), (hash(3), graph_block(3, 3))]);
+        let edge_values = [graph_edge(1, 1, 2, 2), graph_edge(2, 2, 3, 3)];
+        let edges = edge_values.into_iter().map(|edge| (edge.id, edge)).collect();
+
+        GraphView::from_database_projection(2, extent(2, 3), TrackingPolicy::Head, levels, blocks, edges)
     }
 
     fn view(policy: TrackingPolicy) -> GraphView {
@@ -582,5 +922,194 @@ mod tests {
             assert_eq!(nested.tracking_policy(), TrackingPolicy::Frozen);
             assert_eq!(nested.blocks().map(|block| block.hash).collect::<Vec<_>>(), vec![hash(4)]);
         }
+    }
+
+    #[test]
+    fn head_block_mutation_projects_complete_values_edges_and_level_authorities() {
+        let levels = BTreeMap::from([(2, Level { size: 1, daa_score: Some(20) }), (3, Level { size: 2, daa_score: Some(30) })]);
+        let blocks = HashMap::from([(hash(2), graph_block(2, 2)), (hash(3), graph_block(3, 3)), (hash(13), graph_block_at(13, 3, 1))]);
+        let mut view = GraphView::from_database_projection(3, extent(2, 3), TrackingPolicy::Head, levels, blocks, HashMap::new());
+        let committed = committed_block(
+            4,
+            4,
+            0,
+            Arc::from([
+                ParentCommitted { hash: hash(3), coordinate: Some(coordinate(3, 0)) },
+                ParentCommitted { hash: hash(9), coordinate: None },
+                ParentCommitted { hash: hash(13), coordinate: Some(coordinate(3, 1)) },
+            ]),
+            Arc::from([
+                LevelCommitted { level: 3, size: 3, daa_score: Some(999) },
+                LevelCommitted { level: 4, size: 1, daa_score: Some(40) },
+            ]),
+        );
+
+        let delta = view.apply_head_block_committed(&committed, 700).expect("mutable Head").expect("visible update");
+
+        assert_eq!(view.extent(), extent(2, 4));
+        assert_eq!(view.current_revision_id(), 1);
+        assert_eq!(view.current_revision_timestamp_us(), 700);
+        let block = view.block(&hash(4)).expect("inserted block retained");
+        assert_eq!(block.coordinate, coordinate(4, 0));
+        assert_eq!(block.timestamp, 40);
+        assert_eq!(block.daa_score, 400);
+        assert_eq!(block.selected_parent_index, Some(0));
+        assert_eq!(&*block.direct_parents, &[hash(3), hash(9), hash(13)]);
+        assert_eq!(&*block.blue_merge_set, &[hash(20)]);
+        assert_eq!(&*block.red_merge_set, &[hash(21)]);
+        assert_eq!(block.color, BlockColor::Blue);
+        assert!(block.is_in_vspc);
+
+        let first_edge = EdgeId { parent: hash(3), child: hash(4) };
+        let second_edge = EdgeId { parent: hash(13), child: hash(4) };
+        let boundary_edge = EdgeId { parent: hash(9), child: hash(4) };
+        assert!(view.edge(&first_edge).is_some());
+        assert!(view.edge(&second_edge).is_some());
+        assert!(view.edge(&boundary_edge).is_none());
+        assert_eq!(view.level(3), Some(&Level { size: 3, daa_score: Some(30) }));
+        assert_eq!(view.level(4), Some(&Level { size: 1, daa_score: Some(40) }));
+        assert_eq!(view.levels.get(&3).map(|level| level.usage_count), Some(2));
+
+        assert_eq!(delta.from_revision_id(), 0);
+        assert_eq!(delta.to_revision_id(), 1);
+        assert_eq!(delta.revision_timestamp_us(), 700);
+        assert_eq!(delta.high_level(), 4);
+        assert_eq!(delta.block_changes().get(&hash(4)), Some(&Some(block.clone())));
+        assert!(delta.edge_changes().get(&first_edge).is_some_and(Option::is_some));
+        assert!(delta.edge_changes().get(&second_edge).is_some_and(Option::is_some));
+        assert!(!delta.edge_changes().contains_key(&boundary_edge));
+        assert_eq!(
+            delta.level_changes(),
+            &[
+                LevelChange {
+                    level: 3,
+                    before: Some(Level { size: 2, daa_score: Some(30) }),
+                    after: Some(Level { size: 3, daa_score: Some(30) }),
+                },
+                LevelChange { level: 4, before: None, after: Some(Level { size: 1, daa_score: Some(40) }) },
+            ]
+        );
+        assert!(delta.is_in_vspc_changes().is_empty());
+        assert!(delta.color_changes().is_empty());
+    }
+
+    #[test]
+    fn head_pruning_follows_child_owned_edges_and_retains_external_parent_levels() {
+        let mut view = pruning_view();
+        let committed = committed_block(
+            4,
+            4,
+            0,
+            Arc::from([ParentCommitted { hash: hash(3), coordinate: Some(coordinate(3, 0)) }]),
+            Arc::from([
+                LevelCommitted { level: 3, size: 1, daa_score: Some(300) },
+                LevelCommitted { level: 4, size: 1, daa_score: Some(40) },
+            ]),
+        );
+
+        let delta = view.apply_head_block_committed(&committed, 800).expect("mutable Head").expect("visible update");
+
+        let removed_edge = EdgeId { parent: hash(1), child: hash(2) };
+        let parent_only_edge = EdgeId { parent: hash(2), child: hash(3) };
+        assert_eq!(view.extent(), extent(3, 4));
+        assert!(view.block(&hash(2)).is_none());
+        assert!(view.edge(&removed_edge).is_none());
+        assert!(view.edge(&parent_only_edge).is_some());
+        assert!(view.level(1).is_none());
+        assert_eq!(view.level(2), Some(&Level { size: 1, daa_score: Some(20) }));
+        assert_eq!(view.levels.get(&2).map(|level| level.usage_count), Some(1));
+        assert_eq!(delta.block_changes().get(&hash(2)), Some(&None));
+        assert_eq!(delta.edge_changes().get(&removed_edge), Some(&None));
+        assert!(!delta.edge_changes().contains_key(&parent_only_edge));
+        assert_eq!(
+            delta.level_changes(),
+            &[
+                LevelChange { level: 1, before: Some(Level { size: 1, daa_score: Some(10) }), after: None },
+                LevelChange { level: 4, before: None, after: Some(Level { size: 1, daa_score: Some(40) }) },
+            ]
+        );
+
+        let next = committed_block(
+            5,
+            5,
+            0,
+            Arc::from([ParentCommitted { hash: hash(4), coordinate: Some(coordinate(4, 0)) }]),
+            Arc::from([
+                LevelCommitted { level: 4, size: 1, daa_score: Some(400) },
+                LevelCommitted { level: 5, size: 1, daa_score: Some(50) },
+            ]),
+        );
+        view.apply_head_block_committed(&next, 900).expect("mutable Head").expect("visible update");
+
+        assert_eq!(view.extent(), extent(4, 5));
+        assert!(view.block(&hash(3)).is_none());
+        assert!(view.edge(&parent_only_edge).is_none());
+        assert!(view.level(2).is_none());
+        assert_eq!(view.level(3), Some(&Level { size: 1, daa_score: Some(30) }));
+        assert_eq!(view.levels.get(&3).map(|level| level.usage_count), Some(1));
+    }
+
+    #[test]
+    fn below_range_commit_updates_only_a_retained_external_level_and_can_be_a_noop() {
+        let mut view = pruning_view();
+        for (byte, timestamp) in [(4, 800), (5, 900)] {
+            let committed = committed_block(
+                byte,
+                u64::from(byte),
+                0,
+                Arc::from([ParentCommitted { hash: hash(byte - 1), coordinate: Some(coordinate(u64::from(byte - 1), 0)) }]),
+                Arc::from([
+                    LevelCommitted { level: u64::from(byte - 1), size: 1, daa_score: Some(999) },
+                    LevelCommitted { level: u64::from(byte), size: 1, daa_score: Some(u64::from(byte) * 10) },
+                ]),
+            );
+            view.apply_head_block_committed(&committed, timestamp).expect("mutable Head").expect("visible update");
+        }
+        assert_eq!(view.extent(), extent(4, 5));
+        assert_eq!(view.level(3), Some(&Level { size: 1, daa_score: Some(30) }));
+
+        let below_range = committed_block(
+            23,
+            3,
+            1,
+            Arc::from([ParentCommitted { hash: hash(2), coordinate: Some(coordinate(2, 0)) }]),
+            Arc::from([
+                LevelCommitted { level: 2, size: 1, daa_score: Some(222) },
+                LevelCommitted { level: 3, size: 9, daa_score: Some(999) },
+            ]),
+        );
+        let delta = view.apply_head_block_committed(&below_range, 1_000).expect("mutable Head").expect("external level changed");
+
+        assert!(view.block(&hash(23)).is_none());
+        assert_eq!(view.level(3), Some(&Level { size: 9, daa_score: Some(30) }));
+        assert!(view.level(2).is_none());
+        assert!(delta.block_changes().is_empty());
+        assert!(delta.edge_changes().is_empty());
+        assert_eq!(
+            delta.level_changes(),
+            &[LevelChange {
+                level: 3,
+                before: Some(Level { size: 1, daa_score: Some(30) }),
+                after: Some(Level { size: 9, daa_score: Some(30) }),
+            }]
+        );
+        assert_eq!(delta.high_level(), 5);
+        assert_eq!(view.current_revision_id(), 3);
+        assert_eq!(view.current_revision_timestamp_us(), 1_000);
+
+        let unchanged = view.apply_head_block_committed(&below_range, 1_100).expect("mutable Head");
+        assert!(unchanged.is_none());
+        assert_eq!(view.current_revision_id(), 3);
+        assert_eq!(view.current_revision_timestamp_us(), 1_000);
+    }
+
+    #[test]
+    fn frozen_head_mutation_refuses_before_touching_the_payload() {
+        let mut view = view(TrackingPolicy::Frozen);
+        let before = view.clone();
+        let incomplete = committed_block(8, 8, 0, Arc::from([]), Arc::from([]));
+
+        assert_eq!(view.apply_head_block_committed(&incomplete, 1_200), Err(GraphViewUpdateError::Frozen));
+        assert_eq!(view, before);
     }
 }
