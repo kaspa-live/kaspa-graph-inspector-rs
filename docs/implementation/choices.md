@@ -609,6 +609,15 @@ priority receive. Size every processing data mailbox with the capacity owned
 by the [processing lifecycle](../architecture/processing-lifecycle.md#supervisor-and-recovery-intent--settled).
 Terminal shutdown acknowledgements use Tokio one-shots.
 
+Construct processing data mailboxes through the foundational
+`kgi_core::channel::bounded_channel` wrapper. It preserves Tokio's bounded
+sender, receiver, and full/closed result behavior while maintaining one shared
+current-occupancy and sticky high-water snapshot. The same wrapper crosses the
+NodeService notification-routing boundary, so notification callbacks and the
+processor owner expose one measurement for the same queue. Prioritized command
+mailboxes and the separately owned graph-update ingress do not use this
+wrapper.
+
 The DependencyResolver worker is private and generic over a minimal async RPC
 operation adapter. OrphanManager constructs that child with the exact
 `Arc<ValidatedRpcClient>` supplied to the session; tests instantiate

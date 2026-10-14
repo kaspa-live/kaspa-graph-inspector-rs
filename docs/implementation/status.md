@@ -178,7 +178,9 @@ threshold and capacity boundaries, maximum-release ordering, pending-state
 retention, Resolve/Cancel FIFO order, active and waiting RPC limits,
 node-outcome preservation, nested fault propagation, full-result-channel
 failure, cancellation, terminal backlog preemption, and exact RPC-generation
-release.
+release. Unexpected loss of an active processor or descendant command path is
+reported through the typed ownership-fault path rather than interpreted as
+ordinary shutdown.
 The BlockProcessor-owned lifecycle-marker worker provides the nonblocking
 two-command local FIFO, lossless graph-ingress delivery, accepted-command drain
 after local closure, and receiver-closure termination without retaining RPC or
@@ -196,11 +198,16 @@ The VspcProcessor owner loop now retains its exact session RPC and processing
 database generations, anchor-derived sink and materialization history,
 multi-index pending state, synthetic FIFO, ordered resolved notifications,
 overlap flag, and pending metrics. Its inert construction and single launch,
-command priority, event-before-block resolution, notification collision and
+strict command priority, event-before-block resolution, notification collision and
 capacity handling, synthetic priority, Catchup filtering and crossing,
 component-local Live transition, one-batch member resolution, typed path
 attribution, definite-commit graph publication, terminal state clearing, and
-generation release have focused coverage. Together with the previously
+generation release have focused coverage. Every bounded processing data
+mailbox now exposes current occupancy and sticky high-water measurements
+through the processor snapshots; exact-capacity tests cover the BlockProcessor
+notification and synthetic inputs, resolution delivery, OrphanManager input,
+DependencyResolver work, persisted-block delivery, and both VspcProcessor
+inputs. Together with the previously
 completed session-scoped graph-update ingress, these workers complete
 implementation-sequence step 5. ProcessingSession construction,
 synthetic pump ownership, notification-router endpoint installation, global
