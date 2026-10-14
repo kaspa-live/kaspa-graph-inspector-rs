@@ -28,7 +28,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::block_processor::{BlockRpc, PROCESSING_DATA_CHANNEL_CAPACITY, storage_fault};
+use crate::block_processor::{PROCESSING_DATA_CHANNEL_CAPACITY, storage_fault};
 
 pub(crate) const MAX_PENDING_VSPC_CHANGES: usize = 1024;
 
@@ -122,6 +122,16 @@ pub(crate) trait VspcDatabase: Send + Sync + 'static {
     ) -> impl Future<Output = Result<VspcCommitOutcome, ApplyVspcChangeError>> + Send;
 }
 
+pub(crate) trait VspcRpc: Send + Sync + 'static {
+    fn full_block(&self, hash: BlockHash) -> impl Future<Output = Result<kgi_model::block::ValidatedNodeBlock, NodeError>> + Send;
+}
+
+impl VspcRpc for ValidatedRpcClient {
+    async fn full_block(&self, hash: BlockHash) -> Result<kgi_model::block::ValidatedNodeBlock, NodeError> {
+        ValidatedRpcClient::full_block(self, hash).await
+    }
+}
+
 impl VspcDatabase for ValidatedDbClient {
     async fn resolve_materialized_ids(&self, hashes: &[BlockHash]) -> Result<Box<[CompactId]>, ResolveMaterializedIdsError> {
         self.resolve_materialized_ids(hashes).await
@@ -132,7 +142,7 @@ impl VspcDatabase for ValidatedDbClient {
     }
 }
 
-pub(crate) struct VspcProcessor<D: VspcDatabase = ValidatedDbClient, R: BlockRpc = ValidatedRpcClient> {
+pub(crate) struct VspcProcessor<D: VspcDatabase = ValidatedDbClient, R: VspcRpc = ValidatedRpcClient> {
     commands: mpsc::UnboundedSender<VspcProcessorCommand>,
     notifications: mpsc::Sender<VspcChange>,
     synthetic: mpsc::Sender<VspcChange>,
@@ -142,7 +152,7 @@ pub(crate) struct VspcProcessor<D: VspcDatabase = ValidatedDbClient, R: BlockRpc
     join: Option<JoinHandle<()>>,
 }
 
-impl<D: VspcDatabase, R: BlockRpc> VspcProcessor<D, R> {
+impl<D: VspcDatabase, R: VspcRpc> VspcProcessor<D, R> {
     pub(crate) fn new(
         mode: RecoveryMode,
         rpc: Arc<R>,
@@ -450,7 +460,7 @@ impl VspcState {
     }
 }
 
-struct VspcProcessorWorker<D: VspcDatabase, R: BlockRpc> {
+struct VspcProcessorWorker<D: VspcDatabase, R: VspcRpc> {
     commands: mpsc::UnboundedReceiver<VspcProcessorCommand>,
     notifications: mpsc::Receiver<VspcChange>,
     synthetic: mpsc::Receiver<VspcChange>,
@@ -465,7 +475,7 @@ struct VspcProcessorWorker<D: VspcDatabase, R: BlockRpc> {
     faulted: bool,
 }
 
-impl<D: VspcDatabase, R: BlockRpc> VspcProcessorWorker<D, R> {
+impl<D: VspcDatabase, R: VspcRpc> VspcProcessorWorker<D, R> {
     fn initialize(&mut self, anchor: MaterializedSyncAnchor) -> Result<(), ComponentFault> {
         let VspcProcessorRun::Inert { mode } = self.run else {
             return Err(invalid_lifecycle("VspcProcessor initialization requires an inert worker"));
@@ -1041,7 +1051,6 @@ fn node_operation_fault(error: NodeError, is_live: bool, hash: BlockHash) -> Com
 mod tests {
     use std::{collections::VecDeque, sync::Weak};
 
-    use kaspa_consensus_core::network::{NetworkId, NetworkType};
     use kgi_api_ingress::channel::{GraphUpdateReceiveEvent, graph_update_channel};
     use kgi_model::{
         block::{BlueWork, ConsensusOrder},
@@ -1050,8 +1059,6 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::block_processor::DependencyRpc;
-
     #[derive(Default)]
     struct MockDbState {
         resolved_batches: Vec<Vec<BlockHash>>,
@@ -1093,14 +1100,12 @@ mod tests {
     }
 
     struct MockRpc {
-        network_id: NetworkId,
-        genesis_hash: BlockHash,
         results: Mutex<VecDeque<Result<kgi_model::block::ValidatedNodeBlock, NodeError>>>,
     }
 
     impl MockRpc {
-        fn new(genesis_hash: BlockHash) -> Arc<Self> {
-            Arc::new(Self { network_id: NetworkId::new(NetworkType::Mainnet), genesis_hash, results: Mutex::new(VecDeque::new()) })
+        fn new() -> Arc<Self> {
+            Arc::new(Self { results: Mutex::new(VecDeque::new()) })
         }
 
         fn push_result(&self, result: Result<kgi_model::block::ValidatedNodeBlock, NodeError>) {
@@ -1108,19 +1113,9 @@ mod tests {
         }
     }
 
-    impl DependencyRpc for MockRpc {
+    impl VspcRpc for MockRpc {
         async fn full_block(&self, hash: BlockHash) -> Result<kgi_model::block::ValidatedNodeBlock, NodeError> {
             self.results.lock().expect("mock RPC mutex").pop_front().unwrap_or(Err(NodeError::BlockNotFound { hash }))
-        }
-    }
-
-    impl BlockRpc for MockRpc {
-        fn network_id(&self) -> NetworkId {
-            self.network_id
-        }
-
-        fn genesis_hash(&self) -> BlockHash {
-            self.genesis_hash
         }
     }
 
@@ -1187,7 +1182,7 @@ mod tests {
 
     fn fixture(anchor: MaterializedSyncAnchor) -> Fixture {
         let db = Arc::new(MockDb::default());
-        let rpc = MockRpc::new(anchor.point.hash());
+        let rpc = MockRpc::new();
         let (persisted_tx, persisted_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (graph_tx, mut graph_rx) = graph_update_channel();
         graph_tx.publish_post_seal().expect("open graph producer gate");
@@ -1201,7 +1196,7 @@ mod tests {
     #[tokio::test]
     async fn construction_and_initialization_are_inert_until_start() {
         let db = Arc::new(MockDb::default());
-        let rpc = MockRpc::new(hash(1));
+        let rpc = MockRpc::new();
         let weak_db: Weak<MockDb> = Arc::downgrade(&db);
         let weak_rpc: Weak<MockRpc> = Arc::downgrade(&rpc);
         let (_persisted_tx, persisted_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
@@ -1220,7 +1215,7 @@ mod tests {
     #[tokio::test]
     async fn consuming_shutdown_releases_exact_session_generations() {
         let db = Arc::new(MockDb::default());
-        let rpc = MockRpc::new(hash(1));
+        let rpc = MockRpc::new();
         let weak_db = Arc::downgrade(&db);
         let weak_rpc = Arc::downgrade(&rpc);
         let (_persisted_tx, persisted_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
@@ -1240,7 +1235,7 @@ mod tests {
     #[tokio::test]
     async fn failed_start_before_initialization_remains_joinable() {
         let db = Arc::new(MockDb::default());
-        let rpc = MockRpc::new(hash(1));
+        let rpc = MockRpc::new();
         let (_persisted_tx, persisted_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (graph, _graph_rx) = graph_update_channel();
         let (mut processor, _events) = VspcProcessor::new(RecoveryMode::Resync, rpc, db, graph, persisted_rx);

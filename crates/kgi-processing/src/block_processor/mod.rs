@@ -16,7 +16,6 @@ mod marker;
 mod orphan;
 mod processor;
 
-pub(crate) use dependency::DependencyRpc;
 pub(crate) use processor::storage_fault;
 #[allow(unused_imports, reason = "consumed by the upcoming ProcessingSession integration point")]
 pub(crate) use processor::{BlockOverlap, BlockProcessor, BlockProcessorControlError, BlockProcessorEvent, BlockSubmissionError};
@@ -70,7 +69,7 @@ impl BlockDatabase for ValidatedDbClient {
     }
 }
 
-pub(crate) trait BlockRpc: DependencyRpc {
+pub(crate) trait BlockRpc: dependency::DependencyRpc {
     fn network_id(&self) -> NetworkId;
 
     fn genesis_hash(&self) -> BlockHash;
