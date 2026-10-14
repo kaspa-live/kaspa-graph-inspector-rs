@@ -717,3 +717,7 @@ edge-usage count. Preserve semantic relationship order in immutable
 `Arc<[T]>` arrays. These collections are graph-model implementation details;
 public access uses values and read-only iteration rather than exporting mutable
 collection ownership.
+
+Place `LevelExtent` and `LevelExtentError`, whose semantics are owned by the
+[API graph model](../architecture/api-graph.md#graph-values-views-revisions-and-history--settled),
+in `kgi_api_model::graph` alongside `GraphView`.

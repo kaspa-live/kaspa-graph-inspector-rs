@@ -72,6 +72,14 @@ enum GraphDeltaCreationError {
         from_revision_id: u64,
         to_revision_id: u64,
     },
+    ZeroHighLevel,
+}
+
+enum LevelExtentError {
+    InvalidBounds {
+        low_level: u64,
+        high_level: u64,
+    },
 }
 
 enum GraphHistoryAppendError {
@@ -109,8 +117,24 @@ enum GraphHistoryRange {
 }
 
 enum GraphViewExtractError {
-    InvalidExtent,
     OutsideSourceExtent,
+}
+
+struct LevelExtent {
+    low_level: u64,
+    high_level: u64,
+}
+
+impl LevelExtent {
+    pub fn new(low_level: u64, high_level: u64) -> Result<Self, LevelExtentError>;
+
+    pub fn low_level(&self) -> u64;
+    pub fn high_level(&self) -> u64;
+    pub fn depth(&self) -> u64;
+    pub fn contains_level(&self, level: u64) -> bool;
+    pub fn contains_extent(&self, other: LevelExtent) -> bool;
+    pub fn overlaps(&self, other: LevelExtent) -> bool;
+    pub fn intersects_span(&self, parent_level: u64, child_level: u64) -> bool;
 }
 
 struct Level {
@@ -155,14 +179,20 @@ struct GraphBlock {
 
 struct GraphView {
     max_depth: u64,
-    low_level: u64,
-    high_level: u64,
+    extent: LevelExtent,
     current_revision_id: u64,
     current_revision_timestamp_us: u64,
     tracking_policy: TrackingPolicy,
     levels: LevelSet, // each retained entry also keeps derived usage_count
     blocks: BlockSet,
     edges: EdgeSet,
+}
+
+impl GraphView {
+    pub fn max_depth(&self) -> u64;
+    pub fn extent(&self) -> LevelExtent;
+    pub fn low_level(&self) -> u64;
+    pub fn high_level(&self) -> u64;
 }
 
 struct GraphDelta {
@@ -219,6 +249,32 @@ independently non-repeating and first-occurrence ordered. A hash may occur in
 both colors; the settled blue-then-red VSPC application order determines its
 final color. `GraphBlock.hash` is absent from all three relationship vectors.
 
+`LevelExtent` is the immutable validated value for one inclusive nominal graph
+extent. Its fields are private, and `new` is its only raw-bounds constructor.
+Construction succeeds exactly when `1 <= low_level <= high_level`; every other
+pair returns `LevelExtentError::InvalidBounds` with the supplied values. Its
+inclusive depth is `high_level - low_level + 1`, which is representable for
+every valid extent, including `[1, u64::MAX]`.
+
+`contains_level` includes both boundaries. `contains_extent` requires both
+boundaries of the other extent to lie inside this extent. `overlaps` is true
+when the two inclusive extents share at least one level. `intersects_span`
+applies the graph-edge span rule: the child level is at or above this extent's
+low boundary and the parent level is at or below its high boundary.
+
+Every `GraphView` has a positive `max_depth`, stores one `LevelExtent`, and
+maintains `extent.depth() <= max_depth`. A view may be shallower than its
+configured capacity at the lower graph boundary. Graph-view construction takes
+an already validated `LevelExtent` rather than another pair of raw bounds. The
+`low_level` and `high_level` accessors expose the corresponding extent
+boundaries without creating a second source of state. `LevelExtent` belongs to
+the canonical in-memory graph model. Its public transport representation
+remains under the [API protocol](api-protocol.md).
+
+Head mutation and Head delta application derive positive ordered bounds from a
+positive `max_depth` and positive lineage high level. Their extent construction
+therefore cannot fail and adds no `LevelExtentError` to either update result.
+
 A `GraphView` has no clock origin,
 liveness, database, or publication status. A view constructed from a database
 starts at revision zero with revision timestamp zero. A subview extract
@@ -232,27 +288,24 @@ its captured contents, revision, and revision timestamp.
 
 ```rust
 impl GraphView {
-    fn extract_subview(
-        &self,
-        low_level: u64,
-        high_level: u64,
-    ) -> Result<GraphView, GraphViewExtractError>;
+    pub fn extract_subview(&self, extent: LevelExtent)
+        -> Result<GraphView, GraphViewExtractError>;
 }
 ```
 
-Extraction requires `low_level <= high_level` and the requested nominal extent
-to be fully contained in the source's nominal `[low_level, high_level]` extent.
-An invalid order returns `InvalidExtent`; a well-ordered range outside the
-source extent returns `OutsideSourceExtent`. Additional endpoint levels retained
-outside the source's nominal extent do not expand the extractable range.
+Extraction requires the requested nominal extent to be fully contained in the
+source's nominal extent. A non-contained extent returns
+`OutsideSourceExtent`. Raw invalid bounds fail during `LevelExtent`
+construction and therefore cannot reach extraction. Additional endpoint levels
+retained outside the source's nominal extent do not expand the extractable
+range.
 
 The operation reads one coherent source state, does not mutate the source, and
 returns a view with:
 
 ```text
-low_level           = requested low_level
-high_level          = requested high_level
-max_depth           = high_level - low_level + 1
+extent              = requested extent
+max_depth           = extent.depth()
 current_revision_id = source.current_revision_id
 current_revision_timestamp_us = source.current_revision_timestamp_us
 tracking_policy     = Frozen
@@ -304,6 +357,7 @@ nominal extent:
 ```text
 target_high = max(current_high, block.coordinate.level)
 target_low  = max(1, target_high - max_depth + 1)
+target_extent = LevelExtent::new(target_low, target_high)
 ```
 
 The operation then performs one atomic graph-state transition:
@@ -357,13 +411,8 @@ immutable reference to the resulting complete Head state. It then offers the
 same original value and that post-update Head reference to Fixed even when Head
 produced no visible delta. Head and Fixed revisions remain independent.
 
-Before applying the value, evaluate the post-update nominal extents:
-
-```text
-fixed.low_level <= head.high_level
-AND
-head.low_level <= fixed.high_level
-```
+Before applying the value, require
+`fixed.extent.overlaps(head.extent)` for the post-update nominal extents.
 
 If they are disjoint, change the tracking policy from `Fixed` to `Frozen`
 without applying that value or advancing the graph revision. Head bounds never
@@ -429,10 +478,12 @@ observe revision `n+1` while a delta-history request can reach only revision
 `GraphDelta::new` is the only constructor. Its revision fields are private,
 have no setters, and are exposed only through their read-only accessors. The
 constructor rejects `to_revision_id <= from_revision_id` with
-`NonForwardRevision`. Direct view mutation produces one-step deltas, and
-composition constructs its results through the same checked constructor.
-Delta application and history append trust this construction invariant and do
-not check it again.
+`NonForwardRevision`, and rejects `high_level == 0` with `ZeroHighLevel`.
+Revision ordering is checked first, so an input violating both invariants
+returns `NonForwardRevision`.
+Direct view mutation produces one-step deltas, and composition constructs its
+results through the same checked constructor. Delta application and history
+append trust these construction invariants and do not check them again.
 
 `revision_timestamp_us` is the timestamp of the target revision. The graph
 model treats it as an opaque, nondecreasing value within one lineage. The
@@ -479,9 +530,10 @@ the same delta. In the final phase, a Head view sets:
 ```text
 high_level = delta.high_level
 low_level  = max(1, high_level - max_depth + 1)
+extent     = LevelExtent::new(low_level, high_level)
 ```
 
-A Fixed view retains both nominal bounds. Every accepted view then sets
+A Fixed view retains its nominal extent. Every accepted view then sets
 `current_revision_id = delta.to_revision_id` and
 `current_revision_timestamp_us = delta.revision_timestamp_us`. An error leaves
 the complete view, revision, and timestamp unchanged. Direct application of a
@@ -630,8 +682,9 @@ snapshot for an absent level remains ignored; if a later block snapshot first
 retains that level only as an external endpoint, the preceding paragraph's
 accepted contextual DAA value applies.
 
-An edge belongs to an extent `[low_level, high_level]` when its level span
-intersects that extent:
+An edge belongs to a `LevelExtent` when
+`extent.intersects_span(edge.parent_coordinate.level,
+edge.child_coordinate.level)` is true, equivalently:
 
 ```text
 edge.child_coordinate.level >= low_level
