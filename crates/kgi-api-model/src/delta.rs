@@ -31,6 +31,10 @@ pub enum GraphDeltaCreationError {
     /// A delta must advance to a strictly newer revision.
     #[error("graph delta target revision {to_revision_id} does not follow source revision {from_revision_id}")]
     NonForwardRevision { from_revision_id: u64, to_revision_id: u64 },
+
+    /// A delta lineage cannot have the reserved zero high level.
+    #[error("graph delta high level must be positive")]
+    ZeroHighLevel,
 }
 
 /// One canonical graph-state transition over a forward revision interval.
@@ -63,6 +67,9 @@ impl GraphDelta {
     ) -> Result<Self, GraphDeltaCreationError> {
         if to_revision_id <= from_revision_id {
             return Err(GraphDeltaCreationError::NonForwardRevision { from_revision_id, to_revision_id });
+        }
+        if high_level == 0 {
+            return Err(GraphDeltaCreationError::ZeroHighLevel);
         }
 
         Ok(Self {
@@ -187,6 +194,22 @@ mod tests {
     fn constructor_rejects_equal_and_backward_revisions() {
         assert_eq!(delta(8, 8), Err(GraphDeltaCreationError::NonForwardRevision { from_revision_id: 8, to_revision_id: 8 }));
         assert_eq!(delta(8, 7), Err(GraphDeltaCreationError::NonForwardRevision { from_revision_id: 8, to_revision_id: 7 }));
+    }
+
+    #[test]
+    fn constructor_rejects_zero_high_level_after_revision_ordering() {
+        let empty = || (HashMap::new(), HashMap::new(), Vec::new(), HashMap::new(), HashMap::new());
+        let (blocks, edges, levels, membership, colors) = empty();
+        assert_eq!(
+            GraphDelta::new(8, 9, 77, 0, blocks, edges, levels, membership, colors),
+            Err(GraphDeltaCreationError::ZeroHighLevel)
+        );
+
+        let (blocks, edges, levels, membership, colors) = empty();
+        assert_eq!(
+            GraphDelta::new(8, 8, 77, 0, blocks, edges, levels, membership, colors),
+            Err(GraphDeltaCreationError::NonForwardRevision { from_revision_id: 8, to_revision_id: 8 })
+        );
     }
 
     #[test]
