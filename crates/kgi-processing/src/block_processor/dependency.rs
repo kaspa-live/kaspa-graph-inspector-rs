@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     sync::{
         Arc,
@@ -119,6 +119,7 @@ impl<R: DependencyRpc> DependencyResolver<R> {
             tasks: JoinSet::new(),
             tasks_by_hash: HashMap::new(),
             hashes_by_task: HashMap::new(),
+            cancelled_tasks: HashSet::new(),
             faulted: false,
             work_open: true,
         };
@@ -182,6 +183,7 @@ struct DependencyResolverWorker<R> {
     tasks: JoinSet<Result<ValidatedNodeBlock, NodeError>>,
     tasks_by_hash: HashMap<BlockHash, (Id, AbortHandle)>,
     hashes_by_task: HashMap<Id, BlockHash>,
+    cancelled_tasks: HashSet<Id>,
     faulted: bool,
     work_open: bool,
 }
@@ -213,11 +215,6 @@ impl<R: DependencyRpc> DependencyResolverWorker<R> {
                         }
                     }
                 }
-                result = self.tasks.join_next_with_id(), if !self.tasks.is_empty() => {
-                    if let Some(result) = result {
-                        self.handle_task_result(result);
-                    }
-                }
                 work = self.work.recv(), if !self.faulted && self.work_open => {
                     match work {
                         Some(work) => self.handle_work(work).await,
@@ -227,6 +224,11 @@ impl<R: DependencyRpc> DependencyResolverWorker<R> {
                             self.faulted = true;
                             self.tasks.abort_all();
                         }
+                    }
+                }
+                result = self.tasks.join_next_with_id(), if !self.tasks.is_empty() => {
+                    if let Some(result) = result {
+                        self.handle_task_result(result);
                     }
                 }
             }
@@ -252,7 +254,8 @@ impl<R: DependencyRpc> DependencyResolverWorker<R> {
         match work {
             ResolverWork::Resolve(hash) => self.start_resolution(hash),
             ResolverWork::Cancel(hash) => {
-                if let Some((_, abort)) = self.tasks_by_hash.get(&hash) {
+                if let Some((task_id, abort)) = self.tasks_by_hash.get(&hash) {
+                    self.cancelled_tasks.insert(*task_id);
                     abort.abort();
                 }
             }
@@ -287,12 +290,16 @@ impl<R: DependencyRpc> DependencyResolverWorker<R> {
             Ok((task_id, _)) => *task_id,
             Err(error) => error.id(),
         };
+        let cancelled = self.cancelled_tasks.remove(&task_id);
         let Some(hash) = self.hashes_by_task.remove(&task_id) else {
             self.report_fault(ChildFaultKind::InvalidProtocol(Arc::from("dependency task completed without tracked hash")));
             self.faulted = true;
             return;
         };
         self.tasks_by_hash.remove(&hash);
+        if cancelled {
+            return;
+        }
 
         match result {
             Ok((_, result)) if !self.faulted => {
@@ -333,6 +340,7 @@ impl<R: DependencyRpc> DependencyResolverWorker<R> {
         }
         self.tasks_by_hash.clear();
         self.hashes_by_task.clear();
+        self.cancelled_tasks.clear();
     }
 
     fn drain_work(&mut self) {
@@ -465,6 +473,30 @@ mod tests {
             snapshot.active_operations == 0 && snapshot.waiting_operations == 0
         })
         .await;
+        assert!(resolution.try_recv().is_err());
+        assert!(faults.try_recv().is_err());
+        resolver.shutdown().await.expect("shutdown barrier");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_cancellation_wins_an_already_ready_rpc_result() {
+        let ResolverFixture { resolver, mut resolution, mut faults, mut started, releases, .. } = resolver().await;
+        let requested = hash(8);
+        resolver.resolve(requested).expect("resolve request");
+        assert_eq!(started.recv().await, Some(requested));
+
+        // Both wakeups become ready before this current-thread test yields back
+        // to the resolver. Work priority must record the task-ID cancellation
+        // before the completed RPC result is joined.
+        releases.add_permits(1);
+        resolver.cancel(requested).expect("cancel request");
+
+        wait_until(|| {
+            let snapshot = resolver.metrics();
+            snapshot.active_operations == 0 && snapshot.waiting_operations == 0
+        })
+        .await;
+        tokio::task::yield_now().await;
         assert!(resolution.try_recv().is_err());
         assert!(faults.try_recv().is_err());
         resolver.shutdown().await.expect("shutdown barrier");
