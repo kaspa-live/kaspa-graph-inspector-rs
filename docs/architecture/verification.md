@@ -786,8 +786,11 @@ with injected clocks and deterministic jitter:
   source policy; a synthetic conflict on both sides records Rebuild, retires and
   counts the generation, while the notification form records Rebuild without
   retirement or malformed-budget consumption;
-- malformed, definitively absent, `RpcRequestFailed`, cancelled, and
-  generation-lost attribution probes retain their distinct dispositions; and
+- malformed, definitively absent, `RpcRequestFailed`, and generation-lost
+  attribution probes retain their distinct dispositions; processor shutdown
+  locally cancels a blocked attribution probe without a fault, while an
+  RPC-returned `NodeError::Cancelled` during active VSPC processing produces
+  the lifecycle-owned Fatal ownership fault; and
 - both `BoundedStateExhausted` variants atomically reject the triggering input,
   disable both notification streams, require Resync without weakening Rebuild,
   retire no RPC generation, consume no malformed-input budget, and proceed
@@ -876,6 +879,10 @@ Verify [block admission](block-processing.md#admission-and-materialization),
     through capacity. Hold resolver RPCs open and prove active work never
     exceeds its focused-owner concurrency bound while cancellation and queued
     work continue to make progress.
+13. Natural-arrival and transitive-shutdown cancellation of resolver work emits
+    no dependency result or fault. A resolver RPC that instead completes with
+    `NodeError::Cancelled` while BlockProcessor remains active produces the
+    lifecycle-owned Fatal `Ownership(ManagedComponentUnavailable)` fault.
 
 ## VSPC processing
 

@@ -399,3 +399,9 @@ Resolver control-path faults and unexpected termination follow the
 During OrphanManager's transitive Shutdown barrier,
 BlockProcessor continues draining and discarding resolver results so a full
 result channel cannot deadlock task cancellation and join.
+Cancelling a resolver task through `Cancel(hash)` or the transitive Shutdown
+barrier prevents that task from delivering a resolver result. If the validated
+RPC operation itself returns `NodeError::Cancelled` while BlockProcessor
+remains active, BlockProcessor reports the lifecycle-owned active-cancellation
+fault; it does not treat that result as successful resolver cancellation or
+leave the dependency pending silently.

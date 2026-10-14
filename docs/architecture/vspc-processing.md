@@ -285,10 +285,16 @@ definitive not-found:
     AttributionBlockUnavailable
 ```
 
-A malformed probe remains `MalformedGetBlock`. `RpcRequestFailed`,
-cancellation, or generation loss establishes no attribution and retains its
-existing typed node error. VspcProcessor reports the attribution result
-together with the candidate source, or reports that probe error unchanged. The
+A malformed probe remains `MalformedGetBlock`. `RpcRequestFailed` or
+generation loss establishes no attribution and retains its existing typed node
+error. VspcProcessor reports the attribution result together with the candidate
+source, or reports that probe error unchanged. Its terminal shutdown cancels an
+in-flight attribution future locally, discards the held candidate with the
+retiring session, and completes through the teardown disposition owned by the
+[processing lifecycle](processing-lifecycle.md#termination-triggered-global-shutdown--settled).
+An RPC-returned `NodeError::Cancelled` before that local shutdown cancellation
+wins is the active-lifecycle violation under that contract, not a probe result
+that VspcProcessor may ignore. The
 [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
 solely owns their retirement, retry-budget, and recovery-strength consequences.
 Definite readiness commits through

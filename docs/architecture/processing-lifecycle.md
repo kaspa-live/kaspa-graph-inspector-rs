@@ -422,9 +422,12 @@ recovery-response budget. A malformed individual full-block GetBlock, whether
 issued by DependencyResolver or VspcProcessor attribution, retires the exact
 RPC generation: during active recovery it consumes the shared malformed-input
 budget, while in Live it requires Resync without consuming that recovery-only
-budget. Attribution `RpcRequestFailed`, cancellation, or generation loss
-establishes neither candidate nor database blame; its typed lifecycle
-disposition remains unchanged.
+budget. Attribution `RpcRequestFailed` or generation loss establishes neither
+candidate nor database blame and retains its typed lifecycle disposition.
+The [VspcProcessor attribution contract](vspc-processing.md#readiness-and-materiality--settled)
+owns its local probe-shutdown outcome. An RPC-returned cancellation while the
+processor remains active follows the service/session ordering violation owned
+by the terminal-shutdown contract below.
 
 When Supervisor still holds the same published RPC and processing DB
 generations, whole-attempt recovery retries use nominal
@@ -864,9 +867,12 @@ still applies.
 
 A definitive absent response from the node, a stored/returned DAA-score
 mismatch, or a sink blue score below the boundary seal threshold reports the
-`RequireRebuild` startup outcome to Supervisor. An opaque
-`RpcRequestFailed`, cancellation, connection loss, or validated-client loss is
-instead a session fault/retry and does not prove that Rebuild is required.
+`RequireRebuild` startup outcome to Supervisor. An opaque `RpcRequestFailed`,
+connection loss, or validated-client loss is instead a session fault/retry and
+does not prove that Rebuild is required. Supervisor-requested startup
+cancellation produces the session's `Cancelled` outcome. An RPC-returned
+`NodeError::Cancelled` before that local cancellation wins violates the
+service/session ordering and follows the Fatal ownership policy below.
 NodeService owns classification of a malformed GetBlock response as
 `RecoveryInputInvalid(MalformedGetBlock)`; ProcessingSession applies the bounded
 malformed-recovery-input policy above. Rebuild occurs as a separate run.
@@ -1357,6 +1363,17 @@ until its owning service completes shutdown. After entering terminal shutdown
 it discards those events instead of retaining a generation, starting recovery,
 or forwarding a new API generation. Closure of a service-event path after that
 service's completed shutdown is expected termination rather than a fault.
+
+The ordering above makes cancellation of a validated RPC generation
+teardown-local: every processor and resolver task has already stopped before
+`NodeService::shutdown` can cancel that generation. Processor-owned
+cancellation used to stop an in-flight RPC future during its own shutdown emits
+no upward fault. If `NodeError::Cancelled` nevertheless completes an RPC while
+BlockProcessor or VspcProcessor is still active, the service/session ordering
+has been violated. The processor reports `Fatal` with
+`Ownership(ManagedComponentUnavailable)`; it must not silently retain work,
+translate the result to `SessionDataEndpointLost`, retry the RPC, or infer a
+recovery mode.
 
 Dropping the graph-update receiver during this coordinated barrier unblocks a
 marker worker awaiting lossless delivery. Resulting producer closure is

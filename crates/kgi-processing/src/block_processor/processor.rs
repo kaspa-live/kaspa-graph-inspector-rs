@@ -592,9 +592,7 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessorWorker<D, R> {
                 }
             }
             BlockResolutionEvent::DependencyResolved { requested_hash, result: Err(error) } => {
-                if let Some(fault) = node_fault(error, self.is_live(), requested_hash) {
-                    self.enter_fault(fault).await;
-                }
+                self.enter_fault(node_fault(error, self.is_live(), requested_hash)).await;
             }
         }
     }
@@ -831,7 +829,7 @@ enum BlockDisposition {
     Orphaned,
 }
 
-fn node_fault(error: NodeError, is_live: bool, requested_hash: BlockHash) -> Option<ComponentFault> {
+fn node_fault(error: NodeError, is_live: bool, requested_hash: BlockHash) -> ComponentFault {
     let diagnostic: Arc<str> = Arc::from(error.to_string());
     let (source, disposition, kind) = match error {
         NodeError::GenerationLost => (
@@ -839,7 +837,9 @@ fn node_fault(error: NodeError, is_live: bool, requested_hash: BlockHash) -> Opt
             active_or_live(is_live, FaultDisposition::Retry),
             FaultKind::ServiceGenerationLost(ServiceKind::Node),
         ),
-        NodeError::Cancelled => return None,
+        NodeError::Cancelled => {
+            (Component::NodeService, FaultDisposition::Fatal, FaultKind::Ownership(OwnershipFault::ManagedComponentUnavailable))
+        }
         NodeError::BlockNotFound { .. } => {
             (Component::DependencyResolver, FaultDisposition::Require(RecoveryMode::Rebuild), FaultKind::DependencyUnavailable)
         }
@@ -860,7 +860,7 @@ fn node_fault(error: NodeError, is_live: bool, requested_hash: BlockHash) -> Opt
             (Component::NodeService, FaultDisposition::Fatal, FaultKind::Ownership(OwnershipFault::ManagedComponentUnavailable))
         }
     };
-    Some(ComponentFault { source, disposition, kind, diagnostic: Arc::from(format!("dependency {requested_hash}: {diagnostic}")) })
+    ComponentFault { source, disposition, kind, diagnostic: Arc::from(format!("dependency {requested_hash}: {diagnostic}")) }
 }
 
 fn materiality_fault(hash: BlockHash, diagnostic: impl std::fmt::Display) -> ComponentFault {
@@ -1587,5 +1587,14 @@ mod tests {
         let unavailable = storage_fault(ProcessingDbError::ServiceUnavailable { diagnostic: Arc::from("control") }, false);
         assert_eq!(unavailable.disposition, FaultDisposition::Fatal);
         assert_eq!(unavailable.kind, FaultKind::Ownership(OwnershipFault::ManagedComponentUnavailable));
+    }
+
+    #[test]
+    fn active_rpc_cancellation_is_a_fatal_service_lifecycle_violation() {
+        let fault = node_fault(NodeError::Cancelled, false, hash(9));
+
+        assert_eq!(fault.source, Component::NodeService);
+        assert_eq!(fault.disposition, FaultDisposition::Fatal);
+        assert_eq!(fault.kind, FaultKind::Ownership(OwnershipFault::ManagedComponentUnavailable));
     }
 }

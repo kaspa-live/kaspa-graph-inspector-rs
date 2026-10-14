@@ -934,7 +934,6 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessorWorker<D, R> {
                 Some(attribution_fault(source, attribution))
             }
             Err(NodeError::BlockNotFound { .. }) => Some(attribution_fault(source, VspcPathAttribution::AttributionBlockUnavailable)),
-            Err(NodeError::Cancelled) => None,
             Err(error) => Some(node_operation_fault(error, self.is_live(), conflict.child)),
         }
     }
@@ -1095,7 +1094,7 @@ fn node_operation_fault(error: NodeError, is_live: bool, hash: BlockHash) -> Com
         NodeError::InvalidSubscriptionState => {
             (FaultDisposition::Fatal, FaultKind::Ownership(OwnershipFault::InvalidLifecycleControl))
         }
-        NodeError::Cancelled => return session_endpoint_fault(is_live, diagnostic),
+        NodeError::Cancelled => (FaultDisposition::Fatal, FaultKind::Ownership(OwnershipFault::ManagedComponentUnavailable)),
         NodeError::BlockNotFound { .. } => unreachable!("definitive absence is handled as path attribution"),
     };
     ComponentFault { source: Component::NodeService, disposition, kind, diagnostic }
@@ -1768,6 +1767,30 @@ mod tests {
         assert!(weak_rpc.upgrade().is_none());
         assert!(graph.try_recv_update().is_err());
         assert!(events.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn active_rpc_cancellation_is_a_fatal_service_lifecycle_violation() {
+        let Fixture { processor, mut events, persisted, graph: _graph, db, rpc } = fixture(anchor(1));
+        persisted.send(persisted_block(2, 1)).await.expect("destination");
+        db.push_apply(Err(ApplyVspcChangeError::VspcPathDiscontinuity(VspcPathConflict {
+            child: hash(2),
+            expected_parent: hash(1),
+            stored_parent: hash(9),
+        })));
+        rpc.push_result(Err(NodeError::Cancelled));
+        processor.submit_synthetic(added(&[2])).await.expect("synthetic change");
+
+        assert!(matches!(
+            events.recv().await,
+            Some(VspcProcessorEvent::Fault(ComponentFault {
+                source: Component::NodeService,
+                disposition: FaultDisposition::Fatal,
+                kind: FaultKind::Ownership(OwnershipFault::ManagedComponentUnavailable),
+                ..
+            }))
+        ));
+        processor.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]

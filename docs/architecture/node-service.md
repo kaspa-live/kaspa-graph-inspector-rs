@@ -536,6 +536,14 @@ The raw message remains diagnostic outside this private adapter.
 Cancellation and generation loss are established by KGI-owned operation state,
 not inferred from the flattened error. If either wins the operation-completion
 race, its existing typed outcome takes precedence over `RpcRequestFailed`.
+For a runtime operation on a validated generation, `Cancelled` means
+NodeService intentionally cancelled that exact generation during terminal
+service shutdown; it is not an independently requested cancellation of one
+RPC. Notification-subscription transitions retain their locally defined use of
+the same typed outcome. The
+[processing lifecycle](processing-lifecycle.md#termination-triggered-global-shutdown--settled)
+owns the ordering that prevents a running processor from observing runtime
+generation cancellation and the disposition if that ordering is violated.
 Validation RPCs and notification subscription control retain their dedicated
 lifecycle contracts rather than using this runtime-operation outcome.
 The [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
