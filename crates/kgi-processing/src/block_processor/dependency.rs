@@ -193,6 +193,9 @@ impl<R: DependencyRpc> DependencyResolverWorker<R> {
                             }
                         }
                         None => {
+                            if !self.faulted {
+                                self.report_fault(ChildFaultKind::Ownership(OwnershipFault::InternalControlPathLost));
+                            }
                             self.abort_and_join().await;
                             return;
                         }
@@ -476,6 +479,19 @@ mod tests {
         assert!(rpc.upgrade().is_some());
         resolver.shutdown().await.expect("shutdown barrier");
         assert!(rpc.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_an_active_owner_reports_command_path_loss() {
+        let ResolverFixture { resolver, mut faults, .. } = resolver().await;
+
+        drop(resolver);
+
+        assert_eq!(
+            faults.recv().await,
+            Some(ChildFault::new(Component::DependencyResolver, ChildFaultKind::Ownership(OwnershipFault::InternalControlPathLost),))
+        );
+        assert!(faults.recv().await.is_none());
     }
 
     #[tokio::test]

@@ -510,7 +510,10 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessorWorker<D, R> {
                     biased;
                     command = self.commands.recv() => match command {
                         Some(command) => if self.handle_command(command).await { return; },
-                        None => return,
+                        None => {
+                            self.report_command_path_loss();
+                            return;
+                        }
                     },
                     _ = self.persisted.recv() => {}
                     _ = self.synthetic.recv() => {}
@@ -540,7 +543,10 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessorWorker<D, R> {
                 biased;
                 command = self.commands.recv() => match command {
                     Some(command) => if self.handle_command(command).await { return; },
-                    None => return,
+                    None => {
+                        self.report_command_path_loss();
+                        return;
+                    }
                 },
                 persisted = self.persisted.recv() => match persisted {
                     Some(persisted) => self.handle_persisted(persisted).await,
@@ -918,6 +924,18 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessorWorker<D, R> {
         let _ = self.events.send(VspcProcessorEvent::Fault(fault));
     }
 
+    fn report_command_path_loss(&mut self) {
+        if self.faulted || !matches!(self.run, VspcProcessorRun::Active(_)) {
+            return;
+        }
+        self.enter_fault(ComponentFault {
+            source: Component::VspcProcessor,
+            disposition: FaultDisposition::Fatal,
+            kind: FaultKind::Ownership(OwnershipFault::InternalControlPathLost),
+            diagnostic: Arc::from("VspcProcessor command path closed while the worker was active"),
+        });
+    }
+
     fn is_live(&self) -> bool {
         matches!(&self.run, VspcProcessorRun::Active(state) if state.phase.is_live())
     }
@@ -1252,6 +1270,24 @@ mod tests {
         processor.shutdown().await.expect("shutdown");
         assert!(weak_db.upgrade().is_none());
         assert!(weak_rpc.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_an_active_owner_reports_command_path_loss() {
+        let Fixture { processor, mut events, .. } = fixture(anchor(1));
+
+        drop(processor);
+
+        assert!(matches!(
+            events.recv().await,
+            Some(VspcProcessorEvent::Fault(ComponentFault {
+                source: Component::VspcProcessor,
+                disposition: FaultDisposition::Fatal,
+                kind: FaultKind::Ownership(OwnershipFault::InternalControlPathLost),
+                ..
+            }))
+        ));
+        assert!(events.recv().await.is_none());
     }
 
     #[tokio::test]

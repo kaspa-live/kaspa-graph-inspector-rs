@@ -182,7 +182,10 @@ impl<R: DependencyRpc> OrphanManagerWorker<R> {
                                 return;
                             }
                         }
-                        None => return,
+                        None => {
+                            self.enter_own_fault(ChildFaultKind::Ownership(OwnershipFault::InternalControlPathLost)).await;
+                            return;
+                        }
                     }
                 }
                 fault = self.resolver_faults.recv(), if self.resolver_faults_open => {
@@ -746,6 +749,19 @@ mod tests {
         assert!(weak_rpc.upgrade().is_some());
         manager.shutdown().await.expect("shutdown barrier");
         assert!(weak_rpc.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_an_active_owner_reports_command_path_loss() {
+        let ManagerFixture { manager, mut faults, .. } = manager_fixture();
+
+        drop(manager);
+
+        assert_eq!(
+            faults.recv().await,
+            Some(ChildFault::new(Component::OrphanManager, ChildFaultKind::Ownership(OwnershipFault::InternalControlPathLost),))
+        );
+        assert!(faults.recv().await.is_none());
     }
 
     #[tokio::test]

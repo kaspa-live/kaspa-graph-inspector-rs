@@ -375,6 +375,7 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessorWorker<D, R> {
                     command = self.commands.recv() => match command {
                         Some(command) => if self.handle_command(command).await { return; },
                         None => {
+                            self.report_command_path_loss().await;
                             let _ = self.shutdown_worker().await;
                             return;
                         }
@@ -409,6 +410,7 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessorWorker<D, R> {
                 command = self.commands.recv() => match command {
                     Some(command) => if self.handle_command(command).await { return; },
                     None => {
+                        self.report_command_path_loss().await;
                         let _ = self.shutdown_worker().await;
                         return;
                     }
@@ -759,6 +761,18 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessorWorker<D, R> {
             let secondary = child_control_fault(Component::OrphanManager, error, "OrphanManager fault barrier");
             let _ = self.events.send(BlockProcessorEvent::Fault(secondary));
         }
+    }
+
+    async fn report_command_path_loss(&mut self) {
+        if self.faulted || !matches!(self.run, BlockProcessorRun::Active { .. }) {
+            return;
+        }
+        self.enter_fault(ownership_fault(
+            Component::BlockProcessor,
+            OwnershipFault::InternalControlPathLost,
+            "BlockProcessor command path closed while the worker was active",
+        ))
+        .await;
     }
 
     fn is_live(&self) -> bool {
@@ -1418,6 +1432,26 @@ mod tests {
         processor.shutdown().await.expect("shutdown");
         assert!(weak_db.upgrade().is_none());
         assert!(weak_rpc.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_an_active_owner_reports_command_path_loss() {
+        let genesis = hash(1);
+        let (graph, _graph_rx) = graph_update_channel();
+        let ProcessorFixture { processor, mut events, .. } = fixture(genesis, RecoveryMode::Resync, anchor(hash(3), 20), 10, graph);
+
+        drop(processor);
+
+        assert!(matches!(
+            events.recv().await,
+            Some(BlockProcessorEvent::Fault(ComponentFault {
+                source: Component::BlockProcessor,
+                disposition: FaultDisposition::Fatal,
+                kind: FaultKind::Ownership(OwnershipFault::InternalControlPathLost),
+                ..
+            }))
+        ));
+        assert!(events.recv().await.is_none());
     }
 
     #[tokio::test]
