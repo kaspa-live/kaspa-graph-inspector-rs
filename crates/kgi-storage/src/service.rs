@@ -1349,8 +1349,9 @@ mod tests {
             DatabaseConnector, LockedDatabase, SqlxDatabaseConnector, ValidatedGenerations, open_api_generation,
             open_validated_generations_managed,
         },
-        error::{RebuildSetupFault, StorageError, StorageRejection},
+        error::{ProcessingDbError, RebuildSetupFault, StorageError, StorageRejection},
         generation::{ValidatedApiDbClient, ValidatedDbClient},
+        operation::RebuildFromPruningPointError,
         replacement::ApiReplacementGate,
         runtime::{RebuildSender, RetirementSender},
         state::DatabaseState,
@@ -1609,7 +1610,9 @@ mod tests {
 
         assert!(matches!(
             processing.rebuild_from_pruning_point(invalid).await,
-            Err(StorageError::ScoreOutOfRange(kgi_model::lifecycle::ScoreRangeFault::DaaScore))
+            Err(RebuildFromPruningPointError::Database(ProcessingDbError::ScoreOutOfRange(
+                kgi_model::lifecycle::ScoreRangeFault::DaaScore
+            )))
         ));
         assert!(processing.is_valid());
         assert!(api.is_valid());
@@ -1742,7 +1745,10 @@ mod tests {
             event => panic!("expected gated API publication, got {event:?}"),
         };
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &fresh)));
-        assert_eq!(rebuild.await.expect("Rebuild task"), Err(StorageError::Persistence(PersistenceFault::DefiniteFailure)));
+        assert_eq!(
+            rebuild.await.expect("Rebuild task"),
+            Err(RebuildFromPruningPointError::Database(ProcessingDbError::Persistence(PersistenceFault::DefiniteFailure)))
+        );
         assert!(processing.is_valid());
         assert!(!fresh.is_valid());
         assert_eq!(
@@ -1776,7 +1782,10 @@ mod tests {
         assert!(
             matches!(next_event(&mut events).await, StorageServiceEvent::ProcessingDbRetired(retired) if Arc::ptr_eq(&retired, &processing))
         );
-        assert_eq!(rebuild.await.expect("Rebuild task"), Err(StorageError::GenerationLost));
+        assert_eq!(
+            rebuild.await.expect("Rebuild task"),
+            Err(RebuildFromPruningPointError::Database(ProcessingDbError::GenerationLost))
+        );
 
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM block_identifiers")
             .fetch_one(&mut PgConnection::connect(database_url.as_str()).await.expect("truth-inspection connection"))
@@ -1819,7 +1828,7 @@ mod tests {
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
         assert_eq!(
             rebuild.await.expect("Rebuild task"),
-            Err(StorageError::RebuildSetupFailed(RebuildSetupFault::ApiGenerationPreparation))
+            Err(RebuildFromPruningPointError::Setup(RebuildSetupFault::ApiGenerationPreparation))
         );
         assert!(processing.is_valid());
         assert_eq!(
@@ -1886,7 +1895,10 @@ mod tests {
         };
 
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &fresh)));
-        assert_eq!(rebuild.await.expect("Rebuild task"), Err(StorageError::RebuildSetupFailed(RebuildSetupFault::ApiReadExclusion)));
+        assert_eq!(
+            rebuild.await.expect("Rebuild task"),
+            Err(RebuildFromPruningPointError::Setup(RebuildSetupFault::ApiReadExclusion))
+        );
         assert!(lease.is_cancelled());
         assert!(processing.is_valid());
         assert_eq!(
@@ -1941,7 +1953,10 @@ mod tests {
         let rebuild = tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point).await });
 
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
-        assert!(matches!(rebuild.await.expect("Rebuild task"), Err(StorageError::ReplacementControlUnavailable { .. })));
+        assert!(matches!(
+            rebuild.await.expect("Rebuild task"),
+            Err(RebuildFromPruningPointError::ReplacementControlUnavailable { .. })
+        ));
         assert!(processing.is_valid());
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM block_identifiers")
@@ -1971,7 +1986,10 @@ mod tests {
         service.break_replacement_control();
 
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &fresh)));
-        assert!(matches!(rebuild.await.expect("Rebuild task"), Err(StorageError::ReplacementControlUnavailable { .. })));
+        assert!(matches!(
+            rebuild.await.expect("Rebuild task"),
+            Err(RebuildFromPruningPointError::ReplacementControlUnavailable { .. })
+        ));
         assert!(lease.is_cancelled());
         assert!(processing.is_valid());
         assert_eq!(
@@ -2004,7 +2022,10 @@ mod tests {
         assert!(
             matches!(next_event(&mut events).await, StorageServiceEvent::ProcessingDbRetired(retired) if Arc::ptr_eq(&retired, &processing))
         );
-        assert_eq!(rebuild.await.expect("Rebuild task"), Err(StorageError::Persistence(PersistenceFault::AmbiguousCommit)));
+        assert_eq!(
+            rebuild.await.expect("Rebuild task"),
+            Err(RebuildFromPruningPointError::Database(ProcessingDbError::Persistence(PersistenceFault::AmbiguousCommit)))
+        );
         assert!(!processing.has_cached_identity(pruning_point.hash));
 
         let committed: bool = sqlx::query_scalar(
@@ -2036,7 +2057,7 @@ mod tests {
         let (service, mut events, processing, api) = initialize_service(database_url).await;
 
         processing.close().await;
-        assert_eq!(processing.load_session_state().await, Err(StorageError::GenerationLost));
+        assert_eq!(processing.load_session_state().await, Err(ProcessingDbError::GenerationLost));
         match next_event(&mut events).await {
             StorageServiceEvent::ProcessingDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &processing)),
             event => panic!("expected processing retirement, got {event:?}"),
@@ -2782,7 +2803,7 @@ mod tests {
 
         processing.close().await;
         let result = timeout(TEST_TIMEOUT, processing.load_session_state()).await.expect("operation retirement barrier must complete");
-        assert_eq!(result, Err(StorageError::EventPathClosed));
+        assert!(matches!(result, Err(ProcessingDbError::ServiceUnavailable { .. })));
         assert_eq!(service.shutdown().await, Err(StorageError::EventPathClosed));
     }
 
@@ -3142,7 +3163,10 @@ mod tests {
                 assert!(
                     matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &fresh))
                 );
-                assert_eq!(rebuild.await.expect("Rebuild task"), Err(StorageError::Persistence(PersistenceFault::DefiniteFailure)));
+                assert_eq!(
+                    rebuild.await.expect("Rebuild task"),
+                    Err(RebuildFromPruningPointError::Database(ProcessingDbError::Persistence(PersistenceFault::DefiniteFailure)))
+                );
             }
         }
         assert_eq!(service.status().state, StorageServiceStatusState::Ready);

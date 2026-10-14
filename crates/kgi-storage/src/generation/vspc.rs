@@ -14,8 +14,8 @@ use super::ValidatedDbClient;
 use crate::{
     cache::{CachedMaterializedBlock, CachedMergeSets, CachedVspcSink, ProcessingCacheDomains},
     database::NO_VSPC_DAA_SCORE,
-    error::StorageError,
-    operation::{VspcCommitOutcome, VspcPathConflict},
+    error::{ProcessingDbError, StorageError},
+    operation::{ApplyVspcChangeError, VspcCommitOutcome, VspcPathConflict},
     transaction::{self, TransactionAttemptError},
 };
 
@@ -47,9 +47,11 @@ enum SemanticError {
 
 impl ValidatedDbClient {
     /// Atomically applies one materialized, endpoint-resolved VSPC transition.
-    pub async fn apply_vspc_change(&self, change: ReadyVspcChange) -> Result<VspcCommitOutcome, StorageError> {
+    pub async fn apply_vspc_change(&self, change: ReadyVspcChange) -> Result<VspcCommitOutcome, ApplyVspcChangeError> {
         if change.added.is_empty() {
-            return Err(StorageError::invalid_metadata("a ready VSPC change must contain an added path"));
+            return Err(ApplyVspcChangeError::Database(ProcessingDbError::ServiceUnavailable {
+                diagnostic: Arc::from("a ready VSPC change must contain an added path"),
+            }));
         }
         let commit_behavior = self.next_vspc_commit_behavior();
         self.run_operation(|| async {
@@ -80,6 +82,12 @@ impl ValidatedDbClient {
             Ok(success.outcome)
         })
         .await
+        .map_err(|error| match error {
+            StorageError::VspcSourceDiscontinuity => ApplyVspcChangeError::VspcSourceDiscontinuity,
+            StorageError::VspcMemberNotMaterialized { id } => ApplyVspcChangeError::VspcMemberNotMaterialized { id },
+            StorageError::VspcPathDiscontinuity(conflict) => ApplyVspcChangeError::VspcPathDiscontinuity(conflict),
+            error => ApplyVspcChangeError::Database(ProcessingDbError::mutation(error)),
+        })
     }
 
     fn next_vspc_commit_behavior(&self) -> CommitBehavior {
@@ -435,7 +443,7 @@ async fn update_level_scores(
         .iter()
         .map(|level| {
             i64::try_from(*level)
-                .map_err(|_| TransactionAttemptError::Storage(StorageError::invalid_metadata("affected VSPC level exceeds BIGINT")))
+                .map_err(|_| TransactionAttemptError::Storage(StorageError::internal_failure("affected VSPC level exceeds BIGINT")))
         })
         .collect::<Result<_, _>>()?;
     let rows = sqlx::query(
@@ -532,9 +540,9 @@ mod tests {
     use crate::{
         cache::{CachedMaterializedBlock, ProcessingCacheDomains},
         database::{LockedDatabase, PreparedDatabase, open_processing_generation},
-        error::StorageError,
+        error::{ProcessingDbError, StorageError},
         generation::ValidatedDbClient,
-        operation::VspcPathConflict,
+        operation::{ApplyVspcChangeError, VspcPathConflict},
         runtime::{RetirementReceiver, RetirementTarget, retirement_channel},
         state::DatabaseState,
     };
@@ -861,16 +869,16 @@ mod tests {
 
         let wrong_source =
             client.apply_vspc_change(change(graph.old_parent, graph.new_parent, Vec::new(), vec![graph.new_parent.1])).await;
-        assert_eq!(wrong_source, Err(StorageError::VspcSourceDiscontinuity));
+        assert_eq!(wrong_source, Err(ApplyVspcChangeError::VspcSourceDiscontinuity));
 
         let boundary = client.apply_vspc_change(change(graph.old_sink, graph.boundary, Vec::new(), vec![graph.boundary.1])).await;
-        assert_eq!(boundary, Err(StorageError::VspcMemberNotMaterialized { id: graph.boundary.1 }));
+        assert_eq!(boundary, Err(ApplyVspcChangeError::VspcMemberNotMaterialized { id: graph.boundary.1 }));
 
         let added_only =
             client.apply_vspc_change(change(graph.old_sink, graph.new_parent, Vec::new(), vec![graph.new_parent.1])).await;
         assert_eq!(
             added_only,
-            Err(StorageError::VspcPathDiscontinuity(VspcPathConflict {
+            Err(ApplyVspcChangeError::VspcPathDiscontinuity(VspcPathConflict {
                 child: graph.new_parent.0,
                 expected_parent: graph.old_sink.0,
                 stored_parent: graph.common.0,
@@ -887,7 +895,7 @@ mod tests {
             .await;
         assert_eq!(
             removed_path,
-            Err(StorageError::VspcPathDiscontinuity(VspcPathConflict {
+            Err(ApplyVspcChangeError::VspcPathDiscontinuity(VspcPathConflict {
                 child: graph.old_sink.0,
                 expected_parent: graph.common.0,
                 stored_parent: graph.old_parent.0,
@@ -904,7 +912,7 @@ mod tests {
             .await;
         assert_eq!(
             pivot,
-            Err(StorageError::VspcPathDiscontinuity(VspcPathConflict {
+            Err(ApplyVspcChangeError::VspcPathDiscontinuity(VspcPathConflict {
                 child: graph.new_sink.0,
                 expected_parent: graph.common.0,
                 stored_parent: graph.new_parent.0,
@@ -921,7 +929,7 @@ mod tests {
             .await;
         assert_eq!(
             added_path,
-            Err(StorageError::VspcPathDiscontinuity(VspcPathConflict {
+            Err(ApplyVspcChangeError::VspcPathDiscontinuity(VspcPathConflict {
                 child: graph.old_sink.0,
                 expected_parent: graph.new_parent.0,
                 stored_parent: graph.old_parent.0,
@@ -936,7 +944,7 @@ mod tests {
                 vec![graph.old_sink.1],
             ))
             .await;
-        assert!(matches!(duplicate, Err(StorageError::VspcPathDiscontinuity(_))));
+        assert!(matches!(duplicate, Err(ApplyVspcChangeError::VspcPathDiscontinuity(_))));
         assert_eq!(block_state(&mut database, graph.old_sink.1).await, (BlockColor::Red as i16, true));
         assert!(!block_state(&mut database, graph.new_parent.1).await.1);
         assert!(!block_state(&mut database, graph.new_sink.1).await.1);
@@ -1004,7 +1012,10 @@ mod tests {
         let operation = tokio::spawn(async move { operation_client.apply_vspc_change(transition).await });
 
         complete_processing_retirement(&mut retirements, &client).await;
-        assert_eq!(operation.await.expect("VSPC task"), Err(StorageError::Persistence(PersistenceFault::AmbiguousCommit)));
+        assert_eq!(
+            operation.await.expect("VSPC task"),
+            Err(ApplyVspcChangeError::Database(ProcessingDbError::Persistence(PersistenceFault::AmbiguousCommit)))
+        );
         assert!(!client.is_valid());
         assert!(!client.has_cached_merge_sets(graph.new_parent.1));
         assert!(!client.has_cached_merge_sets(graph.new_sink.1));

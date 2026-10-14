@@ -34,7 +34,7 @@ pub(super) async fn intern_identities<S>(
     .await
     .map_err(|error| TransactionAttemptError::database("block-identity interning", error))?;
     if rows.len() != hashes.len() {
-        return Err(TransactionAttemptError::Storage(StorageError::invalid_metadata(
+        return Err(TransactionAttemptError::Storage(StorageError::internal_failure(
             "batched block-identity interning returned an incomplete result",
         )));
     }
@@ -44,11 +44,11 @@ pub(super) async fn intern_identities<S>(
         let encoded_hash: Vec<u8> =
             row.try_get("hash").map_err(|error| TransactionAttemptError::database("interned block hash decode", error))?;
         let hash = BlockHash::try_from(encoded_hash.as_slice()).map_err(|error| {
-            TransactionAttemptError::Storage(StorageError::invalid_metadata(format!("invalid interned block hash: {error}")))
+            TransactionAttemptError::Storage(StorageError::internal_failure(format!("invalid interned block hash: {error}")))
         })?;
         let raw_id: i64 = row.try_get("id").map_err(|error| TransactionAttemptError::database("interned block ID decode", error))?;
         let id = CompactId::new(raw_id).ok_or_else(|| {
-            TransactionAttemptError::Storage(StorageError::invalid_metadata(format!("generated compact ID is not positive: {raw_id}")))
+            TransactionAttemptError::Storage(StorageError::internal_failure(format!("generated compact ID is not positive: {raw_id}")))
         })?;
         identities.insert(hash, id);
     }

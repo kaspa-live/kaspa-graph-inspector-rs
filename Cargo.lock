@@ -2988,10 +2988,14 @@ dependencies = [
 name = "kgi-processing"
 version = "0.1.0"
 dependencies = [
+ "kaspa-consensus-core",
  "kgi-api-ingress",
+ "kgi-core",
  "kgi-model",
  "kgi-node",
  "kgi-storage",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

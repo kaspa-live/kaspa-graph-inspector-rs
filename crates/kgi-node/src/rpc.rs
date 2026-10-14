@@ -11,6 +11,7 @@ use kaspa_rpc_core::{
     GetBlockDagInfoRequest, GetBlockRequest, GetBlocksRequest, GetSinkRequest, GetVirtualChainFromBlockV2Request,
     RpcDataVerbosityLevel, RpcError, RpcResult,
 };
+use kgi_core::channel::BoundedSender;
 use kgi_model::{
     block::{BlockHash, ValidatedNodeBlock, ValidatedRecoveryHeader},
     lifecycle::{FaultKind, RecoveryInputKind},
@@ -95,8 +96,8 @@ impl NotificationFault {
 /// Bounded processor destinations and reliable fault path for one session.
 #[derive(Debug)]
 pub struct NotificationChannels {
-    blocks: mpsc::Sender<ValidatedNodeBlock>,
-    vspc: mpsc::Sender<VspcChange>,
+    blocks: BoundedSender<ValidatedNodeBlock>,
+    vspc: BoundedSender<VspcChange>,
     faults: mpsc::UnboundedSender<NotificationFault>,
 }
 
@@ -104,18 +105,18 @@ impl NotificationChannels {
     /// Groups the session endpoints installed before remote subscription starts.
     #[must_use]
     pub fn new(
-        blocks: mpsc::Sender<ValidatedNodeBlock>,
-        vspc: mpsc::Sender<VspcChange>,
+        blocks: BoundedSender<ValidatedNodeBlock>,
+        vspc: BoundedSender<VspcChange>,
         faults: mpsc::UnboundedSender<NotificationFault>,
     ) -> Self {
         Self { blocks, vspc, faults }
     }
 
-    pub(crate) const fn blocks(&self) -> &mpsc::Sender<ValidatedNodeBlock> {
+    pub(crate) const fn blocks(&self) -> &BoundedSender<ValidatedNodeBlock> {
         &self.blocks
     }
 
-    pub(crate) const fn vspc(&self) -> &mpsc::Sender<VspcChange> {
+    pub(crate) const fn vspc(&self) -> &BoundedSender<VspcChange> {
         &self.vspc
     }
 
@@ -2228,14 +2229,14 @@ mod tests {
     }
 
     type NotificationReceivers = (
-        mpsc::Receiver<kgi_model::block::ValidatedNodeBlock>,
-        mpsc::Receiver<kgi_model::vspc::VspcChange>,
+        kgi_core::channel::BoundedReceiver<kgi_model::block::ValidatedNodeBlock>,
+        kgi_core::channel::BoundedReceiver<kgi_model::vspc::VspcChange>,
         mpsc::UnboundedReceiver<super::NotificationFault>,
     );
 
     fn notification_channels() -> (NotificationChannels, NotificationReceivers) {
-        let (block_tx, block_rx) = mpsc::channel(1);
-        let (vspc_tx, vspc_rx) = mpsc::channel(1);
+        let (block_tx, block_rx) = kgi_core::channel::bounded_channel(1);
+        let (vspc_tx, vspc_rx) = kgi_core::channel::bounded_channel(1);
         let (fault_tx, fault_rx) = mpsc::unbounded_channel();
         (NotificationChannels::new(block_tx, vspc_tx, fault_tx), (block_rx, vspc_rx, fault_rx))
     }

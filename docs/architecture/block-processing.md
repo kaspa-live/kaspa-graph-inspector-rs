@@ -12,19 +12,20 @@ owns raw BlockAdded validation and routing.
 
 ## PP-boundary phase behavior — settled
 
-ResyncEngine supplies `boundary_seal_blue_score` in the Begin payload. Its
+ProcessingSession supplies `boundary_seal_blue_score` while initializing the
+inert BlockProcessor after successful preparation. Its
 [boundary threshold contract](processing-lifecycle.md#boundary-seal-threshold-construction)
 owns construction and failure disposition; BlockProcessor only consumes the
 supplied value.
 
 Genesis has no discarded DAG past, so a Genesis PP is intrinsically sealed at
-blue score zero. After the atomic Genesis rebuild transaction, `BeginRebuild`
-starts BlockProcessor directly in `PostSeal`, enqueues `PublishPostSeal` to its
-lifecycle-marker worker, and then emits the existing exact-once
-`PpBoundarySealed` milestone while handling Begin. Genesis never enters the
-ordinary BlockProcessor or `PersistedBlock` path.
+blue score zero. After the atomic Genesis rebuild transaction, Rebuild
+initialization starts BlockProcessor directly in
+`PostSeal`, enqueues `PublishPostSeal` to its lifecycle-marker worker, and then
+emits the existing exact-once `PpBoundarySealed` milestone. Genesis never enters
+the ordinary BlockProcessor or `PersistedBlock` path.
 
-For every non-Genesis PP, `BeginRebuild` starts in
+For every non-Genesis PP, Rebuild initialization starts in
 `PreSeal { seal_blue_score: boundary_seal_blue_score }`. PreSeal blocks arrive
 in consensus-topological order and use storage's `AllowBoundaryIdentities`
 policy. Missing parents and merge-set identities may be outside the retained
@@ -35,7 +36,7 @@ For a non-Genesis PP, the **first** block whose blue score is at or above the
 threshold uses `RequireMaterialized`, not the permissive policy. Only its
 definite successful commit changes BlockProcessor's local phase to `PostSeal`
 and authorizes the exact-once `PpBoundarySealed` milestone upward to
-ResyncEngine. For an inserted sealing block, BlockProcessor emits that
+ProcessingSession. For an inserted sealing block, BlockProcessor emits that
 milestone only after offering the block's graph update obtains the intentional
 `SuppressedPreSeal` outcome and its marker worker accepts the
 `PublishPostSeal` command. An ambiguous or failed transaction enqueues no
@@ -43,9 +44,9 @@ marker command and emits no milestone.
 `PpBoundarySealed` is never a command sent back to BlockProcessor.
 
 The [processing lifecycle](processing-lifecycle.md) owns propagation of the
-milestone and the prohibition on entering Catchup before ResyncEngine observes
-it. `BeginResync` starts BlockProcessor in PostSeal only after successful
-reconciliation. All PostSeal materialization is strict.
+milestone and the prohibition on entering Catchup before ProcessingSession
+observes it. Successful Resync preparation initializes BlockProcessor in
+PostSeal before its task starts. All PostSeal materialization is strict.
 
 If the process stops after the Genesis rebuild transaction commits but before
 the milestone is observed, restart derives the sealed boundary from committed
@@ -76,41 +77,49 @@ Use explicit higher-priority polling or draining around lower-priority work.
 `tokio::select! { biased; ... }` alone does not guarantee this order under
 continually ready inputs.
 
-The Begin variants use the
-[`BlockProcessorBegin`](processing-lifecycle.md#processor-begin-payloads)
-payload owned by the processing lifecycle. Conceptual commands are:
+The [session construction](processing-lifecycle.md#processor-construction)
+supplies one inert BlockProcessor with direct inputs for the immutable recovery
+mode, exact RPC and DB generations, graph-update producer, and private
+session-channel endpoints. BlockProcessor owns the inert marker worker and
+OrphanManager values; OrphanManager owns its inert DependencyResolver, which
+receives the exact RPC generation. None of these BlockProcessor-owned values
+starts a task or producer during construction. Conceptual commands after task
+startup are:
 
 ```text
-BeginRebuild(BlockProcessorBegin)
-BeginResync(BlockProcessorBegin)
 Catchup { lower_bound, ... }
 Live
-Deactivate
 Shutdown
 ```
 
-A Begin command resets all processor-local run state: phase, source gates,
-overlap map and flag, orphan state, and descendants. It installs the exact DB
-and RPC generations for the run and activates DependencyResolver with that RPC
-generation. It validates the Begin payload and applies the mode-specific phase
-and milestone behavior owned by the
-[PP-boundary contract](#pp-boundary-phase-behavior--settled).
+After successful session preparation, ProcessingSession initializes the closed
+notification gate, overlap state, empty orphan state, committed anchor, seal
+threshold, and mode-specific initial phase, then starts the complete
+BlockProcessor tree under the
+[cross-processor construction contract](processing-lifecycle.md#processor-construction).
+Initial task execution performs the local milestone and marker behavior owned
+by the [PP-boundary contract](#pp-boundary-phase-behavior--settled). Resync
+startup immediately enqueues `PublishPostSeal`; Rebuild startup follows the
+marker-command enqueue points owned above. Processing cannot reach Catchup
+until every startup marker command has been accepted by the marker
+worker. That acceptance precedes the processing-lifecycle-owned successful
+[`start` outcome](processing-lifecycle.md#processingsession--settled). Startup
+does not wait for marker delivery through the graph-update channel.
 
-`BeginResync` starts directly in PostSeal and immediately enqueues
-`PublishPostSeal` to its lifecycle-marker worker. `BeginRebuild` follows the
-marker-command enqueue points owned by the PP-boundary contract above.
-Processing cannot reach Catchup before the Rebuild command has been accepted
-by the marker worker.
-
-Begin has no acknowledgement. `Deactivate` is an acknowledged descendant
-barrier; Shutdown is terminal under the shared lifecycle contract. No separate
-Genesis flag, recovery-mode field, or boundary-phase field is carried in the
-payload.
+Construction and initialization themselves create no BlockProcessor-specific
+lifecycle result. A preparation failure leaves the entire inert tree owned by
+ProcessingSession, which drops it during consuming shutdown without launching
+its tasks. Child command or acknowledgement loss follows the
+processing-lifecycle-owned startup or post-start fault path according to
+whether the startup barrier has completed. Shutdown is the sole terminal
+descendant barrier. No separate Genesis flag or mutable recovery-mode field
+exists.
 
 ### Graph lifecycle-marker delivery — settled
 
-Each Begin creates one small BlockProcessor-owned marker worker for that
-session's `GraphUpdateProducer`. BlockProcessor sends it only two commands,
+Each BlockProcessor owns one small marker worker value for that session's
+`GraphUpdateProducer`; its task starts with the rest of the BlockProcessor tree.
+BlockProcessor sends it only two commands,
 each at most once and in this order:
 
 ```text
@@ -128,15 +137,15 @@ Handling BlockProcessor's existing `Live` command enqueues `Live` to its
 lifecycle-marker worker; `EnteredLive` does not trigger API delivery. After
 that command, no later marker exists for the session.
 
-Deactivate closes the local marker-command input but does not wait for a
-marker command already accepted there. The worker drains its accepted commands
-and exits after delivery, or exits when a later `ApiService::reset` call drops
-the old receiver.
-It holds no validated RPC or DB client and therefore cannot delay processing
-session teardown or resource-generation replacement. If no marker is pending,
-it exits immediately.
+Shutdown closes the local marker-command input. The worker drains accepted
+commands and exits after delivery, or exits when ApiService replacement or
+shutdown drops that session feed's receiver. The worker owns only its clone of
+the session-scoped `GraphUpdateProducer` and no validated RPC or DB client.
+BlockProcessor joins it as part of terminal shutdown; the processing lifecycle
+owns the cross-component ordering that ensures a closed receiver can release a
+blocked lossless delivery. If no marker is pending, it exits immediately.
 
-The local notification gate closes on Begin and opens on Catchup. Continue
+The local notification gate starts closed and opens on Catchup. Continue
 polling its receiver while closed and discard received notifications
 immediately. Do not accumulate them for later processing. NodeService rejects
 an Enabled BlockAdded that cannot become a `ValidatedNodeBlock` before it
@@ -170,6 +179,12 @@ Handle its typed semantic failures in this precedence order:
 4. The same missing-only result during Catchup or Live admits the block to
    OrphanManager with the complete missing set.
 
+`block_presence` failures and the `Database(ProcessingDbError)` branch of
+`MaterializeBlockError` retain Storage's typed normalization. BlockProcessor
+reports the corresponding cross-worker fault through the
+[processing-lifecycle mapping](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
+without inspecting diagnostics or reclassifying the database outcome.
+
 PreSeal boundary absences are accepted only through
 `AllowBoundaryIdentities`; they do not produce
 `NonMaterializedReferences`. An `IncomingBoundaryIdentity` remains a violation
@@ -197,7 +212,8 @@ order. A notification proven below the sealed PP is discarded as invalid.
 Legitimate delayed notifications at or above the bound may deduplicate,
 materialize, or orphan normally.
 
-Begin resets BlockProcessor's overlap state. Catchup starts accounting with:
+Post-preparation initialization sets BlockProcessor's overlap state. Catchup
+starts accounting with:
 
 ```text
 SourceBits::SYNTHETIC
@@ -211,7 +227,7 @@ When the notification bit is already present for a hash, silently discard the
 second BlockAdded before materialization or orphan admission. It changes no
 source bit, earns no overlap credit, and requests no recovery. Implementations
 may count it diagnostically. GetBlocks hashes may repeat across responses, so
-ResyncEngine filters synthetic repeats before dispatch; a filtered repeat earns
+ProcessingSession filters synthetic repeats before dispatch; a filtered repeat earns
 no overlap credit. Complete-page observation and synthetic repeat-filtering
 rules belong to the [processing lifecycle](processing-lifecycle.md).
 
@@ -232,7 +248,7 @@ It carries the point and selected parent required by downstream consumers.
 Every delivered `PersistedBlock` represents a non-Genesis block and therefore
 has a mandatory selected parent. Genesis never enters the ordinary
 BlockProcessor-to-consumer `PersistedBlock` path; VspcProcessor instead
-constructs its initial history record from the Begin anchor. No
+constructs its initial history record from the session anchor. No
 VSPC `added` or `removed` member is Genesis, although a derived VSPC source may
 be Genesis.
 
@@ -265,9 +281,11 @@ A later session rederives authoritative state from the database.
 
 ## OrphanManager — settled
 
-OrphanManager is an asynchronous child owned by BlockProcessor. It has a
-prioritized unbounded command input and a bounded data-message input so
-lifecycle commands remain prompt.
+The [system control tree](overview.md#system-shape--settled) defines
+OrphanManager's component parent and child relationships. OrphanManager is the
+sole producer of DependencyResolver work, and its resolver command and work
+channels are private. OrphanManager has a prioritized unbounded command input
+and a bounded data-message input so lifecycle commands remain prompt.
 
 It owns:
 
@@ -278,17 +296,24 @@ It owns:
 - dependency request selection; and
 - cancellation when natural arrival makes a request unnecessary.
 
-Messages include new orphan, `BlockPersisted`, dependency result/failure, and
-capacity/topology updates. `BlockPersisted` resolves every affected edge.
-Every newly ready orphan is removed from orphan storage and returned through
-BlockProcessor's Intern/resolved lane. No waiter belongs in the committed
-block index, and deduplicated hashes are harmless.
+Messages from BlockProcessor include new orphan, `BlockPersisted`, and
+capacity/topology updates. DependencyResolver results return directly to
+BlockProcessor's Intern/resolved lane; BlockProcessor retains result
+classification and materialization and reports the resulting `AddOrphan` or
+`BlockPersisted` state change to OrphanManager. `BlockPersisted` resolves every
+affected edge. Every newly ready orphan is removed from orphan storage and
+returned through the same BlockProcessor lane. No waiter belongs in the
+committed block index, and deduplicated hashes are harmless.
 
-Begin and Deactivate clear or cancel run-local state. Deactivate acknowledges
-only after descendants have stopped. After a resolver RPC succeeds, keep its
-hash in `resolution_pending` until OrphanManager observes `AddOrphan` or
-`BlockPersisted` for that hash. RPC completion alone must not reopen the
-request gap before BlockProcessor accounts for the result.
+BlockProcessor constructs OrphanManager with empty run-local state and its
+private DependencyResolver, which receives the session's exact RPC generation
+directly. Terminal shutdown is transitive: OrphanManager stops resolver work
+admission, cancels and joins resolver tasks, releases the child's RPC-generation
+clone, and completes its own barrier before acknowledging BlockProcessor.
+After a resolver RPC succeeds, keep its hash in
+`resolution_pending` until OrphanManager observes `AddOrphan` or
+`BlockPersisted` for that hash. RPC completion alone must not reopen the request
+gap before BlockProcessor accounts for the result.
 
 Dependency selection uses orphan topology only. Age and DAA score are not
 inputs. Define:
@@ -308,8 +333,12 @@ the topology consumes no additional slot. If admitting a new orphan would
 exceed capacity, reject that block before changing orphan storage, reverse
 indexes, topology, or `resolution_pending`; do not evict an existing orphan.
 OrphanManager reports `BoundedStateExhausted(Orphans)` through BlockProcessor,
-then both admit only lifecycle commands until Deactivate clears their retained
-run-local state and descendants. The
+then BlockProcessor and OrphanManager admit only the terminal shutdown command.
+Entering
+this or any other terminal local fault state immediately closes resolver work
+admission and cancels and joins DependencyResolver. The acknowledged shutdown
+barrier confirms that the child is stopped and its RPC-generation clone is
+released. The
 [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
 owns routing shutdown and recovery disposition.
 
@@ -322,8 +351,8 @@ independent age fallback is required.
 
 ## DependencyResolver — settled
 
-DependencyResolver is owned for lifecycle by BlockProcessor and driven by
-OrphanManager. It has:
+The [system control tree](overview.md#system-shape--settled) owns
+DependencyResolver's component parent. Its local worker contract has:
 
 - separate command and bounded work channels;
 - the processing session's exact `Arc<ValidatedRpcClient>`;
@@ -341,6 +370,10 @@ Dependency resolution is exceptional repair work rather than an intensive
 steady-state RPC lane. The limit allows parallel release of orphan topology
 without dominating the validated node connection.
 DependencyResolver reports active and permit-waiting RPC operations.
+
+DependencyResolver is constructed with the session's exact RPC generation and
+an empty work queue before OrphanManager is exposed to BlockProcessor. It is
+never rebound to another generation.
 
 OrphanManager sends Resolve work and `Cancel(hash)` when a block arrives
 naturally. It owns the pending set and prevents duplicate requests. Resolver
@@ -361,7 +394,14 @@ For OrphanManager-to-Resolver bounded work sends, full reports
 `SessionContinuityLost`, while closed or unavailable reports
 `Ownership(SessionDataEndpointLost)`. Their dispositions belong to the shared
 [session-channel policy](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
-Deactivation cancels and joins tasks and releases descendant
-session-resource clones before acknowledging. BlockProcessor continues
-draining and discarding child results while joining descendants so a full
-result channel cannot deadlock the barrier.
+Resolver control-path faults and unexpected termination follow the
+[owner-directed fault route](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
+During OrphanManager's transitive Shutdown barrier,
+BlockProcessor continues draining and discarding resolver results so a full
+result channel cannot deadlock task cancellation and join.
+Cancelling a resolver task through `Cancel(hash)` or the transitive Shutdown
+barrier prevents that task from delivering a resolver result. If the validated
+RPC operation itself returns `NodeError::Cancelled` while BlockProcessor
+remains active, BlockProcessor reports the lifecycle-owned active-cancellation
+fault; it does not treat that result as successful resolver cancellation or
+leave the dependency pending silently.

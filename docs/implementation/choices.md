@@ -548,7 +548,7 @@ Use one generation-local `tokio::sync::RwLock` as the shared processing
 mutation guard. Materialization and VSPC mutations hold read permits in
 addition to their independent lane mutexes, so those lanes retain their
 permitted overlap. Rebuild will acquire the write permit with `try_write`; it
-will not wait behind an unexpected mutation after processor deactivation.
+will not wait behind an unexpected mutation after predecessor-session shutdown.
 
 Group the four independent Moka domains in one `ProcessingCacheDomains` value
 and hold the current value through `ArcSwap`. Short synchronous interactions
@@ -590,3 +590,111 @@ than from later publication. Once the transaction begins, it runs to a definite
 or ambiguous database outcome even if lifecycle retirement is selected
 concurrently; the worker then applies the exact outcome to the already selected
 lifecycle disposition.
+
+## 12 October 2026: Processing child workers
+
+### Module and channel boundaries
+
+Keep OrphanManager and DependencyResolver in private `block_processor::orphan`
+and `block_processor::dependency` modules. Their owner-facing data values stay
+beside BlockProcessor so the later processor loop can consume one resolution
+lane without exposing child protocols from `kgi-processing`. Keep shared typed
+child control failures, worker faults, and session-data path diagnostics in
+the private `block_processor::error` module; operation-local topology errors
+remain with their implementation.
+
+Use separate `tokio::sync::mpsc::unbounded_channel` command mailboxes and
+bounded Tokio data mailboxes. Explicit command draining precedes every lower
+priority receive. Size every processing data mailbox with the capacity owned
+by the [processing lifecycle](../architecture/processing-lifecycle.md#supervisor-and-recovery-intent--settled).
+Terminal shutdown acknowledgements use Tokio one-shots.
+
+Construct processing data mailboxes through the foundational
+`kgi_core::channel::bounded_channel` wrapper. It preserves Tokio's bounded
+sender, receiver, and full/closed result behavior while maintaining one shared
+current-occupancy and sticky high-water snapshot. The same wrapper crosses the
+NodeService notification-routing boundary, so notification callbacks and the
+processor owner expose one measurement for the same queue. Prioritized command
+mailboxes and the separately owned graph-update ingress do not use this
+wrapper.
+
+The DependencyResolver worker is private and generic over a minimal async RPC
+operation adapter. OrphanManager constructs that child with the exact
+`Arc<ValidatedRpcClient>` supplied to the session; tests instantiate
+the same nested workers with deterministic RPC behavior. The adapter uses
+static dispatch and does not create a public mock surface or boxed futures.
+
+### Orphan topology and resolver scheduling
+
+Represent orphan storage by block hash, each block's distinct unresolved
+reference set, and a reverse missing-hash-to-dependent-block index.
+Keep the focused owner's `resolution_pending` state as a distinct hash set.
+
+When active, rank frontier hashes by the number of distinct stored orphans
+transitively blocked behind them, with block hash as a deterministic tie
+breaker. Send Resolve requests in that order. This realizes the focused
+owner's topology-only maximum-release policy without using arrival time or
+consensus scores. Resolve and best-effort Cancel use the same bounded FIFO
+mailbox, preserving their single-producer causal order.
+
+DependencyResolver enforces the
+[architecture-owned local allowance](../architecture/block-processing.md#dependencyresolver--settled)
+with a Tokio semaphore. Tasks waiting for a local permit and tasks holding one
+are measured separately. Per-hash cancellation aborts either state. Terminal
+Shutdown aborts and joins all tasks before acknowledging.
+
+### Lifecycle-marker worker primitive
+
+Use a Tokio unbounded MPSC channel for the BlockProcessor-owned marker worker.
+Its architecture-owned protocol admits at most the two ordered commands for
+one session, so the channel is intrinsically bounded by the producer protocol
+while keeping command handoff independent of graph-update-channel capacity.
+Dropping the sole command sender closes the input and the worker drains
+accepted commands. The graph-update producer remains the sole owner of
+lossless marker backpressure and receiver-closure classification, and
+BlockProcessor joins the worker during terminal session shutdown.
+
+### BlockProcessor owner loop
+
+Keep the one-session BlockProcessor loop in the private
+`block_processor::processor` module. Use the same prioritized unbounded command
+mailbox and separate bounded Tokio mailboxes for resolved, notification, and
+synthetic inputs. Represent Catchup source accounting with a compact bit value
+stored by block hash, and expose overlap observation through a cloneable
+read-only wrapper around `Arc<AtomicBool>`.
+
+Use private statically dispatched database and RPC adapters for deterministic
+owner-loop tests. The production implementations delegate directly to
+`ValidatedDbClient` and `ValidatedRpcClient`; the adapters add no boxed future,
+public mock API, or alternate runtime behavior. Preserve child-fault provenance
+as a typed `Component` field while forwarding it through OrphanManager.
+
+Keep marker-worker receiver closure in a shared atomic flag so a later local
+handoff failure can remain distinct from an internal command-path failure. The
+flag is diagnostic coordination inside the worker primitive; graph-update gate
+state and delivery semantics remain owned by the ingress capability.
+
+## 14 October 2026: VspcProcessor owner loop
+
+Keep the one-session VspcProcessor in the private `vspc_processor` module. Use
+an unbounded Tokio command mailbox and separate bounded mailboxes for
+notification and synthetic changes; receive BlockProcessor's persisted-block
+stream through its separately bounded channel. Drain commands before data and
+use one consuming one-shot acknowledgement for terminal shutdown.
+
+Represent pending candidates with monotonically allocated local `u64` keys.
+Use hash maps for candidate, missing-hash, and notification-destination
+indexes, a `BTreeMap<ConsensusOrder, PendingId>` for resolved notification
+selection, and a `VecDeque<PendingId>` for the synthetic FIFO. Keep the two
+materialization-history indexes in private hash and ordered maps and update
+them within one synchronous worker transition. This is the concrete
+implementation of the structures owned by the
+[VSPC processing contract](../architecture/vspc-processing.md#pending-state-and-history--settled),
+not an additional protocol.
+
+Expose overlap through a cloneable read-only wrapper around `Arc<AtomicBool>`
+and pending occupancy through a small mutex-protected metrics snapshot. Use
+private statically dispatched database and RPC adapters for focused tests; the
+production adapters delegate to the exact `ValidatedDbClient` and
+`ValidatedRpcClient` retained by the worker and add no public mock surface or
+boxed futures.

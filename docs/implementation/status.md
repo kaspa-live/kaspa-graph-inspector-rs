@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 11 October 2026.
+Updated 14 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -20,7 +20,10 @@ fault, status, VSPC, and committed graph-update values are implemented against
 the selected rusty-kaspa `v2.1.0` value crates. The session-scoped graph-update
 ingress implements the shared pre-seal gate, nonblocking ordinary offers,
 lossless lifecycle markers, coalescing gap observation, and ingress metrics.
-Processing and API service crates remain behavior-free scaffolds. The first
+The API service crate remains behavior-free scaffolding. The processing crate
+contains the session-scoped BlockProcessor and VspcProcessor slices described
+below.
+The first
 StorageService implementation slice selects SQLx with PostgreSQL and Rustls,
 embeds the forward-only metadata and processing-schema migrations, acquires the
 dedicated advisory ownership lock, classifies database bootstrap states, and
@@ -81,6 +84,11 @@ before and after fresh API publication, pre-commit connection loss with
 rolled-back truth, and ambiguous commit with truth-derived processing
 republication. No open architecture requirement currently blocks the remaining
 storage work.
+Validated processing operations now normalize their common failures through
+`ProcessingDbError`, while materialization, VSPC mutation, and Rebuild retain
+their operation-specific semantic wrappers. Internal and non-persisted
+representation failures remain distinct from invalid persisted-state evidence
+before crossing into processing.
 
 The imported browser still uses the v1 graph data source, models, and update
 behavior, so it is not yet compatible with the v2 HTTP, SSE, publication, and
@@ -152,6 +160,59 @@ and provides terminal idempotent shutdown. Deterministic tests cover the owner
 loop, subscription failure paths, publication and retirement order, IBD gate,
 retry sequence and reset boundary, and the operation-retirement completion
 barrier.
+
+The processing-worker increment is complete through its standalone processor
+boundary. Private OrphanManager and DependencyResolver child loops are
+implemented. Each worker tree is constructed inert with
+its exact session resources, launched once after initialization, and consumed
+through terminal shutdown; no reusable Begin, Deactivate, or generation-rebind
+path remains. OrphanManager owns bounded normalized-block storage, reverse
+missing-reference topology, topology-ranked frontier selection, logical
+resolution-pending state, natural-arrival cancellation, and induced ready-block
+delivery. It owns DependencyResolver as a private child; that worker owns the
+exact session RPC generation, its local concurrency allowance, cancellable
+GetBlock tasks, and typed result delivery without reclassifying node outcomes.
+Separate prioritized command paths preempt bounded data backlogs. Existing
+focused tests cover inert construction, reverse-topology release, exact
+threshold and capacity boundaries, maximum-release ordering, pending-state
+retention, Resolve/Cancel FIFO order, active and waiting RPC limits,
+node-outcome preservation, nested fault propagation, full-result-channel
+failure, cancellation, terminal backlog preemption, and exact RPC-generation
+release. Unexpected loss of an active processor or descendant command path is
+reported through the typed ownership-fault path rather than interpreted as
+ordinary shutdown.
+The BlockProcessor-owned lifecycle-marker worker provides the nonblocking
+two-command local FIFO, lossless graph-ingress delivery, accepted-command drain
+after local closure, and receiver-closure termination without retaining RPC or
+database generations. Terminal BlockProcessor shutdown joins it after draining
+accepted markers. The BlockProcessor owner loop implements explicit input
+priority, notification gating, phase-specific materialization policy, PostSeal
+transition, graph-before-persisted delivery, Catchup lower-bound and
+source-overlap accounting, child fault provenance, and typed storage and node
+fault normalization. Focused tests cover inert construction and initialization,
+single launch, final startup-handoff failure, Genesis and non-Genesis marker
+paths, strict sealing, closed-gate discard, late notification filtering, exact
+overlap, post-commit delivery loss, API receiver closure, terminal input
+preemption, complete descendant joining, and session-generation release.
+The VspcProcessor owner loop now retains its exact session RPC and processing
+database generations, anchor-derived sink and materialization history,
+multi-index pending state, synthetic FIFO, ordered resolved notifications,
+overlap flag, and pending metrics. Its inert construction and single launch,
+strict command priority, event-before-block resolution, notification collision and
+capacity handling, synthetic priority, Catchup filtering and crossing,
+component-local Live transition, one-batch member resolution, typed path
+attribution, definite-commit graph publication, terminal state clearing, and
+generation release have focused coverage. Every bounded processing data
+mailbox now exposes current occupancy and sticky high-water measurements
+through the processor snapshots; exact-capacity tests cover the BlockProcessor
+notification and synthetic inputs, resolution delivery, OrphanManager input,
+DependencyResolver work, persisted-block delivery, and both VspcProcessor
+inputs. Together with the previously
+completed session-scoped graph-update ingress, these workers complete
+implementation-sequence step 5. ProcessingSession construction,
+synthetic pump ownership, notification-router endpoint installation, global
+Live coordination, and Supervisor event handling remain for the integration
+point.
 
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.

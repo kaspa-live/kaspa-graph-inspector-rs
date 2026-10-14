@@ -71,8 +71,9 @@ impl NodeService {
 `NodeServiceState` and published status outlive individual validated client
 generations. Connection validation precedes publication of every generation.
 NodeService autonomously connects, validates, retires, reconnects, and
-republishes without a request from Supervisor or ResyncEngine. It reports every
-generation transition through one reliable ordered `NodeServiceEvent` stream.
+republishes without a request from Supervisor or ProcessingSession. It reports
+every generation transition through one reliable ordered `NodeServiceEvent`
+stream.
 The event path must be installed before NodeService can publish its initial
 generation or enter `Rejected`.
 
@@ -360,8 +361,10 @@ inclusive-low-hash contract used by the pump.
 
 ### NotificationRouter
 
-`NotificationRouter` implements rusty-kaspa's `Notify` trait and owns the two
-bounded senders to the processors.
+`NotificationRouter` implements rusty-kaspa's `Notify` trait. While enabled
+for one processing session, it owns that session's bounded BlockProcessor and
+VspcProcessor senders plus its reliable fault destination. Disabled and
+Retired routers retain none of those session endpoints.
 
 Router states:
 
@@ -409,6 +412,7 @@ Kaspa path properties under the
 Enable ordering:
 
 ```text
+install the fresh session's block, VSPC, and fault endpoints
 start BlockAdded remotely
 start VirtualChainChanged remotely
 enable router only when both succeeded
@@ -417,13 +421,16 @@ publish subscription Enabled only when both succeeded
 
 The
 [processing lifecycle](processing-lifecycle.md#entering-recovery-phases)
-owns activation invocation and its caller-side preconditions. Once invoked,
-NodeService owns the complete activation sequence above.
+owns activation invocation, supplies the three fresh endpoints as direct
+arguments, and owns its caller-side preconditions. Once invoked, NodeService
+owns the complete activation sequence above. Reusing a still-valid
+`ValidatedRpcClient` in a later processing session installs only the later
+session's endpoints; activation never resolves through an old sender.
 
 Disable ordering:
 
 ```text
-disable router immediately
+disable router and clear all installed session endpoints immediately
 stop both remote subscriptions
 ```
 
@@ -435,12 +442,12 @@ and subscription state Disabled, clears the installed notification channels,
 keeps the exact validated handle admitted, and emits no `RpcRetired` event.
 
 When activation rollback cannot be proven, or either remote unsubscription
-fails, NodeService disables the router, retires the exact validated handle,
-enqueues `RpcRetired` before completing the operation, and returns
-`GenerationLost`. Disable attempts still issue both remote stops before this
-retirement decision. Cancellation or an independently observed retirement
-retains its existing typed outcome rather than being reclassified as a
-subscription-control failure. The
+fails, NodeService disables the router, clears the installed session endpoints,
+retires the exact validated handle, enqueues `RpcRetired` before completing
+the operation, and returns `GenerationLost`. Disable attempts still issue both
+remote stops before this retirement decision. Cancellation or an independently
+observed retirement retains its existing typed outcome rather than being
+reclassified as a subscription-control failure. The
 [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
 owns the cross-worker fault and disposition of the generation-preserving
 result and the coalescing of a generation-ending result with `RpcRetired`.
@@ -484,9 +491,11 @@ MAX_RPC_CONCURRENCY = 32
 Every runtime operation waits cancellably for a permit before issuing its RPC.
 Permit waiting is ordinary local backpressure, not notification loss or a
 recovery fault. DependencyResolver independently admits at most its
-BlockProcessor-owned concurrency limit, leaving capacity for recovery and VSPC
-operations. Connection validation precedes publication and remains sequential;
-it does not consume this runtime budget.
+concurrency limit owned by the focused
+[block-processing contract](block-processing.md#dependencyresolver--settled),
+leaving capacity for recovery and VSPC operations. Connection validation
+precedes publication and remains sequential; it does not consume this runtime
+budget.
 NodeService reports active and permit-waiting runtime RPC operations.
 
 #### GetBlock not-found compatibility classification
@@ -527,6 +536,14 @@ The raw message remains diagnostic outside this private adapter.
 Cancellation and generation loss are established by KGI-owned operation state,
 not inferred from the flattened error. If either wins the operation-completion
 race, its existing typed outcome takes precedence over `RpcRequestFailed`.
+For a runtime operation on a validated generation, `Cancelled` means
+NodeService intentionally cancelled that exact generation during terminal
+service shutdown; it is not an independently requested cancellation of one
+RPC. Notification-subscription transitions retain their locally defined use of
+the same typed outcome. The
+[processing lifecycle](processing-lifecycle.md#termination-triggered-global-shutdown--settled)
+owns the ordering that prevents a running processor from observing runtime
+generation cancellation and the disposition if that ordering is violated.
 Validation RPCs and notification subscription control retain their dedicated
 lifecycle contracts rather than using this runtime-operation outcome.
 The [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)

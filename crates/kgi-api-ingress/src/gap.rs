@@ -1,16 +1,16 @@
-use crate::channel::GraphUpdateIngressMetrics;
+use crate::channel::GraphUpdateChannelState;
 use tokio::sync::watch;
 
 /// Producer-side reporter for a lost ordinary graph update.
 #[derive(Clone, Debug)]
 pub(crate) struct GraphUpdateGapReporter {
     generation: watch::Sender<u64>,
-    metrics: GraphUpdateIngressMetrics,
+    channel_state: GraphUpdateChannelState,
 }
 
 impl GraphUpdateGapReporter {
-    pub(crate) fn new(generation: watch::Sender<u64>, metrics: GraphUpdateIngressMetrics) -> Self {
-        Self { generation, metrics }
+    pub(crate) fn new(generation: watch::Sender<u64>, channel_state: GraphUpdateChannelState) -> Self {
+        Self { generation, channel_state }
     }
 
     /// Advances the session gap generation and publishes its newest value.
@@ -22,7 +22,7 @@ impl GraphUpdateGapReporter {
     ///
     /// Panics if the generation exceeds `u64::MAX`.
     pub(crate) fn report(&self) {
-        let next = self.metrics.advance_gap_generation().expect("graph-update gap generation overflow");
+        let next = self.channel_state.advance_gap_generation().expect("graph-update gap generation overflow");
         self.generation.send_replace(next);
     }
 }

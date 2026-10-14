@@ -213,7 +213,7 @@ fn identity(
     identities
         .get(&hash)
         .copied()
-        .ok_or_else(|| TransactionAttemptError::Storage(StorageError::invalid_metadata("Rebuild reference identity was not interned")))
+        .ok_or_else(|| TransactionAttemptError::Storage(StorageError::internal_failure("Rebuild reference identity was not interned")))
 }
 
 fn ids(

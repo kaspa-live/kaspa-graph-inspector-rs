@@ -18,9 +18,9 @@ use tokio::sync::{Mutex, RwLock, oneshot, watch};
 
 use crate::{
     cache::{CachedVspcSink, ProcessingCaches},
-    error::StorageError,
+    error::{ProcessingDbError, StorageError},
     identity,
-    operation::ResolveMaterializedIdsError,
+    operation::{RebuildFromPruningPointError, ResolveMaterializedIdsError},
     replacement::{ApiDbReadLease, ApiReplacementGate},
     runtime::{RebuildRequest, RebuildSender, RetirementRequest, RetirementSender, RetirementTarget},
     state::ProcessingStateInspection,
@@ -211,8 +211,11 @@ impl ValidatedDbClient {
     }
 
     /// Loads fresh local processing state for one recovery-session attempt.
-    pub async fn load_session_state(&self) -> Result<StoredSessionState, StorageError> {
-        let state = self.run_operation(|| ProcessingStateInspection::load(self.runtime.pool(), self.binding)).await?;
+    pub async fn load_session_state(&self) -> Result<StoredSessionState, ProcessingDbError> {
+        let state = self
+            .run_operation(|| ProcessingStateInspection::load(self.runtime.pool(), self.binding))
+            .await
+            .map_err(ProcessingDbError::query)?;
         if let StoredSessionState::Initialized(snapshot) = state {
             self.caches
                 .load()
@@ -222,15 +225,19 @@ impl ValidatedDbClient {
     }
 
     /// Resolves one hash without creating or promoting a persistent identity.
-    pub async fn block_presence(&self, hash: BlockHash) -> Result<BlockPresence, StorageError> {
+    pub async fn block_presence(&self, hash: BlockHash) -> Result<BlockPresence, ProcessingDbError> {
         let caches = self.caches.load_full();
-        self.run_operation(|| identity::block_presence(self.runtime.pool(), &caches, hash)).await
+        self.run_operation(|| identity::block_presence(self.runtime.pool(), &caches, hash)).await.map_err(ProcessingDbError::query)
     }
 
     /// Resolves an ordered hash batch only when every position is materialized.
     pub async fn resolve_materialized_ids(&self, hashes: &[BlockHash]) -> Result<Box<[CompactId]>, ResolveMaterializedIdsError> {
         let caches = self.caches.load_full();
-        match self.run_operation(|| identity::resolve_materialized_ids(self.runtime.pool(), &caches, hashes)).await? {
+        match self
+            .run_operation(|| identity::resolve_materialized_ids(self.runtime.pool(), &caches, hashes))
+            .await
+            .map_err(ProcessingDbError::query)?
+        {
             identity::MaterializedIdResolution::Resolved(ids) => Ok(ids),
             identity::MaterializedIdResolution::NonMaterialized { missing, identity_only } => {
                 Err(ResolveMaterializedIdsError::NonMaterialized { missing, identity_only })
@@ -239,16 +246,21 @@ impl ValidatedDbClient {
     }
 
     /// Atomically replaces all processing data with one validated pruning-point anchor.
-    pub async fn rebuild_from_pruning_point(&self, pruning_point: ValidatedNodeBlock) -> Result<MaterializedSyncAnchor, StorageError> {
-        rebuild::validate_input(&pruning_point)?;
+    pub async fn rebuild_from_pruning_point(
+        &self,
+        pruning_point: ValidatedNodeBlock,
+    ) -> Result<MaterializedSyncAnchor, RebuildFromPruningPointError> {
+        rebuild::validate_input(&pruning_point)
+            .map_err(ProcessingDbError::mutation)
+            .map_err(RebuildFromPruningPointError::Database)?;
         if !self.is_valid() {
-            return Err(StorageError::GenerationLost);
+            return Err(RebuildFromPruningPointError::Database(ProcessingDbError::GenerationLost));
         }
         let (completion, acknowledgement) = oneshot::channel();
         self.rebuild_tx
             .send(RebuildRequest::new(self.runtime.self_weak.clone(), pruning_point, completion))
-            .map_err(|_| StorageError::ControlUnavailable)?;
-        acknowledgement.await.map_err(|_| StorageError::ControlUnavailable)?
+            .map_err(|_| rebuild_error(StorageError::ControlUnavailable))?;
+        acknowledgement.await.map_err(|_| rebuild_error(StorageError::ControlUnavailable))?.map_err(rebuild_error)
     }
 
     #[allow(dead_code, reason = "used by processing operations in the persistence increment")]
@@ -332,6 +344,16 @@ impl ValidatedDbClient {
             result
         })
         .await
+    }
+}
+
+fn rebuild_error(error: StorageError) -> RebuildFromPruningPointError {
+    match error {
+        StorageError::RebuildSetupFailed(reason) => RebuildFromPruningPointError::Setup(reason),
+        StorageError::ReplacementControlUnavailable { diagnostic } => {
+            RebuildFromPruningPointError::ReplacementControlUnavailable { diagnostic }
+        }
+        error => RebuildFromPruningPointError::Database(ProcessingDbError::mutation(error)),
     }
 }
 

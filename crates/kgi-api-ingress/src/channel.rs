@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use kgi_model::graph_update::{BlockCommitted, GraphUpdate, VspcCommitted};
@@ -66,12 +66,12 @@ pub struct GraphUpdateIngressMetricsSnapshot {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct GraphUpdateIngressMetrics {
-    inner: Arc<Mutex<GraphUpdateIngressMetricsInner>>,
+pub(crate) struct GraphUpdateChannelState {
+    inner: Arc<Mutex<GraphUpdateChannelStateInner>>,
 }
 
 #[derive(Debug, Default)]
-struct GraphUpdateIngressMetricsInner {
+struct GraphUpdateChannelStateInner {
     current_occupancy: usize,
     high_water_mark: usize,
     reported_gap_count: u64,
@@ -85,76 +85,29 @@ enum GraphUpdateTrySendError {
     Closed,
 }
 
-impl GraphUpdateIngressMetrics {
+impl GraphUpdateChannelState {
     fn new() -> Self {
-        Self { inner: Arc::new(Mutex::new(GraphUpdateIngressMetricsInner::default())) }
+        Self { inner: Arc::new(Mutex::new(GraphUpdateChannelStateInner::default())) }
     }
 
-    fn send_reserved(&self, permit: mpsc::Permit<'_, GraphUpdate>, update: GraphUpdate) -> Result<(), GraphUpdateProducerError> {
-        let mut inner = self.inner.lock().expect("graph-update metrics mutex poisoned");
-        if inner.receiver_closed {
-            return Err(GraphUpdateProducerError::ReceiverClosed);
-        }
-
-        Self::record_enqueue(&mut inner);
-        permit.send(update);
-        Ok(())
-    }
-
-    fn try_send(&self, tx: &mpsc::Sender<GraphUpdate>, update: GraphUpdate) -> Result<(), GraphUpdateTrySendError> {
-        let mut inner = self.inner.lock().expect("graph-update metrics mutex poisoned");
-        if inner.receiver_closed {
-            return Err(GraphUpdateTrySendError::Closed);
-        }
-
-        match tx.try_send(update) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => return Err(GraphUpdateTrySendError::Full),
-            Err(mpsc::error::TrySendError::Closed(_)) => return Err(GraphUpdateTrySendError::Closed),
-        }
-        Self::record_enqueue(&mut inner);
-        Ok(())
-    }
-
-    fn record_enqueue(inner: &mut GraphUpdateIngressMetricsInner) {
-        inner.current_occupancy = inner.current_occupancy.checked_add(1).expect("graph-update occupancy overflow");
-        inner.high_water_mark = inner.high_water_mark.max(inner.current_occupancy);
-    }
-
-    fn dequeued(&self) {
-        let mut inner = self.inner.lock().expect("graph-update metrics mutex poisoned");
-        inner.current_occupancy = inner.current_occupancy.checked_sub(1).expect("graph-update occupancy underflow");
+    fn lock(&self) -> MutexGuard<'_, GraphUpdateChannelStateInner> {
+        self.inner.lock().expect("graph-update channel-state mutex poisoned")
     }
 
     pub(crate) fn advance_gap_generation(&self) -> Option<u64> {
-        let mut inner = self.inner.lock().expect("graph-update metrics mutex poisoned");
+        let mut inner = self.lock();
         let generation = inner.reported_gap_count.checked_add(1)?;
         inner.reported_gap_count = generation;
         Some(generation)
     }
 
-    fn close_receiver(&self, rx: &mut mpsc::Receiver<GraphUpdate>) {
-        let mut inner = self.inner.lock().expect("graph-update metrics mutex poisoned");
-        rx.close();
-        if !inner.receiver_closed {
-            inner.receiver_closed = true;
-            inner.receiver_closure_count = inner.receiver_closure_count.checked_add(1).expect("receiver-closure count overflow");
-        }
-    }
-
-    fn drop_receiver(&self, rx: &mut mpsc::Receiver<GraphUpdate>) {
-        let mut inner = self.inner.lock().expect("graph-update metrics mutex poisoned");
-        rx.close();
-        if !inner.receiver_closed {
-            inner.receiver_closed = true;
-            inner.receiver_closure_count = inner.receiver_closure_count.checked_add(1).expect("receiver-closure count overflow");
-        }
-        inner.current_occupancy = 0;
+    fn record_dequeue(&self) {
+        self.lock().record_dequeue();
     }
 
     #[must_use]
     fn snapshot(&self) -> GraphUpdateIngressMetricsSnapshot {
-        let inner = self.inner.lock().expect("graph-update metrics mutex poisoned");
+        let inner = self.lock();
         GraphUpdateIngressMetricsSnapshot {
             current_occupancy: inner.current_occupancy,
             high_water_mark: inner.high_water_mark,
@@ -164,17 +117,35 @@ impl GraphUpdateIngressMetrics {
     }
 }
 
+impl GraphUpdateChannelStateInner {
+    fn record_enqueue(&mut self) {
+        self.current_occupancy = self.current_occupancy.checked_add(1).expect("graph-update occupancy overflow");
+        self.high_water_mark = self.high_water_mark.max(self.current_occupancy);
+    }
+
+    fn record_dequeue(&mut self) {
+        self.current_occupancy = self.current_occupancy.checked_sub(1).expect("graph-update occupancy underflow");
+    }
+
+    fn record_receiver_closed(&mut self) {
+        if !self.receiver_closed {
+            self.receiver_closed = true;
+            self.receiver_closure_count = self.receiver_closure_count.checked_add(1).expect("receiver-closure count overflow");
+        }
+    }
+}
+
 /// Cloneable producer capability for one processing session.
 #[derive(Clone, Debug)]
 pub struct GraphUpdateProducer {
     tx: mpsc::Sender<GraphUpdate>,
     gate: Arc<GraphUpdateGate>,
-    metrics: GraphUpdateIngressMetrics,
+    channel_state: GraphUpdateChannelState,
 }
 
 impl GraphUpdateProducer {
-    fn new(tx: mpsc::Sender<GraphUpdate>, gate: Arc<GraphUpdateGate>, metrics: GraphUpdateIngressMetrics) -> Self {
-        Self { tx, gate, metrics }
+    fn new(tx: mpsc::Sender<GraphUpdate>, gate: Arc<GraphUpdateGate>, channel_state: GraphUpdateChannelState) -> Self {
+        Self { tx, gate, channel_state }
     }
 
     /// Nonblockingly offers a committed block update to the session feed.
@@ -208,7 +179,7 @@ impl GraphUpdateProducer {
             return Ok(GraphUpdateOfferOutcome::SuppressedPreSeal);
         }
 
-        match self.metrics.try_send(&self.tx, update) {
+        match self.try_send(update) {
             Ok(()) => Ok(GraphUpdateOfferOutcome::Enqueued),
             Err(GraphUpdateTrySendError::Full) => {
                 self.gate.gap.report();
@@ -233,7 +204,7 @@ impl GraphUpdateProducer {
         let mut state = self.gate.state.lock().expect("graph-update gate mutex poisoned");
         assert_eq!(*state, GraphUpdateGateState::PreSeal, "PublishPostSeal requires the PreSeal graph-update gate");
 
-        match self.metrics.try_send(&self.tx, GraphUpdate::PublishPostSeal) {
+        match self.try_send(GraphUpdate::PublishPostSeal) {
             Ok(()) => {
                 *state = GraphUpdateGateState::Open;
                 Ok(())
@@ -270,13 +241,39 @@ impl GraphUpdateProducer {
 
         let permit = self.tx.reserve().await.map_err(|_| GraphUpdateProducerError::ReceiverClosed)?;
         after_reservation.await;
-        self.metrics.send_reserved(permit, GraphUpdate::Live)
+        self.send_reserved(permit, GraphUpdate::Live)
+    }
+
+    fn try_send(&self, update: GraphUpdate) -> Result<(), GraphUpdateTrySendError> {
+        let mut channel_state = self.channel_state.lock();
+        if channel_state.receiver_closed {
+            return Err(GraphUpdateTrySendError::Closed);
+        }
+
+        match self.tx.try_send(update) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => return Err(GraphUpdateTrySendError::Full),
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(GraphUpdateTrySendError::Closed),
+        }
+        channel_state.record_enqueue();
+        Ok(())
+    }
+
+    fn send_reserved(&self, permit: mpsc::Permit<'_, GraphUpdate>, update: GraphUpdate) -> Result<(), GraphUpdateProducerError> {
+        let mut channel_state = self.channel_state.lock();
+        if channel_state.receiver_closed {
+            return Err(GraphUpdateProducerError::ReceiverClosed);
+        }
+
+        permit.send(update);
+        channel_state.record_enqueue();
+        Ok(())
     }
 
     #[must_use]
     /// Returns the current operational measurements for this session feed.
     pub fn metrics(&self) -> GraphUpdateIngressMetricsSnapshot {
-        self.metrics.snapshot()
+        self.channel_state.snapshot()
     }
 }
 
@@ -285,18 +282,18 @@ impl GraphUpdateProducer {
 pub struct GraphUpdateReceiver {
     rx: mpsc::Receiver<GraphUpdate>,
     gap: GraphUpdateGap,
-    metrics: GraphUpdateIngressMetrics,
+    channel_state: GraphUpdateChannelState,
 }
 
 impl GraphUpdateReceiver {
-    fn new(rx: mpsc::Receiver<GraphUpdate>, gap: GraphUpdateGap, metrics: GraphUpdateIngressMetrics) -> Self {
-        Self { rx, gap, metrics }
+    fn new(rx: mpsc::Receiver<GraphUpdate>, gap: GraphUpdateGap, channel_state: GraphUpdateChannelState) -> Self {
+        Self { rx, gap, channel_state }
     }
 
     /// Waits for the next ordered channel value.
     pub async fn recv_update(&mut self) -> Option<GraphUpdate> {
         let update = self.rx.recv().await?;
-        self.metrics.dequeued();
+        self.channel_state.record_dequeue();
         Some(update)
     }
 
@@ -335,7 +332,7 @@ impl GraphUpdateReceiver {
                 }
                 update = self.rx.recv() => {
                     let update = update?;
-                    self.metrics.dequeued();
+                    self.channel_state.record_dequeue();
                     return Some(GraphUpdateReceiveEvent::Update(update));
                 }
             }
@@ -345,7 +342,7 @@ impl GraphUpdateReceiver {
     /// Attempts to receive only an ordered update without waiting.
     pub fn try_recv_update(&mut self) -> Result<GraphUpdate, mpsc::error::TryRecvError> {
         let update = self.rx.try_recv()?;
-        self.metrics.dequeued();
+        self.channel_state.record_dequeue();
         Ok(update)
     }
 
@@ -362,18 +359,23 @@ impl GraphUpdateReceiver {
 
     /// Stops new producer delivery while retaining already queued updates.
     pub fn close(&mut self) {
-        self.metrics.close_receiver(&mut self.rx);
+        let mut channel_state = self.channel_state.lock();
+        self.rx.close();
+        channel_state.record_receiver_closed();
     }
 
     #[must_use]
     pub fn metrics(&self) -> GraphUpdateIngressMetricsSnapshot {
-        self.metrics.snapshot()
+        self.channel_state.snapshot()
     }
 }
 
 impl Drop for GraphUpdateReceiver {
     fn drop(&mut self) {
-        self.metrics.drop_receiver(&mut self.rx);
+        let mut channel_state = self.channel_state.lock();
+        self.rx.close();
+        channel_state.record_receiver_closed();
+        channel_state.current_occupancy = 0;
     }
 }
 
@@ -382,13 +384,16 @@ impl Drop for GraphUpdateReceiver {
 pub fn graph_update_channel() -> (GraphUpdateProducer, GraphUpdateReceiver) {
     let (tx, rx) = mpsc::channel(GRAPH_UPDATE_CHANNEL_CAPACITY);
     let (gap_tx, gap_rx) = watch::channel(0);
-    let metrics = GraphUpdateIngressMetrics::new();
+    let channel_state = GraphUpdateChannelState::new();
     let gate = Arc::new(GraphUpdateGate::new(
         Mutex::new(GraphUpdateGateState::PreSeal),
-        GraphUpdateGapReporter::new(gap_tx, metrics.clone()),
+        GraphUpdateGapReporter::new(gap_tx, channel_state.clone()),
     ));
 
-    (GraphUpdateProducer::new(tx, gate, metrics.clone()), GraphUpdateReceiver::new(rx, GraphUpdateGap::new(gap_rx), metrics))
+    (
+        GraphUpdateProducer::new(tx, gate, channel_state.clone()),
+        GraphUpdateReceiver::new(rx, GraphUpdateGap::new(gap_rx), channel_state),
+    )
 }
 
 #[cfg(test)]

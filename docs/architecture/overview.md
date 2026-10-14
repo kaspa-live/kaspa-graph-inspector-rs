@@ -47,12 +47,13 @@ Supervisor
 ├── Arc<StorageService>
 │   ├───────────────────────────► Arc<ValidatedDbClient> (one processing generation)
 │   └───────────────────────────► Arc<ValidatedApiDbClient> (one API generation)
-├── Arc<ResyncEngine>
-│   ├── Arc<BlockProcessor>
-│   │   ├── OrphanManager
-│   │   ├── DependencyResolver
-│   │   └── lifecycle-marker worker
-│   └── Arc<VspcProcessor>
+├── private processing-session slot
+│   └── ProcessingSession, while active
+│       ├── BlockProcessor
+│       │   ├── OrphanManager
+│       │   │   └── DependencyResolver
+│       │   └── lifecycle-marker worker
+│       └── VspcProcessor
 └── Arc<ApiService> ────────────► GraphPublication
                                   ├── Head GraphView / GraphHistory
                                   └── publication-scoped GraphCache
@@ -65,27 +66,33 @@ BlockProcessor ── PersistedBlock ──► OrphanManager, VspcProcessor
 BlockProcessor/VspcProcessor
     ── per-session ordered graph updates ──► ApiService
 BlockProcessor ── lifecycle markers ──► ApiService
-ResyncEngine ── lifecycle milestones ──► Supervisor
+ProcessingSession ── lifecycle milestones ──► Supervisor
 NodeService ── ordered RPC generation events ──► Supervisor
 StorageService ── ordered DB generation events ──► Supervisor
 Supervisor ── update API DB generation / reset / shutdown ──► ApiService
 ```
 
 The top `kgi` crate is the binary, composition root, and home of Supervisor. It
-constructs the long-lived components and gives Supervisor their `Arc` values.
-Autonomous long-lived workers form a control tree. `ResyncEngine` owns both
-processors and a run's `ProcessingSession`; `BlockProcessor` owns
-OrphanManager, DependencyResolver, and its lifecycle-marker worker. Supervisor
-invokes public control methods on the four components it manages. Internal
-owners may retain explicit child-worker command protocols. Children report
-reliable faults and milestones upward. Strong reference cycles are forbidden.
-`Arc<Component>` is the settled Supervisor-facing shape; separate control
-handles are unnecessary.
+constructs the long-lived services and gives Supervisor their `Arc` values.
+Supervisor constructs at most one uniquely owned, non-reusable
+`ProcessingSession` from current service generations. The
+[processing lifecycle](processing-lifecycle.md#processingsession--settled) owns
+the private slot's states and transitions. The active session owns both
+processors and all session channels and tasks; `BlockProcessor` owns
+OrphanManager and its lifecycle-marker worker, and OrphanManager owns
+DependencyResolver. Supervisor invokes public control methods on the three
+long-lived services and the current session. Internal owners may retain
+explicit child-worker command protocols. Child fault and milestone delivery
+follows the
+[processing-lifecycle contract](processing-lifecycle.md#supervisor-and-recovery-intent--settled).
+Strong reference cycles are forbidden. `Arc<Component>` is the settled shape
+for long-lived services; the current session remains private and uniquely
+owned by Supervisor.
 
 Every worker serializes its local state changes in one event loop despite
 concurrent inputs. Live ingestion remains subscription-based. Notifications
 travel directly from NotificationRouter to the processors and never pass
-through ResyncEngine.
+through ProcessingSession.
 
 ApiService is an in-process, derived read-model service. Its work and freshness
 have lower priority than processing. [API ingress](api-ingress.md) owns
@@ -128,15 +135,15 @@ admission limits or lifecycle ownership.
 | Supervisor | Orchestration state and the strongest unsatisfied recovery obligation | [Processing lifecycle](processing-lifecycle.md) |
 | NodeService | Node connectivity, validated RPC generations, and notification routing | [Node service](node-service.md) |
 | StorageService | Database connectivity, validated DB generations, persistence, and caches | [Storage](storage.md) |
-| ResyncEngine | Processing sessions, recovery preparation, synchronization, and phase coordination | [Processing lifecycle](processing-lifecycle.md) |
+| ProcessingSession | One processing attempt's preparation, synchronization, processors, channels, phase coordination, and terminal teardown | [Processing lifecycle](processing-lifecycle.md) |
 | BlockProcessor | Block admission and materialization coordination | [Block processing](block-processing.md) |
 | OrphanManager | In-memory orphan topology and dependency demand | [Block processing](block-processing.md) |
 | DependencyResolver | Bounded node retrieval for requested dependencies | [Block processing](block-processing.md) |
 | VspcProcessor | VSPC sequencing, readiness, and coloring coordination | [VSPC processing](vspc-processing.md) |
 | ApiService | Graph publications, views, delta history, control, and graph API serving | [API graph model](api-graph.md), [API graph publication](api-publication.md), [ApiService](api-service.md), [API protocol](api-protocol.md) |
 
-NodeService, StorageService, ResyncEngine, and Supervisor each own their
-respective service, processing, or orchestration state. Published statuses are
+NodeService, StorageService, the current ProcessingSession, and Supervisor each
+own their respective service, session, or orchestration state. Published statuses are
 observations of those owners, never a second source of lifecycle authority.
 
 ## Core crate structure — settled
@@ -203,7 +210,7 @@ persistence, `StorageServiceEvent`, and the API projection read against
 `kgi-api-ingress`. `kgi-api-core` owns ApiService,
 `ApiDbGenerationEvent`, graph publication behavior, HTTP/SSE, and API runtime
 state.
-`kgi-processing` owns ResyncEngine and the processing workers, consumes the
+`kgi-processing` owns ProcessingSession and the processing workers, consumes the
 graph-update producer, and does not depend on `kgi-api-core`.
 
 The top `kgi` crate owns Supervisor, process composition, CLI command dispatch,
@@ -380,7 +387,7 @@ by the administrative operation remain available to
 only the bounded RPC and database capabilities required by the
 [storage-owned administrative transaction](storage.md#administrative-reinitialization--settled);
 it does not start NodeService, StorageService, ApiService, the HTTP server,
-processors, ResyncEngine, or Supervisor. It executes once and exits: a
+processors, ProcessingSession, or Supervisor. It executes once and exits: a
 definite successful commit exits successfully, while cancellation, rejection,
 definite failure, and ambiguous commit exit nonzero. A later ordinary service
 invocation observes the resulting network-bound Empty database and follows
@@ -839,9 +846,9 @@ readiness.
 
 ## Interaction rules — settled
 
-- Supervisor invokes public control methods on its managed `Arc<Component>`
-  values; their private mailbox or event-loop implementation is not an
-  architectural interface.
+- Supervisor invokes public control methods on its managed service `Arc`
+  values and its uniquely owned current ProcessingSession; private mailbox or
+  event-loop implementations are not architectural interfaces.
 - Internal lifecycle control flows from parent to child.
 - Reliable faults and milestones flow from child to parent.
 - Managed sibling components do not acquire one another's validated service
