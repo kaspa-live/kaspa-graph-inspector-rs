@@ -698,3 +698,22 @@ private statically dispatched database and RPC adapters for focused tests; the
 production adapters delegate to the exact `ValidatedDbClient` and
 `ValidatedRpcClient` retained by the worker and add no public mock surface or
 boxed futures.
+
+## 14 October 2026: API graph model foundation
+
+### Module and collection boundaries
+
+Place canonical graph values and the later `GraphView` implementation in the
+public `kgi_api_model::graph` module, canonical changes and `GraphDelta` in the
+public `kgi_api_model::delta` module, and retained-history behavior in a public
+`kgi_api_model::history` module when that behavior is implemented. Keep public
+imports module-qualified and add no crate-root wildcard re-exports. Publication,
+runtime, cache, encoding, and transport DTO behavior remains in later modules
+and owning crates rather than entering the canonical graph model.
+
+Use a numerically ordered map for retained levels, hash maps for block, edge,
+and delta-change identity indexes, and private per-level state for the derived
+edge-usage count. Preserve semantic relationship order in immutable
+`Arc<[T]>` arrays. These collections are graph-model implementation details;
+public access uses values and read-only iteration rather than exporting mutable
+collection ownership.

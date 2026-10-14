@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 kgi-model = { path = "../kgi-model" }
+thiserror.workspace = true
 
 [lints]
 workspace = true

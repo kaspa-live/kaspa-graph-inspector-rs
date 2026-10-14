@@ -2940,6 +2940,7 @@ name = "kgi-api-model"
 version = "0.1.0"
 dependencies = [
  "kgi-model",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
