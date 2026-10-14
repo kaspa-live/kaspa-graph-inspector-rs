@@ -25,7 +25,7 @@ use kgi_storage::{
 };
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 
@@ -159,6 +159,7 @@ pub(crate) struct VspcProcessor<D: VspcDatabase = ValidatedDbClient, R: VspcRpc 
     synthetic: BoundedSender<VspcChange>,
     overlap: VspcOverlap,
     metrics: VspcProcessorMetrics,
+    attribution_cancel: watch::Sender<bool>,
     worker: Option<VspcProcessorWorker<D, R>>,
     join: Option<JoinHandle<()>>,
 }
@@ -175,6 +176,7 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessor<D, R> {
         let (notification_tx, notification_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (synthetic_tx, synthetic_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (attribution_cancel_tx, attribution_cancel_rx) = watch::channel(false);
         let overlap = VspcOverlap::new();
         let metrics = VspcProcessorMetrics {
             pending: Arc::new(Mutex::new(VspcProcessorMetricsSnapshot::default())),
@@ -191,6 +193,7 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessor<D, R> {
             rpc,
             db,
             graph_updates,
+            attribution_cancel: attribution_cancel_rx,
             overlap: overlap.clone(),
             metrics: metrics.clone(),
             run: VspcProcessorRun::Inert { mode },
@@ -203,6 +206,7 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessor<D, R> {
                 synthetic: synthetic_tx,
                 overlap,
                 metrics,
+                attribution_cancel: attribution_cancel_tx,
                 worker: Some(worker),
                 join: None,
             },
@@ -255,6 +259,7 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessor<D, R> {
         if self.worker.take().is_some() {
             return Ok(());
         }
+        self.attribution_cancel.send_replace(true);
         let (completion, acknowledgement) = oneshot::channel();
         let result = match self.commands.send(VspcProcessorCommand::Shutdown(completion)) {
             Ok(()) => match acknowledgement.await {
@@ -487,6 +492,7 @@ struct VspcProcessorWorker<D: VspcDatabase, R: VspcRpc> {
     rpc: Arc<R>,
     db: Arc<D>,
     graph_updates: GraphUpdateProducer,
+    attribution_cancel: watch::Receiver<bool>,
     overlap: VspcOverlap,
     metrics: VspcProcessorMetrics,
     run: VspcProcessorRun,
@@ -909,8 +915,14 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessorWorker<D, R> {
         let _ = self.graph_updates.offer_vspc_committed(update);
     }
 
-    async fn attribute_path(&self, source: CandidateSource, conflict: VspcPathConflict) -> Option<ComponentFault> {
-        match self.rpc.full_block(conflict.child).await {
+    async fn attribute_path(&mut self, source: CandidateSource, conflict: VspcPathConflict) -> Option<ComponentFault> {
+        let rpc = self.rpc.clone();
+        let result = tokio::select! {
+            biased;
+            _ = self.attribution_cancel.changed() => return None,
+            result = rpc.full_block(conflict.child) => result,
+        };
+        match result {
             Ok(block) => {
                 let attribution = if block.selected_parent == conflict.expected_parent {
                     VspcPathAttribution::StoredParentConflict
@@ -1159,21 +1171,35 @@ mod tests {
 
     struct MockRpc {
         results: Mutex<VecDeque<Result<kgi_model::block::ValidatedNodeBlock, NodeError>>>,
+        full_block_gate: Mutex<Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>>,
     }
 
     impl MockRpc {
         fn new() -> Arc<Self> {
-            Arc::new(Self { results: Mutex::new(VecDeque::new()) })
+            Arc::new(Self { results: Mutex::new(VecDeque::new()), full_block_gate: Mutex::new(None) })
         }
 
         fn push_result(&self, result: Result<kgi_model::block::ValidatedNodeBlock, NodeError>) {
             self.results.lock().expect("mock RPC mutex").push_back(result);
         }
+
+        fn gate_next_full_block(&self) -> (mpsc::UnboundedReceiver<()>, Arc<Semaphore>) {
+            let (started_tx, started_rx) = mpsc::unbounded_channel();
+            let releases = Arc::new(Semaphore::new(0));
+            *self.full_block_gate.lock().expect("mock RPC gate mutex") = Some((started_tx, releases.clone()));
+            (started_rx, releases)
+        }
     }
 
     impl VspcRpc for MockRpc {
         async fn full_block(&self, hash: BlockHash) -> Result<kgi_model::block::ValidatedNodeBlock, NodeError> {
-            self.results.lock().expect("mock RPC mutex").pop_front().unwrap_or(Err(NodeError::BlockNotFound { hash }))
+            let result = self.results.lock().expect("mock RPC mutex").pop_front().unwrap_or(Err(NodeError::BlockNotFound { hash }));
+            let gate = self.full_block_gate.lock().expect("mock RPC gate mutex").take();
+            if let Some((started, releases)) = gate {
+                let _ = started.send(());
+                releases.acquire().await.expect("mock RPC release semaphore remains open").forget();
+            }
+            result
         }
     }
 
@@ -1712,6 +1738,36 @@ mod tests {
             }))
         ));
         processor.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_an_in_flight_path_attribution_probe() {
+        let Fixture { processor, mut events, persisted, mut graph, db, rpc } = fixture(anchor(1));
+        let weak_db = Arc::downgrade(&db);
+        let weak_rpc = Arc::downgrade(&rpc);
+        persisted.send(persisted_block(2, 1)).await.expect("destination");
+        db.push_apply(Err(ApplyVspcChangeError::VspcPathDiscontinuity(VspcPathConflict {
+            child: hash(2),
+            expected_parent: hash(1),
+            stored_parent: hash(9),
+        })));
+        rpc.push_result(Ok(node_block(hash(2), hash(1))));
+        let (mut probe_started, _probe_releases) = rpc.gate_next_full_block();
+        processor.submit_synthetic(added(&[2])).await.expect("synthetic change");
+        probe_started.recv().await.expect("attribution probe started");
+        assert_eq!(db.state.lock().expect("mock DB mutex").applied.len(), 1);
+
+        drop(db);
+        drop(rpc);
+        tokio::time::timeout(std::time::Duration::from_secs(1), processor.shutdown())
+            .await
+            .expect("shutdown must not await the attribution RPC")
+            .expect("shutdown");
+
+        assert!(weak_db.upgrade().is_none());
+        assert!(weak_rpc.upgrade().is_none());
+        assert!(graph.try_recv_update().is_err());
+        assert!(events.recv().await.is_none());
     }
 
     #[tokio::test]
