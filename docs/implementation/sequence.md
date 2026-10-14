@@ -74,6 +74,36 @@ implemented and can be verified end to end at the narrowest useful level.
 | 7. Integrate recovery lifecycle | Implement one non-reusable ProcessingSession per attempt, including preparation, the common GetBlocks/VSPC pump, its fresh processor tree and channels, Catchup overlap, the ordered processor/global Live transition, consuming terminal teardown, top-crate Supervisor recovery intent, Supervisor-owned termination handling, and global shutdown ordering. Retain NodeService's published RPC generation and StorageService's published processing DB generation until both can form a new session. Have Supervisor react to either retirement through session teardown, use replacements only for new sessions, preserve typed malformed-response faults that follow RPC retirement, map ordered API DB events through ApiService's control method, install each API ingress through `reset`, let BlockProcessor deliver lifecycle markers independently, and route rebuild through the tested StorageService replacement gate. | End-to-end Resync, Rebuild, RPC plus processing and API DB generation loss and autonomous replacement, exact-generation stale-event suppression, retirement/fault coalescence, recovery escalation including consecutive Resync/Rebuild resets, interruption, retained `--clear-db` intent, complete actor-tree join and session-clone release, same-generation reuse without cross-session messages or state, VSPC synthetic-input abandonment at Live, successful-enqueue accounting, Catchup cross-page dedup, continued VSPC notification progress, current-DB-sink Resync disposition, complete-page overlap-based Live-boundary tests, idempotent first- and second-signal shutdown requests, third-signal forced exit, and concurrent API/processing shutdown before service shutdown. |
 | 8. Integrate Web behavior and verify release | Import the KGI v1 React application, replace Create React App with Vite as an isolated tooling change, and then adapt the Web graph model to hash identity, SSE cursor catch-up, head-following and fixed-view freeze, DAA anchor behavior, and runtime Web configuration. Run Vitest, deterministic and full-stack Playwright flows, Go parity, KGI RPC handling, PostgreSQL, recovery, packaging, logging, and resource-isolation tests against the complete stack. | A stable reviewable implementation commit/diff, an atomic conventional bundle and equivalent container image, updated implementation status, and evidence for the focused [verification contract](../architecture/verification.md). |
 
+### Active Step 6a increment: canonical graph model
+
+Step 6 is an implementation milestone rather than one reviewable change. Its
+first bounded increment implements the canonical in-memory graph model in
+`kgi-api-model`; completing this increment does not complete Step 6. Publication
+runtime, storage seed reads, ApiService control and resource ownership, response
+caching and encoding, HTTP/SSE delivery, and top-crate HTTP composition remain
+later Step 6 work.
+
+Execute Step 6a as these ordered points:
+
+1. Record the graph-model module and collection choices, then add the
+   foundational graph values and checked `GraphDelta` construction.
+2. Implement seeded `GraphView` construction and frozen subview extraction.
+3. Implement Head `BlockCommitted` mutation, edge retention, external-level
+   maintenance, and bounded pruning.
+4. Implement VSPC projection and Fixed-view update and terminal-freeze behavior.
+5. Implement delta application and gapless composition.
+6. Implement `GraphHistory` append, cumulative estimates, level-scoped pruning,
+   and retained-range selection.
+7. Update implementation status and run formatting, workspace unit and
+   integration tests through Nextest, Cargo doctests, Cargo check, Clippy with
+   warnings denied, and `git diff --check`.
+
+This increment adds no placeholder publication, storage, cache, encoding,
+router, or SSE API. Its production scope is `kgi-api-model`; the graph model's
+focused tests provide its completion evidence.
+
+## Cross-step ordering
+
 Steps 5 and 6 may be developed in parallel after their shared graph-update and
 `reset` interfaces are fixed, but integration must preserve their causal order.
 The API cannot be treated as a later optional service, while database

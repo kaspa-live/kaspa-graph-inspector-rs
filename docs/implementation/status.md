@@ -216,3 +216,8 @@ point.
 
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.
+
+Sequence Step 6 is now active through its first bounded increment, Step 6a:
+the canonical in-memory graph model in `kgi-api-model`. The tracked ordered
+points and the work explicitly left to later Step 6 increments are recorded in
+[the implementation sequence](sequence.md#active-step-6a-increment-canonical-graph-model).
