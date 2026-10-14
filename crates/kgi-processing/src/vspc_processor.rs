@@ -1739,6 +1739,55 @@ mod tests {
         processor.shutdown().await.expect("shutdown");
     }
 
+    async fn synthetic_attribution_probe_fault(result: Result<kgi_model::block::ValidatedNodeBlock, NodeError>) -> ComponentFault {
+        let Fixture { processor, mut events, persisted, mut graph, db, rpc } = fixture(anchor(1));
+        persisted.send(persisted_block(2, 1)).await.expect("destination");
+        db.push_apply(Err(ApplyVspcChangeError::VspcPathDiscontinuity(VspcPathConflict {
+            child: hash(2),
+            expected_parent: hash(1),
+            stored_parent: hash(9),
+        })));
+        rpc.push_result(result);
+        processor.submit_synthetic(added(&[2])).await.expect("synthetic change");
+
+        let Some(VspcProcessorEvent::Fault(fault)) = events.recv().await else {
+            panic!("attribution probe must report one fault");
+        };
+        assert!(graph.try_recv_update().is_err());
+        processor.shutdown().await.expect("shutdown");
+        fault
+    }
+
+    #[tokio::test]
+    async fn attribution_probe_errors_retain_their_distinct_active_dispositions() {
+        let malformed =
+            synthetic_attribution_probe_fault(Err(NodeError::RecoveryInputInvalid(RecoveryInputKind::MalformedGetBlock))).await;
+        assert_eq!(malformed.source, Component::NodeService);
+        assert_eq!(malformed.disposition, FaultDisposition::Retry);
+        assert_eq!(malformed.kind, FaultKind::RecoveryInputInvalid(RecoveryInputKind::MalformedGetBlock));
+
+        let absent = synthetic_attribution_probe_fault(Err(NodeError::BlockNotFound { hash: hash(2) })).await;
+        assert_eq!(absent.source, Component::VspcProcessor);
+        assert_eq!(absent.disposition, FaultDisposition::Retry);
+        assert_eq!(
+            absent.kind,
+            FaultKind::RecoveryInputInvalid(RecoveryInputKind::MalformedVspcResponse(
+                MalformedVspcResponseReason::SelectedParentPathDiscontinuity
+            ))
+        );
+
+        let opaque =
+            synthetic_attribution_probe_fault(Err(NodeError::RpcRequestFailed { diagnostic: Arc::from("opaque failure") })).await;
+        assert_eq!(opaque.source, Component::NodeService);
+        assert_eq!(opaque.disposition, FaultDisposition::Retry);
+        assert_eq!(opaque.kind, FaultKind::RpcRequestFailed);
+
+        let generation_lost = synthetic_attribution_probe_fault(Err(NodeError::GenerationLost)).await;
+        assert_eq!(generation_lost.source, Component::NodeService);
+        assert_eq!(generation_lost.disposition, FaultDisposition::Retry);
+        assert_eq!(generation_lost.kind, FaultKind::ServiceGenerationLost(ServiceKind::Node));
+    }
+
     #[tokio::test]
     async fn shutdown_cancels_an_in_flight_path_attribution_probe() {
         let Fixture { processor, mut events, persisted, mut graph, db, rpc } = fixture(anchor(1));

@@ -936,7 +936,9 @@ mod tests {
     use tokio::sync::{Semaphore, mpsc};
 
     use super::*;
-    use crate::block_processor::{BlockDatabase, BlockProcessorInitialization, BlockRpc, dependency::DependencyRpc};
+    use crate::block_processor::{
+        BlockDatabase, BlockProcessorInitialization, BlockRpc, dependency::DependencyRpc, orphan::ORPHAN_RESOLUTION_THRESHOLD,
+    };
 
     #[derive(Default)]
     struct MockDbState {
@@ -1016,11 +1018,22 @@ mod tests {
     struct MockRpc {
         network_id: NetworkId,
         genesis_hash: BlockHash,
+        results: Mutex<VecDeque<Result<ValidatedNodeBlock, NodeError>>>,
+    }
+
+    impl MockRpc {
+        fn new(network_id: NetworkId, genesis_hash: BlockHash) -> Arc<Self> {
+            Arc::new(Self { network_id, genesis_hash, results: Mutex::new(VecDeque::new()) })
+        }
+
+        fn push_result(&self, result: Result<ValidatedNodeBlock, NodeError>) {
+            self.results.lock().expect("mock RPC mutex").push_back(result);
+        }
     }
 
     impl DependencyRpc for MockRpc {
         async fn full_block(&self, hash: BlockHash) -> Result<ValidatedNodeBlock, NodeError> {
-            Err(NodeError::BlockNotFound { hash })
+            self.results.lock().expect("mock RPC mutex").pop_front().unwrap_or(Err(NodeError::BlockNotFound { hash }))
         }
     }
 
@@ -1036,6 +1049,13 @@ mod tests {
 
     fn hash(byte: u8) -> BlockHash {
         BlockHash::from_bytes([byte; 32])
+    }
+
+    fn indexed_hash(value: usize) -> BlockHash {
+        let bytes = value.to_le_bytes();
+        let mut hash = [0_u8; 32];
+        hash[..bytes.len()].copy_from_slice(&bytes);
+        BlockHash::from_bytes(hash)
     }
 
     fn id(value: i64) -> CompactId {
@@ -1097,7 +1117,7 @@ mod tests {
         graph_updates: GraphUpdateProducer,
     ) -> ProcessorFixture {
         let db = MockDb::new(genesis_hash);
-        let rpc = Arc::new(MockRpc { network_id: db.network_id, genesis_hash: db.genesis_hash });
+        let rpc = MockRpc::new(db.network_id, db.genesis_hash);
         let (persisted_tx, persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (mut processor, events) = BlockProcessor::new(mode, rpc.clone(), db.clone(), graph_updates, persisted_tx);
         processor
@@ -1111,7 +1131,7 @@ mod tests {
     async fn construction_and_initialization_are_inert_until_single_start() {
         let genesis = hash(1);
         let db = MockDb::new(genesis);
-        let rpc = Arc::new(MockRpc { network_id: db.network_id, genesis_hash: db.genesis_hash });
+        let rpc = MockRpc::new(db.network_id, db.genesis_hash);
         let (graph, mut graph_rx) = graph_update_channel();
         let (persisted, _persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (mut processor, mut events) = BlockProcessor::new(RecoveryMode::Resync, rpc, db, graph, persisted);
@@ -1133,7 +1153,7 @@ mod tests {
     async fn direct_input_channels_report_exact_capacity_and_high_water() {
         let genesis = hash(1);
         let db = MockDb::new(genesis);
-        let rpc = Arc::new(MockRpc { network_id: db.network_id, genesis_hash: db.genesis_hash });
+        let rpc = MockRpc::new(db.network_id, db.genesis_hash);
         let (graph, _graph_rx) = graph_update_channel();
         let (persisted, _persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (processor, _events) = BlockProcessor::new(RecoveryMode::Resync, rpc, db, graph, persisted);
@@ -1162,7 +1182,7 @@ mod tests {
     async fn final_startup_handoff_failure_remains_joinable() {
         let genesis = hash(1);
         let db = MockDb::new(genesis);
-        let rpc = Arc::new(MockRpc { network_id: db.network_id, genesis_hash: db.genesis_hash });
+        let rpc = MockRpc::new(db.network_id, db.genesis_hash);
         let weak_db = Arc::downgrade(&db);
         let weak_rpc = Arc::downgrade(&rpc);
         let (graph, _graph_rx) = graph_update_channel();
@@ -1477,7 +1497,7 @@ mod tests {
     async fn failed_initialization_leaves_an_inert_tree_for_consuming_shutdown() {
         let genesis = hash(1);
         let db = MockDb::new(genesis);
-        let wrong_rpc = Arc::new(MockRpc { network_id: db.network_id, genesis_hash: hash(99) });
+        let wrong_rpc = MockRpc::new(db.network_id, hash(99));
         let (graph, _graph_rx) = graph_update_channel();
         let (persisted, _persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (mut processor, _events) = BlockProcessor::new(RecoveryMode::Resync, wrong_rpc, db, graph, persisted);
@@ -1533,7 +1553,7 @@ mod tests {
         let genesis = hash(1);
         let inserted = block(hash(4), 4);
         let db = MockDb::new(genesis);
-        let rpc = Arc::new(MockRpc { network_id: db.network_id, genesis_hash: db.genesis_hash });
+        let rpc = MockRpc::new(db.network_id, db.genesis_hash);
         db.push_presence(Ok(BlockPresence::Absent));
         db.push_materialization(Ok(MaterializeBlockOutcome::Inserted { committed: committed(&inserted, id(4)) }));
         let (persisted_tx, mut persisted_rx) = bounded_channel(1);
@@ -1589,12 +1609,38 @@ mod tests {
         assert_eq!(unavailable.kind, FaultKind::Ownership(OwnershipFault::ManagedComponentUnavailable));
     }
 
-    #[test]
-    fn active_rpc_cancellation_is_a_fatal_service_lifecycle_violation() {
-        let fault = node_fault(NodeError::Cancelled, false, hash(9));
+    #[tokio::test]
+    async fn active_resolver_rpc_cancellation_faults_the_processor() {
+        let genesis = hash(1);
+        let dependency = indexed_hash(10_000);
+        let (graph, _graph_rx) = graph_update_channel();
+        let ProcessorFixture { processor, mut events, persisted: _persisted, db, rpc } =
+            fixture(genesis, RecoveryMode::Resync, anchor(genesis, 20), 10, graph);
+        rpc.push_result(Err(NodeError::Cancelled));
+        processor.catchup(id(1)).expect("Catchup command");
 
-        assert_eq!(fault.source, Component::NodeService);
-        assert_eq!(fault.disposition, FaultDisposition::Fatal);
-        assert_eq!(fault.kind, FaultKind::Ownership(OwnershipFault::ManagedComponentUnavailable));
+        for value in 0..ORPHAN_RESOLUTION_THRESHOLD {
+            db.push_presence(Ok(BlockPresence::Absent));
+            db.push_materialization(Err(MaterializeBlockError::NonMaterializedReferences {
+                missing: Arc::from([dependency]),
+                identity_only: Arc::from([]),
+            }));
+            processor
+                .submit_synthetic(block(indexed_hash(value + 1_000), u64::try_from(value).expect("orphan test index fits u64")))
+                .await
+                .expect("orphan block");
+        }
+
+        assert!(matches!(
+            events.recv().await,
+            Some(BlockProcessorEvent::Fault(ComponentFault {
+                source: Component::NodeService,
+                disposition: FaultDisposition::Fatal,
+                kind: FaultKind::Ownership(OwnershipFault::ManagedComponentUnavailable),
+                ..
+            }))
+        ));
+        assert_eq!(db.state.lock().expect("mock DB mutex").presence_hashes.len(), ORPHAN_RESOLUTION_THRESHOLD);
+        processor.shutdown().await.expect("shutdown");
     }
 }
