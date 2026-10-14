@@ -644,3 +644,23 @@ Dropping the sole command sender closes the input and the worker drains
 accepted commands. The graph-update producer remains the sole owner of
 lossless marker backpressure and receiver-closure classification, and
 BlockProcessor joins the worker during terminal session shutdown.
+
+### BlockProcessor owner loop
+
+Keep the one-session BlockProcessor loop in the private
+`block_processor::processor` module. Use the same prioritized unbounded command
+mailbox and separate bounded Tokio mailboxes for resolved, notification, and
+synthetic inputs. Represent Catchup source accounting with a compact bit value
+stored by block hash, and expose overlap observation through a cloneable
+read-only wrapper around `Arc<AtomicBool>`.
+
+Use private statically dispatched database and RPC adapters for deterministic
+owner-loop tests. The production implementations delegate directly to
+`ValidatedDbClient` and `ValidatedRpcClient`; the adapters add no boxed future,
+public mock API, or alternate runtime behavior. Preserve child-fault provenance
+as a typed `Component` field while forwarding it through OrphanManager.
+
+Keep marker-worker receiver closure in a shared atomic flag so a later local
+handoff failure can remain distinct from an internal command-path failure. The
+flag is diagnostic coordination inside the worker primitive; graph-update gate
+state and delivery semantics remain owned by the ingress capability.

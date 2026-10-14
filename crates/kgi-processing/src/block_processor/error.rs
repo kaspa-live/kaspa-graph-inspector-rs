@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use kgi_model::lifecycle::OwnershipFault;
+use kgi_model::lifecycle::{Component, OwnershipFault};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -22,8 +22,20 @@ pub(crate) enum SessionDataPath {
     Resolution,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChildFault {
+    pub source: Component,
+    pub kind: ChildFaultKind,
+}
+
+impl ChildFault {
+    pub(crate) const fn new(source: Component, kind: ChildFaultKind) -> Self {
+        Self { source, kind }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub(crate) enum ChildFault {
+pub(crate) enum ChildFaultKind {
     #[error("orphan capacity is exhausted")]
     OrphanCapacityExhausted,
 
@@ -42,11 +54,12 @@ pub(crate) enum ChildFault {
 
 impl From<ChildControlError> for ChildFault {
     fn from(error: ChildControlError) -> Self {
-        match error {
+        let kind = match error {
             ChildControlError::CommandPathClosed | ChildControlError::AcknowledgementLost => {
-                Self::Ownership(OwnershipFault::InternalControlPathLost)
+                ChildFaultKind::Ownership(OwnershipFault::InternalControlPathLost)
             }
-            ChildControlError::WorkerJoinFailed => Self::Ownership(OwnershipFault::UnexpectedWorkerTermination),
-        }
+            ChildControlError::WorkerJoinFailed => ChildFaultKind::Ownership(OwnershipFault::UnexpectedWorkerTermination),
+        };
+        Self::new(Component::DependencyResolver, kind)
     }
 }

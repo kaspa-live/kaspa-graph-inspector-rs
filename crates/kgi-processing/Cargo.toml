@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+kaspa-consensus-core.workspace = true
 kgi-api-ingress = { path = "../kgi-api-ingress" }
 kgi-model = { path = "../kgi-model" }
 kgi-node = { path = "../kgi-node" }

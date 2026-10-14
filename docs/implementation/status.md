@@ -161,29 +161,36 @@ retry sequence and reset boundary, and the operation-retirement completion
 barrier.
 
 The processing-worker increment has begun with private OrphanManager and
-DependencyResolver child loops. Their topology, scheduling, cancellation, and
-typed result behavior remain applicable, while their committed reusable
-Begin/Deactivate lifecycle implements a superseded architecture and must be
-refactored to the session-scoped ProcessingSession contract before the
-increment can complete. OrphanManager owns bounded normalized-block
-storage, reverse missing-reference topology, topology-ranked frontier
-selection, logical resolution-pending state, natural-arrival cancellation, and
-induced ready-block delivery. It owns DependencyResolver as a private child;
-that worker owns the exact session RPC generation, its local concurrency
-allowance, cancellable GetBlock tasks, and typed result delivery without
-reclassifying node outcomes. Separate prioritized command paths preempt bounded
-data backlogs. Existing focused tests
-cover reverse-topology release, exact threshold and capacity boundaries,
-maximum-release ordering, pending-state retention, Resolve/Cancel FIFO order,
-active and waiting RPC limits, node-outcome preservation, nested command
-priority and fault propagation, full-result-channel failure, cancellation, and
-exact RPC-generation release.
+DependencyResolver child loops. Each worker tree is now constructed inert with
+its exact session resources, launched once after initialization, and consumed
+through terminal shutdown; no reusable Begin, Deactivate, or generation-rebind
+path remains. OrphanManager owns bounded normalized-block storage, reverse
+missing-reference topology, topology-ranked frontier selection, logical
+resolution-pending state, natural-arrival cancellation, and induced ready-block
+delivery. It owns DependencyResolver as a private child; that worker owns the
+exact session RPC generation, its local concurrency allowance, cancellable
+GetBlock tasks, and typed result delivery without reclassifying node outcomes.
+Separate prioritized command paths preempt bounded data backlogs. Existing
+focused tests cover inert construction, reverse-topology release, exact
+threshold and capacity boundaries, maximum-release ordering, pending-state
+retention, Resolve/Cancel FIFO order, active and waiting RPC limits,
+node-outcome preservation, nested fault propagation, full-result-channel
+failure, cancellation, terminal backlog preemption, and exact RPC-generation
+release.
 The BlockProcessor-owned lifecycle-marker worker provides the nonblocking
 two-command local FIFO, lossless graph-ingress delivery, accepted-command drain
 after local closure, and receiver-closure termination without retaining RPC or
-database generations. Its ownership must be adapted so terminal
-BlockProcessor shutdown joins it. BlockProcessor integration and VspcProcessor
-remain pending in this increment.
+database generations. Terminal BlockProcessor shutdown joins it after draining
+accepted markers. The BlockProcessor owner loop implements explicit input
+priority, notification gating, phase-specific materialization policy, PostSeal
+transition, graph-before-persisted delivery, Catchup lower-bound and
+source-overlap accounting, child fault provenance, and typed storage and node
+fault normalization. Focused tests cover inert construction and initialization,
+single launch, final startup-handoff failure, Genesis and non-Genesis marker
+paths, strict sealing, closed-gate discard, late notification filtering, exact
+overlap, post-commit delivery loss, API receiver closure, terminal input
+preemption, complete descendant joining, and session-generation release.
+VspcProcessor remains pending in this increment.
 
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.

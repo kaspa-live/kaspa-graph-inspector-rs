@@ -5,7 +5,7 @@ use std::{
 
 use kgi_model::{
     block::{BlockHash, ValidatedNodeBlock},
-    lifecycle::OwnershipFault,
+    lifecycle::{Component, OwnershipFault},
 };
 use kgi_node::rpc::ValidatedRpcClient;
 use tokio::{
@@ -16,7 +16,7 @@ use tokio::{
 use super::{
     BlockResolutionEvent, PROCESSING_DATA_CHANNEL_CAPACITY,
     dependency::{DependencyResolver, DependencyResolverMetrics, DependencyResolverMetricsSnapshot, DependencyRpc},
-    error::{ChildControlError, ChildFault, SessionDataPath},
+    error::{ChildControlError, ChildFault, ChildFaultKind, SessionDataPath},
 };
 
 pub(crate) const MAX_ORPHAN_BLOCKS: usize = 1024;
@@ -57,9 +57,7 @@ impl OrphanManagerMetrics {
     }
 }
 
-enum OrphanCommand<R> {
-    Begin { rpc: Arc<R>, completion: oneshot::Sender<Result<(), ChildControlError>> },
-    Deactivate(oneshot::Sender<Result<(), ChildControlError>>),
+enum OrphanCommand {
     Shutdown(oneshot::Sender<Result<(), ChildControlError>>),
 }
 
@@ -69,42 +67,42 @@ enum OrphanMessage {
 }
 
 pub(crate) struct OrphanManager<R: DependencyRpc = ValidatedRpcClient> {
-    commands: mpsc::UnboundedSender<OrphanCommand<R>>,
+    commands: mpsc::UnboundedSender<OrphanCommand>,
     messages: mpsc::Sender<OrphanMessage>,
     metrics: OrphanManagerMetrics,
     resolver_metrics: Arc<DependencyResolverMetrics>,
+    worker: Option<OrphanManagerWorker<R>>,
     join: Option<JoinHandle<()>>,
 }
 
 impl<R: DependencyRpc> OrphanManager<R> {
-    pub(crate) fn start(resolution: mpsc::Sender<BlockResolutionEvent>, faults: mpsc::UnboundedSender<ChildFault>) -> Self {
+    pub(crate) fn new(rpc: Arc<R>, resolution: mpsc::Sender<BlockResolutionEvent>, faults: mpsc::UnboundedSender<ChildFault>) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (message_tx, message_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (resolver_fault_tx, resolver_fault_rx) = mpsc::unbounded_channel();
         let metrics = OrphanManagerMetrics::default();
-        let resolver = DependencyResolver::start(resolution.clone(), resolver_fault_tx);
+        let resolver = DependencyResolver::new(rpc, resolution.clone(), resolver_fault_tx);
         let resolver_metrics = resolver.metrics_source();
         let worker = OrphanManagerWorker {
             commands: command_rx,
             messages: message_rx,
-            resolver,
+            resolver: Some(resolver),
             resolution,
             resolver_faults: resolver_fault_rx,
             faults,
             metrics: metrics.clone(),
             topology: OrphanTopology::default(),
-            state: OrphanManagerState::Inactive,
+            state: OrphanManagerState::Active,
             messages_open: true,
             resolver_faults_open: true,
         };
-        let join = tokio::spawn(worker.run());
-        Self { commands: command_tx, messages: message_tx, metrics, resolver_metrics, join: Some(join) }
+        Self { commands: command_tx, messages: message_tx, metrics, resolver_metrics, worker: Some(worker), join: None }
     }
 
-    pub(crate) async fn begin(&self, rpc: Arc<R>) -> Result<(), ChildControlError> {
-        let (completion, acknowledgement) = oneshot::channel();
-        self.commands.send(OrphanCommand::Begin { rpc, completion }).map_err(|_| ChildControlError::CommandPathClosed)?;
-        acknowledgement.await.map_err(|_| ChildControlError::AcknowledgementLost)?
+    pub(crate) fn start(&mut self) {
+        let mut worker = self.worker.take().expect("OrphanManager starts exactly once");
+        worker.resolver.as_mut().expect("inert OrphanManager owns its resolver").start();
+        self.join = Some(tokio::spawn(worker.run()));
     }
 
     pub(crate) fn add_orphan(
@@ -119,13 +117,10 @@ impl<R: DependencyRpc> OrphanManager<R> {
         self.messages.try_send(OrphanMessage::BlockPersisted(hash)).map_err(map_try_send_error)
     }
 
-    pub(crate) async fn deactivate(&self) -> Result<(), ChildControlError> {
-        let (completion, acknowledgement) = oneshot::channel();
-        self.commands.send(OrphanCommand::Deactivate(completion)).map_err(|_| ChildControlError::CommandPathClosed)?;
-        acknowledgement.await.map_err(|_| ChildControlError::AcknowledgementLost)?
-    }
-
-    pub(crate) async fn shutdown(&mut self) -> Result<(), ChildControlError> {
+    pub(crate) async fn shutdown(mut self) -> Result<(), ChildControlError> {
+        if self.worker.take().is_some() {
+            return Ok(());
+        }
         let (completion, acknowledgement) = oneshot::channel();
         let barrier = match self.commands.send(OrphanCommand::Shutdown(completion)) {
             Ok(()) => acknowledgement.await.map_err(|_| ChildControlError::AcknowledgementLost)?,
@@ -150,15 +145,14 @@ impl<R: DependencyRpc> OrphanManager<R> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OrphanManagerState {
-    Inactive,
     Active,
     Faulted,
 }
 
 struct OrphanManagerWorker<R: DependencyRpc> {
-    commands: mpsc::UnboundedReceiver<OrphanCommand<R>>,
+    commands: mpsc::UnboundedReceiver<OrphanCommand>,
     messages: mpsc::Receiver<OrphanMessage>,
-    resolver: DependencyResolver<R>,
+    resolver: Option<DependencyResolver<R>>,
     resolution: mpsc::Sender<BlockResolutionEvent>,
     resolver_faults: mpsc::UnboundedReceiver<ChildFault>,
     faults: mpsc::UnboundedSender<ChildFault>,
@@ -195,7 +189,7 @@ impl<R: DependencyRpc> OrphanManagerWorker<R> {
                         Some(fault) => self.enter_fault(fault).await,
                         None => {
                             self.resolver_faults_open = false;
-                            self.enter_fault(ChildFault::Ownership(OwnershipFault::UnexpectedWorkerTermination)).await;
+                            self.enter_own_fault(ChildFaultKind::Ownership(OwnershipFault::UnexpectedWorkerTermination)).await;
                         }
                     }
                 }
@@ -204,7 +198,7 @@ impl<R: DependencyRpc> OrphanManagerWorker<R> {
                         Some(message) => self.handle_message(message).await,
                         None => {
                             self.messages_open = false;
-                            self.enter_fault(ChildFault::SessionDataEndpointLost(SessionDataPath::OrphanInput)).await;
+                            self.enter_own_fault(ChildFaultKind::SessionDataEndpointLost(SessionDataPath::OrphanInput)).await;
                         }
                     }
                 }
@@ -212,36 +206,16 @@ impl<R: DependencyRpc> OrphanManagerWorker<R> {
         }
     }
 
-    async fn handle_command(&mut self, command: OrphanCommand<R>) -> bool {
+    async fn handle_command(&mut self, command: OrphanCommand) -> bool {
         match command {
-            OrphanCommand::Begin { rpc, completion } => {
-                self.state = OrphanManagerState::Inactive;
-                self.clear_state();
-                self.drain_messages();
-                let result = self.resolver.begin(rpc).await;
-                self.state = if result.is_ok() { OrphanManagerState::Active } else { OrphanManagerState::Faulted };
-                let _ = completion.send(result);
-                false
-            }
-            OrphanCommand::Deactivate(completion) => {
-                self.state = OrphanManagerState::Inactive;
-                self.clear_state();
-                self.drain_messages();
-                let result = self.resolver.deactivate().await;
-                if result.is_err() {
-                    self.state = OrphanManagerState::Faulted;
-                }
-                let _ = completion.send(result);
-                false
-            }
             OrphanCommand::Shutdown(completion) => {
-                self.state = OrphanManagerState::Inactive;
+                self.state = OrphanManagerState::Faulted;
                 self.clear_state();
                 self.drain_messages();
-                let result = self.resolver.shutdown().await;
-                if result.is_err() {
-                    self.state = OrphanManagerState::Faulted;
-                }
+                let result = match self.resolver.take() {
+                    Some(resolver) => resolver.shutdown().await,
+                    None => Ok(()),
+                };
                 let _ = completion.send(result);
                 true
             }
@@ -257,12 +231,14 @@ impl<R: DependencyRpc> OrphanManagerWorker<R> {
         let mutation = match result {
             Ok(mutation) => mutation,
             Err(TopologyError::CapacityExhausted) => {
-                self.enter_fault(ChildFault::OrphanCapacityExhausted).await;
+                self.enter_own_fault(ChildFaultKind::OrphanCapacityExhausted).await;
                 return;
             }
             Err(TopologyError::EmptyMissingSet) => {
-                self.enter_fault(ChildFault::InvalidProtocol(Arc::from("orphan admission requires at least one missing reference")))
-                    .await;
+                self.enter_own_fault(ChildFaultKind::InvalidProtocol(Arc::from(
+                    "orphan admission requires at least one missing reference",
+                )))
+                .await;
                 return;
             }
         };
@@ -277,11 +253,11 @@ impl<R: DependencyRpc> OrphanManagerWorker<R> {
             match self.resolution.try_send(BlockResolutionEvent::OrphanReady(block)) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    self.enter_fault(ChildFault::SessionDataFull(SessionDataPath::Resolution)).await;
+                    self.enter_own_fault(ChildFaultKind::SessionDataFull(SessionDataPath::Resolution)).await;
                     return;
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    self.enter_fault(ChildFault::SessionDataEndpointLost(SessionDataPath::Resolution)).await;
+                    self.enter_own_fault(ChildFaultKind::SessionDataEndpointLost(SessionDataPath::Resolution)).await;
                     return;
                 }
             }
@@ -295,28 +271,34 @@ impl<R: DependencyRpc> OrphanManagerWorker<R> {
     }
 
     async fn request_resolution(&mut self, hash: BlockHash) -> bool {
-        match self.resolver.resolve(hash) {
+        let Some(resolver) = self.resolver.as_ref() else {
+            return false;
+        };
+        match resolver.resolve(hash) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.enter_fault(ChildFault::SessionDataFull(SessionDataPath::ResolverWork)).await;
+                self.enter_own_fault(ChildFaultKind::SessionDataFull(SessionDataPath::ResolverWork)).await;
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.enter_fault(ChildFault::SessionDataEndpointLost(SessionDataPath::ResolverWork)).await;
+                self.enter_own_fault(ChildFaultKind::SessionDataEndpointLost(SessionDataPath::ResolverWork)).await;
                 false
             }
         }
     }
 
     async fn cancel_resolution(&mut self, hash: BlockHash) -> bool {
-        match self.resolver.cancel(hash) {
+        let Some(resolver) = self.resolver.as_ref() else {
+            return false;
+        };
+        match resolver.cancel(hash) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.enter_fault(ChildFault::SessionDataFull(SessionDataPath::ResolverWork)).await;
+                self.enter_own_fault(ChildFaultKind::SessionDataFull(SessionDataPath::ResolverWork)).await;
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.enter_fault(ChildFault::SessionDataEndpointLost(SessionDataPath::ResolverWork)).await;
+                self.enter_own_fault(ChildFaultKind::SessionDataEndpointLost(SessionDataPath::ResolverWork)).await;
                 false
             }
         }
@@ -328,9 +310,15 @@ impl<R: DependencyRpc> OrphanManagerWorker<R> {
         }
         self.state = OrphanManagerState::Faulted;
         self.report_fault(fault);
-        if let Err(error) = self.resolver.deactivate().await {
+        if let Some(resolver) = self.resolver.take()
+            && let Err(error) = resolver.shutdown().await
+        {
             self.report_fault(error.into());
         }
+    }
+
+    async fn enter_own_fault(&mut self, kind: ChildFaultKind) {
+        self.enter_fault(ChildFault::new(Component::OrphanManager, kind)).await;
     }
 
     fn clear_state(&mut self) {
@@ -572,7 +560,6 @@ mod tests {
         faults: mpsc::UnboundedReceiver<ChildFault>,
         started: mpsc::UnboundedReceiver<BlockHash>,
         releases: Arc<Semaphore>,
-        rpc: Arc<GatedRpc>,
         weak_rpc: Weak<GatedRpc>,
     }
 
@@ -583,8 +570,9 @@ mod tests {
         let releases = Arc::new(Semaphore::new(0));
         let rpc = Arc::new(GatedRpc { started: started_tx, releases: releases.clone() });
         let weak_rpc = Arc::downgrade(&rpc);
-        let manager = OrphanManager::start(resolution_tx, fault_tx);
-        ManagerFixture { manager, resolution: resolution_rx, faults: fault_rx, started: started_rx, releases, rpc, weak_rpc }
+        let mut manager = OrphanManager::new(rpc, resolution_tx, fault_tx);
+        manager.start();
+        ManagerFixture { manager, resolution: resolution_rx, faults: fault_rx, started: started_rx, releases, weak_rpc }
     }
 
     #[test]
@@ -671,9 +659,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_emits_resolution_only_at_the_exact_threshold_and_clears_on_deactivate() {
-        let ManagerFixture { mut manager, resolution: _resolution, mut faults, mut started, rpc, .. } = manager_fixture();
-        manager.begin(rpc).await.expect("begin barrier");
+    async fn worker_emits_resolution_only_at_the_exact_threshold() {
+        let ManagerFixture { manager, resolution: _resolution, mut faults, mut started, .. } = manager_fixture();
         let dependency = hash(20_000);
 
         for value in 0..ORPHAN_RESOLUTION_THRESHOLD - 1 {
@@ -693,17 +680,12 @@ mod tests {
         assert_eq!(manager.metrics().threshold_crossings, 1);
         assert!(faults.try_recv().is_err());
 
-        manager.deactivate().await.expect("deactivation barrier");
-        assert_eq!(manager.metrics().current_occupancy, 0);
-        assert_eq!(manager.metrics().resolution_pending, 0);
-        assert_eq!(manager.resolver_metrics(), DependencyResolverMetricsSnapshot { active_operations: 0, waiting_operations: 0 });
         manager.shutdown().await.expect("shutdown barrier");
     }
 
     #[tokio::test]
     async fn natural_body_admission_orders_cancel_before_replacement_resolution() {
-        let ManagerFixture { mut manager, mut resolution, mut faults, mut started, releases, rpc, .. } = manager_fixture();
-        manager.begin(rpc).await.expect("begin barrier");
+        let ManagerFixture { manager, mut resolution, mut faults, mut started, releases, .. } = manager_fixture();
         let dependency = hash(20_000);
         let replacement = hash(20_001);
         for value in 0..ORPHAN_RESOLUTION_THRESHOLD {
@@ -723,37 +705,28 @@ mod tests {
         assert!(resolution.try_recv().is_err());
         assert!(faults.try_recv().is_err());
 
-        manager.deactivate().await.expect("deactivation barrier");
         manager.shutdown().await.expect("shutdown barrier");
     }
 
     #[tokio::test]
-    async fn deactivation_preempts_and_discards_a_queued_data_backlog() {
-        let ManagerFixture { mut manager, resolution: _resolution, mut faults, rpc, .. } = manager_fixture();
-        manager.begin(rpc).await.expect("begin barrier");
+    async fn shutdown_preempts_and_discards_a_queued_data_backlog() {
+        let ManagerFixture { manager, resolution: _resolution, mut faults, .. } = manager_fixture();
+        let metrics = manager.metrics.clone();
+        let resolver_metrics = manager.resolver_metrics.clone();
         for value in 0..PROCESSING_DATA_CHANNEL_CAPACITY {
             manager.add_orphan(block(value), Arc::from([hash(20_000)])).expect("queued orphan");
         }
 
-        manager.deactivate().await.expect("deactivation barrier");
-        assert_eq!(manager.metrics().current_occupancy, 0);
-        assert_eq!(manager.metrics().resolution_pending, 0);
-        assert_eq!(manager.resolver_metrics(), DependencyResolverMetricsSnapshot { active_operations: 0, waiting_operations: 0 });
-        assert!(faults.try_recv().is_err());
         manager.shutdown().await.expect("shutdown barrier");
+        assert_eq!(metrics.snapshot().current_occupancy, 0);
+        assert_eq!(metrics.snapshot().resolution_pending, 0);
+        assert_eq!(resolver_metrics.snapshot(), DependencyResolverMetricsSnapshot { active_operations: 0, waiting_operations: 0 });
+        assert!(faults.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn begin_discards_old_messages_before_acknowledging_new_session_readiness() {
-        let ManagerFixture { mut manager, resolution: _resolution, mut faults, mut started, rpc, .. } = manager_fixture();
-
-        for value in 0..PROCESSING_DATA_CHANNEL_CAPACITY {
-            manager.add_orphan(block(value), Arc::from([hash(20_000)])).expect("old-session orphan");
-        }
-        manager.begin(rpc).await.expect("begin barrier");
-        assert_eq!(manager.metrics().current_occupancy, 0);
-        assert!(started.try_recv().is_err());
-
+    async fn one_session_manager_accepts_its_first_work_after_launch() {
+        let ManagerFixture { manager, resolution: _resolution, mut faults, .. } = manager_fixture();
         manager.add_orphan(block(30_000), Arc::from([hash(30_001)])).expect("new-session orphan");
         for _ in 0..10_000 {
             if manager.metrics().current_occupancy == 1 {
@@ -767,33 +740,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transitive_begin_releases_the_old_rpc_and_retains_first_new_session_work() {
-        let ManagerFixture { mut manager, resolution: _resolution, mut faults, mut started, rpc, weak_rpc, .. } = manager_fixture();
-        manager.begin(rpc).await.expect("first begin barrier");
-        let old_dependency = hash(20_000);
-        for value in 0..ORPHAN_RESOLUTION_THRESHOLD {
-            manager.add_orphan(block(value), Arc::from([old_dependency])).expect("old-session orphan");
-        }
-        assert_eq!(started.recv().await, Some(old_dependency));
-
-        let (new_started_tx, mut new_started_rx) = mpsc::unbounded_channel();
-        let new_rpc = Arc::new(GatedRpc { started: new_started_tx, releases: Arc::new(Semaphore::new(0)) });
-        manager.begin(new_rpc).await.expect("second begin barrier");
-        assert!(weak_rpc.upgrade().is_none());
-
-        let new_dependency = hash(30_000);
-        for value in ORPHAN_RESOLUTION_THRESHOLD..ORPHAN_RESOLUTION_THRESHOLD * 2 {
-            manager.add_orphan(block(value), Arc::from([new_dependency])).expect("new-session orphan");
-        }
-        assert_eq!(new_started_rx.recv().await, Some(new_dependency));
-        assert!(faults.try_recv().is_err());
+    async fn transitive_shutdown_releases_the_exact_rpc_generation() {
+        let ManagerFixture { manager, weak_rpc, .. } = manager_fixture();
+        assert!(weak_rpc.upgrade().is_some());
         manager.shutdown().await.expect("shutdown barrier");
+        assert!(weak_rpc.upgrade().is_none());
     }
 
     #[tokio::test]
     async fn orphan_capacity_fault_stops_the_resolver_and_releases_its_rpc_generation() {
-        let ManagerFixture { mut manager, resolution: _resolution, mut faults, mut started, rpc, weak_rpc, .. } = manager_fixture();
-        manager.begin(rpc).await.expect("begin barrier");
+        let ManagerFixture { manager, resolution: _resolution, mut faults, mut started, weak_rpc, .. } = manager_fixture();
         let dependency = hash(20_000);
         for value in 0..MAX_ORPHAN_BLOCKS {
             manager.add_orphan(block(value), Arc::from([dependency])).expect("orphan within capacity");
@@ -802,12 +758,11 @@ mod tests {
         assert_eq!(started.recv().await, Some(dependency));
 
         manager.add_orphan(block(MAX_ORPHAN_BLOCKS), Arc::from([dependency])).expect("capacity-triggering input");
-        assert_eq!(faults.recv().await, Some(ChildFault::OrphanCapacityExhausted));
+        assert_eq!(faults.recv().await, Some(ChildFault::new(Component::OrphanManager, ChildFaultKind::OrphanCapacityExhausted)));
         wait_until(|| manager.resolver_metrics() == DependencyResolverMetricsSnapshot { active_operations: 0, waiting_operations: 0 })
             .await;
         assert!(weak_rpc.upgrade().is_none());
 
-        manager.deactivate().await.expect("transitive deactivation barrier");
         manager.shutdown().await.expect("shutdown barrier");
     }
 
@@ -822,8 +777,8 @@ mod tests {
         let releases = Arc::new(Semaphore::new(0));
         let rpc = Arc::new(GatedRpc { started: started_tx, releases: releases.clone() });
         let weak_rpc = Arc::downgrade(&rpc);
-        let mut manager = OrphanManager::start(resolution_tx, fault_tx);
-        manager.begin(rpc).await.expect("begin barrier");
+        let mut manager = OrphanManager::new(rpc, resolution_tx, fault_tx);
+        manager.start();
 
         let dependency = hash(20_000);
         for value in 0..ORPHAN_RESOLUTION_THRESHOLD {
@@ -831,12 +786,14 @@ mod tests {
         }
         assert_eq!(started_rx.recv().await, Some(dependency));
         releases.add_permits(1);
-        assert_eq!(fault_rx.recv().await, Some(ChildFault::SessionDataFull(SessionDataPath::Resolution)));
+        assert_eq!(
+            fault_rx.recv().await,
+            Some(ChildFault::new(Component::DependencyResolver, ChildFaultKind::SessionDataFull(SessionDataPath::Resolution)))
+        );
         wait_until(|| manager.resolver_metrics() == DependencyResolverMetricsSnapshot { active_operations: 0, waiting_operations: 0 })
             .await;
         assert!(weak_rpc.upgrade().is_none());
 
-        manager.deactivate().await.expect("transitive deactivation barrier");
         manager.shutdown().await.expect("shutdown barrier");
     }
 

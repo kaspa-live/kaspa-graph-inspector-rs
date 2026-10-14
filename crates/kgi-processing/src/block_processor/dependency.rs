@@ -9,7 +9,7 @@ use std::{
 
 use kgi_model::{
     block::{BlockHash, ValidatedNodeBlock},
-    lifecycle::OwnershipFault,
+    lifecycle::{Component, OwnershipFault},
 };
 use kgi_node::{error::NodeError, rpc::ValidatedRpcClient};
 use tokio::{
@@ -19,7 +19,7 @@ use tokio::{
 
 use super::{
     BlockResolutionEvent, PROCESSING_DATA_CHANNEL_CAPACITY,
-    error::{ChildControlError, ChildFault, SessionDataPath},
+    error::{ChildControlError, ChildFault, ChildFaultKind, SessionDataPath},
 };
 
 pub(crate) const MAX_DEPENDENCY_RPC_CONCURRENCY: usize = 8;
@@ -78,21 +78,20 @@ impl Drop for CounterGuard {
     }
 }
 
-enum ResolverCommand<R> {
-    Begin { rpc: Arc<R>, completion: oneshot::Sender<()> },
-    Deactivate(oneshot::Sender<()>),
+enum ResolverCommand {
     Shutdown(oneshot::Sender<()>),
 }
 
 pub(crate) struct DependencyResolver<R: DependencyRpc = ValidatedRpcClient> {
-    commands: mpsc::UnboundedSender<ResolverCommand<R>>,
+    commands: mpsc::UnboundedSender<ResolverCommand>,
     work: mpsc::Sender<ResolverWork>,
     metrics: Arc<DependencyResolverMetrics>,
+    worker: Option<DependencyResolverWorker<R>>,
     join: Option<JoinHandle<()>>,
 }
 
 impl<R: DependencyRpc> DependencyResolver<R> {
-    pub(crate) fn start(resolution: mpsc::Sender<BlockResolutionEvent>, faults: mpsc::UnboundedSender<ChildFault>) -> Self {
+    pub(crate) fn new(rpc: Arc<R>, resolution: mpsc::Sender<BlockResolutionEvent>, faults: mpsc::UnboundedSender<ChildFault>) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (work_tx, work_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let metrics = Arc::new(DependencyResolverMetrics::default());
@@ -103,15 +102,19 @@ impl<R: DependencyRpc> DependencyResolver<R> {
             faults,
             metrics: metrics.clone(),
             permits: Arc::new(Semaphore::new(MAX_DEPENDENCY_RPC_CONCURRENCY)),
-            rpc: None,
+            rpc,
             tasks: JoinSet::new(),
             tasks_by_hash: HashMap::new(),
             hashes_by_task: HashMap::new(),
             faulted: false,
             work_open: true,
         };
-        let join = tokio::spawn(worker.run());
-        Self { commands: command_tx, work: work_tx, metrics, join: Some(join) }
+        Self { commands: command_tx, work: work_tx, metrics, worker: Some(worker), join: None }
+    }
+
+    pub(crate) fn start(&mut self) {
+        let worker = self.worker.take().expect("DependencyResolver starts exactly once");
+        self.join = Some(tokio::spawn(worker.run()));
     }
 
     pub(super) fn resolve(&self, hash: BlockHash) -> Result<(), mpsc::error::TrySendError<()>> {
@@ -122,19 +125,10 @@ impl<R: DependencyRpc> DependencyResolver<R> {
         self.work.try_send(ResolverWork::Cancel(hash)).map_err(map_work_send_error)
     }
 
-    pub(crate) async fn begin(&self, rpc: Arc<R>) -> Result<(), ChildControlError> {
-        let (completion, acknowledgement) = oneshot::channel();
-        self.commands.send(ResolverCommand::Begin { rpc, completion }).map_err(|_| ChildControlError::CommandPathClosed)?;
-        acknowledgement.await.map_err(|_| ChildControlError::AcknowledgementLost)
-    }
-
-    pub(crate) async fn deactivate(&self) -> Result<(), ChildControlError> {
-        let (completion, acknowledgement) = oneshot::channel();
-        self.commands.send(ResolverCommand::Deactivate(completion)).map_err(|_| ChildControlError::CommandPathClosed)?;
-        acknowledgement.await.map_err(|_| ChildControlError::AcknowledgementLost)
-    }
-
-    pub(crate) async fn shutdown(&mut self) -> Result<(), ChildControlError> {
+    pub(crate) async fn shutdown(mut self) -> Result<(), ChildControlError> {
+        if self.worker.take().is_some() {
+            return Ok(());
+        }
         let (completion, acknowledgement) = oneshot::channel();
         let barrier = match self.commands.send(ResolverCommand::Shutdown(completion)) {
             Ok(()) => acknowledgement.await.map_err(|_| ChildControlError::AcknowledgementLost),
@@ -165,13 +159,13 @@ fn map_work_send_error(error: mpsc::error::TrySendError<ResolverWork>) -> mpsc::
 }
 
 struct DependencyResolverWorker<R> {
-    commands: mpsc::UnboundedReceiver<ResolverCommand<R>>,
+    commands: mpsc::UnboundedReceiver<ResolverCommand>,
     work: mpsc::Receiver<ResolverWork>,
     resolution: mpsc::Sender<BlockResolutionEvent>,
     faults: mpsc::UnboundedSender<ChildFault>,
     metrics: Arc<DependencyResolverMetrics>,
     permits: Arc<Semaphore>,
-    rpc: Option<Arc<R>>,
+    rpc: Arc<R>,
     tasks: JoinSet<Result<ValidatedNodeBlock, NodeError>>,
     tasks_by_hash: HashMap<BlockHash, (Id, AbortHandle)>,
     hashes_by_task: HashMap<Id, BlockHash>,
@@ -208,12 +202,12 @@ impl<R: DependencyRpc> DependencyResolverWorker<R> {
                         self.handle_task_result(result);
                     }
                 }
-                work = self.work.recv(), if self.rpc.is_some() && !self.faulted && self.work_open => {
+                work = self.work.recv(), if !self.faulted && self.work_open => {
                     match work {
                         Some(work) => self.handle_work(work).await,
                         None => {
                             self.work_open = false;
-                            self.report_fault(ChildFault::SessionDataEndpointLost(SessionDataPath::ResolverWork));
+                            self.report_fault(ChildFaultKind::SessionDataEndpointLost(SessionDataPath::ResolverWork));
                             self.faulted = true;
                             self.tasks.abort_all();
                         }
@@ -227,27 +221,9 @@ impl<R: DependencyRpc> DependencyResolverWorker<R> {
     ///
     /// Returns `true` only when the worker must terminate after completing the
     /// command's acknowledgement barrier.
-    async fn handle_command(&mut self, command: ResolverCommand<R>) -> bool {
+    async fn handle_command(&mut self, command: ResolverCommand) -> bool {
         match command {
-            ResolverCommand::Begin { rpc, completion } => {
-                self.rpc = None;
-                self.abort_and_join().await;
-                self.drain_work();
-                self.rpc = Some(rpc);
-                self.faulted = false;
-                let _ = completion.send(());
-                false
-            }
-            ResolverCommand::Deactivate(completion) => {
-                self.rpc = None;
-                self.abort_and_join().await;
-                self.drain_work();
-                self.faulted = false;
-                let _ = completion.send(());
-                false
-            }
             ResolverCommand::Shutdown(completion) => {
-                self.rpc = None;
                 self.abort_and_join().await;
                 self.drain_work();
                 let _ = completion.send(());
@@ -269,17 +245,13 @@ impl<R: DependencyRpc> DependencyResolverWorker<R> {
 
     fn start_resolution(&mut self, hash: BlockHash) {
         if self.tasks_by_hash.contains_key(&hash) {
-            self.report_fault(ChildFault::InvalidProtocol(Arc::from("duplicate dependency resolution request")));
+            self.report_fault(ChildFaultKind::InvalidProtocol(Arc::from("duplicate dependency resolution request")));
             self.faulted = true;
             self.tasks.abort_all();
             return;
         }
 
-        let Some(rpc) = self.rpc.clone() else {
-            self.report_fault(ChildFault::Ownership(OwnershipFault::InvalidLifecycleControl));
-            self.faulted = true;
-            return;
-        };
+        let rpc = self.rpc.clone();
         let permits = self.permits.clone();
         let waiting = CounterGuard::new(self.metrics.waiting.clone());
         let active_counter = self.metrics.active.clone();
@@ -300,7 +272,7 @@ impl<R: DependencyRpc> DependencyResolverWorker<R> {
             Err(error) => error.id(),
         };
         let Some(hash) = self.hashes_by_task.remove(&task_id) else {
-            self.report_fault(ChildFault::InvalidProtocol(Arc::from("dependency task completed without tracked hash")));
+            self.report_fault(ChildFaultKind::InvalidProtocol(Arc::from("dependency task completed without tracked hash")));
             self.faulted = true;
             return;
         };
@@ -311,12 +283,12 @@ impl<R: DependencyRpc> DependencyResolverWorker<R> {
                 match self.resolution.try_send(BlockResolutionEvent::DependencyResolved { requested_hash: hash, result }) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        self.report_fault(ChildFault::SessionDataFull(SessionDataPath::Resolution));
+                        self.report_fault(ChildFaultKind::SessionDataFull(SessionDataPath::Resolution));
                         self.faulted = true;
                         self.tasks.abort_all();
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        self.report_fault(ChildFault::SessionDataEndpointLost(SessionDataPath::Resolution));
+                        self.report_fault(ChildFaultKind::SessionDataEndpointLost(SessionDataPath::Resolution));
                         self.faulted = true;
                         self.tasks.abort_all();
                     }
@@ -325,7 +297,7 @@ impl<R: DependencyRpc> DependencyResolverWorker<R> {
             Ok(_) => {}
             Err(error) if error.is_cancelled() => {}
             Err(_) => {
-                self.report_fault(ChildFault::Ownership(OwnershipFault::UnexpectedWorkerTermination));
+                self.report_fault(ChildFaultKind::Ownership(OwnershipFault::UnexpectedWorkerTermination));
                 self.faulted = true;
                 self.tasks.abort_all();
             }
@@ -351,8 +323,8 @@ impl<R: DependencyRpc> DependencyResolverWorker<R> {
         while self.work.try_recv().is_ok() {}
     }
 
-    fn report_fault(&self, fault: ChildFault) {
-        let _ = self.faults.send(fault);
+    fn report_fault(&self, kind: ChildFaultKind) {
+        let _ = self.faults.send(ChildFault::new(Component::DependencyResolver, kind));
     }
 }
 
@@ -427,14 +399,14 @@ mod tests {
         let releases = Arc::new(Semaphore::new(0));
         let rpc = Arc::new(GatedRpc { started: started_tx, releases: releases.clone() });
         let weak = Arc::downgrade(&rpc);
-        let resolver = DependencyResolver::start(resolution_tx, fault_tx);
-        resolver.begin(rpc).await.expect("begin barrier");
+        let mut resolver = DependencyResolver::new(rpc, resolution_tx, fault_tx);
+        resolver.start();
         ResolverFixture { resolver, resolution: resolution_rx, faults: fault_rx, started: started_rx, releases, rpc: weak }
     }
 
     #[tokio::test]
     async fn local_rpc_limit_tracks_active_and_waiting_operations() {
-        let ResolverFixture { mut resolver, mut resolution, mut faults, mut started, releases, .. } = resolver().await;
+        let ResolverFixture { resolver, mut resolution, mut faults, mut started, releases, .. } = resolver().await;
         for value in 0..=MAX_DEPENDENCY_RPC_CONCURRENCY {
             resolver.resolve(hash(value)).expect("resolver work");
         }
@@ -462,7 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn natural_arrival_cancels_waiting_or_active_work_without_a_result() {
-        let ResolverFixture { mut resolver, mut resolution, mut faults, mut started, .. } = resolver().await;
+        let ResolverFixture { resolver, mut resolution, mut faults, mut started, .. } = resolver().await;
         let requested = hash(7);
         resolver.resolve(requested).expect("resolve request");
         assert_eq!(started.recv().await, Some(requested));
@@ -475,7 +447,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_parent_result_channel_faults_without_blocking_deactivation() {
+    async fn full_parent_result_channel_faults_without_blocking_shutdown() {
         let (resolution_tx, _resolution_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         for value in 0..PROCESSING_DATA_CHANNEL_CAPACITY {
             resolution_tx.try_send(BlockResolutionEvent::OrphanReady(block(hash(value)))).expect("fill resolution channel");
@@ -484,33 +456,33 @@ mod tests {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let releases = Arc::new(Semaphore::new(0));
         let rpc = Arc::new(GatedRpc { started: started_tx, releases: releases.clone() });
-        let mut resolver = DependencyResolver::start(resolution_tx, fault_tx);
-        resolver.begin(rpc).await.expect("begin barrier");
+        let mut resolver = DependencyResolver::new(rpc, resolution_tx, fault_tx);
+        resolver.start();
         resolver.resolve(hash(5_000)).expect("resolve request");
         assert_eq!(started_rx.recv().await, Some(hash(5_000)));
         releases.add_permits(1);
-        assert_eq!(fault_rx.recv().await, Some(ChildFault::SessionDataFull(SessionDataPath::Resolution)));
+        assert_eq!(
+            fault_rx.recv().await,
+            Some(ChildFault::new(Component::DependencyResolver, ChildFaultKind::SessionDataFull(SessionDataPath::Resolution)))
+        );
 
-        resolver.deactivate().await.expect("deactivation barrier");
-        assert_eq!(resolver.metrics(), DependencyResolverMetricsSnapshot { active_operations: 0, waiting_operations: 0 });
         resolver.shutdown().await.expect("shutdown barrier");
     }
 
     #[tokio::test]
-    async fn deactivation_releases_the_exact_rpc_generation() {
-        let ResolverFixture { mut resolver, rpc, .. } = resolver().await;
+    async fn consuming_shutdown_releases_the_exact_rpc_generation() {
+        let ResolverFixture { resolver, rpc, .. } = resolver().await;
         assert!(rpc.upgrade().is_some());
-        resolver.deactivate().await.expect("deactivation barrier");
-        assert!(rpc.upgrade().is_none());
         resolver.shutdown().await.expect("shutdown barrier");
+        assert!(rpc.upgrade().is_none());
     }
 
     #[tokio::test]
     async fn resolver_preserves_unavailable_and_opaque_node_outcomes() {
         let (resolution_tx, mut resolution_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (fault_tx, mut fault_rx) = mpsc::unbounded_channel();
-        let mut resolver = DependencyResolver::start(resolution_tx, fault_tx);
-        resolver.begin(Arc::new(FailingRpc)).await.expect("begin barrier");
+        let mut resolver = DependencyResolver::new(Arc::new(FailingRpc), resolution_tx, fault_tx);
+        resolver.start();
         resolver.resolve(hash(1)).expect("not-found request");
         resolver.resolve(hash(2)).expect("opaque-failure request");
 
@@ -535,36 +507,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deactivation_preempts_and_discards_a_queued_work_backlog() {
-        let ResolverFixture { mut resolver, mut resolution, mut faults, mut started, .. } = resolver().await;
+    async fn shutdown_preempts_and_discards_a_queued_work_backlog() {
+        let ResolverFixture { resolver, mut resolution, mut faults, mut started, .. } = resolver().await;
+        let metrics = resolver.metrics_source();
         for value in 0..PROCESSING_DATA_CHANNEL_CAPACITY {
             resolver.resolve(hash(value)).expect("queued resolution");
         }
 
-        resolver.deactivate().await.expect("deactivation barrier");
-        assert_eq!(resolver.metrics(), DependencyResolverMetricsSnapshot { active_operations: 0, waiting_operations: 0 });
+        resolver.shutdown().await.expect("shutdown barrier");
+        assert_eq!(metrics.snapshot(), DependencyResolverMetricsSnapshot { active_operations: 0, waiting_operations: 0 });
         assert!(started.try_recv().is_err());
         assert!(resolution.try_recv().is_err());
         assert!(faults.try_recv().is_err());
-        resolver.shutdown().await.expect("shutdown barrier");
     }
 
     #[tokio::test]
-    async fn begin_discards_old_work_before_acknowledging_new_generation_readiness() {
+    async fn inert_construction_starts_no_rpc_before_single_launch() {
         let (resolution_tx, mut resolution_rx) = mpsc::channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (fault_tx, mut fault_rx) = mpsc::unbounded_channel();
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let releases = Arc::new(Semaphore::new(0));
         let rpc = Arc::new(GatedRpc { started: started_tx, releases: releases.clone() });
-        let mut resolver = DependencyResolver::start(resolution_tx, fault_tx);
-        for value in 0..PROCESSING_DATA_CHANNEL_CAPACITY {
-            resolver.resolve(hash(value)).expect("old-session work");
-        }
-        resolver.begin(rpc).await.expect("begin barrier");
+        let mut resolver = DependencyResolver::new(rpc, resolution_tx, fault_tx);
         assert!(started_rx.try_recv().is_err());
+        resolver.start();
 
         let requested = hash(30_000);
-        resolver.resolve(requested).expect("new-session work");
+        resolver.resolve(requested).expect("session work");
         assert_eq!(started_rx.recv().await, Some(requested));
         releases.add_permits(1);
         assert!(
