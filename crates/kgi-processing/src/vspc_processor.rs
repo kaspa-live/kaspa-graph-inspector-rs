@@ -519,6 +519,10 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessorWorker<D, R> {
                 continue;
             }
 
+            if self.drive_once().await {
+                continue;
+            }
+
             if let Ok(persisted) = self.persisted.try_recv() {
                 self.handle_persisted(persisted).await;
                 continue;
@@ -561,7 +565,6 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessorWorker<D, R> {
                 {
                     state.phase = VspcPhase::Catchup { synthetic_sink_lower_bound };
                     self.overlap.reset();
-                    self.drive().await;
                 } else {
                     self.enter_fault(invalid_lifecycle("Catchup requires active synchronization"));
                 }
@@ -576,7 +579,6 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessorWorker<D, R> {
                     state.phase = VspcPhase::Live;
                     state.prune_history();
                     self.metrics.update(state.pending_len());
-                    self.drive().await;
                 } else {
                     self.enter_fault(invalid_lifecycle("Live requires active Catchup"));
                 }
@@ -602,7 +604,6 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessorWorker<D, R> {
         for id in waiting {
             state.refresh_candidate(id);
         }
-        self.drive().await;
     }
 
     async fn handle_change(&mut self, change: VspcChange, source: CandidateSource) {
@@ -658,61 +659,61 @@ impl<D: VspcDatabase, R: VspcRpc> VspcProcessorWorker<D, R> {
         }
         state.refresh_candidate(id);
         self.metrics.update(state.pending_len());
-        self.drive().await;
     }
 
-    async fn drive(&mut self) {
-        loop {
-            if self.faulted {
-                return;
+    /// Advances at most one ready state-machine action so the owner loop can
+    /// recheck its prioritized lifecycle-command mailbox between actions.
+    async fn drive_once(&mut self) -> bool {
+        if self.faulted {
+            return false;
+        }
+        let Some(action) = self.next_action() else {
+            return false;
+        };
+        match action {
+            DriveAction::Discard(id, overlap) => {
+                let VspcProcessorRun::Active(state) = &mut self.run else {
+                    return false;
+                };
+                state.remove_candidate(id);
+                self.metrics.update(state.pending_len());
+                if overlap {
+                    self.overlap.observe();
+                }
             }
-            let Some(action) = self.next_action() else {
-                return;
-            };
-            match action {
-                DriveAction::Discard(id, overlap) => {
-                    let VspcProcessorRun::Active(state) = &mut self.run else {
-                        return;
-                    };
-                    state.remove_candidate(id);
-                    self.metrics.update(state.pending_len());
-                    if overlap {
-                        self.overlap.observe();
-                    }
+            DriveAction::NormalizeCrossing(id, suffix) => {
+                let VspcProcessorRun::Active(state) = &mut self.run else {
+                    return false;
+                };
+                if let Some(candidate) = state.pending.get_mut(&id) {
+                    candidate.change = VspcChange { removed: Arc::from([]), added: suffix };
+                    candidate.overlap_credited = true;
                 }
-                DriveAction::NormalizeCrossing(id, suffix) => {
-                    let VspcProcessorRun::Active(state) = &mut self.run else {
-                        return;
-                    };
-                    if let Some(candidate) = state.pending.get_mut(&id) {
-                        candidate.change = VspcChange { removed: Arc::from([]), added: suffix };
-                        candidate.overlap_credited = true;
-                    }
-                    state.refresh_candidate(id);
-                    self.overlap.observe();
+                state.refresh_candidate(id);
+                self.overlap.observe();
+            }
+            DriveAction::MarkOverlap(id) => {
+                let VspcProcessorRun::Active(state) = &mut self.run else {
+                    return false;
+                };
+                if let Some(candidate) = state.pending.get_mut(&id) {
+                    candidate.overlap_credited = true;
                 }
-                DriveAction::MarkOverlap(id) => {
-                    let VspcProcessorRun::Active(state) = &mut self.run else {
-                        return;
-                    };
-                    if let Some(candidate) = state.pending.get_mut(&id) {
-                        candidate.overlap_credited = true;
-                    }
-                    self.overlap.observe();
+                self.overlap.observe();
+            }
+            DriveAction::Commit(id) => {
+                if !self.commit_candidate(id).await {
+                    return false;
                 }
-                DriveAction::Commit(id) => {
-                    if !self.commit_candidate(id).await {
-                        return;
-                    }
-                }
-                DriveAction::CompetingNotifications => {
-                    self.enter_fault(malformed_notification(MalformedVspcNotificationReason::CompetingNextMove, RecoveryMode::Resync));
-                }
-                DriveAction::SyntheticSourceMismatch => {
-                    self.enter_fault(malformed_synthetic(MalformedVspcResponseReason::ResolvedSourceDiscontinuity));
-                }
+            }
+            DriveAction::CompetingNotifications => {
+                self.enter_fault(malformed_notification(MalformedVspcNotificationReason::CompetingNextMove, RecoveryMode::Resync));
+            }
+            DriveAction::SyntheticSourceMismatch => {
+                self.enter_fault(malformed_synthetic(MalformedVspcResponseReason::ResolvedSourceDiscontinuity));
             }
         }
+        true
     }
 
     fn next_action(&self) -> Option<DriveAction> {
@@ -1061,7 +1062,7 @@ mod tests {
         block::{BlueWork, ConsensusOrder},
         graph_update::GraphUpdate,
     };
-    use tokio::sync::mpsc;
+    use tokio::sync::{Semaphore, mpsc};
 
     use super::*;
     #[derive(Default)]
@@ -1075,6 +1076,7 @@ mod tests {
     #[derive(Default)]
     struct MockDb {
         state: Mutex<MockDbState>,
+        apply_gate: Mutex<Option<(mpsc::UnboundedSender<()>, Arc<Semaphore>)>>,
     }
 
     impl MockDb {
@@ -1084,6 +1086,13 @@ mod tests {
 
         fn push_apply(&self, result: Result<VspcCommitOutcome, ApplyVspcChangeError>) {
             self.state.lock().expect("mock DB mutex").apply_results.push_back(result);
+        }
+
+        fn gate_next_apply(&self) -> (mpsc::UnboundedReceiver<()>, Arc<Semaphore>) {
+            let (started_tx, started_rx) = mpsc::unbounded_channel();
+            let releases = Arc::new(Semaphore::new(0));
+            *self.apply_gate.lock().expect("mock DB gate mutex") = Some((started_tx, releases.clone()));
+            (started_rx, releases)
         }
     }
 
@@ -1095,12 +1104,20 @@ mod tests {
         }
 
         async fn apply_vspc_change(&self, change: ReadyVspcChange) -> Result<VspcCommitOutcome, ApplyVspcChangeError> {
-            let mut state = self.state.lock().expect("mock DB mutex");
-            state.applied.push(change.clone());
-            state
-                .apply_results
-                .pop_front()
-                .unwrap_or_else(|| Ok(VspcCommitOutcome { destination: change.destination, level_snapshots: Arc::from([]) }))
+            let result = {
+                let mut state = self.state.lock().expect("mock DB mutex");
+                state.applied.push(change.clone());
+                state
+                    .apply_results
+                    .pop_front()
+                    .unwrap_or_else(|| Ok(VspcCommitOutcome { destination: change.destination, level_snapshots: Arc::from([]) }))
+            };
+            let gate = self.apply_gate.lock().expect("mock DB gate mutex").take();
+            if let Some((started, releases)) = gate {
+                let _ = started.send(());
+                releases.acquire().await.expect("mock DB release semaphore remains open").forget();
+            }
+            result
         }
     }
 
@@ -1271,6 +1288,55 @@ mod tests {
         let applied = db.state.lock().expect("mock DB mutex").applied.clone();
         assert_eq!(applied.len(), 1);
         assert_eq!(applied[0].added.as_ref(), &[id(2)]);
+        assert!(events.try_recv().is_err());
+        processor.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn live_preempts_the_ready_synthetic_suffix_after_an_in_flight_commit() {
+        let Fixture { processor, mut events, persisted, mut graph, db, .. } = fixture(anchor(1));
+        processor.catchup(point(1)).expect("Catchup");
+
+        // Preload block 3, then admit both synthetic candidates while block 2
+        // is still missing. Persisting block 2 makes the complete suffix ready
+        // in one worker transition.
+        persisted.send(persisted_block(3, 2)).await.expect("later destination");
+        processor.submit_synthetic(added(&[2])).await.expect("first synthetic change");
+        for _ in 0..20 {
+            if processor.metrics().pending_occupancy == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(processor.metrics().pending_occupancy, 1);
+        processor.submit_synthetic(added(&[3])).await.expect("second synthetic change");
+        for _ in 0..20 {
+            if processor.metrics().pending_occupancy == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(processor.metrics().pending_occupancy, 2);
+
+        let (mut apply_started, apply_releases) = db.gate_next_apply();
+        persisted.send(persisted_block(2, 1)).await.expect("shared missing history");
+        apply_started.recv().await.expect("first synthetic commit started");
+        processor.live().expect("Live while first commit is in flight");
+        apply_releases.add_permits(1);
+
+        assert!(matches!(
+            graph.next_event().await,
+            Some(GraphUpdateReceiveEvent::Update(GraphUpdate::VspcCommitted(VspcCommitted { destination, .. })))
+                if destination == hash(2)
+        ));
+        for _ in 0..20 {
+            if processor.metrics().pending_occupancy == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(processor.metrics().pending_occupancy, 0);
+        assert_eq!(db.state.lock().expect("mock DB mutex").applied.len(), 1);
         assert!(events.try_recv().is_err());
         processor.shutdown().await.expect("shutdown");
     }
