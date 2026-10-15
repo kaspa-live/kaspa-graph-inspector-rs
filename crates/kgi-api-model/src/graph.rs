@@ -5,11 +5,11 @@ use std::{
 
 use kgi_model::{
     block::{BlockColor, BlockCoordinate, BlockHash, Timestamp},
-    graph_update::{BlockCommitted, LevelCommitted},
+    graph_update::{BlockCommitted, LevelCommitted, VspcCommitted},
 };
 use thiserror::Error;
 
-use crate::delta::{GraphDelta, LevelChange};
+use crate::delta::{FieldChange, GraphDelta, LevelChange};
 
 /// Complete retained level depth of the canonical Head graph.
 pub const MAX_CACHE_DEPTH: u64 = 1_000;
@@ -329,6 +329,140 @@ impl GraphView {
         let target_extent = LevelExtent::new(target_low, target_high).expect("derived Head extent is positive and ordered");
         let mut mutation = GraphMutation::default();
 
+        self.apply_block_projection(committed, target_extent, &mut mutation);
+
+        let pruned_block_levels: Vec<_> =
+            self.block_hashes_by_level.range(..target_extent.low_level()).map(|(&level, _)| level).collect();
+        let mut pruned_blocks = Vec::new();
+        for level in pruned_block_levels {
+            pruned_blocks.extend(self.block_hashes_by_level.remove(&level).expect("a selected block level exists"));
+        }
+        for &hash in &pruned_blocks {
+            let block = self.blocks.remove(&hash).expect("an indexed block exists");
+            mutation.capture_removed_block(hash, block);
+        }
+
+        let mut pruned_edges = Vec::new();
+        for child in pruned_blocks {
+            if let Some(parents) = self.edge_parents_by_child.remove(&child) {
+                pruned_edges.extend(parents.into_iter().map(|parent| EdgeId { parent, child }));
+            }
+        }
+        for id in pruned_edges {
+            let edge = self.edges.remove(&id).expect("a selected retained edge exists");
+            mutation.capture_removed_edge(id, edge);
+            self.decrement_parent_usage(edge.parent_coordinate.level());
+        }
+
+        let pruned_levels: Vec<_> = self
+            .levels
+            .range(..target_extent.low_level())
+            .filter(|(_, stored)| stored.usage_count == 0)
+            .map(|(&level, _)| level)
+            .collect();
+        for level in pruned_levels {
+            let stored = self.levels.remove(&level).expect("a selected retained level exists");
+            mutation.capture_removed_level(level, stored.value);
+        }
+
+        self.extent = target_extent;
+        Ok(self.finish_mutation(mutation, revision_timestamp_us))
+    }
+
+    /// Applies one committed VSPC transition to a head-tracking view.
+    ///
+    /// Absent block targets and absent levels are ignored. A visible projected
+    /// mutation advances the view by one revision.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called on a Fixed view.
+    pub fn apply_head_vspc_committed(
+        &mut self,
+        committed: &VspcCommitted,
+        revision_timestamp_us: u64,
+    ) -> Result<Option<GraphDelta>, GraphViewUpdateError> {
+        if self.tracking_policy == TrackingPolicy::Frozen {
+            return Err(GraphViewUpdateError::Frozen);
+        }
+        assert_eq!(self.tracking_policy, TrackingPolicy::Head, "head mutation requires a Head graph view");
+
+        let added_metadata: Vec<_> =
+            committed.added.iter().filter_map(|hash| self.blocks.get(hash)).map(VspcProjectionMetadata::from).collect();
+        Ok(self.apply_vspc_projection(committed, &added_metadata, revision_timestamp_us))
+    }
+
+    /// Applies one original committed block to a fixed view using post-update Head context.
+    ///
+    /// A disjoint post-update Head extent freezes this view without applying
+    /// the value or advancing its revision.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless this is a Fixed view and `head` is a Head view, or when
+    /// the committed payload violates Storage's coherent projection invariants.
+    pub fn apply_fixed_block_committed(
+        &mut self,
+        committed: &BlockCommitted,
+        head: &GraphView,
+        revision_timestamp_us: u64,
+    ) -> Result<Option<GraphDelta>, GraphViewUpdateError> {
+        if self.tracking_policy == TrackingPolicy::Frozen {
+            return Err(GraphViewUpdateError::Frozen);
+        }
+        assert_eq!(self.tracking_policy, TrackingPolicy::Fixed, "fixed mutation requires a Fixed graph view");
+        assert_eq!(head.tracking_policy, TrackingPolicy::Head, "fixed mutation requires post-update Head context");
+
+        if !self.extent.overlaps(head.extent) {
+            self.tracking_policy = TrackingPolicy::Frozen;
+            return Ok(None);
+        }
+
+        let mut mutation = GraphMutation::default();
+        self.apply_block_projection(committed, self.extent, &mut mutation);
+        Ok(self.finish_mutation(mutation, revision_timestamp_us))
+    }
+
+    /// Applies one original committed VSPC transition to a fixed view.
+    ///
+    /// Immutable metadata is resolved from this view and the post-update Head
+    /// view before mutation. Disjoint extents or missing required metadata
+    /// freeze this view without changing its graph contents or revision.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless this is a Fixed view and `head` is a Head view.
+    pub fn apply_fixed_vspc_committed(
+        &mut self,
+        committed: &VspcCommitted,
+        head: &GraphView,
+        revision_timestamp_us: u64,
+    ) -> Result<Option<GraphDelta>, GraphViewUpdateError> {
+        if self.tracking_policy == TrackingPolicy::Frozen {
+            return Err(GraphViewUpdateError::Frozen);
+        }
+        assert_eq!(self.tracking_policy, TrackingPolicy::Fixed, "fixed mutation requires a Fixed graph view");
+        assert_eq!(head.tracking_policy, TrackingPolicy::Head, "fixed mutation requires post-update Head context");
+
+        if !self.extent.overlaps(head.extent) {
+            self.tracking_policy = TrackingPolicy::Frozen;
+            return Ok(None);
+        }
+
+        let added_metadata: Option<Vec<_>> = committed
+            .added
+            .iter()
+            .map(|hash| self.blocks.get(hash).or_else(|| head.blocks.get(hash)).map(VspcProjectionMetadata::from))
+            .collect();
+        let Some(added_metadata) = added_metadata else {
+            self.tracking_policy = TrackingPolicy::Frozen;
+            return Ok(None);
+        };
+
+        Ok(self.apply_vspc_projection(committed, &added_metadata, revision_timestamp_us))
+    }
+
+    fn apply_block_projection(&mut self, committed: &BlockCommitted, target_extent: LevelExtent, mutation: &mut GraphMutation) {
         let graph_block = graph_block_from_committed(committed);
         if target_extent.contains_level(graph_block.coordinate.level()) {
             mutation.capture_block(&self.blocks, graph_block.hash);
@@ -374,45 +508,61 @@ impl GraphView {
                 self.increment_parent_usage(edge.parent_coordinate.level());
             }
         }
+    }
 
-        let pruned_block_levels: Vec<_> =
-            self.block_hashes_by_level.range(..target_extent.low_level()).map(|(&level, _)| level).collect();
-        let mut pruned_blocks = Vec::new();
-        for level in pruned_block_levels {
-            pruned_blocks.extend(self.block_hashes_by_level.remove(&level).expect("a selected block level exists"));
-        }
-        for &hash in &pruned_blocks {
-            let block = self.blocks.remove(&hash).expect("an indexed block exists");
-            mutation.capture_removed_block(hash, block);
-        }
+    fn apply_vspc_projection(
+        &mut self,
+        committed: &VspcCommitted,
+        added_metadata: &[VspcProjectionMetadata],
+        revision_timestamp_us: u64,
+    ) -> Option<GraphDelta> {
+        let mut mutation = GraphMutation::default();
 
-        let mut pruned_edges = Vec::new();
-        for child in pruned_blocks {
-            if let Some(parents) = self.edge_parents_by_child.remove(&child) {
-                pruned_edges.extend(parents.into_iter().map(|parent| EdgeId { parent, child }));
+        for hash in committed.removed.iter().copied() {
+            if let Some(block) = self.blocks.get_mut(&hash) {
+                mutation.capture_membership(hash, block.is_in_vspc);
+                mutation.capture_color(hash, block.color);
+                block.is_in_vspc = false;
+                block.color = BlockColor::Gray;
             }
         }
-        for id in pruned_edges {
-            let edge = self.edges.remove(&id).expect("a selected retained edge exists");
-            mutation.capture_removed_edge(id, edge);
-            self.decrement_parent_usage(edge.parent_coordinate.level());
+
+        for hash in committed.added.iter().copied() {
+            if let Some(block) = self.blocks.get_mut(&hash) {
+                mutation.capture_membership(hash, block.is_in_vspc);
+                block.is_in_vspc = true;
+            }
         }
 
-        let pruned_levels: Vec<_> = self
-            .levels
-            .range(..target_extent.low_level())
-            .filter(|(_, stored)| stored.usage_count == 0)
-            .map(|(&level, _)| level)
-            .collect();
-        for level in pruned_levels {
-            let stored = self.levels.remove(&level).expect("a selected retained level exists");
-            mutation.capture_removed_level(level, stored.value);
+        for metadata in added_metadata {
+            for hash in metadata.blue_merge_set.iter().copied() {
+                if let Some(block) = self.blocks.get_mut(&hash) {
+                    mutation.capture_color(hash, block.color);
+                    block.color = BlockColor::Blue;
+                }
+            }
+            for hash in metadata.red_merge_set.iter().copied() {
+                if let Some(block) = self.blocks.get_mut(&hash) {
+                    mutation.capture_color(hash, block.color);
+                    block.color = BlockColor::Red;
+                }
+            }
         }
 
-        self.extent = target_extent;
+        for snapshot in committed.level_snapshots.iter() {
+            if let Some(stored) = self.levels.get_mut(&snapshot.level) {
+                mutation.capture_level_value(snapshot.level, stored.value);
+                stored.value.daa_score = snapshot.daa_score;
+            }
+        }
+
+        self.finish_mutation(mutation, revision_timestamp_us)
+    }
+
+    fn finish_mutation(&mut self, mutation: GraphMutation, revision_timestamp_us: u64) -> Option<GraphDelta> {
         let changes = mutation.finish(self);
         if changes.is_empty() {
-            return Ok(None);
+            return None;
         }
 
         let next_revision = self.current_revision_id.checked_add(1).expect("graph revision fits u64");
@@ -420,18 +570,18 @@ impl GraphView {
             self.current_revision_id,
             next_revision,
             revision_timestamp_us,
-            target_high,
+            self.high_level(),
             changes.blocks,
             changes.edges,
             changes.levels,
-            HashMap::new(),
-            HashMap::new(),
+            changes.is_in_vspc,
+            changes.colors,
         )
-        .expect("Head mutation constructs a forward delta with a positive high level");
+        .expect("graph mutation constructs a forward delta with a positive high level");
         self.current_revision_id = next_revision;
         self.current_revision_timestamp_us = revision_timestamp_us;
 
-        Ok(Some(delta))
+        Some(delta)
     }
 
     fn insert_block(&mut self, block: GraphBlock) {
@@ -553,11 +703,24 @@ fn graph_block_from_committed(committed: &BlockCommitted) -> GraphBlock {
     }
 }
 
+struct VspcProjectionMetadata {
+    blue_merge_set: Arc<[BlockHash]>,
+    red_merge_set: Arc<[BlockHash]>,
+}
+
+impl From<&GraphBlock> for VspcProjectionMetadata {
+    fn from(block: &GraphBlock) -> Self {
+        Self { blue_merge_set: Arc::clone(&block.blue_merge_set), red_merge_set: Arc::clone(&block.red_merge_set) }
+    }
+}
+
 #[derive(Default)]
 struct GraphMutation {
     blocks: HashMap<BlockHash, Option<GraphBlock>>,
     edges: HashMap<EdgeId, Option<GraphEdge>>,
     levels: BTreeMap<u64, Option<Level>>,
+    is_in_vspc: HashMap<BlockHash, bool>,
+    colors: HashMap<BlockHash, BlockColor>,
 }
 
 impl GraphMutation {
@@ -585,6 +748,18 @@ impl GraphMutation {
         self.levels.entry(level).or_insert(Some(value));
     }
 
+    fn capture_level_value(&mut self, level: u64, value: Level) {
+        self.levels.entry(level).or_insert(Some(value));
+    }
+
+    fn capture_membership(&mut self, hash: BlockHash, is_in_vspc: bool) {
+        self.is_in_vspc.entry(hash).or_insert(is_in_vspc);
+    }
+
+    fn capture_color(&mut self, hash: BlockHash, color: BlockColor) {
+        self.colors.entry(hash).or_insert(color);
+    }
+
     fn finish(self, view: &GraphView) -> GraphChanges {
         let blocks = self
             .blocks
@@ -610,8 +785,24 @@ impl GraphMutation {
                 (before != after).then_some(LevelChange { level, before, after })
             })
             .collect();
+        let is_in_vspc = self
+            .is_in_vspc
+            .into_iter()
+            .filter_map(|(hash, before)| {
+                let after = view.blocks.get(&hash)?.is_in_vspc;
+                (before != after).then_some((hash, FieldChange { before, after }))
+            })
+            .collect();
+        let colors = self
+            .colors
+            .into_iter()
+            .filter_map(|(hash, before)| {
+                let after = view.blocks.get(&hash)?.color;
+                (before != after).then_some((hash, FieldChange { before, after }))
+            })
+            .collect();
 
-        GraphChanges { blocks, edges, levels }
+        GraphChanges { blocks, edges, levels, is_in_vspc, colors }
     }
 }
 
@@ -619,11 +810,17 @@ struct GraphChanges {
     blocks: HashMap<BlockHash, Option<GraphBlock>>,
     edges: HashMap<EdgeId, Option<GraphEdge>>,
     levels: Vec<LevelChange>,
+    is_in_vspc: HashMap<BlockHash, FieldChange<bool>>,
+    colors: HashMap<BlockHash, FieldChange<BlockColor>>,
 }
 
 impl GraphChanges {
     fn is_empty(&self) -> bool {
-        self.blocks.is_empty() && self.edges.is_empty() && self.levels.is_empty()
+        self.blocks.is_empty()
+            && self.edges.is_empty()
+            && self.levels.is_empty()
+            && self.is_in_vspc.is_empty()
+            && self.colors.is_empty()
     }
 }
 
@@ -695,6 +892,20 @@ mod tests {
             red_merge_set: Arc::from([hash(21)]),
             color: BlockColor::Blue,
             is_in_vspc: true,
+            level_snapshots: level_snapshots.into(),
+        }
+    }
+
+    fn vspc_committed(
+        removed: impl Into<Arc<[BlockHash]>>,
+        added: impl Into<Arc<[BlockHash]>>,
+        level_snapshots: impl Into<Arc<[LevelCommitted]>>,
+    ) -> VspcCommitted {
+        VspcCommitted {
+            source: hash(90),
+            destination: hash(91),
+            removed: removed.into(),
+            added: added.into(),
             level_snapshots: level_snapshots.into(),
         }
     }
@@ -1108,8 +1319,303 @@ mod tests {
         let mut view = view(TrackingPolicy::Frozen);
         let before = view.clone();
         let incomplete = committed_block(8, 8, 0, Arc::from([]), Arc::from([]));
+        let vspc = vspc_committed(Arc::from([]), Arc::from([hash(99)]), Arc::from([]));
 
         assert_eq!(view.apply_head_block_committed(&incomplete, 1_200), Err(GraphViewUpdateError::Frozen));
         assert_eq!(view, before);
+        assert_eq!(view.apply_head_vspc_committed(&vspc, 1_200), Err(GraphViewUpdateError::Frozen));
+        assert_eq!(view, before);
+    }
+
+    #[test]
+    fn head_vspc_projection_records_final_fields_and_retained_level_scores() {
+        let levels = BTreeMap::from([
+            (1, Level { size: 1, daa_score: Some(10) }),
+            (2, Level { size: 1, daa_score: Some(20) }),
+            (3, Level { size: 1, daa_score: Some(30) }),
+            (4, Level { size: 1, daa_score: Some(40) }),
+            (5, Level { size: 1, daa_score: Some(50) }),
+        ]);
+        let mut removed = graph_block(2, 2);
+        removed.is_in_vspc = true;
+        removed.color = BlockColor::Red;
+        let mut added = graph_block(5, 5);
+        added.blue_merge_set = Arc::from([hash(3), hash(4)]);
+        added.red_merge_set = Arc::from([hash(4), hash(8)]);
+        let blocks = HashMap::from([(hash(2), removed), (hash(3), graph_block(3, 3)), (hash(4), graph_block(4, 4)), (hash(5), added)]);
+        let crossing_edge = graph_edge(1, 1, 2, 2);
+        let mut view = GraphView::from_database_projection(
+            4,
+            extent(2, 5),
+            TrackingPolicy::Head,
+            levels,
+            blocks,
+            HashMap::from([(crossing_edge.id, crossing_edge)]),
+        );
+        let committed = vspc_committed(
+            Arc::from([hash(2), hash(88)]),
+            Arc::from([hash(5), hash(89)]),
+            Arc::from([
+                LevelCommitted { level: 1, size: 999, daa_score: Some(11) },
+                LevelCommitted { level: 4, size: 999, daa_score: None },
+                LevelCommitted { level: 99, size: 999, daa_score: Some(99) },
+            ]),
+        );
+
+        let delta = view.apply_head_vspc_committed(&committed, 1_300).expect("mutable Head").expect("visible projection");
+
+        assert_eq!(view.block(&hash(2)).map(|block| (block.is_in_vspc, block.color)), Some((false, BlockColor::Gray)));
+        assert_eq!(view.block(&hash(3)).map(|block| block.color), Some(BlockColor::Blue));
+        assert_eq!(view.block(&hash(4)).map(|block| block.color), Some(BlockColor::Red));
+        assert_eq!(view.block(&hash(5)).map(|block| block.is_in_vspc), Some(true));
+        assert_eq!(view.level(1), Some(&Level { size: 1, daa_score: Some(11) }));
+        assert_eq!(view.level(4), Some(&Level { size: 1, daa_score: None }));
+        assert!(view.level(99).is_none());
+        assert_eq!(view.levels.get(&1).map(|stored| stored.usage_count), Some(1));
+
+        assert_eq!(delta.from_revision_id(), 0);
+        assert_eq!(delta.to_revision_id(), 1);
+        assert_eq!(delta.high_level(), 5);
+        assert!(delta.block_changes().is_empty());
+        assert!(delta.edge_changes().is_empty());
+        assert_eq!(delta.is_in_vspc_changes().get(&hash(2)), Some(&FieldChange { before: true, after: false }));
+        assert_eq!(delta.is_in_vspc_changes().get(&hash(5)), Some(&FieldChange { before: false, after: true }));
+        assert_eq!(delta.color_changes().get(&hash(2)), Some(&FieldChange { before: BlockColor::Red, after: BlockColor::Gray }));
+        assert_eq!(delta.color_changes().get(&hash(4)), Some(&FieldChange { before: BlockColor::Gray, after: BlockColor::Red }));
+        assert_eq!(
+            delta.level_changes(),
+            &[
+                LevelChange {
+                    level: 1,
+                    before: Some(Level { size: 1, daa_score: Some(10) }),
+                    after: Some(Level { size: 1, daa_score: Some(11) }),
+                },
+                LevelChange {
+                    level: 4,
+                    before: Some(Level { size: 1, daa_score: Some(40) }),
+                    after: Some(Level { size: 1, daa_score: None }),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn head_vspc_noops_and_absent_targets_do_not_advance_revision() {
+        let mut view = view(TrackingPolicy::Head);
+        let committed = vspc_committed(
+            Arc::from([hash(2), hash(88)]),
+            Arc::from([hash(89)]),
+            Arc::from([
+                LevelCommitted { level: 2, size: 999, daa_score: Some(20) },
+                LevelCommitted { level: 99, size: 1, daa_score: Some(99) },
+            ]),
+        );
+        let before = view.clone();
+
+        assert!(view.apply_head_vspc_committed(&committed, 1_300).expect("mutable Head").is_none());
+        assert_eq!(view, before);
+    }
+
+    #[test]
+    fn fixed_block_projection_uses_original_event_even_when_head_has_no_effect() {
+        let head_levels = (5..=7).map(|level| (level, Level { size: 1, daa_score: Some(level * 10) })).collect();
+        let head_blocks = (5..=7).map(|level| (hash(level as u8), graph_block(level as u8, level))).collect();
+        let mut head =
+            GraphView::from_database_projection(3, extent(5, 7), TrackingPolicy::Head, head_levels, head_blocks, HashMap::new());
+        let fixed_levels = (3..=5).map(|level| (level, Level { size: 1, daa_score: Some(level * 10) })).collect();
+        let fixed_blocks = (3..=5).map(|level| (hash(level as u8), graph_block(level as u8, level))).collect();
+        let mut fixed =
+            GraphView::from_database_projection(3, extent(3, 5), TrackingPolicy::Fixed, fixed_levels, fixed_blocks, HashMap::new());
+        let below_head = committed_block(
+            24,
+            4,
+            1,
+            Arc::from([ParentCommitted { hash: hash(2), coordinate: Some(coordinate(2, 0)) }]),
+            Arc::from([
+                LevelCommitted { level: 2, size: 1, daa_score: Some(20) },
+                LevelCommitted { level: 4, size: 2, daa_score: Some(44) },
+            ]),
+        );
+
+        assert!(head.apply_head_block_committed(&below_head, 1_400).expect("mutable Head").is_none());
+        let delta =
+            fixed.apply_fixed_block_committed(&below_head, &head, 1_500).expect("mutable Fixed").expect("visible Fixed update");
+
+        assert_eq!(head.current_revision_id(), 0);
+        assert_eq!(fixed.current_revision_id(), 1);
+        assert_eq!(fixed.extent(), extent(3, 5));
+        assert!(fixed.block(&hash(24)).is_some());
+        assert!(fixed.edge(&EdgeId { parent: hash(2), child: hash(24) }).is_some());
+        assert_eq!(fixed.level(2), Some(&Level { size: 1, daa_score: Some(20) }));
+        assert_eq!(fixed.level(4), Some(&Level { size: 2, daa_score: Some(40) }));
+        assert_eq!(delta.high_level(), 5);
+
+        let above_fixed = committed_block(
+            26,
+            6,
+            1,
+            Arc::from([ParentCommitted { hash: hash(5), coordinate: Some(coordinate(5, 0)) }]),
+            Arc::from([
+                LevelCommitted { level: 5, size: 2, daa_score: Some(999) },
+                LevelCommitted { level: 6, size: 2, daa_score: Some(60) },
+            ]),
+        );
+        head.apply_head_block_committed(&above_fixed, 1_600).expect("mutable Head").expect("Head retains block");
+        let crossing =
+            fixed.apply_fixed_block_committed(&above_fixed, &head, 1_700).expect("mutable Fixed").expect("crossing edge retained");
+
+        assert!(fixed.block(&hash(26)).is_none());
+        assert!(fixed.edge(&EdgeId { parent: hash(5), child: hash(26) }).is_some());
+        assert_eq!(fixed.level(5), Some(&Level { size: 2, daa_score: Some(50) }));
+        assert!(crossing.block_changes().is_empty());
+        assert!(crossing.edge_changes().contains_key(&EdgeId { parent: hash(5), child: hash(26) }));
+    }
+
+    #[test]
+    fn fixed_vspc_projection_resolves_added_metadata_from_both_views() {
+        let mut fixed_member = graph_block(5, 5);
+        fixed_member.blue_merge_set = Arc::from([hash(3)]);
+        let mut fixed_target = graph_block(3, 3);
+        fixed_target.color = BlockColor::Red;
+        let fixed_levels = BTreeMap::from([
+            (2, Level { size: 1, daa_score: Some(20) }),
+            (3, Level { size: 1, daa_score: Some(30) }),
+            (4, Level { size: 1, daa_score: Some(40) }),
+            (5, Level { size: 1, daa_score: Some(50) }),
+        ]);
+        let fixed_edge = graph_edge(2, 2, 3, 3);
+        let mut fixed = GraphView::from_database_projection(
+            3,
+            extent(3, 5),
+            TrackingPolicy::Fixed,
+            fixed_levels,
+            HashMap::from([(hash(3), fixed_target), (hash(4), graph_block(4, 4)), (hash(5), fixed_member)]),
+            HashMap::from([(fixed_edge.id, fixed_edge)]),
+        );
+
+        let mut head_member = graph_block(7, 7);
+        head_member.blue_merge_set = Arc::from([hash(4)]);
+        head_member.red_merge_set = Arc::from([hash(3), hash(4)]);
+        let head_levels = (5..=7).map(|level| (level, Level { size: 1, daa_score: Some(level * 10) })).collect();
+        let mut head = GraphView::from_database_projection(
+            3,
+            extent(5, 7),
+            TrackingPolicy::Head,
+            head_levels,
+            HashMap::from([(hash(7), head_member)]),
+            HashMap::new(),
+        );
+        let committed = vspc_committed(
+            Arc::from([]),
+            Arc::from([hash(5), hash(7)]),
+            Arc::from([LevelCommitted { level: 2, size: 999, daa_score: Some(22) }]),
+        );
+
+        head.apply_head_vspc_committed(&committed, 1_800).expect("mutable Head").expect("Head member enters VSPC");
+        let delta = fixed
+            .apply_fixed_vspc_committed(&committed, &head, 1_900)
+            .expect("mutable Fixed")
+            .expect("metadata recolors retained blocks");
+
+        assert_eq!(fixed.block(&hash(5)).map(|block| block.is_in_vspc), Some(true));
+        assert_eq!(fixed.block(&hash(3)).map(|block| block.color), Some(BlockColor::Red));
+        assert_eq!(fixed.block(&hash(4)).map(|block| block.color), Some(BlockColor::Red));
+        assert_eq!(fixed.level(2), Some(&Level { size: 1, daa_score: Some(22) }));
+        assert_eq!(fixed.levels.get(&2).map(|stored| stored.usage_count), Some(1));
+        assert_eq!(delta.color_changes().get(&hash(4)), Some(&FieldChange { before: BlockColor::Gray, after: BlockColor::Red }));
+        assert!(!delta.color_changes().contains_key(&hash(3)), "temporary Blue restores the original Red and is omitted");
+    }
+
+    #[test]
+    fn fixed_vspc_missing_metadata_freezes_before_any_projection() {
+        let head = view(TrackingPolicy::Head);
+        let mut fixed = view(TrackingPolicy::Fixed);
+        fixed.current_revision_id = 7;
+        fixed.current_revision_timestamp_us = 700;
+        let before = fixed.clone();
+        let committed = vspc_committed(
+            Arc::from([hash(2)]),
+            Arc::from([hash(99)]),
+            Arc::from([LevelCommitted { level: 4, size: 999, daa_score: None }]),
+        );
+
+        assert!(fixed.apply_fixed_vspc_committed(&committed, &head, 2_000).expect("terminal freeze").is_none());
+        let mut expected = before;
+        expected.tracking_policy = TrackingPolicy::Frozen;
+        assert_eq!(fixed, expected);
+    }
+
+    #[test]
+    fn fixed_disjoint_extent_freezes_and_later_updates_refuse_before_inspection() {
+        let head_levels = BTreeMap::from([(4, Level { size: 1, daa_score: Some(40) }), (5, Level { size: 1, daa_score: Some(50) })]);
+        let head =
+            GraphView::from_database_projection(2, extent(4, 5), TrackingPolicy::Head, head_levels, HashMap::new(), HashMap::new());
+        let fixed_levels = BTreeMap::from([(2, Level { size: 1, daa_score: Some(20) }), (3, Level { size: 1, daa_score: Some(30) })]);
+        let mut fixed =
+            GraphView::from_database_projection(2, extent(2, 3), TrackingPolicy::Fixed, fixed_levels, HashMap::new(), HashMap::new());
+        let before = fixed.clone();
+        let block = committed_block(8, 8, 0, Arc::from([]), Arc::from([]));
+
+        assert!(fixed.apply_fixed_block_committed(&block, &head, 2_100).expect("terminal freeze").is_none());
+        let mut expected = before;
+        expected.tracking_policy = TrackingPolicy::Frozen;
+        assert_eq!(fixed, expected);
+
+        let invalid_head_context = view(TrackingPolicy::Fixed);
+        let vspc = vspc_committed(Arc::from([]), Arc::from([hash(99)]), Arc::from([]));
+        assert_eq!(fixed.apply_fixed_vspc_committed(&vspc, &invalid_head_context, 2_200), Err(GraphViewUpdateError::Frozen));
+        assert_eq!(fixed.apply_fixed_block_committed(&block, &invalid_head_context, 2_200), Err(GraphViewUpdateError::Frozen));
+    }
+
+    #[test]
+    fn materialization_and_vspc_delivery_orders_preserve_separate_level_authorities() {
+        let make_view = || {
+            GraphView::from_database_projection(
+                3,
+                extent(2, 3),
+                TrackingPolicy::Head,
+                BTreeMap::from([(2, Level { size: 1, daa_score: Some(20) }), (3, Level { size: 1, daa_score: Some(30) })]),
+                HashMap::from([(hash(3), graph_block(3, 3))]),
+                HashMap::new(),
+            )
+        };
+        let block = committed_block(
+            4,
+            4,
+            0,
+            Arc::from([ParentCommitted { hash: hash(3), coordinate: Some(coordinate(3, 0)) }]),
+            Arc::from([
+                LevelCommitted { level: 3, size: 2, daa_score: Some(30) },
+                LevelCommitted { level: 4, size: 1, daa_score: Some(40) },
+            ]),
+        );
+        let vspc = vspc_committed(
+            Arc::from([hash(88)]),
+            Arc::from([hash(89)]),
+            Arc::from([LevelCommitted { level: 3, size: 999, daa_score: Some(33) }]),
+        );
+
+        let mut materialization_first = make_view();
+        materialization_first.apply_head_block_committed(&block, 1).expect("mutable Head").expect("visible block");
+        let level_only = materialization_first.apply_head_vspc_committed(&vspc, 2).expect("mutable Head").expect("visible score");
+
+        let mut vspc_first = make_view();
+        vspc_first.apply_head_vspc_committed(&vspc, 1).expect("mutable Head").expect("visible score");
+        vspc_first.apply_head_block_committed(&block, 2).expect("mutable Head").expect("visible block");
+
+        assert_eq!(materialization_first.level(3), Some(&Level { size: 2, daa_score: Some(33) }));
+        assert_eq!(vspc_first.level(3), Some(&Level { size: 2, daa_score: Some(33) }));
+        assert!(level_only.block_changes().is_empty());
+        assert!(level_only.edge_changes().is_empty());
+        assert!(level_only.is_in_vspc_changes().is_empty());
+        assert!(level_only.color_changes().is_empty());
+        assert_eq!(
+            level_only.level_changes(),
+            &[LevelChange {
+                level: 3,
+                before: Some(Level { size: 2, daa_score: Some(30) }),
+                after: Some(Level { size: 2, daa_score: Some(33) }),
+            }]
+        );
     }
 }
