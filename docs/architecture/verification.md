@@ -1030,6 +1030,20 @@ It must return the common `400 invalid-request` response before client
 registration validation, cache lookup, or history work, so `BackwardTarget`
 cannot arise from that public input.
 
+Verify the graph-owned
+[`LevelExtent`](api-graph.md#graph-values-views-revisions-and-history--settled)
+accepts inclusive single-level and `[1, u64::MAX]` extents, computes their
+depth without overflow, and rejects zero or reversed bounds. Cover inclusive
+boundary behavior for level containment, extent containment, overlap, and edge
+span intersection. Verify every `GraphView` retains one such extent whose
+depth does not exceed its positive configured `max_depth` and that its bound
+accessors expose that same value.
+
+Verify `GraphDelta::new` rejects a zero lineage `high_level`, preserves its
+existing non-forward-revision rejection, and gives revision ordering precedence
+when both inputs are invalid. Direct mutation and composition continue to
+construct positive lineage bounds.
+
 Verify every subview extract inherits its source revision and revision
 timestamp with
 `TrackingPolicy::Frozen`. `BlockCommitted` and `VspcCommitted` mutation entry
@@ -1040,7 +1054,8 @@ accepted by `Head` or `Fixed`.
 
 Verify [frozen subview extraction](api-graph.md#frozen-subview-extraction--settled)
 from `Head`, `Fixed`, and `Frozen` sources, including nested extraction. Cover
-invalid and outside extents; inherited revision and calculated nominal depth;
+invalid raw extent construction and outside-source extraction; inherited
+revision and calculated nominal depth;
 complete in-range blocks; crossing edges with zero, one, and two endpoint
 blocks; all nominal and endpoint levels with exact state; recomputed derived
 counters; and absence of source mutation, delta production, or history.
@@ -1485,7 +1500,11 @@ For every appended history entry, verify `estimated_raw_bytes` and the absolute
 `cumulative_estimated_bytes` boundary at `delta.to_revision_id`. Cover range
 cost subtraction before and after prefix pruning, the first retained left
 boundary derivation, and an aggregated entry exposing only its final cost
-boundary. Exercise the delta-to-Head regions at the exact half-distance and 80%
+boundary. Verify an exact cumulative value of `u64::MAX` is accepted and that
+the next positive estimate panics before changing the revision, cumulative
+value, or retained entries. A simultaneous revision mismatch must return
+`RevisionMismatch` before cumulative arithmetic and must not panic. Exercise
+the delta-to-Head regions at the exact half-distance and 80%
 level boundaries. In the heat region, cover no heated boundary, competing
 destination counts, the outgoing-cache/job and youngest-revision tie breaks,
 and exclusion when a boundary leaves retained history or the moving heat

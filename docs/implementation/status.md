@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 14 October 2026.
+Updated 15 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -216,3 +216,17 @@ point.
 
 The non-normative [implementation sequence](sequence.md) records
 the proposed work order and prerequisites.
+
+Implementation increment 6 is implemented: `kgi-api-model` now contains the
+canonical graph values, checked deltas, seeded and extracted views, Head and
+Fixed mutation, delta application and composition, and level-scoped retained
+history. Focused tests cover graph extent and projection behavior, derived edge
+and level maintenance, terminal Fixed freezing, all canonical delta mutation
+and composition forms, gapless history append, cumulative estimates,
+prefix-only pruning, detached entry lifetime, and retained-range selection.
+Publication, database projection reads, encoding, transport, and ApiService
+runtime behavior remain in the separately numbered increments recorded in
+[the implementation sequence](sequence.md#active-increment-6-canonical-graph-model).
+Completion validation passed workspace formatting, Cargo check, 337/337
+Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
+with warnings denied, and `git diff --check`.
