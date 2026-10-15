@@ -223,7 +223,10 @@ fn find_boundary_index(entries: &VecDeque<Arc<GraphHistoryEntry>>, revision_id: 
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        panic::{AssertUnwindSafe, catch_unwind},
+    };
 
     use super::*;
 
@@ -269,6 +272,42 @@ mod tests {
         assert_eq!(entries[1].estimated_raw_bytes(), 30);
         assert_eq!(entries[1].cumulative_estimated_bytes(), 40);
         assert_eq!(entries[2].cumulative_estimated_bytes(), 60);
+    }
+
+    #[test]
+    fn append_accepts_the_maximum_cumulative_cost_boundary() {
+        let mut history = GraphHistory::new();
+
+        history.append(delta(0, 1, 1), u64::MAX).expect("maximum cumulative cost is valid");
+
+        assert_eq!(history.current_revision_id(), 1);
+        assert_eq!(history.current_cumulative_estimated_bytes(), u64::MAX);
+        assert_eq!(history.entries().next().expect("entry").cumulative_estimated_bytes(), u64::MAX);
+    }
+
+    #[test]
+    fn cumulative_cost_overflow_panics_before_mutating_history() {
+        let mut history = GraphHistory::new();
+        history.append(delta(0, 1, 1), u64::MAX).expect("maximum cumulative cost is valid");
+        let before = history.clone();
+
+        let result = catch_unwind(AssertUnwindSafe(|| history.append(delta(1, 2, 2), 1)));
+
+        assert!(result.is_err());
+        assert_eq!(history, before);
+    }
+
+    #[test]
+    fn revision_mismatch_precedes_cumulative_cost_overflow() {
+        let mut history = GraphHistory::new();
+        history.append(delta(0, 1, 1), u64::MAX).expect("maximum cumulative cost is valid");
+        let before = history.clone();
+
+        assert_eq!(
+            history.append(delta(0, 2, 2), 1),
+            Err(GraphHistoryAppendError::RevisionMismatch { history_revision: 1, delta_from: 0 })
+        );
+        assert_eq!(history, before);
     }
 
     #[test]
