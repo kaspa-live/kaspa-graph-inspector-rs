@@ -597,11 +597,13 @@ impl GraphView {
             })
             .filter(|edge| target_extent.intersects_span(edge.parent_coordinate.level(), edge.child_coordinate.level()))
             .collect();
-        let retained_parent_levels: HashSet<_> = retained_edges.iter().map(|edge| edge.parent_coordinate.level()).collect();
+        let retained_endpoint_levels: HashSet<_> =
+            retained_edges.iter().flat_map(|edge| [edge.parent_coordinate.level(), edge.child_coordinate.level()]).collect();
 
         for snapshot in committed.level_snapshots.iter() {
             let retained_external = self.levels.get(&snapshot.level).is_some_and(|level| level.usage_count > 0);
-            if target_extent.contains_level(snapshot.level) || retained_external || retained_parent_levels.contains(&snapshot.level) {
+            if target_extent.contains_level(snapshot.level) || retained_external || retained_endpoint_levels.contains(&snapshot.level)
+            {
                 mutation.capture_level(&self.levels, snapshot.level);
                 self.apply_materialization_snapshot(snapshot);
             }
@@ -1640,8 +1642,39 @@ mod tests {
         assert!(fixed.block(&hash(26)).is_none());
         assert!(fixed.edge(&EdgeId { parent: hash(5), child: hash(26) }).is_some());
         assert_eq!(fixed.level(5), Some(&Level { size: 2, daa_score: Some(50) }));
+        assert_eq!(fixed.level(6), Some(&Level { size: 2, daa_score: Some(60) }));
         assert!(crossing.block_changes().is_empty());
         assert!(crossing.edge_changes().contains_key(&EdgeId { parent: hash(5), child: hash(26) }));
+
+        let neither_endpoint_retained = committed_block(
+            27,
+            7,
+            1,
+            Arc::from([ParentCommitted { hash: hash(2), coordinate: Some(coordinate(2, 0)) }]),
+            Arc::from([
+                LevelCommitted { level: 2, size: 3, daa_score: Some(20) },
+                LevelCommitted { level: 7, size: 4, daa_score: Some(70) },
+            ]),
+        );
+        head.apply_head_block_committed(&neither_endpoint_retained, 1_800).expect("mutable Head").expect("Head retains block");
+        fixed
+            .apply_fixed_block_committed(&neither_endpoint_retained, &head, 1_900)
+            .expect("mutable Fixed")
+            .expect("crossing edge with external endpoints retained");
+
+        let parent_external_edge = EdgeId { parent: hash(2), child: hash(27) };
+        assert!(fixed.block(&hash(2)).is_none());
+        assert!(fixed.block(&hash(27)).is_none());
+        assert!(fixed.edge(&parent_external_edge).is_some());
+        assert_eq!(fixed.level(2), Some(&Level { size: 3, daa_score: Some(20) }));
+        assert_eq!(fixed.level(7), Some(&Level { size: 4, daa_score: Some(70) }));
+
+        let extracted = fixed.extract_subview(extent(3, 5)).expect("every crossing edge has complete endpoint levels");
+        assert!(extracted.edge(&EdgeId { parent: hash(5), child: hash(26) }).is_some());
+        assert!(extracted.edge(&parent_external_edge).is_some());
+        assert_eq!(extracted.level(2), fixed.level(2));
+        assert_eq!(extracted.level(6), fixed.level(6));
+        assert_eq!(extracted.level(7), fixed.level(7));
     }
 
     #[test]
