@@ -132,6 +132,11 @@ impl GraphHistory {
     }
 
     /// Appends one gapless direct or aggregated delta.
+    ///
+    /// # Panics
+    ///
+    /// Panics before modifying history if the cumulative estimated-byte cost
+    /// would overflow `u64`.
     pub fn append(&mut self, delta: GraphDelta, estimated_raw_bytes: u64) -> Result<(), GraphHistoryAppendError> {
         if self.current_revision_id != delta.from_revision_id() {
             return Err(GraphHistoryAppendError::RevisionMismatch {
