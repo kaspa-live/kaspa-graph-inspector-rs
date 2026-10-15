@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 
 use thiserror::Error;
 
@@ -181,24 +181,13 @@ impl GraphHistory {
             return Ok(GraphHistoryRange::UpToDate { revision: from_revision_id });
         }
 
-        let mut start_index = None;
-        for (index, entry) in self.entries.iter().enumerate().rev() {
-            let entry_from = entry.delta.from_revision_id();
-            if entry_from == from_revision_id {
-                start_index = Some(index);
-                break;
-            }
-            if entry_from < from_revision_id {
-                break;
-            }
-        }
-        let Some(start_index) = start_index else {
+        let Some(start_index) = find_boundary_index(&self.entries, from_revision_id, || {}) else {
             return Err(GraphHistoryRangeError::StartUnavailable { requested: from_revision_id, current: self.current_revision_id });
         };
 
         let mut selected = Vec::new();
         let mut actual_target = from_revision_id;
-        for entry in self.entries.iter().skip(start_index) {
+        for entry in self.entries.range(start_index..) {
             actual_target = entry.delta.to_revision_id();
             selected.push(Arc::clone(entry));
             if actual_target >= target_revision_id {
@@ -213,6 +202,23 @@ impl GraphHistory {
             entries: Arc::from(selected),
         })
     }
+}
+
+// Gapless append preserves strictly increasing stored left boundaries, so an
+// exact boundary can be classified without visiting newer history entries.
+fn find_boundary_index(entries: &VecDeque<Arc<GraphHistoryEntry>>, revision_id: u64, mut inspect: impl FnMut()) -> Option<usize> {
+    let mut low = 0;
+    let mut high = entries.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        inspect();
+        match entries[middle].delta.from_revision_id().cmp(&revision_id) {
+            Ordering::Less => low = middle + 1,
+            Ordering::Greater => high = middle,
+            Ordering::Equal => return Some(middle),
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -345,6 +351,23 @@ mod tests {
             "an internal aggregate revision is not reconstructed"
         );
         assert_eq!(history.range(6, 7), Err(GraphHistoryRangeError::StartUnavailable { requested: 6, current: 5 }));
+    }
+
+    #[test]
+    fn unavailable_internal_aggregate_boundary_uses_bounded_search() {
+        let mut history = GraphHistory::new();
+        history.append(delta(0, 100, 100), 10).expect("aggregate entry");
+        for revision in 100..4_196 {
+            history.append(delta(revision, revision + 1, revision + 1), 1).expect("later entry");
+        }
+
+        let mut inspected = 0;
+        assert_eq!(find_boundary_index(&history.entries, 50, || inspected += 1), None);
+        assert!(inspected <= 13, "binary search inspected {inspected} of {} entries", history.len());
+        assert_eq!(
+            history.range(50, history.current_revision_id()),
+            Err(GraphHistoryRangeError::StartUnavailable { requested: 50, current: 4_196 })
+        );
     }
 
     #[test]
