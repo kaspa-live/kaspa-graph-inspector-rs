@@ -541,13 +541,23 @@ Head-generated delta remains
 prohibited for internal Fixed; only a delta from the same Fixed lineage has the
 required context.
 
-`append` requires only
-`history.current_revision_id == delta.from_revision_id`. On success, it takes
-ownership of the delta and its protocol-supplied `estimated_raw_bytes`, adds
-that estimate to `current_cumulative_estimated_bytes`, appends the resulting
+`append` first requires
+`history.current_revision_id == delta.from_revision_id`. A mismatch returns
+`RevisionMismatch` without evaluating cumulative-cost arithmetic, and all
+values remain unchanged. For a gapless append, checked addition of the
+protocol-supplied `estimated_raw_bytes` to
+`current_cumulative_estimated_bytes` occurs before any history mutation. An
+exact cumulative result of `u64::MAX` is valid. Overflow is an internal
+invariant failure and panics; it is not a typed `GraphHistoryAppendError`, and
+the history remains unchanged when the panic occurs. Exhausting this absolute
+counter would require an unattainable volume of estimated graph data within
+one publication lifetime given the memory, throughput, and process-lifetime
+resources required to produce it.
+
+On success, `append` takes ownership of the delta, appends the resulting
 `GraphHistoryEntry`, and sets both current fields to the entry's target values
-atomically. On mismatch, all values remain unchanged. A new revision-zero
-history starts with cumulative value zero. A stored entry may hold
+atomically. A new revision-zero history starts with cumulative value zero. A
+stored entry may hold
 either a direct one-step delta or an already aggregated delta. For an aggregate,
 `estimated_raw_bytes` is the sum of its constituents and
 `cumulative_estimated_bytes` is the final constituent's cumulative value.

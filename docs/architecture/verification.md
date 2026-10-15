@@ -1500,7 +1500,11 @@ For every appended history entry, verify `estimated_raw_bytes` and the absolute
 `cumulative_estimated_bytes` boundary at `delta.to_revision_id`. Cover range
 cost subtraction before and after prefix pruning, the first retained left
 boundary derivation, and an aggregated entry exposing only its final cost
-boundary. Exercise the delta-to-Head regions at the exact half-distance and 80%
+boundary. Verify an exact cumulative value of `u64::MAX` is accepted and that
+the next positive estimate panics before changing the revision, cumulative
+value, or retained entries. A simultaneous revision mismatch must return
+`RevisionMismatch` before cumulative arithmetic and must not panic. Exercise
+the delta-to-Head regions at the exact half-distance and 80%
 level boundaries. In the heat region, cover no heated boundary, competing
 destination counts, the outgoing-cache/job and youngest-revision tie breaks,
 and exclusion when a boundary leaves retained history or the moving heat
