@@ -152,6 +152,12 @@ struct StoredLevel {
     usage_count: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExtractionCandidate {
+    Block,
+    Edge,
+}
+
 /// Failure to extract a frozen subview from a graph view.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum GraphViewExtractError {
@@ -193,6 +199,9 @@ pub struct GraphView {
     edges: HashMap<EdgeId, GraphEdge>,
     block_hashes_by_level: BTreeMap<u64, HashSet<BlockHash>>,
     edge_parents_by_child: HashMap<BlockHash, HashSet<BlockHash>>,
+    // Child level is the outer key and parent level the inner key, allowing
+    // extraction to apply both span bounds before visiting edge IDs.
+    edge_ids_by_span: BTreeMap<u64, BTreeMap<u64, HashSet<EdgeId>>>,
 }
 
 impl GraphView {
@@ -221,6 +230,7 @@ impl GraphView {
         let levels: BTreeMap<_, _> = levels.into_iter().map(|(level, value)| (level, StoredLevel { value, usage_count: 0 })).collect();
         let block_hashes_by_level = index_blocks_by_level(&blocks);
         let edge_parents_by_child = index_edge_parents_by_child(&edges);
+        let edge_ids_by_span = index_edges_by_span(&edges);
 
         let mut view = Self {
             max_depth,
@@ -233,6 +243,7 @@ impl GraphView {
             edges,
             block_hashes_by_level,
             edge_parents_by_child,
+            edge_ids_by_span,
         };
         let parent_levels: Vec<_> = view.edges.values().map(|edge| edge.parent_coordinate.level()).collect();
         for parent_level in parent_levels {
@@ -355,24 +366,11 @@ impl GraphView {
             }
             if let Some(previous) = previous {
                 usage_decrements.push(previous.parent_coordinate.level());
+                self.unindex_edge(previous);
             }
             if let Some(edge) = change {
                 usage_increments.push(edge.parent_coordinate.level());
-            }
-
-            match change {
-                Some(_) => {
-                    self.edge_parents_by_child.entry(id.child).or_default().insert(id.parent);
-                }
-                None => {
-                    let remove_child_entry = self.edge_parents_by_child.get_mut(&id.child).is_some_and(|parents| {
-                        parents.remove(&id.parent);
-                        parents.is_empty()
-                    });
-                    if remove_child_entry {
-                        self.edge_parents_by_child.remove(&id.child);
-                    }
-                }
+                self.index_edge(*edge);
             }
         }
 
@@ -460,13 +458,14 @@ impl GraphView {
 
         let mut pruned_edges = Vec::new();
         for child in pruned_blocks {
-            if let Some(parents) = self.edge_parents_by_child.remove(&child) {
-                pruned_edges.extend(parents.into_iter().map(|parent| EdgeId { parent, child }));
+            if let Some(parents) = self.edge_parents_by_child.get(&child) {
+                pruned_edges.extend(parents.iter().copied().map(|parent| EdgeId { parent, child }));
             }
         }
         for id in pruned_edges {
             let edge = self.edges.remove(&id).expect("a selected retained edge exists");
             mutation.capture_removed_edge(id, edge);
+            self.unindex_edge(edge);
             self.decrement_parent_usage(edge.parent_coordinate.level());
         }
 
@@ -622,7 +621,7 @@ impl GraphView {
                 }
             };
             if inserted {
-                self.edge_parents_by_child.entry(edge.id.child).or_default().insert(edge.id.parent);
+                self.index_edge(edge);
                 self.increment_parent_usage(edge.parent_coordinate.level());
             }
         }
@@ -771,24 +770,76 @@ impl GraphView {
         stored.usage_count = stored.usage_count.checked_sub(1).expect("retained parent usage is positive");
     }
 
+    fn index_edge(&mut self, edge: GraphEdge) {
+        self.edge_parents_by_child.entry(edge.id.child).or_default().insert(edge.id.parent);
+        self.edge_ids_by_span
+            .entry(edge.child_coordinate.level())
+            .or_default()
+            .entry(edge.parent_coordinate.level())
+            .or_default()
+            .insert(edge.id);
+    }
+
+    fn unindex_edge(&mut self, edge: GraphEdge) {
+        let remove_child_entry = self.edge_parents_by_child.get_mut(&edge.id.child).is_some_and(|parents| {
+            parents.remove(&edge.id.parent);
+            parents.is_empty()
+        });
+        if remove_child_entry {
+            self.edge_parents_by_child.remove(&edge.id.child);
+        }
+
+        let child_level = edge.child_coordinate.level();
+        let parent_level = edge.parent_coordinate.level();
+        let remove_child_level = self.edge_ids_by_span.get_mut(&child_level).is_some_and(|parents| {
+            let remove_parent_level = parents.get_mut(&parent_level).is_some_and(|ids| {
+                ids.remove(&edge.id);
+                ids.is_empty()
+            });
+            if remove_parent_level {
+                parents.remove(&parent_level);
+            }
+            parents.is_empty()
+        });
+        if remove_child_level {
+            self.edge_ids_by_span.remove(&child_level);
+        }
+    }
+
+    fn select_subview_graph(
+        &self,
+        extent: LevelExtent,
+        mut inspect: impl FnMut(ExtractionCandidate),
+    ) -> (HashMap<BlockHash, GraphBlock>, HashMap<EdgeId, GraphEdge>) {
+        let mut blocks = HashMap::new();
+        for hashes in self.block_hashes_by_level.range(extent.low_level()..=extent.high_level()).map(|(_, hashes)| hashes) {
+            for hash in hashes {
+                inspect(ExtractionCandidate::Block);
+                blocks.insert(*hash, self.blocks.get(hash).expect("an indexed block exists").clone());
+            }
+        }
+
+        let mut edges = HashMap::new();
+        for parents in self.edge_ids_by_span.range(extent.low_level()..).map(|(_, parents)| parents) {
+            for ids in parents.range(..=extent.high_level()).map(|(_, ids)| ids) {
+                for id in ids {
+                    inspect(ExtractionCandidate::Edge);
+                    let edge = *self.edges.get(id).expect("an indexed edge exists");
+                    debug_assert!(extent.intersects_span(edge.parent_coordinate.level(), edge.child_coordinate.level()));
+                    edges.insert(*id, edge);
+                }
+            }
+        }
+        (blocks, edges)
+    }
+
     /// Extracts a coherent frozen view over a contained nominal extent.
     pub fn extract_subview(&self, extent: LevelExtent) -> Result<Self, GraphViewExtractError> {
         if !self.extent.contains_extent(extent) {
             return Err(GraphViewExtractError::OutsideSourceExtent);
         }
 
-        let blocks = self
-            .blocks
-            .iter()
-            .filter(|(_, block)| extent.contains_level(block.coordinate.level()))
-            .map(|(&hash, block)| (hash, block.clone()))
-            .collect();
-        let edges: HashMap<_, _> = self
-            .edges
-            .iter()
-            .filter(|(_, edge)| extent.intersects_span(edge.parent_coordinate.level(), edge.child_coordinate.level()))
-            .map(|(&id, &edge)| (id, edge))
-            .collect();
+        let (blocks, edges) = self.select_subview_graph(extent, |_| {});
 
         let mut selected_levels = BTreeMap::new();
         for level in extent.low_level()..=extent.high_level() {
@@ -800,6 +851,7 @@ impl GraphView {
         }
         let block_hashes_by_level = index_blocks_by_level(&blocks);
         let edge_parents_by_child = index_edge_parents_by_child(&edges);
+        let edge_ids_by_span = index_edges_by_span(&edges);
 
         let mut extracted = Self {
             max_depth: extent.depth(),
@@ -812,6 +864,7 @@ impl GraphView {
             edges,
             block_hashes_by_level,
             edge_parents_by_child,
+            edge_ids_by_span,
         };
         let parent_levels: Vec<_> = extracted.edges.values().map(|edge| edge.parent_coordinate.level()).collect();
         for parent_level in parent_levels {
@@ -833,6 +886,14 @@ fn index_edge_parents_by_child(edges: &HashMap<EdgeId, GraphEdge>) -> HashMap<Bl
     let mut index: HashMap<BlockHash, HashSet<BlockHash>> = HashMap::new();
     for &id in edges.keys() {
         index.entry(id.child).or_default().insert(id.parent);
+    }
+    index
+}
+
+fn index_edges_by_span(edges: &HashMap<EdgeId, GraphEdge>) -> BTreeMap<u64, BTreeMap<u64, HashSet<EdgeId>>> {
+    let mut index: BTreeMap<u64, BTreeMap<u64, HashSet<EdgeId>>> = BTreeMap::new();
+    for (&id, edge) in edges {
+        index.entry(edge.child_coordinate.level()).or_default().entry(edge.parent_coordinate.level()).or_default().insert(id);
     }
     index
 }
@@ -984,6 +1045,12 @@ mod tests {
 
     fn hash(byte: u8) -> BlockHash {
         BlockHash::from_bytes([byte; 32])
+    }
+
+    fn level_hash(level: u64) -> BlockHash {
+        let mut bytes = [0; 32];
+        bytes[..size_of::<u64>()].copy_from_slice(&level.to_le_bytes());
+        BlockHash::from_bytes(bytes)
     }
 
     fn coordinate(level: u64, slot: u64) -> BlockCoordinate {
@@ -1298,6 +1365,66 @@ mod tests {
     }
 
     #[test]
+    fn narrow_extraction_visits_only_indexed_block_and_edge_candidates() {
+        let levels = (1..=MAX_CACHE_DEPTH).map(|level| (level, Level { size: 1, daa_score: Some(level) })).collect();
+        let blocks = (1..=MAX_CACHE_DEPTH)
+            .map(|level| {
+                let hash = level_hash(level);
+                (
+                    hash,
+                    GraphBlock {
+                        hash,
+                        coordinate: coordinate(level, 0),
+                        timestamp: level,
+                        daa_score: level,
+                        selected_parent_index: None,
+                        direct_parents: Arc::from([]),
+                        blue_merge_set: Arc::from([]),
+                        red_merge_set: Arc::from([]),
+                        color: BlockColor::Gray,
+                        is_in_vspc: false,
+                    },
+                )
+            })
+            .collect();
+        let edges = (2..=MAX_CACHE_DEPTH)
+            .map(|child_level| {
+                let parent_level = child_level - 1;
+                let id = EdgeId { parent: level_hash(parent_level), child: level_hash(child_level) };
+                (id, GraphEdge { id, parent_coordinate: coordinate(parent_level, 0), child_coordinate: coordinate(child_level, 0) })
+            })
+            .collect();
+        let source = GraphView::from_database_projection(
+            MAX_CACHE_DEPTH,
+            extent(1, MAX_CACHE_DEPTH),
+            TrackingPolicy::Head,
+            levels,
+            blocks,
+            edges,
+        );
+        let narrow_extent = extent(476, 525);
+        let mut visited_blocks = 0;
+        let mut visited_edges = 0;
+
+        let (selected_blocks, selected_edges) = source.select_subview_graph(narrow_extent, |candidate| match candidate {
+            ExtractionCandidate::Block => visited_blocks += 1,
+            ExtractionCandidate::Edge => visited_edges += 1,
+        });
+
+        assert_eq!(visited_blocks, 50);
+        assert_eq!(visited_edges, 51);
+        assert_eq!(selected_blocks.len(), 50);
+        assert_eq!(selected_edges.len(), 51);
+        assert!(visited_blocks < source.blocks.len());
+        assert!(visited_edges < source.edges.len());
+
+        let extracted = source.extract_subview(narrow_extent).expect("narrow extent is contained");
+        assert_eq!(extracted.blocks.len(), 50);
+        assert_eq!(extracted.edges.len(), 51);
+        assert_eq!(extracted.levels.len(), 52, "both crossing endpoint levels remain retained");
+    }
+
+    #[test]
     fn extraction_works_from_every_policy_and_can_be_nested() {
         for policy in [TrackingPolicy::Head, TrackingPolicy::Fixed, TrackingPolicy::Frozen] {
             let source = view(policy);
@@ -1433,6 +1560,7 @@ mod tests {
         assert!(view.level(2).is_none());
         assert_eq!(view.level(3), Some(&Level { size: 1, daa_score: Some(30) }));
         assert_eq!(view.levels.get(&3).map(|level| level.usage_count), Some(1));
+        view.extract_subview(view.extent()).expect("pruning removes stale span-index entries");
     }
 
     #[test]
@@ -1888,6 +2016,19 @@ mod tests {
         assert_eq!(view.edge(&new_edge.id), Some(&new_edge));
         assert!(!view.edge_parents_by_child.contains_key(&hash(8)));
         assert_eq!(view.edge_parents_by_child.get(&hash(3)), Some(&HashSet::from([hash(1)])));
+        assert!(
+            !view
+                .edge_ids_by_span
+                .get(&old_edge.child_coordinate.level())
+                .and_then(|parents| parents.get(&old_edge.parent_coordinate.level()))
+                .is_some_and(|ids| ids.contains(&old_edge.id))
+        );
+        assert!(
+            view.edge_ids_by_span
+                .get(&new_edge.child_coordinate.level())
+                .and_then(|parents| parents.get(&new_edge.parent_coordinate.level()))
+                .is_some_and(|ids| ids.contains(&new_edge.id))
+        );
         assert!(view.level(1).is_none());
         assert_eq!(view.level(2), Some(&Level { size: 3, daa_score: Some(22) }));
         assert_eq!(view.levels.get(&2).map(|stored| stored.usage_count), Some(1));
