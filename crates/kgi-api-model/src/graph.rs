@@ -168,6 +168,18 @@ pub enum GraphViewUpdateError {
     Frozen,
 }
 
+/// Failure to apply a canonical delta to a graph view.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum GraphDeltaApplyError {
+    /// Frozen views refuse every mutation.
+    #[error("frozen graph views cannot be mutated")]
+    Frozen,
+
+    /// The delta does not begin at the view's current revision.
+    #[error("graph view revision {view_revision} does not match delta source {delta_from}")]
+    RevisionMismatch { view_revision: u64, delta_from: u64 },
+}
+
 /// One complete canonical graph projection and its revision lineage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphView {
@@ -302,6 +314,110 @@ impl GraphView {
     /// Iterates retained edges in unspecified order.
     pub fn edges(&self) -> impl Iterator<Item = &GraphEdge> {
         self.edges.values()
+    }
+
+    /// Applies one canonical delta from this view's current revision.
+    ///
+    /// A Fixed view freezes on a revision mismatch. Frozen views refuse before
+    /// inspecting the supplied delta.
+    pub fn apply_delta(&mut self, delta: &GraphDelta) -> Result<(), GraphDeltaApplyError> {
+        if self.tracking_policy == TrackingPolicy::Frozen {
+            return Err(GraphDeltaApplyError::Frozen);
+        }
+        if self.current_revision_id != delta.from_revision_id() {
+            let error = GraphDeltaApplyError::RevisionMismatch {
+                view_revision: self.current_revision_id,
+                delta_from: delta.from_revision_id(),
+            };
+            if self.tracking_policy == TrackingPolicy::Fixed {
+                self.tracking_policy = TrackingPolicy::Frozen;
+            }
+            return Err(error);
+        }
+
+        for (&hash, change) in delta.block_changes() {
+            match change {
+                Some(block) => self.apply_block_upsert(hash, block.clone()),
+                None => self.apply_block_removal(hash),
+            }
+        }
+
+        let mut usage_decrements = Vec::new();
+        let mut usage_increments = Vec::new();
+        for (&id, change) in delta.edge_changes() {
+            let previous = match change {
+                Some(edge) => self.edges.insert(id, *edge),
+                None => self.edges.remove(&id),
+            };
+
+            if previous.as_ref() == change.as_ref() {
+                continue;
+            }
+            if let Some(previous) = previous {
+                usage_decrements.push(previous.parent_coordinate.level());
+            }
+            if let Some(edge) = change {
+                usage_increments.push(edge.parent_coordinate.level());
+            }
+
+            match change {
+                Some(_) => {
+                    self.edge_parents_by_child.entry(id.child).or_default().insert(id.parent);
+                }
+                None => {
+                    let remove_child_entry = self.edge_parents_by_child.get_mut(&id.child).is_some_and(|parents| {
+                        parents.remove(&id.parent);
+                        parents.is_empty()
+                    });
+                    if remove_child_entry {
+                        self.edge_parents_by_child.remove(&id.child);
+                    }
+                }
+            }
+        }
+
+        for change in delta.level_changes() {
+            match change.after {
+                Some(value) => {
+                    self.levels
+                        .entry(change.level)
+                        .and_modify(|stored| stored.value = value)
+                        .or_insert(StoredLevel { value, usage_count: 0 });
+                }
+                None => {
+                    self.levels.remove(&change.level);
+                }
+            }
+        }
+
+        for level in usage_decrements {
+            if let Some(stored) = self.levels.get_mut(&level) {
+                stored.usage_count = stored.usage_count.checked_sub(1).expect("canonical delta edge removal has retained usage");
+            }
+        }
+        for level in usage_increments {
+            let stored = self.levels.get_mut(&level).expect("canonical delta edge addition has a retained parent level");
+            stored.usage_count = stored.usage_count.checked_add(1).expect("retained edge usage fits u64");
+        }
+
+        for (&hash, change) in delta.is_in_vspc_changes() {
+            if let Some(block) = self.blocks.get_mut(&hash) {
+                block.is_in_vspc = change.after;
+            }
+        }
+        for (&hash, change) in delta.color_changes() {
+            if let Some(block) = self.blocks.get_mut(&hash) {
+                block.color = change.after;
+            }
+        }
+
+        if self.tracking_policy == TrackingPolicy::Head {
+            let target_low = delta.high_level().saturating_sub(self.max_depth - 1).max(1);
+            self.extent = LevelExtent::new(target_low, delta.high_level()).expect("delta lineage high level is positive");
+        }
+        self.current_revision_id = delta.to_revision_id();
+        self.current_revision_timestamp_us = delta.revision_timestamp_us();
+        Ok(())
     }
 
     /// Applies one committed block to a head-tracking view.
@@ -582,6 +698,37 @@ impl GraphView {
         self.current_revision_timestamp_us = revision_timestamp_us;
 
         Some(delta)
+    }
+
+    fn apply_block_upsert(&mut self, hash: BlockHash, block: GraphBlock) {
+        let level = block.coordinate.level();
+        if let Some(previous) = self.blocks.insert(hash, block) {
+            let previous_level = previous.coordinate.level();
+            if previous_level != level {
+                let remove_level_entry = self.block_hashes_by_level.get_mut(&previous_level).is_some_and(|hashes| {
+                    hashes.remove(&hash);
+                    hashes.is_empty()
+                });
+                if remove_level_entry {
+                    self.block_hashes_by_level.remove(&previous_level);
+                }
+            }
+        }
+        self.block_hashes_by_level.entry(level).or_default().insert(hash);
+    }
+
+    fn apply_block_removal(&mut self, hash: BlockHash) {
+        let Some(block) = self.blocks.remove(&hash) else {
+            return;
+        };
+        let level = block.coordinate.level();
+        let remove_level_entry = self.block_hashes_by_level.get_mut(&level).is_some_and(|hashes| {
+            hashes.remove(&hash);
+            hashes.is_empty()
+        });
+        if remove_level_entry {
+            self.block_hashes_by_level.remove(&level);
+        }
     }
 
     fn insert_block(&mut self, block: GraphBlock) {
@@ -908,6 +1055,32 @@ mod tests {
             added: added.into(),
             level_snapshots: level_snapshots.into(),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn graph_delta(
+        from_revision_id: u64,
+        to_revision_id: u64,
+        revision_timestamp_us: u64,
+        high_level: u64,
+        block_changes: HashMap<BlockHash, Option<GraphBlock>>,
+        edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
+        level_changes: Vec<LevelChange>,
+        is_in_vspc_changes: HashMap<BlockHash, FieldChange<bool>>,
+        color_changes: HashMap<BlockHash, FieldChange<BlockColor>>,
+    ) -> GraphDelta {
+        GraphDelta::new(
+            from_revision_id,
+            to_revision_id,
+            revision_timestamp_us,
+            high_level,
+            block_changes,
+            edge_changes,
+            level_changes,
+            is_in_vspc_changes,
+            color_changes,
+        )
+        .expect("valid fixture delta")
     }
 
     fn pruning_view() -> GraphView {
@@ -1617,5 +1790,173 @@ mod tests {
                 after: Some(Level { size: 2, daa_score: Some(33) }),
             }]
         );
+    }
+
+    #[test]
+    fn delta_application_uses_canonical_phase_order_and_maintains_indexes() {
+        let levels = BTreeMap::from([(1, Level { size: 1, daa_score: Some(10) }), (2, Level { size: 2, daa_score: Some(20) })]);
+        let mut retained = graph_block(1, 2);
+        retained.timestamp = 1;
+        let removed = graph_block_at(8, 2, 1);
+        let old_edge = graph_edge(30, 1, 8, 2);
+        let mut view = GraphView::from_database_projection(
+            3,
+            extent(1, 2),
+            TrackingPolicy::Head,
+            levels,
+            HashMap::from([(hash(1), retained), (hash(8), removed)]),
+            HashMap::from([(old_edge.id, old_edge)]),
+        );
+        view.current_revision_id = 4;
+        view.current_revision_timestamp_us = 40;
+
+        let mut replacement = graph_block(1, 2);
+        replacement.timestamp = 99;
+        let added = graph_block(3, 3);
+        let new_edge = graph_edge(1, 2, 3, 3);
+        let delta = graph_delta(
+            4,
+            7,
+            70,
+            3,
+            HashMap::from([(hash(1), Some(replacement.clone())), (hash(3), Some(added)), (hash(8), None)]),
+            HashMap::from([(old_edge.id, None), (new_edge.id, Some(new_edge))]),
+            vec![
+                LevelChange { level: 1, before: Some(Level { size: 999, daa_score: None }), after: None },
+                LevelChange {
+                    level: 2,
+                    before: Some(Level { size: 999, daa_score: None }),
+                    after: Some(Level { size: 3, daa_score: Some(22) }),
+                },
+                LevelChange { level: 3, before: None, after: Some(Level { size: 1, daa_score: Some(30) }) },
+            ],
+            HashMap::from([
+                (hash(3), FieldChange { before: true, after: true }),
+                (hash(8), FieldChange { before: false, after: true }),
+                (hash(99), FieldChange { before: false, after: true }),
+            ]),
+            HashMap::from([
+                (hash(3), FieldChange { before: BlockColor::Red, after: BlockColor::Blue }),
+                (hash(8), FieldChange { before: BlockColor::Gray, after: BlockColor::Red }),
+                (hash(99), FieldChange { before: BlockColor::Gray, after: BlockColor::Red }),
+            ]),
+        );
+
+        view.apply_delta(&delta).expect("matching Head lineage");
+
+        assert_eq!(view.extent(), extent(1, 3));
+        assert_eq!(view.current_revision_id(), 7);
+        assert_eq!(view.current_revision_timestamp_us(), 70);
+        assert_eq!(view.block(&hash(1)), Some(&replacement));
+        assert!(view.block(&hash(8)).is_none());
+        assert!(!view.block_hashes_by_level.get(&2).is_some_and(|hashes| hashes.contains(&hash(8))));
+        assert_eq!(view.block(&hash(3)).map(|block| (block.is_in_vspc, block.color)), Some((true, BlockColor::Blue)));
+        assert!(view.edge(&old_edge.id).is_none());
+        assert_eq!(view.edge(&new_edge.id), Some(&new_edge));
+        assert!(!view.edge_parents_by_child.contains_key(&hash(8)));
+        assert_eq!(view.edge_parents_by_child.get(&hash(3)), Some(&HashSet::from([hash(1)])));
+        assert!(view.level(1).is_none());
+        assert_eq!(view.level(2), Some(&Level { size: 3, daa_score: Some(22) }));
+        assert_eq!(view.levels.get(&2).map(|stored| stored.usage_count), Some(1));
+        assert_eq!(view.level(3), Some(&Level { size: 1, daa_score: Some(30) }));
+    }
+
+    #[test]
+    fn delta_application_errors_preserve_head_and_freeze_fixed_locally() {
+        let delta = graph_delta(1, 2, 20, 9, HashMap::new(), HashMap::new(), Vec::new(), HashMap::new(), HashMap::new());
+
+        let mut head = view(TrackingPolicy::Head);
+        let head_before = head.clone();
+        assert_eq!(head.apply_delta(&delta), Err(GraphDeltaApplyError::RevisionMismatch { view_revision: 0, delta_from: 1 }));
+        assert_eq!(head, head_before);
+
+        let mut fixed = view(TrackingPolicy::Fixed);
+        let fixed_before = fixed.clone();
+        assert_eq!(fixed.apply_delta(&delta), Err(GraphDeltaApplyError::RevisionMismatch { view_revision: 0, delta_from: 1 }));
+        let mut expected_fixed = fixed_before;
+        expected_fixed.tracking_policy = TrackingPolicy::Frozen;
+        assert_eq!(fixed, expected_fixed);
+
+        let frozen_before = fixed.clone();
+        assert_eq!(fixed.apply_delta(&delta), Err(GraphDeltaApplyError::Frozen));
+        assert_eq!(fixed, frozen_before);
+    }
+
+    #[test]
+    fn matching_fixed_delta_advances_revision_without_changing_bounds() {
+        let mut fixed = view(TrackingPolicy::Fixed);
+        let original_extent = fixed.extent();
+        let delta = graph_delta(0, 3, 30, 99, HashMap::new(), HashMap::new(), Vec::new(), HashMap::new(), HashMap::new());
+
+        fixed.apply_delta(&delta).expect("matching Fixed lineage");
+
+        assert_eq!(fixed.extent(), original_extent);
+        assert_eq!(fixed.current_revision_id(), 3);
+        assert_eq!(fixed.current_revision_timestamp_us(), 30);
+        assert_eq!(fixed.tracking_policy(), TrackingPolicy::Fixed);
+    }
+
+    #[test]
+    fn composed_delta_has_the_same_effect_as_sequential_application() {
+        let levels = BTreeMap::from([(1, Level { size: 1, daa_score: Some(10) }), (2, Level { size: 2, daa_score: Some(20) })]);
+        let base = GraphView::from_database_projection(
+            4,
+            extent(1, 2),
+            TrackingPolicy::Head,
+            levels,
+            HashMap::from([(hash(2), graph_block(2, 2)), (hash(8), graph_block_at(8, 2, 1))]),
+            HashMap::new(),
+        );
+
+        let first_block = graph_block(3, 3);
+        let mut touched_then_removed = graph_block_at(8, 2, 1);
+        touched_then_removed.timestamp = 88;
+        let edge = graph_edge(2, 2, 3, 3);
+        let first = graph_delta(
+            0,
+            1,
+            10,
+            3,
+            HashMap::from([(hash(3), Some(first_block)), (hash(8), Some(touched_then_removed))]),
+            HashMap::from([(edge.id, Some(edge))]),
+            vec![LevelChange { level: 3, before: None, after: Some(Level { size: 1, daa_score: Some(30) }) }],
+            HashMap::from([(hash(3), FieldChange { before: false, after: true })]),
+            HashMap::from([(hash(3), FieldChange { before: BlockColor::Gray, after: BlockColor::Blue })]),
+        );
+
+        let mut final_block = graph_block(3, 3);
+        final_block.timestamp = 33;
+        let second = graph_delta(
+            1,
+            2,
+            20,
+            4,
+            HashMap::from([(hash(3), Some(final_block)), (hash(8), None)]),
+            HashMap::new(),
+            vec![
+                LevelChange {
+                    level: 3,
+                    before: Some(Level { size: 999, daa_score: None }),
+                    after: Some(Level { size: 2, daa_score: Some(33) }),
+                },
+                LevelChange { level: 4, before: None, after: Some(Level { size: 1, daa_score: Some(40) }) },
+            ],
+            HashMap::from([(hash(3), FieldChange { before: false, after: true })]),
+            HashMap::from([(hash(3), FieldChange { before: BlockColor::Gray, after: BlockColor::Red })]),
+        );
+        let composed = first.compose(&second).expect("gapless intervals");
+
+        let mut sequential = base.clone();
+        sequential.apply_delta(&first).expect("first interval");
+        sequential.apply_delta(&second).expect("second interval");
+        let mut aggregated = base;
+        aggregated.apply_delta(&composed).expect("composed interval");
+
+        assert_eq!(aggregated, sequential);
+        assert_eq!(aggregated.block(&hash(3)).map(|block| (block.is_in_vspc, block.color)), Some((true, BlockColor::Red)));
+        assert!(aggregated.block(&hash(8)).is_none());
+        assert_eq!(aggregated.current_revision_id(), 2);
+        assert_eq!(aggregated.current_revision_timestamp_us(), 20);
+        assert_eq!(aggregated.extent(), extent(1, 4));
     }
 }
