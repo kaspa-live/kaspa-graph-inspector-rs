@@ -87,8 +87,8 @@ do not enlarge the PR silently. Any future regrouping requires updating this
 sequence first.
 
 The former broad Step 6 is now increments 6–17, former Step 7 is increments
-18–22, and former Step 8 is increments 23–27. Increments 6 and 7 are complete;
-the active work is increment 8, without an additional nesting level.
+18–22, and former Step 8 is increments 23–27. Increments 6–8 are complete;
+the active work is increment 9, without an additional nesting level.
 
 | Increment / PR | Isolated production scope | Completion evidence |
 |---|---|---|
@@ -115,44 +115,56 @@ the active work is increment 8, without an additional nesting level.
 | 26. Deployment and release artifacts | Complete the conventional and Docker layouts, runtime log directories, systemd and Compose examples, static-asset cache behavior, and atomic `xtask` bundle/container construction against the composed binary and Web build. | Reproducible bundle and image checks, matching binary/assets and provenance, missing-root failure, unprivileged/read-only deployment, writable logs, direct signal delivery, and atomic failure cleanup. |
 | 27. Full-stack acceptance | Add only the remaining cross-component fixtures and acceptance coverage needed to prove the focused verification contract across node RPC, PostgreSQL, recovery, API/Web, packaging, logging, and resource isolation; update implementation status with the final evidence. | Full Rust, PostgreSQL, Vitest, deterministic and complete-stack Playwright, parity, packaging, shutdown, and load/isolation suites pass from a clean checkout. |
 
-### Active increment 8: publication state and mutation kernel
+### Active increment 9: graph wire values and codec
 
-Increment 8 is exactly one reviewable PR. It implements the in-memory
-[publication synchronization and capture kernel](../architecture/api-publication.md#publication-synchronization-and-request-capture--settled)
-in `kgi-api-core` over the canonical graph model completed by increment 6.
-Publication construction from Storage, runtime reconstruction, response-cache
-work, client wake delivery, logical request operations, encoding, transport,
-and HTTP serving belong to later increments.
+Increment 9 is exactly one reviewable PR. It implements the representation
+boundary owned by the
+[API protocol](../architecture/api-protocol.md#common-transport-dto-rules--settled)
+over the canonical graph model and projection values completed by increments
+6 and 7. It supplies detached JSON-ready values for later cache, logical
+operation, and transport increments without introducing any of those runtime
+owners.
 
-Execute increment 8 as these ordered points:
+Execute increment 9 as these ordered points:
 
-1. Record the private publication-module boundary, direct crate dependencies,
-   publication-identity generation, and the concrete cheap history-cost
-   estimator weights used by this first dependent implementation.
-2. Add the publication state, atomic core, and kernel owner; initialize it from
-   an already constructed Head `GraphView` and its matching `GraphHistory`, and
-   provide the publication-local identity and monotonic revision clock.
-3. Implement serialized original `BlockCommitted` and `VspcCommitted`
-   application, view/history advancement and pruning, no-effect handling, and
-   typed detection of publication-projection failures.
-4. Implement publication lifecycle transitions and the immutable view,
-   delta-target, and history-range captures whose value dependencies already
-   exist. Defer protocol-owned level capture, client-registry notification,
-   and cache integration to their owning later increments.
-5. Add deterministic tests for the writer gate and atomic core, mutation and
-   state ordering, cancellation before atomic mutation, no-effect updates,
-   revision timestamps, immutable capture coherence, retained-history handles
-   surviving pruning, fresh publication identities, and projection-failure
-   isolation.
-6. Update implementation status and run formatting, workspace unit and
+1. Record the public-semantic and private-wire module boundaries, direct
+   Serde dependencies, the initial internal representation-version value, and
+   the protocol-required semantic Head-ETag input. Keep serialization
+   dependencies out of the canonical graph types.
+2. Add the remaining representation-independent protocol values to
+   `kgi-api-model`, including fresh-view reasons, delta outcomes and
+   continuation, retained Head-level lookup values and outcomes, and the
+   composite system-status value. Reuse the existing projection anchor,
+   resolution, and unavailable-anchor values without duplicating them.
+3. Add private `kgi-api-core` DTOs and compact JSON conversion for scalar,
+   lifecycle, status, common-error, window-source, and SSE-control shapes.
+   Apply the protocol-owned scalar, optional-value, enum, hash, and color
+   representations without adding serialization behavior to domain types.
+4. Implement complete graph, Head snapshot, anchored-window, and retained
+   Head-level DTO construction. Apply the protocol-owned response-local hash
+   dictionary and ordered-versus-unordered collection semantics at this sole
+   conversion boundary.
+5. Implement canonical delta-batch projection over an ordered
+   `GraphHistoryEntryList`. Apply the protocol-owned target-value projection
+   and wire-only omissions while leaving canonical deltas unchanged.
+6. Add focused schema and codec tests for every DTO variant, discriminator,
+   explicit-null case, enum spelling, full-width integer, color code, shared
+   dictionary path, unordered traversal equivalence, omitted removal, safe
+   common error, and semantic ETag input. Prove serialization exposes no
+   `CompactId`, tracking policy, history cost, generation identity, or other
+   internal-only field.
+7. Update implementation status and run formatting, workspace unit and
    integration tests through Nextest, Cargo doctests, Cargo check, Clippy with
    warnings denied, and `git diff --check`.
 
-This increment adds no Storage calls, publication worker, `GraphCache`,
-`DeltaClientRegistry`, level DTO, ApiService control, encoding scheduler,
-router, HTTP path, or SSE behavior. Its production scope is `kgi-api-core`;
-the existing graph model changes only if focused testing exposes a defect in
-its owned behavior.
+This increment adds no encoding scheduler, gzip execution, response-size
+enforcement, `GraphCache`, cache single-flight, heat selection, client wake
+registry, SSE mailbox, publication runtime, logical request operation, Axum
+router, request parser, HTTP header mapping, or response delivery behavior.
+Its production scope is shared semantic values in `kgi-api-model` and the
+private DTO/codec boundary in `kgi-api-core`; canonical graph values change
+only if focused codec testing exposes a defect in their owned read-only
+accessors.
 
 ## Cross-increment ordering
 
