@@ -94,7 +94,7 @@ the active work is increment 8, without an additional nesting level.
 |---|---|---|
 | 6. Canonical graph model | Complete the pure `kgi-api-model` graph values, seeded and extracted views, Head and Fixed mutation, delta application and composition, and level-scoped history. Add no publication, database, cache, encoding, router, or SSE runtime. | Focused graph-model tests for every mutation, extraction, composition, and history contract, followed by the full Rust validation suite. |
 | 7. API graph projection reads | Add the API-owned seed request/result values needed by Storage and implement `ValidatedApiDbClient::load_graph_view_seed` plus the indexed historical anchor reads. Keep all SQL, snapshot, generation-loss, and projection-coherence behavior in `kgi-storage`; add no publication worker or HTTP path. | PostgreSQL tests for Head and every anchored seed, stable-snapshot consistency, crossing edges and external levels, DAA floor/tie behavior, normal misses, incoherent projection, cancellation, and exact API-generation loss. |
-| 8. Publication state and mutation kernel | Implement `GraphPublication` state, writer serialization, view/history advancement, immutable captures, lifecycle transitions, and projection-failure detection in `kgi-api-core`. Do not yet construct publications from Storage or expose request serving. | Deterministic writer-gate tests for the image-before-history interval, state ordering, no-effect updates, capture coherence, pruning-safe history handles, and failure isolation. |
+| 8. Publication state and mutation kernel | Implement `GraphPublication` state, writer serialization, atomic view/history advancement, immutable captures, lifecycle transitions, and projection-failure detection in `kgi-api-core`. Do not yet construct publications from Storage or expose request serving. | Deterministic writer-gate and atomic-core tests for state ordering, cancellation, no-effect updates, capture coherence, pruning-safe history handles, and failure isolation. |
 | 9. Graph wire values and codec | Add the remaining public protocol values and the DTO conversion/serialization boundary, including response-local hash dictionaries, decimal-string integers, delta-entry projection, common errors, status DTOs, and semantic ETag inputs. Reuse the seed and anchor values introduced by increment 7. Keep scheduling, gzip execution, cache retention, and HTTP routing out of this PR. | Codec and schema tests covering every DTO variant, exact null/discriminator rules, dictionary reuse, unordered traversal equivalence, omitted wire removals, full-width integers, colors, and safe errors. |
 | 10. Encoding scheduler and response cache | Implement the bounded blocking encoding scheduler, JSON size enforcement and gzip execution, publication-local single-flight cache slots, Head tiers, source-keyed delta entries, heat bookkeeping, weak insertion, and tracked cache-job completion. | Deterministic queue, priority, cancellation, hard-age retry, tier selection, single-flight, weak-cache, shared-body, size-limit, gzip-failure, and scheduler-shutdown tests. |
 | 11. Client wake registry and SSE mailboxes | Implement the publication-local client registry and bounded ordered mailbox independently of Axum transport. Cover registration, lifecycle messages, graph-wakeup scheduling and coalescing, completion-time rearming, replacement, disconnect, and slow-client removal. | Race tests for atomic required batches, state-before-wakeup ordering, Head/rearm linearization, stale registrations, replacement sequences, queue bounds, and closure. |
@@ -129,8 +129,8 @@ Execute increment 8 as these ordered points:
 1. Record the private publication-module boundary, direct crate dependencies,
    publication-identity generation, and the concrete cheap history-cost
    estimator weights used by this first dependent implementation.
-2. Add the publication state, image, and kernel owner; initialize it from an
-   already constructed Head `GraphView` and its matching `GraphHistory`, and
+2. Add the publication state, atomic core, and kernel owner; initialize it from
+   an already constructed Head `GraphView` and its matching `GraphHistory`, and
    provide the publication-local identity and monotonic revision clock.
 3. Implement serialized original `BlockCommitted` and `VspcCommitted`
    application, view/history advancement and pruning, no-effect handling, and
@@ -139,11 +139,11 @@ Execute increment 8 as these ordered points:
    delta-target, and history-range captures whose value dependencies already
    exist. Defer protocol-owned level capture, client-registry notification,
    and cache integration to their owning later increments.
-5. Add deterministic tests for the writer gate and its observable
-   image-before-history interval, mutation and state ordering, no-effect
-   updates, revision timestamps, immutable capture coherence, retained-history
-   handles surviving pruning, fresh publication identities, and projection
-   failure isolation.
+5. Add deterministic tests for the writer gate and atomic core, mutation and
+   state ordering, cancellation before atomic mutation, no-effect updates,
+   revision timestamps, immutable capture coherence, retained-history handles
+   surviving pruning, fresh publication identities, and projection-failure
+   isolation.
 6. Update implementation status and run formatting, workspace unit and
    integration tests through Nextest, Cargo doctests, Cargo check, Clippy with
    warnings denied, and `git diff --check`.

@@ -748,8 +748,8 @@ and leave the storage operation and validation behavior with the
 
 ### Module, synchronization, and dependency boundary
 
-Place the publication state, image, writer gate, immutable captures, lifecycle
-transitions, and original-update mutation kernel in the private
+Place the publication state, atomic core, writer gate, immutable captures,
+lifecycle transitions, and original-update mutation kernel in the private
 `kgi_api_core::publication` module. Expose only crate-visible operations needed
 by later ApiService modules and add no crate-root re-exports. The increment
 uses `tokio::sync::Mutex` and `tokio::sync::RwLock` exactly as selected by the

@@ -256,17 +256,18 @@ with warnings denied, and `git diff --check`.
 
 Implementation increment 8 is implemented: the private `kgi-api-core`
 publication kernel now owns publication identity and timing, lifecycle state,
-the atomically observed image, the serialized mutation boundary, independently
-readable retained history, and immutable request captures. Original block and
-VSPC updates advance the Head image before appending their estimated-cost
-history entries, prune against the resulting Head extent, and preserve
-no-effect updates without revision advancement. Lifecycle transitions and
-full-view, subview, delta-target, and retained-history captures are present;
-protocol-owned level capture, client notifications, caching, construction from
-Storage, and the long-lived publication runtime remain in later increments.
-Deterministic tests cover the observable image-before-history interval, writer
-ordering and caller-cancellation completion, lifecycle transitions, no-effect
-updates, publication-local millisecond timestamps, detached frozen views,
+the atomically observed Head-and-history core, the serialized mutation
+boundary, and immutable request captures. Original block and VSPC updates
+mutate the Head, append their estimated-cost history entries, and prune against
+the resulting Head extent synchronously under one core write lock. No-effect
+updates preserve both graph values without revision advancement. Lifecycle
+transitions and full-view, subview, delta-target, and retained-history captures
+are present; protocol-owned level capture, client notifications, caching,
+construction from Storage, and the long-lived publication runtime remain in
+later increments.
+Deterministic tests cover atomic core visibility, writer ordering, cancellation
+before mutation begins, lifecycle transitions, no-effect updates,
+publication-local millisecond timestamps, detached frozen views,
 retained history surviving pruning, fresh publication identities, and typed
 projection failures.
 Completion validation passed workspace formatting, Cargo check, 377/377
