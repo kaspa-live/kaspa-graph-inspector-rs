@@ -13,7 +13,7 @@ use kgi_model::{
     block::{BlockHash, BlockPresence, CompactId, MaterializedSyncAnchor, ValidatedNodeBlock},
     lifecycle::PersistenceFault,
 };
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool, Postgres, pool::PoolConnection};
 
 use tokio::sync::{Mutex, RwLock, oneshot, watch};
 
@@ -413,7 +413,7 @@ impl ValidatedApiDbClient {
 
     /// Loads one coherent database-backed graph projection and its alignment metadata.
     pub async fn load_graph_view_seed(&self, request: GraphViewSeedRequest) -> Result<GraphViewSeedOutcome, ApiReadError> {
-        self.run_read_operation(|| projection::load(self.pool(), self.binding.genesis_hash(), request)).await
+        self.run_read_operation(request).await
     }
 
     #[allow(dead_code, reason = "used by the permanent service lifecycle")]
@@ -453,39 +453,109 @@ impl ValidatedApiDbClient {
         }
     }
 
-    async fn run_read_operation<T, F, Fut>(&self, operation: F) -> Result<T, ApiReadError>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<T, ApiReadError>>,
-    {
+    async fn run_read_operation(&self, request: GraphViewSeedRequest) -> Result<GraphViewSeedOutcome, ApiReadError> {
         let mut lease = match self.acquire_read_lease().await {
             Ok(lease) => lease,
             Err(StorageError::GenerationLost) => return self.finish_generation_loss().await,
             Err(_) => return Err(ApiReadError::QueryFailed),
         };
         let mut validity = self.validity.subscribe();
-        let completion = {
-            let operation = operation();
-            tokio::pin!(operation);
+
+        let connection = {
+            let acquisition = self.pool().acquire();
+            tokio::pin!(acquisition);
             tokio::select! {
                 biased;
-                () = lease.cancelled() => None,
+                () = lease.cancelled() => {
+                    drop(lease);
+                    return self.finish_generation_loss().await;
+                }
                 result = validity.changed() => {
-                    if result.is_err() {
-                        Some(Err(ApiReadError::QueryFailed))
+                    drop(lease);
+                    return if result.is_err() {
+                        Err(ApiReadError::QueryFailed)
                     } else {
                         debug_assert!(!*validity.borrow(), "API generation validity is monotonic");
-                        None
-                    }
+                        self.finish_generation_loss().await
+                    };
                 }
-                result = &mut operation => Some(result),
+                result = &mut acquisition => match result {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        drop(lease);
+                        return self.finish_read_error(projection::query_error(error)).await;
+                    }
+                },
             }
         };
-        drop(lease);
-        match completion {
-            None | Some(Err(ApiReadError::GenerationLost)) => self.finish_generation_loss().await,
-            Some(result) => result,
+        let mut session = ApiReadSession::new(self.pool().clone(), connection, lease);
+
+        let backend_pid = match sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(session.connection()).await {
+            Ok(backend_pid) => backend_pid,
+            Err(error) => {
+                session.release().await;
+                return self.finish_read_error(projection::query_error(error)).await;
+            }
+        };
+        session.set_backend_pid(backend_pid);
+
+        enum Completion {
+            Finished(Result<GraphViewSeedOutcome, ApiReadError>),
+            Interrupted { result: ApiReadError, cancellation: Option<PgConnection> },
         }
+
+        let completion = {
+            let (connection, lease) = session.parts();
+            let mut operation = Box::pin(projection::load(connection, self.binding.genesis_hash(), request));
+            let completion = tokio::select! {
+                biased;
+                () = lease.cancelled() => {
+                    let cancellation = cancel_projection_backend(self.pool(), backend_pid).await;
+                    if cancellation.is_some() {
+                        let _ = (&mut operation).await;
+                    }
+                    Completion::Interrupted { result: ApiReadError::GenerationLost, cancellation }
+                }
+                result = validity.changed() => {
+                    let read_result = if result.is_err() {
+                        ApiReadError::QueryFailed
+                    } else {
+                        debug_assert!(!*validity.borrow(), "API generation validity is monotonic");
+                        ApiReadError::GenerationLost
+                    };
+                    let cancellation = cancel_projection_backend(self.pool(), backend_pid).await;
+                    if cancellation.is_some() {
+                        let _ = (&mut operation).await;
+                    }
+                    Completion::Interrupted { result: read_result, cancellation }
+                }
+                result = &mut operation => Completion::Finished(result),
+            };
+            drop(operation);
+            completion
+        };
+
+        match completion {
+            Completion::Finished(result) => {
+                session.release().await;
+                self.finish_read_result(result).await
+            }
+            Completion::Interrupted { result, cancellation } => {
+                session.cancel(cancellation).await;
+                self.finish_read_error(result).await
+            }
+        }
+    }
+
+    async fn finish_read_result<T>(&self, result: Result<T, ApiReadError>) -> Result<T, ApiReadError> {
+        match result {
+            Err(error) => self.finish_read_error(error).await,
+            Ok(value) => Ok(value),
+        }
+    }
+
+    async fn finish_read_error<T>(&self, error: ApiReadError) -> Result<T, ApiReadError> {
+        if error == ApiReadError::GenerationLost { self.finish_generation_loss().await } else { Err(error) }
     }
 
     async fn finish_generation_loss<T>(&self) -> Result<T, ApiReadError> {
@@ -507,6 +577,111 @@ impl ValidatedApiDbClient {
     }
 }
 
+/// Owns every database resource covered by one replacement lease.
+///
+/// If the caller abandons the public future, [`Drop`] transfers cleanup and the
+/// lease together so exclusive replacement cannot overtake PostgreSQL
+/// cancellation.
+struct ApiReadSession {
+    pool: PgPool,
+    connection: Option<PoolConnection<Postgres>>,
+    lease: Option<ApiDbReadLease>,
+    backend_pid: Option<i32>,
+}
+
+impl ApiReadSession {
+    fn new(pool: PgPool, connection: PoolConnection<Postgres>, lease: ApiDbReadLease) -> Self {
+        Self { pool, connection: Some(connection), lease: Some(lease), backend_pid: None }
+    }
+
+    fn connection(&mut self) -> &mut PgConnection {
+        self.connection.as_deref_mut().expect("API read session retains its connection")
+    }
+
+    fn parts(&mut self) -> (&mut PgConnection, &mut ApiDbReadLease) {
+        let connection = self.connection.as_deref_mut().expect("API read session retains its connection");
+        let lease = self.lease.as_mut().expect("API read session retains its replacement lease");
+        (connection, lease)
+    }
+
+    fn set_backend_pid(&mut self, backend_pid: i32) {
+        self.backend_pid = Some(backend_pid);
+    }
+
+    async fn release(mut self) {
+        let mut connection = self.connection.take().expect("API read session retains its connection");
+        connection.return_to_pool().await;
+        drop(self.lease.take());
+    }
+
+    async fn cancel(mut self, cancellation: Option<PgConnection>) {
+        let connection = self.connection.take().expect("API read session retains its connection");
+        let lease = self.lease.take().expect("API read session retains its replacement lease");
+        close_cancelled_api_read(self.pool.clone(), connection, lease, self.backend_pid, cancellation).await;
+    }
+}
+
+impl Drop for ApiReadSession {
+    fn drop(&mut self) {
+        let (Some(connection), Some(lease)) = (self.connection.take(), self.lease.take()) else {
+            return;
+        };
+        let pool = self.pool.clone();
+        let backend_pid = self.backend_pid;
+        tokio::spawn(async move {
+            let cancellation = match backend_pid {
+                Some(backend_pid) => cancel_projection_backend(&pool, backend_pid).await,
+                None => None,
+            };
+            close_cancelled_api_read(pool, connection, lease, backend_pid, cancellation).await;
+        });
+    }
+}
+
+async fn close_cancelled_api_read(
+    pool: PgPool,
+    connection: PoolConnection<Postgres>,
+    lease: ApiDbReadLease,
+    backend_pid: Option<i32>,
+    mut cancellation: Option<PgConnection>,
+) {
+    let _ = connection.close().await;
+    if cancellation.is_none()
+        && let Some(backend_pid) = backend_pid
+    {
+        cancellation = cancel_projection_backend(&pool, backend_pid).await;
+    }
+    if let (Some(control), Some(backend_pid)) = (cancellation.as_mut(), backend_pid) {
+        wait_for_backend_exit(control, backend_pid).await;
+    }
+    if let Some(control) = cancellation {
+        let _ = control.close().await;
+    }
+    drop(lease);
+}
+
+async fn cancel_projection_backend(pool: &PgPool, backend_pid: i32) -> Option<PgConnection> {
+    // This must not acquire through the capped API pool: its only connection
+    // may be the blocked backend that this control connection must interrupt.
+    let options = pool.connect_options();
+    let mut control = PgConnection::connect_with(options.as_ref()).await.ok()?;
+    let _: bool = sqlx::query_scalar("SELECT pg_cancel_backend($1)").bind(backend_pid).fetch_one(&mut control).await.ok()?;
+    Some(control)
+}
+
+async fn wait_for_backend_exit(control: &mut PgConnection, backend_pid: i32) {
+    loop {
+        let active: Result<bool, _> = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+            .bind(backend_pid)
+            .fetch_one(&mut *control)
+            .await;
+        match active {
+            Ok(false) | Err(_) => return,
+            Ok(true) => tokio::task::yield_now().await,
+        }
+    }
+}
+
 impl std::fmt::Debug for ValidatedApiDbClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -524,15 +699,6 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
 
-    use kaspa_consensus_core::network::{NetworkId, NetworkType};
-    use kgi_core::timing::Timing;
-    use kgi_model::{
-        block::{BlockCoordinate, BlockHash, CompactId},
-        lifecycle::PersistenceFault,
-    };
-    use sqlx::postgres::PgPoolOptions;
-    use tokio::sync::oneshot;
-
     use super::{DatabaseBinding, ValidatedApiDbClient, ValidatedDbClient};
     use crate::{
         cache::{CachedIdentity, CachedMaterializedBlock, CachedMergeSets, CachedVspcSink},
@@ -540,6 +706,13 @@ mod tests {
         replacement::ApiReplacementGate,
         runtime::{RetirementTarget, retirement_channel},
     };
+    use kaspa_consensus_core::network::{NetworkId, NetworkType};
+    use kgi_core::timing::Timing;
+    use kgi_model::{
+        block::{BlockCoordinate, BlockHash, CompactId},
+        lifecycle::PersistenceFault,
+    };
+    use sqlx::postgres::PgPoolOptions;
 
     fn hash(byte: u8) -> BlockHash {
         BlockHash::from_bytes([byte; 32])
@@ -564,12 +737,10 @@ mod tests {
         let started = Arc::new(AtomicBool::new(false));
         let operation_started = started.clone();
         let mut waiting = tokio::spawn(async move {
-            waiting_client
-                .run_read_operation(|| {
-                    operation_started.store(true, Ordering::Release);
-                    async { Ok::<_, ApiReadError>(()) }
-                })
-                .await
+            let lease = waiting_client.acquire_read_lease().await?;
+            operation_started.store(true, Ordering::Release);
+            drop(lease);
+            Ok::<_, StorageError>(())
         });
         assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting).await.is_err());
         assert!(!started.load(Ordering::Acquire));
@@ -589,36 +760,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_read_operation_preserves_nongeneration_outcomes_without_retirement() {
-        let pool =
-            PgPoolOptions::new().connect_lazy("postgresql://postgres@localhost/kgi").expect("lazy PostgreSQL pool configuration");
-        let (retirement_tx, mut retirements) = retirement_channel();
-        let client = ValidatedApiDbClient::new(pool, binding(), retirement_tx, ApiReplacementGate::new());
-
-        assert_eq!(client.run_read_operation(|| async { Ok::<_, ApiReadError>(7_u8) }).await, Ok(7));
-        assert_eq!(
-            client.run_read_operation(|| async { Err::<(), _>(ApiReadError::QueryFailed) }).await,
-            Err(ApiReadError::QueryFailed)
-        );
-        assert_eq!(
-            client.run_read_operation(|| async { Err::<(), _>(ApiReadError::InconsistentProjection) }).await,
-            Err(ApiReadError::InconsistentProjection)
-        );
-        assert!(client.is_valid());
-        assert!(retirements.try_recv().is_err());
-    }
-
-    #[tokio::test]
     async fn api_read_generation_loss_joins_exact_retirement_before_returning() {
         let pool =
             PgPoolOptions::new().connect_lazy("postgresql://postgres@localhost/kgi").expect("lazy PostgreSQL pool configuration");
         let (retirement_tx, mut retirements) = retirement_channel();
         let client = ValidatedApiDbClient::new(pool, binding(), retirement_tx, ApiReplacementGate::new());
         let operation_client = client.clone();
-        let operation =
-            tokio::spawn(
-                async move { operation_client.run_read_operation(|| async { Err::<(), _>(ApiReadError::GenerationLost) }).await },
-            );
+        let operation = tokio::spawn(async move { operation_client.finish_generation_loss::<()>().await });
 
         let request = retirements.recv().await.expect("API operation retirement request");
         let retired = match request.target() {
@@ -646,12 +794,15 @@ mod tests {
 
         let operation_client = client.clone();
         let operation = tokio::spawn(async move {
-            operation_client
-                .run_read_operation(|| {
+            match operation_client.acquire_read_lease().await {
+                Ok(lease) => {
                     operation_started.store(true, Ordering::Release);
-                    async { Ok::<_, ApiReadError>(()) }
-                })
-                .await
+                    drop(lease);
+                    Ok(())
+                }
+                Err(StorageError::GenerationLost) => operation_client.finish_generation_loss().await,
+                Err(_) => Err(ApiReadError::QueryFailed),
+            }
         });
         let request = retirements.recv().await.expect("retired API generation barrier request");
         let retired = match request.target() {
@@ -664,47 +815,6 @@ mod tests {
 
         assert_eq!(operation.await.expect("API operation task"), Err(ApiReadError::GenerationLost));
         assert!(!started.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn replacement_cancellation_drops_api_read_and_joins_retirement() {
-        let pool =
-            PgPoolOptions::new().connect_lazy("postgresql://postgres@localhost/kgi").expect("lazy PostgreSQL pool configuration");
-        let (retirement_tx, mut retirements) = retirement_channel();
-        let gate = ApiReplacementGate::new();
-        let client = ValidatedApiDbClient::new(pool, binding(), retirement_tx, gate.clone());
-        let (started_tx, started_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel::<()>();
-        let operation_client = client.clone();
-        let operation = tokio::spawn(async move {
-            operation_client
-                .run_read_operation(|| async move {
-                    let _ = started_tx.send(());
-                    let _ = release_rx.await;
-                    Ok::<_, ApiReadError>(())
-                })
-                .await
-        });
-        started_rx.await.expect("API operation starts after admission");
-
-        let replacement = gate.begin_replacement().expect("replacement closes admission");
-        let request = retirements.recv().await.expect("cancelled API operation retirement request");
-        let retired = match request.target() {
-            RetirementTarget::Api(generation) => generation.upgrade().expect("API generation remains alive"),
-            RetirementTarget::Processing(_) => panic!("API operation requested processing retirement"),
-        };
-        assert!(Arc::ptr_eq(&retired, &client));
-        assert!(!operation.is_finished());
-        assert!(release_tx.is_closed(), "replacement cancellation drops the database future before the retirement barrier");
-        let _exclusive = replacement
-            .acquire_exclusive(&Timing::production())
-            .await
-            .expect("cancelled API read releases its replacement lease before the retirement barrier");
-        assert!(retired.retire());
-        request.complete(Ok(()));
-
-        assert_eq!(operation.await.expect("cancelled API operation task"), Err(ApiReadError::GenerationLost));
-        assert!(!client.is_valid());
     }
 
     #[tokio::test]

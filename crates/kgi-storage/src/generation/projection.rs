@@ -11,7 +11,10 @@ use kgi_api_model::{
     },
 };
 use kgi_model::block::{BlockColor, BlockCoordinate, BlockHash, CompactId, MAX_DAA_SCORE};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{Connection, PgConnection, Postgres, Row, Transaction};
+
+#[cfg(test)]
+use sqlx::PgPool;
 
 use crate::{
     database::{NO_VSPC_DAA_SCORE, timestamp_from_sql},
@@ -55,11 +58,11 @@ struct PreparedGraphEdge {
 }
 
 pub(super) async fn load(
-    pool: &PgPool,
+    connection: &mut PgConnection,
     genesis_hash: BlockHash,
     request: GraphViewSeedRequest,
 ) -> Result<GraphViewSeedOutcome, ApiReadError> {
-    let mut projection = GraphProjection::begin(pool).await?;
+    let mut projection = GraphProjection::begin_on_connection(connection).await?;
     let scope = match projection.resolve_scope(request).await? {
         ProjectionScopeOutcome::Resolved(scope) => scope,
         ProjectionScopeOutcome::AnchorUnavailable(unavailable) => {
@@ -73,8 +76,18 @@ pub(super) async fn load(
 }
 
 impl<'connection> GraphProjection<'connection> {
+    #[cfg(test)]
     pub(super) async fn begin(pool: &'connection PgPool) -> Result<Self, ApiReadError> {
         let transaction = pool.begin().await.map_err(query_error)?;
+        Self::from_transaction(transaction).await
+    }
+
+    async fn begin_on_connection(connection: &'connection mut PgConnection) -> Result<Self, ApiReadError> {
+        let transaction = connection.begin().await.map_err(query_error)?;
+        Self::from_transaction(transaction).await
+    }
+
+    async fn from_transaction(transaction: Transaction<'connection, Postgres>) -> Result<Self, ApiReadError> {
         let mut projection = Self { transaction };
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *projection.transaction)
@@ -514,7 +527,7 @@ fn decode_positive_level(level: i64) -> Result<u64, ApiReadError> {
     u64::try_from(level).ok().filter(|level| *level > 0).ok_or(ApiReadError::InconsistentProjection)
 }
 
-fn query_error(error: sqlx::Error) -> ApiReadError {
+pub(super) fn query_error(error: sqlx::Error) -> ApiReadError {
     if sqlx_connection_lost(&error) { ApiReadError::GenerationLost } else { ApiReadError::QueryFailed }
 }
 
@@ -1167,13 +1180,19 @@ mod tests {
         let operation_client = client.clone();
         let operation =
             tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
-        let _pid = blocked_projection_pid(&fixture.pool).await;
+        let pid = blocked_projection_pid(&fixture.pool).await;
 
         let replacement = gate.begin_replacement().expect("replacement closes admission");
         let exclusive = timeout(Duration::from_secs(1), replacement.acquire_exclusive(&Timing::production()))
             .await
-            .expect("blocked read releases its lease promptly")
+            .expect("blocked read cancels and releases its database resources promptly")
             .expect("replacement exclusion");
+        let backend_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+            .bind(pid)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("cancelled backend inspection");
+        assert!(!backend_exists, "exclusive replacement begins only after the cancelled backend and transaction end");
         let request = retirements.recv().await.expect("cancelled projection retirement request");
         let retired = match request.target() {
             crate::runtime::RetirementTarget::Api(generation) => generation.upgrade().expect("API generation remains alive"),
@@ -1184,6 +1203,78 @@ mod tests {
         assert!(retired.retire());
         request.complete(Ok(()));
         assert_eq!(operation.await.expect("projection task"), Err(crate::error::ApiReadError::GenerationLost));
+
+        exclusive.open().expect("test reopens admission");
+        blocker.rollback().await.expect("release block-table lock");
+    }
+
+    #[tokio::test]
+    async fn generation_retirement_cancels_the_backend_before_its_barrier() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(
+            api_pool,
+            binding(graph.blocks[0].0),
+            retirement_tx,
+            crate::replacement::ApiReplacementGate::new(),
+        );
+        let blocker = lock_blocks(&fixture.pool).await;
+        let operation_client = client.clone();
+        let operation =
+            tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
+        let pid = blocked_projection_pid(&fixture.pool).await;
+
+        assert!(client.retire());
+        let request = retirements.recv().await.expect("retired projection joins the exact-generation barrier");
+        let backend_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+            .bind(pid)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("retired backend inspection");
+        assert!(!backend_exists, "retirement reaches its barrier only after the backend and transaction end");
+        let retired = match request.target() {
+            crate::runtime::RetirementTarget::Api(generation) => generation.upgrade().expect("API generation remains alive"),
+            crate::runtime::RetirementTarget::Processing(_) => panic!("API read requested processing retirement"),
+        };
+        assert!(Arc::ptr_eq(&retired, &client));
+        assert!(!operation.is_finished());
+        request.complete(Ok(()));
+        assert_eq!(operation.await.expect("projection task"), Err(crate::error::ApiReadError::GenerationLost));
+
+        blocker.rollback().await.expect("release block-table lock");
+    }
+
+    #[tokio::test]
+    async fn abandoned_projection_keeps_its_lease_until_backend_cleanup() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let gate = crate::replacement::ApiReplacementGate::new();
+        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(api_pool, binding(graph.blocks[0].0), retirement_tx, gate.clone());
+        let blocker = lock_blocks(&fixture.pool).await;
+        let operation_client = client.clone();
+        let operation =
+            tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
+        let pid = blocked_projection_pid(&fixture.pool).await;
+
+        operation.abort();
+        assert!(operation.await.expect_err("projection task is abandoned").is_cancelled());
+        let replacement = gate.begin_replacement().expect("replacement closes admission");
+        let exclusive = timeout(Duration::from_secs(1), replacement.acquire_exclusive(&Timing::production()))
+            .await
+            .expect("abandoned read cleans up its database resources promptly")
+            .expect("replacement exclusion");
+        let backend_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+            .bind(pid)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("abandoned backend inspection");
+        assert!(!backend_exists, "abandonment retains the lease until the backend and transaction end");
+        assert!(client.is_valid());
+        assert!(retirements.try_recv().is_err());
 
         exclusive.open().expect("test reopens admission");
         blocker.rollback().await.expect("release block-table lock");
