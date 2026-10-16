@@ -815,3 +815,33 @@ publication-lifetime workload rationale as cumulative history overflow. A
 later composed history entry obtains its estimate by adding its constituent
 entry estimates rather than re-estimating the composed mutation maps, so
 composition cancellation cannot retroactively change planning cost.
+
+## 16 October 2026: graph wire codec foundation
+
+### Module and dependency boundary
+
+Place representation-independent public protocol values in the later public
+`kgi_api_model::protocol` module. Place transport DTOs, response-local hash
+substitution, and JSON conversion in the private `kgi_api_core::codec` module,
+with no crate-root re-exports. Canonical graph and protocol values do not
+derive Serde traits and retain no serialization dependency; the codec alone
+constructs private serializable representations at the boundary owned by the
+[API protocol](../architecture/api-protocol.md#common-transport-dto-rules--settled).
+
+Add direct workspace dependencies on `serde` and `serde_json` to
+`kgi-api-core`. Serde derives the private DTO encoders, while `serde_json`
+produces the compact JSON bytes and supports exact schema tests. These
+dependencies remain absent from `kgi-api-model`.
+
+### Representation and Head validator identity
+
+Start the internal graph-payload `representation_version` at `1` and store it
+as a private `u32`. Changing the version remains governed by the API protocol;
+the integer width and initial value are implementation choices and do not add
+a public response field.
+
+Represent the protocol-owned semantic Head validator identity with the private
+`HeadEtagInput` value. It contains the current representation version,
+publication ID, snapshot revision, and one canonical `LevelExtent`. The
+eventual validator formatting and HTTP header handling remain outside this
+codec increment.

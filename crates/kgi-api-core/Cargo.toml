@@ -11,6 +11,8 @@ kgi-api-model = { path = "../kgi-api-model" }
 kgi-model = { path = "../kgi-model" }
 kgi-storage = { path = "../kgi-storage" }
 rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 

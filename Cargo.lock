@@ -2925,6 +2925,8 @@ dependencies = [
  "kgi-model",
  "kgi-storage",
  "rand 0.8.8",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
 ]
