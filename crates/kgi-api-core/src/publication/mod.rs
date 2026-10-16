@@ -3,6 +3,7 @@
 mod error;
 mod estimate;
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use kgi_api_model::{
@@ -100,9 +101,9 @@ impl GraphDeltaTargetCapture {
 pub(crate) struct GraphPublication {
     publication_id: u64,
     revision_clock_origin: Instant,
-    mutation: Mutex<()>,
+    mutation: Arc<Mutex<()>>,
     image: RwLock<GraphPublicationImage>,
-    history: RwLock<GraphHistory>,
+    history: Arc<RwLock<GraphHistory>>,
     #[cfg(test)]
     mutation_test_hook: Option<std::sync::Arc<MutationTestHook>>,
 }
@@ -157,9 +158,9 @@ impl GraphPublication {
         Ok(Self {
             publication_id: random_nonzero_publication_id(),
             revision_clock_origin,
-            mutation: Mutex::new(()),
+            mutation: Arc::new(Mutex::new(())),
             image: RwLock::new(GraphPublicationImage { state: initial_state, view }),
-            history: RwLock::new(history),
+            history: Arc::new(RwLock::new(history)),
             #[cfg(test)]
             mutation_test_hook: None,
         })
@@ -250,7 +251,7 @@ impl GraphPublication {
     }
 
     async fn apply_original_update(&self, update: OriginalUpdate<'_>) -> Result<Option<u64>, PublicationProjectionError> {
-        let _mutation = self.mutation.lock().await;
+        let mutation = Arc::clone(&self.mutation).lock_owned().await;
 
         let image_revision = self.image.read().await.view.current_revision_id();
         let history_revision = self.history.read().await.current_revision_id();
@@ -268,16 +269,26 @@ impl GraphPublication {
         let head_low_level = image.view.low_level();
         drop(image);
 
+        let history = Arc::clone(&self.history);
         #[cfg(test)]
-        if let Some(hook) = &self.mutation_test_hook {
-            hook.pause_after_image_publication().await;
-        }
+        let mutation_test_hook = self.mutation_test_hook.clone();
+        // Transfer every post-image await with the owned writer guard so
+        // abandoning the caller cannot expose an incomplete lineage as idle.
+        tokio::spawn(async move {
+            let _mutation = mutation;
+            #[cfg(test)]
+            if let Some(hook) = mutation_test_hook {
+                hook.pause_after_image_publication().await;
+            }
 
-        let estimated_raw_bytes = estimate_raw_delta_bytes(&delta);
-        let mut history = self.history.write().await;
-        history.append(delta, estimated_raw_bytes)?;
-        history.prune(head_low_level);
-        Ok(Some(target_revision))
+            let estimated_raw_bytes = estimate_raw_delta_bytes(&delta);
+            let mut history = history.write().await;
+            history.append(delta, estimated_raw_bytes)?;
+            history.prune(head_low_level);
+            Ok(Some(target_revision))
+        })
+        .await
+        .expect("publication mutation completion task does not fail")
     }
 
     fn revision_timestamp_ms_at(&self, now: Instant) -> u64 {
@@ -550,6 +561,35 @@ mod tests {
         assert_eq!(final_target.state(), GraphPublicationState::Stale);
         assert_eq!(final_target.revision(), 2);
         assert_eq!(publication.history.read().await.current_revision_id(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_the_caller_keeps_the_gate_until_owned_history_completion() {
+        let (publication, hook) = publication_with_mutation_hook(2);
+        let mutation_publication = Arc::clone(&publication);
+        let mutation = tokio::spawn(async move { mutation_publication.apply_block_committed(&committed_block(2)).await });
+        hook.wait_for_image_publication().await;
+
+        assert_eq!(publication.image.read().await.view.current_revision_id(), 1);
+        assert_eq!(publication.history.read().await.current_revision_id(), 0);
+        let history_capture = publication.history.read().await;
+        mutation.abort();
+        assert!(mutation.await.expect_err("caller mutation task is cancelled").is_cancelled());
+        hook.resume_history_append().await;
+
+        let stale_publication = Arc::clone(&publication);
+        let stale = tokio::spawn(async move { stale_publication.transition_stale().await });
+        tokio::task::yield_now().await;
+        assert!(!stale.is_finished());
+        assert_eq!(publication.capture_delta_target().await.state(), GraphPublicationState::Synchronizing);
+        assert_eq!(history_capture.current_revision_id(), 0);
+
+        drop(history_capture);
+        assert!(stale.await.expect("Stale transition task"));
+        let target = publication.capture_delta_target().await;
+        assert_eq!(target.state(), GraphPublicationState::Stale);
+        assert_eq!(target.revision(), 1);
+        assert_eq!(publication.history.read().await.current_revision_id(), 1);
     }
 
     #[tokio::test]

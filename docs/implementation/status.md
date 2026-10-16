@@ -265,9 +265,10 @@ full-view, subview, delta-target, and retained-history captures are present;
 protocol-owned level capture, client notifications, caching, construction from
 Storage, and the long-lived publication runtime remain in later increments.
 Deterministic tests cover the observable image-before-history interval, writer
-ordering, lifecycle transitions, no-effect updates, publication-local
-millisecond timestamps, detached frozen views, retained history surviving
-pruning, fresh publication identities, and typed projection failures.
-Completion validation passed workspace formatting, Cargo check, 376/376
+ordering and caller-cancellation completion, lifecycle transitions, no-effect
+updates, publication-local millisecond timestamps, detached frozen views,
+retained history surviving pruning, fresh publication identities, and typed
+projection failures.
+Completion validation passed workspace formatting, Cargo check, 377/377
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.
