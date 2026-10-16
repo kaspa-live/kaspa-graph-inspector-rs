@@ -20,9 +20,10 @@ fault, status, VSPC, and committed graph-update values are implemented against
 the selected rusty-kaspa `v2.1.0` value crates. The session-scoped graph-update
 ingress implements the shared pre-seal gate, nonblocking ordinary offers,
 lossless lifecycle markers, coalescing gap observation, and ingress metrics.
-The API service crate remains behavior-free scaffolding. The processing crate
-contains the session-scoped BlockProcessor and VspcProcessor slices described
-below.
+ApiService orchestration remains behavior-free scaffolding; `kgi-api-core`
+contains the in-memory publication kernel described below. The processing
+crate contains the session-scoped BlockProcessor and VspcProcessor slices
+described below.
 The first
 StorageService implementation slice selects SQLx with PostgreSQL and Rustls,
 embeds the forward-only metadata and processing-schema migrations, acquires the
@@ -250,5 +251,23 @@ failure, exact API-generation retirement, and processing/API pool isolation.
 Publication construction and request serving remain in the later increments
 recorded in [the implementation sequence](sequence.md#remaining-reviewable-increments).
 Completion validation passed workspace formatting, Cargo check, 357/357
+Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
+with warnings denied, and `git diff --check`.
+
+Implementation increment 8 is implemented: the private `kgi-api-core`
+publication kernel now owns publication identity and timing, lifecycle state,
+the atomically observed image, the serialized mutation boundary, independently
+readable retained history, and immutable request captures. Original block and
+VSPC updates advance the Head image before appending their estimated-cost
+history entries, prune against the resulting Head extent, and preserve
+no-effect updates without revision advancement. Lifecycle transitions and
+full-view, subview, delta-target, and retained-history captures are present;
+protocol-owned level capture, client notifications, caching, construction from
+Storage, and the long-lived publication runtime remain in later increments.
+Deterministic tests cover the observable image-before-history interval, writer
+ordering, lifecycle transitions, no-effect updates, publication-local
+millisecond timestamps, detached frozen views, retained history surviving
+pruning, fresh publication identities, and typed projection failures.
+Completion validation passed workspace formatting, Cargo check, 376/376
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.
