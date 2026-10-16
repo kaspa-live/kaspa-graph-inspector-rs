@@ -1,6 +1,21 @@
 #![allow(dead_code, reason = "the isolated codec foundation is integrated by later API increments")]
 
+pub(crate) mod error;
+pub(crate) mod lifecycle;
+pub(crate) mod scalar;
+pub(crate) mod sse;
+pub(crate) mod status;
+pub(crate) mod window;
+
 use kgi_api_model::graph::LevelExtent;
+use serde::Serialize;
+
+fn to_json_bytes<T>(value: &T) -> Result<Vec<u8>, serde_json::Error>
+where
+    T: Serialize,
+{
+    serde_json::to_vec(value)
+}
 
 /// Current internal graph-payload representation version.
 pub(crate) const GRAPH_REPRESENTATION_VERSION: u32 = 1;

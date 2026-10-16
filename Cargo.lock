@@ -2920,6 +2920,7 @@ dependencies = [
 name = "kgi-api-core"
 version = "0.1.0"
 dependencies = [
+ "kaspa-consensus-core",
  "kgi-api-ingress",
  "kgi-api-model",
  "kgi-model",

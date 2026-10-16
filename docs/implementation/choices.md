@@ -833,6 +833,13 @@ Add direct workspace dependencies on `serde` and `serde_json` to
 produces the compact JSON bytes and supports exact schema tests. These
 dependencies remain absent from `kgi-api-model`.
 
+Add a direct `kaspa-consensus-core` dependency to `kgi-api-core` when status
+DTO conversion is introduced. The shared semantic status continues to carry
+the `kgi-model`-owned `ValidatedNodeStatus`; the codec names the upstream
+`NetworkType` only to exhaustively construct the protocol-owned structural
+network value without parsing or depending on a display string. This creates
+no dependency on NodeService or `kgi-node`.
+
 ### Representation and Head validator identity
 
 Start the internal graph-payload `representation_version` at `1` and store it
