@@ -1651,6 +1651,25 @@ VSPC membership, and construction metadata into the API-owned result. The
 materialized-ID cut is the only compact ID exposed by this operation; no
 database transaction object is exposed to ApiService.
 
+Canonical relationship validation belongs to the accepted Storage mutation
+paths, not to this projection read. Rebuild and ordinary materialization
+persist only the domain-owned canonical relationship sequences described by
+the schema contract above, and the API projection consumes those persisted
+relationships as already validated. It does not perform a second exhaustive
+audit of per-vector uniqueness, own-hash exclusion, Genesis relationship
+shape, or other relationship invariants established before persistence, and
+it does not repair or canonicalize persisted relationships while reading.
+Permitted cross-vector overlap remains unchanged.
+
+`InconsistentProjection` still covers a failure encountered while decoding or
+resolving the stored values required to construct the requested complete
+projection, including an absent required identity, level, selected-parent
+position, or construction-metadata value. It does not promise exhaustive
+detection of schema-valid relationship state that accepted Storage mutation
+paths cannot produce. Direct or out-of-band mutation of processing tables is
+outside the validated-generation contract and does not create a requirement
+for projection-time relationship revalidation.
+
 `HeadPublication` returns `Loaded` or an `ApiReadError`; it has no anchor-miss
 outcome. For a valid `AnchoredWindow`, resolve the anchor inside the same
 stable transaction used for projection and return these normal outcomes before
@@ -1676,9 +1695,10 @@ ordered `StorageServiceEvent::ApiDbRetired`, starts autonomous reacquisition, an
 reports `GenerationLost` to the operation only after `is_valid()` is false,
 without retiring the independent processing handle. Publication of the
 validated replacement emits
-`StorageServiceEvent::ApiDbPublished`. A structurally incomplete or internally
-incoherent result reports `InconsistentProjection`; it never returns a partial
-seed. The [publication construction contract](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled)
+`StorageServiceEvent::ApiDbPublished`. A result covered by the read-local
+resolution rules above reports `InconsistentProjection`; it never returns a
+partial seed. The
+[publication construction contract](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled)
 owns those errors during Head construction; the
 [API protocol](api-protocol.md#anchored-graph-windows--settled) owns public
 anchored-window dispositions.

@@ -1835,6 +1835,15 @@ attempt abandons that candidate and invokes ordinary reconstruction while
 retaining the exact current API DB client. `InconsistentProjection` never
 substitutes for an anchor-unavailability result.
 
+Exercise API projection relationship handling through the accepted Rebuild
+and ordinary materialization paths, and verify that the returned direct-parent
+and merge-set values preserve the canonical persisted relationships. Per the
+[Storage projection-read contract](storage.md#api-graph-projection-reads--settled),
+projection verification does not require direct SQL mutation that bypasses
+those paths in order to prove duplicate, own-hash, or Genesis-relationship
+detection a second time. Continue to exercise read-local failures that prevent
+resolution of a complete seed as `InconsistentProjection`.
+
 For Rebuild, verify `reset(Rebuild)` atomically clears the locally bound API
 client and disables public reads without changing the old client's
 storage-owned validity. StorageService then closes replacement admission,
