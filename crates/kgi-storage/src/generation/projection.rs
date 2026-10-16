@@ -1294,14 +1294,14 @@ mod tests {
         let blocker = lock_blocks(&fixture.pool).await;
         let (cleanup_reached_tx, cleanup_reached_rx) = oneshot::channel();
         let (cleanup_release_tx, cleanup_release_rx) = oneshot::channel();
-        client.hold_next_cleanup(cleanup_reached_tx, cleanup_release_rx);
+        client.hold_next_resource_handoff(cleanup_reached_tx, cleanup_release_rx);
         let operation_client = client.clone();
         let operation =
             tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
         let pid = blocked_projection_pid(&fixture.pool).await;
 
         let replacement = gate.begin_replacement().expect("replacement closes admission");
-        cleanup_reached_rx.await.expect("cleanup task receives the database resources and lease");
+        assert_eq!(cleanup_reached_rx.await.expect("cleanup task receives the database resources and lease"), Some(pid));
         operation.abort();
         assert!(operation.await.expect_err("projection task is abandoned during cleanup").is_cancelled());
 
@@ -1333,6 +1333,80 @@ mod tests {
 
         exclusive.open().expect("test reopens admission");
         blocker.rollback().await.expect("release block-table lock");
+    }
+
+    #[tokio::test]
+    async fn abandoned_projection_release_keeps_its_lease_until_rollback_and_pool_return() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        sqlx::query(
+            "INSERT INTO parents (child_id, parent_id, child_level, child_slot, parent_level, parent_slot)
+             VALUES ($1, $2, 2, 0, 0, 0)",
+        )
+        .bind(graph.blocks[1].1)
+        .bind(i64::MAX)
+        .execute(&fixture.pool)
+        .await
+        .expect("incoherent parent fixture");
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let gate = crate::replacement::ApiReplacementGate::new();
+        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(api_pool, binding(graph.blocks[0].0), retirement_tx, gate.clone());
+        let (release_reached_tx, release_reached_rx) = oneshot::channel();
+        let (release_continue_tx, release_continue_rx) = oneshot::channel();
+        client.hold_next_resource_handoff(release_reached_tx, release_continue_rx);
+
+        let operation_client = client.clone();
+        let operation = tokio::spawn(async move {
+            operation_client
+                .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 1 })
+                .await
+        });
+        let pid = release_reached_rx
+            .await
+            .expect("release task receives the database resources and lease")
+            .expect("release follows backend discovery");
+        operation.abort();
+        assert!(operation.await.expect_err("projection task is abandoned during release").is_cancelled());
+
+        let replacement = gate.begin_replacement().expect("replacement closes admission");
+        let timing = Timing::production();
+        let exclusive = replacement.acquire_exclusive(&timing);
+        tokio::pin!(exclusive);
+        assert!(
+            timeout(Duration::from_millis(50), &mut exclusive).await.is_err(),
+            "abandoning the release waiter must not release its replacement lease"
+        );
+        let transaction_active: bool = sqlx::query_scalar(
+            "SELECT xact_start IS NOT NULL
+             FROM pg_stat_activity
+             WHERE pid = $1",
+        )
+        .bind(pid)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("held release transaction inspection");
+        assert!(transaction_active, "the queued rollback has not completed while release is held");
+
+        release_continue_tx.send(()).expect("release background pool return");
+        let exclusive = timeout(Duration::from_secs(1), &mut exclusive)
+            .await
+            .expect("background release returns the connection promptly")
+            .expect("replacement exclusion");
+        let transaction_released: bool = sqlx::query_scalar(
+            "SELECT state = 'idle' AND xact_start IS NULL
+             FROM pg_stat_activity
+             WHERE pid = $1",
+        )
+        .bind(pid)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("returned connection transaction inspection");
+        assert!(transaction_released, "exclusive replacement begins only after rollback and pool return");
+        assert!(client.is_valid());
+        assert!(retirements.try_recv().is_err());
+
+        exclusive.open().expect("test reopens admission");
     }
 
     #[tokio::test]

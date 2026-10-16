@@ -377,7 +377,7 @@ pub struct ValidatedApiDbClient {
     admission: StdMutex<()>,
     validity: watch::Sender<bool>,
     #[cfg(test)]
-    cleanup_handoff: StdMutex<Option<ApiReadCleanupHandoff>>,
+    resource_handoff: StdMutex<Option<ApiReadResourceHandoff>>,
 }
 
 impl GenerationKind for ValidatedApiDbClient {
@@ -401,7 +401,7 @@ impl ValidatedApiDbClient {
             admission: StdMutex::new(()),
             validity,
             #[cfg(test)]
-            cleanup_handoff: StdMutex::new(None),
+            resource_handoff: StdMutex::new(None),
         })
     }
 
@@ -494,7 +494,7 @@ impl ValidatedApiDbClient {
         };
         let mut session = ApiReadSession::new(self.pool().clone(), connection, lease);
         #[cfg(test)]
-        session.set_cleanup_handoff(self.cleanup_handoff.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take());
+        session.set_resource_handoff(self.resource_handoff.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take());
 
         let backend_pid = match sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(session.connection()).await {
             Ok(backend_pid) => backend_pid,
@@ -583,35 +583,35 @@ impl ValidatedApiDbClient {
     }
 
     #[cfg(test)]
-    pub(crate) fn hold_next_cleanup(&self, reached: oneshot::Sender<()>, release: oneshot::Receiver<()>) {
+    pub(crate) fn hold_next_resource_handoff(&self, reached: oneshot::Sender<Option<i32>>, release: oneshot::Receiver<()>) {
         let previous = self
-            .cleanup_handoff
+            .resource_handoff
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .replace(ApiReadCleanupHandoff { reached, release });
-        assert!(previous.is_none(), "only one API read cleanup handoff may be installed");
+            .replace(ApiReadResourceHandoff { reached, release });
+        assert!(previous.is_none(), "only one API read resource handoff may be installed");
     }
 }
 
 #[cfg(test)]
-struct ApiReadCleanupHandoff {
-    reached: oneshot::Sender<()>,
+struct ApiReadResourceHandoff {
+    reached: oneshot::Sender<Option<i32>>,
     release: oneshot::Receiver<()>,
 }
 
 /// Owns every database resource covered by one replacement lease.
 ///
-/// Cancellation transfers cleanup and the lease together to an independently
-/// owned task before awaiting it. If the caller abandons the public future
-/// earlier, [`Drop`] performs the same transfer, so exclusive replacement
-/// cannot overtake PostgreSQL cancellation.
+/// Completion and cancellation transfer the connection and lease together to
+/// independently owned release tasks before awaiting them. If the caller
+/// abandons the public future earlier, [`Drop`] performs the same transfer, so
+/// exclusive replacement cannot overtake PostgreSQL transaction cleanup.
 struct ApiReadSession {
     pool: PgPool,
     connection: Option<PoolConnection<Postgres>>,
     lease: Option<ApiDbReadLease>,
     backend_pid: Option<i32>,
     #[cfg(test)]
-    cleanup_handoff: Option<ApiReadCleanupHandoff>,
+    resource_handoff: Option<ApiReadResourceHandoff>,
 }
 
 impl ApiReadSession {
@@ -622,7 +622,7 @@ impl ApiReadSession {
             lease: Some(lease),
             backend_pid: None,
             #[cfg(test)]
-            cleanup_handoff: None,
+            resource_handoff: None,
         }
     }
 
@@ -641,14 +641,13 @@ impl ApiReadSession {
     }
 
     #[cfg(test)]
-    fn set_cleanup_handoff(&mut self, cleanup_handoff: Option<ApiReadCleanupHandoff>) {
-        self.cleanup_handoff = cleanup_handoff;
+    fn set_resource_handoff(&mut self, resource_handoff: Option<ApiReadResourceHandoff>) {
+        self.resource_handoff = resource_handoff;
     }
 
     async fn release(mut self) {
-        let mut connection = self.connection.take().expect("API read session retains its connection");
-        connection.return_to_pool().await;
-        drop(self.lease.take());
+        let release = self.spawn_release().expect("API read session retains its release resources");
+        let _ = release.await;
     }
 
     async fn cancel(mut self, cancellation: Option<PgConnection>) {
@@ -664,11 +663,11 @@ impl ApiReadSession {
         let pool = self.pool.clone();
         let backend_pid = self.backend_pid;
         #[cfg(test)]
-        let cleanup_handoff = self.cleanup_handoff.take();
+        let resource_handoff = self.resource_handoff.take();
         Some(tokio::spawn(async move {
             #[cfg(test)]
-            if let Some(ApiReadCleanupHandoff { reached, release }) = cleanup_handoff {
-                let _ = reached.send(());
+            if let Some(ApiReadResourceHandoff { reached, release }) = resource_handoff {
+                let _ = reached.send(backend_pid);
                 let _ = release.await;
             }
             let cancellation = match (cancellation, backend_pid) {
@@ -677,6 +676,26 @@ impl ApiReadSession {
                 (None, None) => None,
             };
             close_cancelled_api_read(connection, lease, backend_pid, cancellation).await;
+        }))
+    }
+
+    /// Transfers every release resource synchronously before returning its task handle.
+    fn spawn_release(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        let (Some(mut connection), Some(lease)) = (self.connection.take(), self.lease.take()) else {
+            return None;
+        };
+        #[cfg(test)]
+        let backend_pid = self.backend_pid;
+        #[cfg(test)]
+        let resource_handoff = self.resource_handoff.take();
+        Some(tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(ApiReadResourceHandoff { reached, release }) = resource_handoff {
+                let _ = reached.send(backend_pid);
+                let _ = release.await;
+            }
+            connection.return_to_pool().await;
+            drop(lease);
         }))
     }
 }
