@@ -103,6 +103,34 @@ pub(crate) struct GraphPublication {
     mutation: Mutex<()>,
     image: RwLock<GraphPublicationImage>,
     history: RwLock<GraphHistory>,
+    #[cfg(test)]
+    mutation_test_hook: Option<std::sync::Arc<MutationTestHook>>,
+}
+
+#[cfg(test)]
+struct MutationTestHook {
+    image_published: tokio::sync::Barrier,
+    resume_history_append: tokio::sync::Barrier,
+}
+
+#[cfg(test)]
+impl MutationTestHook {
+    fn new() -> Self {
+        Self { image_published: tokio::sync::Barrier::new(2), resume_history_append: tokio::sync::Barrier::new(2) }
+    }
+
+    async fn pause_after_image_publication(&self) {
+        self.image_published.wait().await;
+        self.resume_history_append.wait().await;
+    }
+
+    async fn wait_for_image_publication(&self) {
+        self.image_published.wait().await;
+    }
+
+    async fn resume_history_append(&self) {
+        self.resume_history_append.wait().await;
+    }
 }
 
 impl GraphPublication {
@@ -132,6 +160,8 @@ impl GraphPublication {
             mutation: Mutex::new(()),
             image: RwLock::new(GraphPublicationImage { state: initial_state, view }),
             history: RwLock::new(history),
+            #[cfg(test)]
+            mutation_test_hook: None,
         })
     }
 
@@ -238,6 +268,11 @@ impl GraphPublication {
         let head_low_level = image.view.low_level();
         drop(image);
 
+        #[cfg(test)]
+        if let Some(hook) = &self.mutation_test_hook {
+            hook.pause_after_image_publication().await;
+        }
+
         let estimated_raw_bytes = estimate_raw_delta_bytes(&delta);
         let mut history = self.history.write().await;
         history.append(delta, estimated_raw_bytes)?;
@@ -293,7 +328,8 @@ mod tests {
 
     use kgi_api_model::{
         delta::GraphDelta,
-        graph::{Level, LevelExtent},
+        graph::{GraphViewUpdateError, Level, LevelExtent},
+        history::{GraphHistoryAppendError, GraphHistoryRange, GraphHistoryRangeError},
     };
     use kgi_model::{
         block::{BlockColor, BlockCoordinate, BlockHash, CompactId},
@@ -359,6 +395,19 @@ mod tests {
     fn advanced_delta() -> GraphDelta {
         GraphDelta::new(0, 1, 123, 1, HashMap::new(), HashMap::new(), Vec::new(), HashMap::new(), HashMap::new())
             .expect("valid advancing delta")
+    }
+
+    fn publication_with_mutation_hook(max_depth: u64) -> (Arc<GraphPublication>, Arc<MutationTestHook>) {
+        let hook = Arc::new(MutationTestHook::new());
+        let mut publication = GraphPublication::new(
+            GraphPublicationState::Synchronizing,
+            Instant::now(),
+            head_view_with_depth(max_depth),
+            GraphHistory::new(),
+        )
+        .expect("matching candidate");
+        publication.mutation_test_hook = Some(Arc::clone(&hook));
+        (Arc::new(publication), hook)
     }
 
     #[tokio::test]
@@ -458,6 +507,182 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history.oldest_available_revision(), 1);
         assert_eq!(history.entries().next().expect("oldest retained entry").delta().high_level(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn writer_gate_orders_mutations_and_stale_after_the_image_history_interval() {
+        let (publication, hook) = publication_with_mutation_hook(3);
+
+        let first_publication = Arc::clone(&publication);
+        let first = tokio::spawn(async move { first_publication.apply_block_committed(&committed_block(2)).await });
+        hook.wait_for_image_publication().await;
+
+        assert_eq!(publication.image.read().await.view.current_revision_id(), 1);
+        assert_eq!(publication.history.read().await.current_revision_id(), 0);
+        let first_target = publication.capture_delta_target().await;
+        assert_eq!(first_target.revision(), 1);
+        assert_eq!(
+            publication.capture_history_range(0, first_target).await.expect("complete available history"),
+            GraphHistoryRange::UpToDate { revision: 0 }
+        );
+
+        let second_publication = Arc::clone(&publication);
+        let second = tokio::spawn(async move { second_publication.apply_block_committed(&committed_block(3)).await });
+        tokio::task::yield_now().await;
+        let stale_publication = Arc::clone(&publication);
+        let stale = tokio::spawn(async move { stale_publication.transition_stale().await });
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished());
+        assert!(!stale.is_finished());
+        assert_eq!(publication.capture_delta_target().await.state(), GraphPublicationState::Synchronizing);
+
+        hook.resume_history_append().await;
+        assert_eq!(first.await.expect("first mutation task").expect("first mutation"), Some(1));
+        hook.wait_for_image_publication().await;
+        assert_eq!(publication.image.read().await.view.current_revision_id(), 2);
+        assert_eq!(publication.history.read().await.current_revision_id(), 1);
+        assert!(!stale.is_finished());
+
+        hook.resume_history_append().await;
+        assert_eq!(second.await.expect("second mutation task").expect("second mutation"), Some(2));
+        assert!(stale.await.expect("Stale transition task"));
+        let final_target = publication.capture_delta_target().await;
+        assert_eq!(final_target.state(), GraphPublicationState::Stale);
+        assert_eq!(final_target.revision(), 2);
+        assert_eq!(publication.history.read().await.current_revision_id(), 2);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_transitions_preserve_the_graph_lineage_and_stale_is_idempotent() {
+        let publication =
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view(), GraphHistory::new())
+                .expect("matching candidate");
+        let initial = publication.capture_delta_target().await;
+
+        publication.transition_live().await;
+        let live = publication.capture_delta_target().await;
+        assert_eq!(live.state(), GraphPublicationState::Live);
+        assert_eq!(live.revision(), initial.revision());
+        assert_eq!(live.revision_timestamp_ms(), initial.revision_timestamp_ms());
+        assert_eq!(live.high_level(), initial.high_level());
+        assert_eq!(publication.history.read().await.current_revision_id(), initial.revision());
+
+        assert!(publication.transition_stale().await);
+        assert!(!publication.transition_stale().await);
+        let stale = publication.capture_delta_target().await;
+        assert_eq!(stale.state(), GraphPublicationState::Stale);
+        assert_eq!(stale.revision(), initial.revision());
+        assert_eq!(stale.revision_timestamp_ms(), initial.revision_timestamp_ms());
+        assert_eq!(stale.high_level(), initial.high_level());
+        assert_eq!(publication.history.read().await.current_revision_id(), initial.revision());
+
+        let direct_live = GraphPublication::new(GraphPublicationState::Live, Instant::now(), head_view(), GraphHistory::new())
+            .expect("matching direct-Live candidate");
+        let direct_initial = direct_live.capture_delta_target().await;
+        assert!(direct_live.transition_stale().await);
+        let direct_stale = direct_live.capture_delta_target().await;
+        assert_eq!(direct_initial.state(), GraphPublicationState::Live);
+        assert_eq!(direct_stale.state(), GraphPublicationState::Stale);
+        assert_eq!(direct_stale.revision(), direct_initial.revision());
+        assert_eq!(direct_stale.revision_timestamp_ms(), direct_initial.revision_timestamp_ms());
+        assert_eq!(direct_live.history.read().await.current_revision_id(), direct_initial.revision());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "only a Synchronizing publication becomes Live")]
+    async fn rejects_a_live_transition_from_direct_initial_live() {
+        let publication = GraphPublication::new(GraphPublicationState::Live, Instant::now(), head_view(), GraphHistory::new())
+            .expect("matching candidate");
+
+        publication.transition_live().await;
+    }
+
+    #[tokio::test]
+    async fn captures_are_detached_coherent_and_survive_later_pruning() {
+        let publication =
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view_with_depth(2), GraphHistory::new())
+                .expect("matching candidate");
+        publication.apply_block_committed(&committed_block(2)).await.expect("first block update");
+
+        let full = publication.capture_view().await;
+        assert_eq!(full.publication_id(), publication.publication_id());
+        assert_eq!(full.view().tracking_policy(), TrackingPolicy::Frozen);
+        assert_eq!(full.view().current_revision_id(), 1);
+        assert!(full.view().block(&hash(2)).is_some());
+        let subview = publication.capture_subview(LevelExtent::new(1, 1).expect("valid extent")).await.expect("contained extent");
+        assert_eq!(subview.view().extent(), LevelExtent::new(1, 1).expect("valid extent"));
+        assert_eq!(
+            publication.capture_subview(LevelExtent::new(2, 3).expect("valid extent")).await,
+            Err(GraphViewExtractError::OutsideSourceExtent)
+        );
+
+        publication.apply_block_committed(&committed_block(3)).await.expect("second block update");
+        let target = publication.capture_delta_target().await;
+        assert_eq!(target.publication_id(), publication.publication_id());
+        let retained = publication.capture_history_range(0, target).await.expect("retained history");
+        let GraphHistoryRange::Deltas { actual_target, entries, .. } = retained else {
+            panic!("two updates produce retained deltas");
+        };
+        assert_eq!(actual_target, 2);
+        assert_eq!(entries.len(), 2);
+
+        publication.apply_block_committed(&committed_block(4)).await.expect("third block update");
+        assert_eq!(full.view().current_revision_id(), 1);
+        assert!(full.view().block(&hash(3)).is_none());
+        assert_eq!(target.revision(), 2);
+        assert_eq!(entries[0].delta().from_revision_id(), 0);
+        assert_eq!(entries[1].delta().to_revision_id(), 2);
+
+        let current = publication.capture_delta_target().await;
+        assert_eq!(
+            publication.capture_history_range(0, current).await,
+            Err(GraphHistoryRangeError::StartPruned { requested: 0, oldest_available: 1 })
+        );
+        assert_eq!(full.into_view().tracking_policy(), TrackingPolicy::Frozen);
+    }
+
+    #[tokio::test]
+    async fn projection_failures_remain_typed_and_do_not_partially_apply_the_failing_phase() {
+        let frozen_publication =
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view(), GraphHistory::new())
+                .expect("matching candidate");
+        {
+            let mut image = frozen_publication.image.write().await;
+            image.view = image.view.extract_subview(image.view.extent()).expect("own extent");
+        }
+        assert_eq!(
+            frozen_publication.apply_vspc_committed(&vspc_added(2, None)).await,
+            Err(PublicationProjectionError::ViewUpdate(GraphViewUpdateError::Frozen))
+        );
+        assert_eq!(frozen_publication.image.read().await.view.current_revision_id(), 0);
+        assert_eq!(frozen_publication.history.read().await.current_revision_id(), 0);
+
+        let (publication, hook) = publication_with_mutation_hook(2);
+        let mutation_publication = Arc::clone(&publication);
+        let mutation = tokio::spawn(async move { mutation_publication.apply_block_committed(&committed_block(2)).await });
+        hook.wait_for_image_publication().await;
+        publication.history.write().await.append(advanced_delta(), 1).expect("fixture history drift");
+        hook.resume_history_append().await;
+
+        assert_eq!(
+            mutation.await.expect("mutation task"),
+            Err(PublicationProjectionError::HistoryAppend(GraphHistoryAppendError::RevisionMismatch {
+                history_revision: 1,
+                delta_from: 0,
+            }))
+        );
+        assert_eq!(publication.image.read().await.view.current_revision_id(), 1);
+        assert_eq!(publication.history.read().await.current_revision_id(), 1);
+    }
+
+    #[test]
+    fn independently_constructed_publications_receive_fresh_identities() {
+        let first = GraphPublication::new(GraphPublicationState::Live, Instant::now(), head_view(), GraphHistory::new())
+            .expect("first publication");
+        let second = GraphPublication::new(GraphPublicationState::Live, Instant::now(), head_view(), GraphHistory::new())
+            .expect("second publication");
+
+        assert_ne!(first.publication_id(), second.publication_id());
     }
 
     #[test]
