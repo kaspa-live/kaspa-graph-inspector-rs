@@ -192,7 +192,7 @@ pub struct GraphView {
     max_depth: u64,
     extent: LevelExtent,
     current_revision_id: u64,
-    current_revision_timestamp_us: u64,
+    current_revision_timestamp_ms: u64,
     tracking_policy: TrackingPolicy,
     levels: BTreeMap<u64, StoredLevel>,
     blocks: HashMap<BlockHash, GraphBlock>,
@@ -236,7 +236,7 @@ impl GraphView {
             max_depth,
             extent,
             current_revision_id: 0,
-            current_revision_timestamp_us: 0,
+            current_revision_timestamp_ms: 0,
             tracking_policy,
             levels,
             blocks,
@@ -282,10 +282,10 @@ impl GraphView {
         self.current_revision_id
     }
 
-    /// Returns the publication-local timestamp of the current revision.
+    /// Returns the current revision's whole publication-local milliseconds.
     #[must_use]
-    pub const fn current_revision_timestamp_us(&self) -> u64 {
-        self.current_revision_timestamp_us
+    pub const fn current_revision_timestamp_ms(&self) -> u64 {
+        self.current_revision_timestamp_ms
     }
 
     /// Returns the view's mutation policy.
@@ -414,7 +414,7 @@ impl GraphView {
             self.extent = LevelExtent::new(target_low, delta.high_level()).expect("delta lineage high level is positive");
         }
         self.current_revision_id = delta.to_revision_id();
-        self.current_revision_timestamp_us = delta.revision_timestamp_us();
+        self.current_revision_timestamp_ms = delta.revision_timestamp_ms();
         Ok(())
     }
 
@@ -422,7 +422,7 @@ impl GraphView {
     ///
     /// Returns the exact visible delta, or `None` when the committed value has
     /// no retained effect. A visible mutation advances the view by one
-    /// revision using `revision_timestamp_us`.
+    /// revision using `revision_timestamp_ms`.
     ///
     /// # Panics
     ///
@@ -431,7 +431,7 @@ impl GraphView {
     pub fn apply_head_block_committed(
         &mut self,
         committed: &BlockCommitted,
-        revision_timestamp_us: u64,
+        revision_timestamp_ms: u64,
     ) -> Result<Option<GraphDelta>, GraphViewUpdateError> {
         if self.tracking_policy == TrackingPolicy::Frozen {
             return Err(GraphViewUpdateError::Frozen);
@@ -481,7 +481,7 @@ impl GraphView {
         }
 
         self.extent = target_extent;
-        Ok(self.finish_mutation(mutation, revision_timestamp_us))
+        Ok(self.finish_mutation(mutation, revision_timestamp_ms))
     }
 
     /// Applies one committed VSPC transition to a head-tracking view.
@@ -495,7 +495,7 @@ impl GraphView {
     pub fn apply_head_vspc_committed(
         &mut self,
         committed: &VspcCommitted,
-        revision_timestamp_us: u64,
+        revision_timestamp_ms: u64,
     ) -> Result<Option<GraphDelta>, GraphViewUpdateError> {
         if self.tracking_policy == TrackingPolicy::Frozen {
             return Err(GraphViewUpdateError::Frozen);
@@ -504,7 +504,7 @@ impl GraphView {
 
         let added_metadata: Vec<_> =
             committed.added.iter().filter_map(|hash| self.blocks.get(hash)).map(VspcProjectionMetadata::from).collect();
-        Ok(self.apply_vspc_projection(committed, &added_metadata, revision_timestamp_us))
+        Ok(self.apply_vspc_projection(committed, &added_metadata, revision_timestamp_ms))
     }
 
     /// Applies one original committed block to a fixed view using post-update Head context.
@@ -520,7 +520,7 @@ impl GraphView {
         &mut self,
         committed: &BlockCommitted,
         head: &GraphView,
-        revision_timestamp_us: u64,
+        revision_timestamp_ms: u64,
     ) -> Result<Option<GraphDelta>, GraphViewUpdateError> {
         if self.tracking_policy == TrackingPolicy::Frozen {
             return Err(GraphViewUpdateError::Frozen);
@@ -535,7 +535,7 @@ impl GraphView {
 
         let mut mutation = GraphMutation::default();
         self.apply_block_projection(committed, self.extent, &mut mutation);
-        Ok(self.finish_mutation(mutation, revision_timestamp_us))
+        Ok(self.finish_mutation(mutation, revision_timestamp_ms))
     }
 
     /// Applies one original committed VSPC transition to a fixed view.
@@ -551,7 +551,7 @@ impl GraphView {
         &mut self,
         committed: &VspcCommitted,
         head: &GraphView,
-        revision_timestamp_us: u64,
+        revision_timestamp_ms: u64,
     ) -> Result<Option<GraphDelta>, GraphViewUpdateError> {
         if self.tracking_policy == TrackingPolicy::Frozen {
             return Err(GraphViewUpdateError::Frozen);
@@ -574,7 +574,7 @@ impl GraphView {
             return Ok(None);
         };
 
-        Ok(self.apply_vspc_projection(committed, &added_metadata, revision_timestamp_us))
+        Ok(self.apply_vspc_projection(committed, &added_metadata, revision_timestamp_ms))
     }
 
     fn apply_block_projection(&mut self, committed: &BlockCommitted, target_extent: LevelExtent, mutation: &mut GraphMutation) {
@@ -631,7 +631,7 @@ impl GraphView {
         &mut self,
         committed: &VspcCommitted,
         added_metadata: &[VspcProjectionMetadata],
-        revision_timestamp_us: u64,
+        revision_timestamp_ms: u64,
     ) -> Option<GraphDelta> {
         let mut mutation = GraphMutation::default();
 
@@ -673,10 +673,10 @@ impl GraphView {
             }
         }
 
-        self.finish_mutation(mutation, revision_timestamp_us)
+        self.finish_mutation(mutation, revision_timestamp_ms)
     }
 
-    fn finish_mutation(&mut self, mutation: GraphMutation, revision_timestamp_us: u64) -> Option<GraphDelta> {
+    fn finish_mutation(&mut self, mutation: GraphMutation, revision_timestamp_ms: u64) -> Option<GraphDelta> {
         let changes = mutation.finish(self);
         if changes.is_empty() {
             return None;
@@ -686,7 +686,7 @@ impl GraphView {
         let delta = GraphDelta::new(
             self.current_revision_id,
             next_revision,
-            revision_timestamp_us,
+            revision_timestamp_ms,
             self.high_level(),
             changes.blocks,
             changes.edges,
@@ -696,7 +696,7 @@ impl GraphView {
         )
         .expect("graph mutation constructs a forward delta with a positive high level");
         self.current_revision_id = next_revision;
-        self.current_revision_timestamp_us = revision_timestamp_us;
+        self.current_revision_timestamp_ms = revision_timestamp_ms;
 
         Some(delta)
     }
@@ -857,7 +857,7 @@ impl GraphView {
             max_depth: extent.depth(),
             extent,
             current_revision_id: self.current_revision_id,
-            current_revision_timestamp_us: self.current_revision_timestamp_us,
+            current_revision_timestamp_ms: self.current_revision_timestamp_ms,
             tracking_policy: TrackingPolicy::Frozen,
             levels: selected_levels,
             blocks,
@@ -1130,7 +1130,7 @@ mod tests {
     fn graph_delta(
         from_revision_id: u64,
         to_revision_id: u64,
-        revision_timestamp_us: u64,
+        revision_timestamp_ms: u64,
         high_level: u64,
         block_changes: HashMap<BlockHash, Option<GraphBlock>>,
         edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
@@ -1141,7 +1141,7 @@ mod tests {
         GraphDelta::new(
             from_revision_id,
             to_revision_id,
-            revision_timestamp_us,
+            revision_timestamp_ms,
             high_level,
             block_changes,
             edge_changes,
@@ -1277,7 +1277,7 @@ mod tests {
         assert_eq!(view.low_level(), 2);
         assert_eq!(view.high_level(), 6);
         assert_eq!(view.current_revision_id(), 0);
-        assert_eq!(view.current_revision_timestamp_us(), 0);
+        assert_eq!(view.current_revision_timestamp_ms(), 0);
         assert_eq!(view.tracking_policy(), TrackingPolicy::Head);
         assert_eq!(view.levels.get(&2).map(|level| level.usage_count), Some(1));
         assert_eq!(view.levels.get(&4).map(|level| level.usage_count), Some(2));
@@ -1325,7 +1325,7 @@ mod tests {
     fn extraction_selects_crossing_edges_and_recomputes_endpoint_usage() {
         let mut source = view(TrackingPolicy::Head);
         source.current_revision_id = 17;
-        source.current_revision_timestamp_us = 91;
+        source.current_revision_timestamp_ms = 91;
         let before = source.clone();
 
         let extracted = source.extract_subview(extent(4, 4)).expect("contained extent");
@@ -1335,7 +1335,7 @@ mod tests {
         assert_eq!(extracted.low_level(), 4);
         assert_eq!(extracted.high_level(), 4);
         assert_eq!(extracted.current_revision_id(), 17);
-        assert_eq!(extracted.current_revision_timestamp_us(), 91);
+        assert_eq!(extracted.current_revision_timestamp_ms(), 91);
         assert_eq!(extracted.tracking_policy(), TrackingPolicy::Frozen);
         assert_eq!(extracted.blocks().map(|block| block.hash).collect::<Vec<_>>(), vec![hash(4)]);
 
@@ -1461,7 +1461,7 @@ mod tests {
 
         assert_eq!(view.extent(), extent(2, 4));
         assert_eq!(view.current_revision_id(), 1);
-        assert_eq!(view.current_revision_timestamp_us(), 700);
+        assert_eq!(view.current_revision_timestamp_ms(), 700);
         let block = view.block(&hash(4)).expect("inserted block retained");
         assert_eq!(block.coordinate, coordinate(4, 0));
         assert_eq!(block.timestamp, 40);
@@ -1485,7 +1485,7 @@ mod tests {
 
         assert_eq!(delta.from_revision_id(), 0);
         assert_eq!(delta.to_revision_id(), 1);
-        assert_eq!(delta.revision_timestamp_us(), 700);
+        assert_eq!(delta.revision_timestamp_ms(), 700);
         assert_eq!(delta.high_level(), 4);
         assert_eq!(delta.block_changes().get(&hash(4)), Some(&Some(block.clone())));
         assert!(delta.edge_changes().get(&first_edge).is_some_and(Option::is_some));
@@ -1609,12 +1609,12 @@ mod tests {
         );
         assert_eq!(delta.high_level(), 5);
         assert_eq!(view.current_revision_id(), 3);
-        assert_eq!(view.current_revision_timestamp_us(), 1_000);
+        assert_eq!(view.current_revision_timestamp_ms(), 1_000);
 
         let unchanged = view.apply_head_block_committed(&below_range, 1_100).expect("mutable Head");
         assert!(unchanged.is_none());
         assert_eq!(view.current_revision_id(), 3);
-        assert_eq!(view.current_revision_timestamp_us(), 1_000);
+        assert_eq!(view.current_revision_timestamp_ms(), 1_000);
     }
 
     #[test]
@@ -1865,7 +1865,7 @@ mod tests {
         let head = view(TrackingPolicy::Head);
         let mut fixed = view(TrackingPolicy::Fixed);
         fixed.current_revision_id = 7;
-        fixed.current_revision_timestamp_us = 700;
+        fixed.current_revision_timestamp_ms = 700;
         let before = fixed.clone();
         let committed = vspc_committed(
             Arc::from([hash(2)]),
@@ -1969,7 +1969,7 @@ mod tests {
             HashMap::from([(old_edge.id, old_edge)]),
         );
         view.current_revision_id = 4;
-        view.current_revision_timestamp_us = 40;
+        view.current_revision_timestamp_ms = 40;
 
         let mut replacement = graph_block(1, 2);
         replacement.timestamp = 99;
@@ -2007,7 +2007,7 @@ mod tests {
 
         assert_eq!(view.extent(), extent(1, 3));
         assert_eq!(view.current_revision_id(), 7);
-        assert_eq!(view.current_revision_timestamp_us(), 70);
+        assert_eq!(view.current_revision_timestamp_ms(), 70);
         assert_eq!(view.block(&hash(1)), Some(&replacement));
         assert!(view.block(&hash(8)).is_none());
         assert!(!view.block_hashes_by_level.get(&2).is_some_and(|hashes| hashes.contains(&hash(8))));
@@ -2066,7 +2066,7 @@ mod tests {
 
         assert_eq!(fixed.extent(), original_extent);
         assert_eq!(fixed.current_revision_id(), 3);
-        assert_eq!(fixed.current_revision_timestamp_us(), 30);
+        assert_eq!(fixed.current_revision_timestamp_ms(), 30);
         assert_eq!(fixed.tracking_policy(), TrackingPolicy::Fixed);
     }
 
@@ -2130,7 +2130,7 @@ mod tests {
         assert_eq!(aggregated.block(&hash(3)).map(|block| (block.is_in_vspc, block.color)), Some((true, BlockColor::Red)));
         assert!(aggregated.block(&hash(8)).is_none());
         assert_eq!(aggregated.current_revision_id(), 2);
-        assert_eq!(aggregated.current_revision_timestamp_us(), 20);
+        assert_eq!(aggregated.current_revision_timestamp_ms(), 20);
         assert_eq!(aggregated.extent(), extent(1, 4));
     }
 }

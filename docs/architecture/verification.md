@@ -997,30 +997,37 @@ the Frozen rule. No case may apply a Head-generated delta directly to the
 internal Fixed `GraphView` or perform a storage read.
 
 Verify the settled graph-model core with a view and history initially at
-revision `n`. A retained mutation advances the view to `n+1` and returns
-`GraphDelta(n,n+1)` before history append. During that interval, a view read may
-return `n+1` while a history request exposes only `n`; appending the delta then
-advances history to `n+1`. A no-effect update returns no delta and advances
-neither revision. History rejects a nongapless append and accepts a gapless
-aggregated interval without requiring internal one-step boundaries. Construct
+revision `n`. A retained view mutation returns `GraphDelta(n,n+1)`, and the
+enclosing publication appends that delta before atomically exposing both values
+at revision `n+1`. No capture can observe adjacent revisions. A no-effect
+update returns no delta and advances neither revision. History rejects a
+nongapless append and accepts a gapless aggregated interval without requiring
+internal one-step boundaries. Construct
 direct and composed deltas only through `GraphDelta::new`; verify it
 rejects equal and backward revision endpoints, exposes the accepted endpoints
 and target timestamp through read-only accessors, and offers no revision
 mutation path. Revision zero has timestamp zero. Direct revisions receive the
 publication-local elapsed timestamp sampled for their creation; adjacent
-microsecond-quantized revisions may have equal timestamps. Composition adopts
-the final constituent's timestamp. Replace a publication and verify neither
-server nor Web compares the two publication-local timestamp domains.
+millisecond-quantized revisions may have equal timestamps. Composition adopts
+the final constituent's timestamp. Sample immediately below and at a whole
+millisecond boundary to verify truncation to elapsed whole milliseconds.
+Replace a publication and verify neither server nor Web compares the two
+publication-local timestamp domains.
 
-Exercise the publication-owned writer gate by pausing between image publication
-and history append. A concurrent image capture may observe `n+1`, a history
-capture may expose only `n`, and no second graph mutation or lifecycle-state
-transition may pass the gate. A delta request targeting `n+1` must return only
-complete history through `n` with the ordinary continuation metadata for its
-captured target, without waiting or recapturing the image. After append, a
-Stale transition must publish state only after both values expose `n+1`. Hold
-captured immutable history-entry Arcs across pruning and complete composition
-after releasing the history read lock.
+Exercise the publication-owned writer gate and atomic core with captures racing
+one retained update. A view, delta-target, or history capture observes either
+the complete revision-`n` pair or the complete revision-`n+1` pair, never
+adjacent revisions. No second graph mutation or lifecycle-state transition may
+pass the gate, and a Stale transition publishes only after the complete
+revision-`n+1` pair. Hold captured immutable history-entry Arcs across pruning
+and complete composition after releasing the core read lock.
+
+Cancel an update while it awaits writer-gate or core ownership and verify that
+both values remain at revision `n`. Once mutation begins, verify that it
+publishes the complete revision-`n+1` pair without an await point, pending
+mutation state, or spawned completion task. Abandon an unpublished publication
+without transitioning it to Stale and prove that no mutation task or retained
+publication resource survives its drop.
 
 Verify `GraphHistory::range` checks target ordering before retained-boundary
 selection: a target below the start returns `BackwardTarget` and constructs no
@@ -1237,7 +1244,7 @@ Publication replacement, explicit refresh, view destruction, and shutdown
 cancel timers and release every batch.
 
 Adopt `KGI-Head-Revision-Id` and
-`KGI-Head-Revision-Timestamp-Us` only as one coherent HTTP pair. Calculate
+`KGI-Head-Revision-Timestamp-Ms` only as one coherent HTTP pair. Calculate
 revision and time lag from the last applied entry rather than the first queued
 or last received entry. Do not combine an SSE revision with an older HTTP
 timestamp. Exercise the required observability for response entry count and
@@ -1758,7 +1765,7 @@ from a newer capture, mandatory tier failure and retry without installation,
 and installation with the current publication revision ahead of the cached
 snapshot cursor. The first client catches up from that cursor through retained
 ordinary deltas. Cover first publication revisions zero and above zero, plus
-independently atomic view and history visibility at adjacent revisions.
+jointly atomic view and history visibility at every publication revision.
 
 Verify the current-publication watch starts at `None`, atomically installs a
 complete publication Arc, and accepts installation only from the current

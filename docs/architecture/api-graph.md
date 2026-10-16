@@ -181,7 +181,7 @@ struct GraphView {
     max_depth: u64,
     extent: LevelExtent,
     current_revision_id: u64,
-    current_revision_timestamp_us: u64,
+    current_revision_timestamp_ms: u64,
     tracking_policy: TrackingPolicy,
     levels: LevelSet, // each retained entry also keeps derived usage_count
     blocks: BlockSet,
@@ -198,7 +198,7 @@ impl GraphView {
 struct GraphDelta {
     from_revision_id: u64,
     to_revision_id: u64,
-    revision_timestamp_us: u64,
+    revision_timestamp_ms: u64,
     high_level: u64,
     block_changes: HashMap<BlockHash, Option<GraphBlock>>,
     edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
@@ -225,7 +225,7 @@ impl GraphDelta {
     pub fn new(
         from_revision_id: u64,
         to_revision_id: u64,
-        revision_timestamp_us: u64,
+        revision_timestamp_ms: u64,
         high_level: u64,
         block_changes: HashMap<BlockHash, Option<GraphBlock>>,
         edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
@@ -236,7 +236,7 @@ impl GraphDelta {
 
     pub fn from_revision_id(&self) -> u64;
     pub fn to_revision_id(&self) -> u64;
-    pub fn revision_timestamp_us(&self) -> u64;
+    pub fn revision_timestamp_ms(&self) -> u64;
 }
 ```
 
@@ -307,7 +307,7 @@ returns a view with:
 extent              = requested extent
 max_depth           = extent.depth()
 current_revision_id = source.current_revision_id
-current_revision_timestamp_us = source.current_revision_timestamp_us
+current_revision_timestamp_ms = source.current_revision_timestamp_ms
 tracking_policy     = Frozen
 ```
 
@@ -461,19 +461,22 @@ never invalidates Head or reconstructs ApiService.
 
 ## Revision and history advancement — settled
 
-The view advances before its returned delta is appended to `GraphHistory`:
+`GraphView` produces the delta retained by `GraphHistory`. The enclosing
+publication makes those two synchronous operations atomically visible:
 
 ```text
 GraphView n / GraphHistory n
-    -> apply update to GraphView
-GraphView n+1 / GraphHistory n
-    -> append GraphDelta(n,n+1)
+    -> apply update and append GraphDelta(n,n+1)
+       within one enclosing publication mutation
 GraphView n+1 / GraphHistory n+1
 ```
 
-The intermediate state is valid. A view or subview request may therefore
-observe revision `n+1` while a delta-history request can reach only revision
-`n`. There is no equality invariant between the two current revision fields.
+The sequential in-memory work inside the exclusive section is not externally
+observable. Every observable publication core has equal view and history
+revisions. `GraphView` and `GraphHistory` remain separate graph-model types and
+retain their local validation rules; the
+[publication owner](api-publication.md#publication-synchronization-and-request-capture--settled)
+owns their atomic visibility and mutation ordering.
 
 `GraphDelta::new` is the only constructor. Its revision fields are private,
 have no setters, and are exposed only through their read-only accessors. The
@@ -485,10 +488,10 @@ Direct view mutation produces one-step deltas, and composition constructs its
 results through the same checked constructor. Delta application and history
 append trust these construction invariants and do not check them again.
 
-`revision_timestamp_us` is the timestamp of the target revision. The graph
+`revision_timestamp_ms` is the timestamp of the target revision. The graph
 model treats it as an opaque, nondecreasing value within one lineage. The
 [publication owner](api-publication.md#publication-and-seed-values--settled)
-supplies its publication-local clock domain. Microsecond quantization can give
+supplies its publication-local clock domain. Millisecond quantization can give
 adjacent revisions equal timestamps. Timestamp values from different
 publications are never compared.
 
@@ -535,7 +538,7 @@ extent     = LevelExtent::new(low_level, high_level)
 
 A Fixed view retains its nominal extent. Every accepted view then sets
 `current_revision_id = delta.to_revision_id` and
-`current_revision_timestamp_us = delta.revision_timestamp_us`. An error leaves
+`current_revision_timestamp_ms = delta.revision_timestamp_ms`. An error leaves
 the complete view, revision, and timestamp unchanged. Direct application of a
 Head-generated delta remains
 prohibited for internal Fixed; only a delta from the same Fixed lineage has the
@@ -564,8 +567,8 @@ either a direct one-step delta or an already aggregated delta. For an aggregate,
 Consecutive stored entries remain gapless by their outer interval boundaries;
 history neither requires nor reconstructs internal revision boundaries within
 an aggregate. Once appended, a `GraphHistoryEntry` is immutable and shared by
-`Arc`. Append and pruning mutate the ordered stored collection while holding
-the publication's history write lock. A range capture clones the selected
+`Arc`. Append and pruning mutate the ordered stored collection within the
+enclosing publication's exclusive section. A range capture clones the selected
 entry Arcs into an immutable `GraphHistoryEntryList`, so later pruning cannot
 invalidate work already detached by a reader.
 
@@ -780,10 +783,12 @@ first.cumulative_estimated_bytes - first.estimated_raw_bytes
 Only stored entry boundaries are cost boundaries. An aggregate therefore
 offers one selectable right boundary, not reconstructed internal ones.
 
-After append, ApiService may prune against the current complete Head
-`low_level` before publishing the new complete history value. A history reader
-therefore observes either the previous complete value or the appended and
-pruned complete value; pruning is never exposed halfway through.
+The enclosing publication prunes against the current complete Head `low_level`
+after append and before exposing the new core. A history reader therefore
+observes either the previous complete value or the appended and pruned complete
+value; pruning is never exposed halfway through. The
+[publication owner](api-publication.md#publication-synchronization-and-request-capture--settled)
+defines the enclosing synchronization.
 
 Kaspa does not permit unbounded revision production while the graph remains
 indefinitely at one fixed level. Therefore retaining all history for every
@@ -805,7 +810,7 @@ compose(Delta(a,b), Delta(b,c)) = Delta(a,c)
 
 Composition requires exact equality between the left `to` and right `from`
 revisions. The result uses `a` as `from`, `c` as `to`, and delta `c`'s
-`high_level` and `revision_timestamp_us`. Composition is associative by
+`high_level` and `revision_timestamp_ms`. Composition is associative by
 graph-state effect. A composed delta must have the same graph-state effect as
 applying its constituent deltas in order. It is one replay unit whose timestamp
 therefore represents its final target revision; discarded internal timestamps

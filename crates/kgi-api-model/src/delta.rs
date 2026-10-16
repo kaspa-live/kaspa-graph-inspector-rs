@@ -50,7 +50,7 @@ pub enum GraphDeltaCompositionError {
 pub struct GraphDelta {
     from_revision_id: u64,
     to_revision_id: u64,
-    revision_timestamp_us: u64,
+    revision_timestamp_ms: u64,
     high_level: u64,
     block_changes: HashMap<BlockHash, Option<GraphBlock>>,
     edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
@@ -65,7 +65,7 @@ impl GraphDelta {
     pub fn new(
         from_revision_id: u64,
         to_revision_id: u64,
-        revision_timestamp_us: u64,
+        revision_timestamp_ms: u64,
         high_level: u64,
         block_changes: HashMap<BlockHash, Option<GraphBlock>>,
         edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
@@ -83,7 +83,7 @@ impl GraphDelta {
         Ok(Self {
             from_revision_id,
             to_revision_id,
-            revision_timestamp_us,
+            revision_timestamp_ms,
             high_level,
             block_changes,
             edge_changes,
@@ -105,10 +105,10 @@ impl GraphDelta {
         self.to_revision_id
     }
 
-    /// Returns the publication-local timestamp of the target revision.
+    /// Returns the target revision's whole publication-local milliseconds.
     #[must_use]
-    pub const fn revision_timestamp_us(&self) -> u64 {
-        self.revision_timestamp_us
+    pub const fn revision_timestamp_ms(&self) -> u64 {
+        self.revision_timestamp_ms
     }
 
     /// Returns the target high level of this delta's lineage.
@@ -178,7 +178,7 @@ impl GraphDelta {
         Ok(Self::new(
             self.from_revision_id,
             next.to_revision_id,
-            next.revision_timestamp_us,
+            next.revision_timestamp_ms,
             next.high_level,
             block_changes,
             edge_changes,
@@ -291,7 +291,7 @@ mod tests {
 
         assert_eq!(delta.from_revision_id(), 8);
         assert_eq!(delta.to_revision_id(), 9);
-        assert_eq!(delta.revision_timestamp_us(), 77);
+        assert_eq!(delta.revision_timestamp_ms(), 77);
         assert_eq!(delta.high_level(), 4);
         assert_eq!(delta.block_changes().get(&block_hash), Some(&Some(block(block_hash))));
         assert_eq!(delta.edge_changes().get(&edge_id).and_then(Option::as_ref).map(|edge| edge.id), Some(edge_id));
@@ -307,7 +307,7 @@ mod tests {
 
         assert_eq!(delta.from_revision_id(), 4);
         assert_eq!(delta.to_revision_id(), 7);
-        assert_eq!(delta.revision_timestamp_us(), 88);
+        assert_eq!(delta.revision_timestamp_ms(), 88);
         assert_eq!(delta.high_level(), 12);
         assert!(delta.block_changes().is_empty());
         assert!(delta.edge_changes().is_empty());
@@ -395,7 +395,7 @@ mod tests {
 
         assert_eq!(composed.from_revision_id(), 5);
         assert_eq!(composed.to_revision_id(), 9);
-        assert_eq!(composed.revision_timestamp_us(), 90);
+        assert_eq!(composed.revision_timestamp_ms(), 90);
         assert_eq!(composed.high_level(), 7);
         assert_eq!(composed.block_changes().get(&hash(1)), Some(&Some(right_block_1)));
         assert_eq!(composed.block_changes().get(&hash(2)), Some(&None));
@@ -456,7 +456,7 @@ mod tests {
 
         assert_eq!(composed.from_revision_id(), 1);
         assert_eq!(composed.to_revision_id(), 3);
-        assert_eq!(composed.revision_timestamp_us(), 30);
+        assert_eq!(composed.revision_timestamp_ms(), 30);
         assert!(composed.block_changes().is_empty());
         assert!(composed.edge_changes().is_empty());
         assert!(composed.level_changes().is_empty());

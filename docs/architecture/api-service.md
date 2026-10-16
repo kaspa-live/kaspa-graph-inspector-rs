@@ -420,7 +420,7 @@ target. A Head snapshot tier job captures one immutable Frozen extraction.
 The mandatory tier-50 Prewarming job and later demand-triggered tier jobs use
 the same tracked scheduler and final response construction path. Every job
 holds only detached immutable inputs during JSON serialization and gzip and no
-image, history, or cache-state lock.
+publication-core or cache-state lock.
 
 For a Head-tier job, successful encoding is one candidate attempt rather than
 terminal job completion. The orchestration task applies the protocol-owned
@@ -556,10 +556,10 @@ enum DeltaCompletionResult {
 The map key is the random `u64` whose wire encoding is owned by the
 [publication protocol](api-protocol.md#publication-wire-observation--settled).
 The registry's publication-wide Head revision is the latest revision already
-published in history. It closes the race between graph advancement and an HTTP
-response rearming a client and is not a per-client highest revision. Each SSE
-connection owns the strong `Arc<SseMailbox>`, while the registry retains only
-a weak reference and the connection-local cancellation token.
+published by the publication core. It closes the race between graph advancement
+and an HTTP response rearming a client and is not a per-client highest revision.
+Each SSE connection owns the strong `Arc<SseMailbox>`, while the registry
+retains only a weak reference and the connection-local cancellation token.
 
 Registry operations and mailbox mutation use only short synchronous critical
 sections. The sole lock order is registry then mailbox. The mailbox receiver
@@ -585,12 +585,13 @@ receives the new state in its initial batch. Failed weak upgrades and clients
 whose mailbox rejects required admission are removed; their connection tokens
 are cancelled after releasing the locks.
 
-After history publishes a new graph revision, `advance_head` first records the
-revision and then linearly scans registrations. For an unsent boundary already
-reached, it queues the ordinary graph wakeup and marks it sent. For a sent
-schedule whose ordinary wakeup is still queued, it coalesces that item to the
-newer revision. A delta response completion acquires the registry once and
-looks up the supplied identifier. Absence returns `RegistrationMissing`
+After the publication core atomically publishes a new graph revision,
+`advance_head` first records the revision and then linearly scans registrations.
+For an unsent boundary already reached, it queues the ordinary graph wakeup and
+marks it sent. For a sent schedule whose ordinary wakeup is still queued, it
+coalesces that item to the newer revision. A delta response completion acquires
+the registry once and looks up the supplied identifier. Absence returns
+`RegistrationMissing`
 without changing another registration. Presence applies the protocol-selected
 schedule action and returns `Accepted`; the final Stale-Head action validates
 the registration without installing a schedule. Rearming removes any

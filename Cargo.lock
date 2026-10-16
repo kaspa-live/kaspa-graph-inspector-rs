@@ -2924,6 +2924,9 @@ dependencies = [
  "kgi-api-model",
  "kgi-model",
  "kgi-storage",
+ "rand 0.8.8",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

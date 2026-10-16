@@ -92,13 +92,13 @@ MAX_DELTA_REPLAY_BATCHES = 10
 The replay state distinguishes:
 
 ```text
-applied_revision_id / applied_revision_timestamp_us
+applied_revision_id / applied_revision_timestamp_ms
     last entry already installed in the visible graph
 
 received_revision_id
     final cursor of every admitted batch
 
-observed_head_revision_id / observed_head_timestamp_us
+observed_head_revision_id / observed_head_timestamp_ms
     newest coherent Head pair received in delta-response headers
 
 replay_deadline
@@ -139,11 +139,11 @@ immediately. After applying entry `D`, let `P` be the next entry, `L` the final
 queued entry, and calculate:
 
 ```text
-SI = L.revision_timestamp_us - D.revision_timestamp_us
+SI = L.revision_timestamp_ms - D.revision_timestamp_ms
 SC = replay_deadline - client_now
 
 next_replay_at = client_now
-    + (P.revision_timestamp_us - D.revision_timestamp_us) * SC / SI
+    + (P.revision_timestamp_ms - D.revision_timestamp_ms) * SC / SI
 ```
 
 Server timestamp subtraction is nonnegative within one validated publication
@@ -155,13 +155,13 @@ rendering move the deadline and accelerate catch-up. Applying one entry is
 atomic from the browser graph's perspective.
 
 Each successful delta response also supplies a coherent
-`KGI-Head-Revision-Id` and `KGI-Head-Revision-Timestamp-Us` pair. The Web never
+`KGI-Head-Revision-Id` and `KGI-Head-Revision-Timestamp-Ms` pair. The Web never
 combines an SSE revision with an older HTTP timestamp. Its observable lag is:
 
 ```text
 applied_revision_lag = observed_head_revision_id - applied_revision_id
-applied_time_lag_us  = observed_head_timestamp_us
-                     - applied_revision_timestamp_us
+applied_time_lag_ms  = observed_head_timestamp_ms
+                     - applied_revision_timestamp_ms
 ```
 
 These values describe the visible graph rather than the newest downloaded
@@ -248,7 +248,7 @@ Because the selected cache tier is never smaller than a valid
 `target_depth`, caching requires no placeholder or progressive-fill UI. A
 snapshot can still be naturally shorter at the pruning-point boundary. The Web
 adopts the snapshot's exact `(publication_id, revision)` cursor,
-`revision_timestamp_us`, and current publication-context headers, then uses
+`revision_timestamp_ms`, and current publication-context headers, then uses
 ordinary canonical delta catch-up toward its desired cursor.
 
 ## Fixed views — settled

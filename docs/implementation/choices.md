@@ -743,3 +743,75 @@ These choices implement the shared-value side of the
 [database seed contract](../architecture/api-publication.md#publication-and-seed-values--settled)
 and leave the storage operation and validation behavior with the
 [API graph projection owner](../architecture/storage.md#api-graph-projection-reads--settled).
+
+## 16 October 2026: API publication mutation kernel
+
+### Module, synchronization, and dependency boundary
+
+Place the publication state, atomic core, writer gate, immutable captures,
+lifecycle transitions, and original-update mutation kernel in the private
+`kgi_api_core::publication` module. Expose only crate-visible operations needed
+by later ApiService modules and add no crate-root re-exports. The increment
+uses `tokio::sync::Mutex` and `tokio::sync::RwLock` exactly as selected by the
+[publication owner](../architecture/api-publication.md#publication-synchronization-and-request-capture--settled).
+
+Add direct workspace dependencies on `tokio`, `rand`, and `thiserror` alongside
+the existing KGI crate dependencies of `kgi-api-core`. Tokio
+provides the settled asynchronous locks, `rand` provides publication identity
+sampling, and `thiserror` implements the private typed kernel failure. Do not
+add a `kgi-core` dependency: publication timing is a monotonic revision clock,
+not retry scheduling, and the settled crate dependency direction does not
+include that edge.
+
+Sample each publication ID independently from `rand::rngs::OsRng`, retrying
+the reserved zero value. Keep the externally observed representation as the
+architecture-owned `u64`; `NonZeroU64` may remain a local construction aid but
+does not create a second public identity type.
+
+### Canonical delta raw-byte estimate
+
+Estimate one original canonical Head delta with fixed additive weights. The
+estimator traverses only mutation collections already present in `GraphDelta`
+and collects the distinct hashes that its cacheable wire entry would emit. It
+performs no DTO construction, numeric `HashRef` assignment, JSON serialization,
+or compression. Use representative five-digit `HashRef` lengths and these
+weights:
+
+| Contribution | Estimated bytes |
+|---|---:|
+| Delta entry and amortized batch framing | 232 |
+| Each distinct emitted hash dictionary entry | 68 |
+| Block upsert excluding relationship array items | 240 |
+| Each direct-parent or merge-set `HashRef` item in a block upsert | 6 |
+| Edge upsert | 160 |
+| Level installation (`after = Some`) | 72 |
+| Level removal (`after = None`) | 40 |
+| VSPC-membership mutation | 32 |
+| Color mutation | 25 |
+| Block or edge removal | 0 |
+
+The structural constants include the approximate compact-JSON field names,
+punctuation, scalar values, and fixed `HashRef` occurrences, but not hexadecimal
+dictionary strings. The entry base includes its lineage fields and empty
+mutation arrays plus an additive share of the outer `GraphDeltaBatchDto`
+framing. A temporary `HashSet<BlockHash>` counts each hash once
+across block upserts and their relationship arrays, edge upserts, membership
+mutations, and color mutations. The 68-byte charge approximates one quoted
+64-character hexadecimal hash plus its collection separator. Block and edge
+removals neither contribute structure nor enter the set because the settled
+delta serializer omits them. Level and field removals remain charged because
+those mutations stay on the wire. Level installation and removal use separate
+weights because the latter emits `null` instead of a complete `LevelDto`.
+
+The estimator remains additive across history entries. Consequently, a hash
+repeated by different entries can still be charged once per entry even though
+the later batch serializer shares one response-local dictionary. This bounded
+cross-entry overestimate avoids constructing the eventual batch dictionary
+during publication while removing the much larger within-entry overestimate.
+
+Use checked `u64` arithmetic for every contribution. Exhausting the estimate
+is an internal invariant failure under the same physically unattainable
+publication-lifetime workload rationale as cumulative history overflow. A
+later composed history entry obtains its estimate by adding its constituent
+entry estimates rather than re-estimating the composed mutation maps, so
+composition cancellation cannot retroactively change planning cost.
