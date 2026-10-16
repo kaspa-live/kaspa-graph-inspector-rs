@@ -7,8 +7,8 @@ use std::time::Instant;
 
 use kgi_api_model::{
     delta::GraphDelta,
-    graph::{GraphView, TrackingPolicy},
-    history::GraphHistory,
+    graph::{GraphView, GraphViewExtractError, LevelExtent, TrackingPolicy},
+    history::{GraphHistory, GraphHistoryRange, GraphHistoryRangeError},
 };
 use kgi_model::graph_update::{BlockCommitted, VspcCommitted};
 use rand::{RngCore, rngs::OsRng};
@@ -33,6 +33,67 @@ pub(crate) enum GraphPublicationState {
 pub(crate) struct GraphPublicationImage {
     state: GraphPublicationState,
     view: GraphView,
+}
+
+/// One detached immutable graph view from a specific publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GraphViewCapture {
+    publication_id: u64,
+    view: GraphView,
+}
+
+impl GraphViewCapture {
+    /// Returns the publication that supplied this view.
+    pub(crate) const fn publication_id(&self) -> u64 {
+        self.publication_id
+    }
+
+    /// Returns the captured frozen graph view.
+    pub(crate) const fn view(&self) -> &GraphView {
+        &self.view
+    }
+
+    /// Consumes the capture and returns its frozen graph view.
+    pub(crate) fn into_view(self) -> GraphView {
+        self.view
+    }
+}
+
+/// One coherent target sampled before selecting retained delta history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GraphDeltaTargetCapture {
+    publication_id: u64,
+    state: GraphPublicationState,
+    revision: u64,
+    revision_timestamp_ms: u64,
+    high_level: u64,
+}
+
+impl GraphDeltaTargetCapture {
+    /// Returns the publication whose Head supplied this target.
+    pub(crate) const fn publication_id(self) -> u64 {
+        self.publication_id
+    }
+
+    /// Returns the lifecycle state observed with the target Head.
+    pub(crate) const fn state(self) -> GraphPublicationState {
+        self.state
+    }
+
+    /// Returns the captured Head revision.
+    pub(crate) const fn revision(self) -> u64 {
+        self.revision
+    }
+
+    /// Returns the captured revision's publication-local timestamp.
+    pub(crate) const fn revision_timestamp_ms(self) -> u64 {
+        self.revision_timestamp_ms
+    }
+
+    /// Returns the captured Head's nominal upper level.
+    pub(crate) const fn high_level(self) -> u64 {
+        self.high_level
+    }
 }
 
 /// One publication-local graph lineage and its synchronization boundary.
@@ -82,6 +143,64 @@ impl GraphPublication {
     /// Samples whole milliseconds elapsed in this publication's clock domain.
     pub(crate) fn revision_timestamp_ms(&self) -> u64 {
         self.revision_timestamp_ms_at(Instant::now())
+    }
+
+    /// Transitions a visible Synchronizing publication to Live.
+    pub(crate) async fn transition_live(&self) {
+        let _mutation = self.mutation.lock().await;
+        let mut image = self.image.write().await;
+        assert_eq!(image.state, GraphPublicationState::Synchronizing, "only a Synchronizing publication becomes Live");
+        image.state = GraphPublicationState::Live;
+    }
+
+    /// Makes a visible publication terminally Stale.
+    ///
+    /// Returns whether this call performed the transition. Repeating the
+    /// terminal transition has no additional effect.
+    pub(crate) async fn transition_stale(&self) -> bool {
+        let _mutation = self.mutation.lock().await;
+        let mut image = self.image.write().await;
+        if image.state == GraphPublicationState::Stale {
+            return false;
+        }
+        image.state = GraphPublicationState::Stale;
+        true
+    }
+
+    /// Captures the complete current Head as an owned frozen view.
+    pub(crate) async fn capture_view(&self) -> GraphViewCapture {
+        let image = self.image.read().await;
+        let view = image.view.extract_subview(image.view.extent()).expect("a graph view contains its own extent");
+        GraphViewCapture { publication_id: self.publication_id, view }
+    }
+
+    /// Captures one contained extent from the current Head as an owned frozen view.
+    pub(crate) async fn capture_subview(&self, extent: LevelExtent) -> Result<GraphViewCapture, GraphViewExtractError> {
+        let image = self.image.read().await;
+        let view = image.view.extract_subview(extent)?;
+        Ok(GraphViewCapture { publication_id: self.publication_id, view })
+    }
+
+    /// Captures one coherent canonical-delta target from the current image.
+    pub(crate) async fn capture_delta_target(&self) -> GraphDeltaTargetCapture {
+        let image = self.image.read().await;
+        GraphDeltaTargetCapture {
+            publication_id: self.publication_id,
+            state: image.state,
+            revision: image.view.current_revision_id(),
+            revision_timestamp_ms: image.view.current_revision_timestamp_ms(),
+            high_level: image.view.high_level(),
+        }
+    }
+
+    /// Captures immutable retained history through a previously sampled target.
+    pub(crate) async fn capture_history_range(
+        &self,
+        from_revision_id: u64,
+        target: GraphDeltaTargetCapture,
+    ) -> Result<GraphHistoryRange, GraphHistoryRangeError> {
+        assert_eq!(target.publication_id, self.publication_id, "delta target belongs to this publication");
+        self.history.read().await.range(from_revision_id, target.revision)
     }
 
     /// Applies one committed block and publishes any resulting history entry.
