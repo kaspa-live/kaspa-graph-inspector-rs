@@ -721,3 +721,25 @@ collection ownership.
 Place `LevelExtent` and `LevelExtentError`, whose semantics are owned by the
 [API graph model](../architecture/api-graph.md#graph-values-views-revisions-and-history--settled),
 in `kgi_api_model::graph` alongside `GraphView`.
+
+## 16 October 2026: API graph projection reads
+
+### Projection model placement and collections
+
+Place the shared window-anchor, resolution, unavailable-anchor, and graph-seed
+values in a public `kgi_api_model::projection` module. Keep imports
+module-qualified and add no crate-root re-exports. This module contains owned
+cross-crate values only; SQL rows, database errors, transactions, generation
+state, and publication runtime state remain in their owning crates.
+
+Represent one detached graph seed with `BTreeMap<u64, Level>` for numerically
+ordered levels, `HashMap<BlockHash, GraphBlock>` for blocks, and
+`HashMap<EdgeId, GraphEdge>` for edges. These are the same owned collection
+shapes accepted by `GraphView::from_database_projection`, so Storage can detach
+one coherent projection without an intermediate copy or a second public
+container vocabulary. Map iteration order has no graph semantics.
+
+These choices implement the shared-value side of the
+[database seed contract](../architecture/api-publication.md#publication-and-seed-values--settled)
+and leave the storage operation and validation behavior with the
+[API graph projection owner](../architecture/storage.md#api-graph-projection-reads--settled).
