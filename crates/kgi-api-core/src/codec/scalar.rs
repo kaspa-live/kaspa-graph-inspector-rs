@@ -14,6 +14,13 @@ impl From<u64> for U64Dto {
     }
 }
 
+impl U64Dto {
+    /// Returns the semantic integer represented by this wire scalar.
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 impl Serialize for U64Dto {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

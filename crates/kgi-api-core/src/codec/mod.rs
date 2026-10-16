@@ -1,11 +1,14 @@
 #![allow(dead_code, reason = "the isolated codec foundation is integrated by later API increments")]
 
 pub(crate) mod error;
+pub(crate) mod graph;
 pub(crate) mod lifecycle;
 pub(crate) mod scalar;
 pub(crate) mod sse;
 pub(crate) mod status;
 pub(crate) mod window;
+
+mod dictionary;
 
 use kgi_api_model::graph::LevelExtent;
 use serde::Serialize;
