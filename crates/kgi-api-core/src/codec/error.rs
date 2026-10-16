@@ -52,12 +52,12 @@ impl ApiErrorDto {
     }
 
     /// Constructs a typed unavailable-Head-level response body.
-    pub(crate) fn head_level_unavailable(requested_level: u64) -> Self {
+    pub(crate) fn head_level_unavailable(requested_level: u32) -> Self {
         Self {
             category: ApiErrorCategoryDto::NotFound,
             code: ApiErrorCodeDto::HeadLevelUnavailable,
             message: "A requested Head level is unavailable.",
-            details: Some(ApiErrorDetailsDto::HeadLevelUnavailable { requested_level: requested_level.into() }),
+            details: Some(ApiErrorDetailsDto::HeadLevelUnavailable { requested_level }),
         }
     }
 
@@ -162,7 +162,7 @@ enum ApiErrorCodeDto {
 #[serde(untagged)]
 enum ApiErrorDetailsDto {
     WindowAnchorUnavailable(WindowAnchorUnavailableDetailsDto),
-    HeadLevelUnavailable { requested_level: U64Dto },
+    HeadLevelUnavailable { requested_level: u32 },
     FreshViewRequired { reason: FreshViewReasonDto },
     GraphResponseTooLarge { max_uncompressed_bytes: U64Dto, actual_uncompressed_bytes: U64Dto },
 }
@@ -170,7 +170,7 @@ enum ApiErrorDetailsDto {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "reason", rename_all = "kebab-case")]
 enum WindowAnchorUnavailableDetailsDto {
-    LevelNotRetained { requested_level: U64Dto },
+    LevelNotRetained { requested_level: u32 },
     BlockNotMaterialized { requested_hash: BlockHashDto },
     NoRetainedDaaMatch { requested_score: U64Dto },
 }
@@ -178,9 +178,7 @@ enum WindowAnchorUnavailableDetailsDto {
 impl From<GraphWindowAnchorUnavailable> for WindowAnchorUnavailableDetailsDto {
     fn from(value: GraphWindowAnchorUnavailable) -> Self {
         match value {
-            GraphWindowAnchorUnavailable::LevelNotRetained { requested_level } => {
-                Self::LevelNotRetained { requested_level: requested_level.into() }
-            }
+            GraphWindowAnchorUnavailable::LevelNotRetained { requested_level } => Self::LevelNotRetained { requested_level },
             GraphWindowAnchorUnavailable::BlockNotMaterialized { requested_hash } => {
                 Self::BlockNotMaterialized { requested_hash: requested_hash.into() }
             }
@@ -256,9 +254,9 @@ mod tests {
     fn structured_errors_use_exact_detail_shapes() {
         assert_eq!(
             value(&ApiErrorDto::window_anchor_unavailable(GraphWindowAnchorUnavailable::LevelNotRetained {
-                requested_level: u64::MAX,
+                requested_level: u32::MAX,
             }))["details"],
-            json!({ "reason": "level-not-retained", "requested_level": u64::MAX.to_string() })
+            json!({ "reason": "level-not-retained", "requested_level": u32::MAX })
         );
         assert_eq!(
             value(&ApiErrorDto::window_anchor_unavailable(GraphWindowAnchorUnavailable::BlockNotMaterialized {
@@ -270,7 +268,7 @@ mod tests {
             value(&ApiErrorDto::window_anchor_unavailable(GraphWindowAnchorUnavailable::NoRetainedDaaMatch { requested_score: 17 }))["details"],
             json!({ "reason": "no-retained-daa-match", "requested_score": "17" })
         );
-        assert_eq!(value(&ApiErrorDto::head_level_unavailable(19))["details"], json!({ "requested_level": "19" }));
+        assert_eq!(value(&ApiErrorDto::head_level_unavailable(19))["details"], json!({ "requested_level": 19 }));
         assert_eq!(
             value(&ApiErrorDto::graph_response_too_large(23, 29))["details"],
             json!({ "max_uncompressed_bytes": "23", "actual_uncompressed_bytes": "29" })

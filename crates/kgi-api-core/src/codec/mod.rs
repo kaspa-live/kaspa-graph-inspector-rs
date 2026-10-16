@@ -61,7 +61,7 @@ mod tests {
     use super::{GRAPH_REPRESENTATION_VERSION, HeadEtagInput};
     use kgi_api_model::graph::LevelExtent;
 
-    fn extent(low_level: u64, high_level: u64) -> LevelExtent {
+    fn extent(low_level: u32, high_level: u32) -> LevelExtent {
         LevelExtent::new(low_level, high_level).expect("test extent is valid")
     }
 

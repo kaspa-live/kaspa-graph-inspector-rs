@@ -351,7 +351,10 @@ mod tests {
     use std::sync::Arc;
 
     use kaspa_consensus_core::network::{NetworkId, NetworkType};
-    use kgi_model::{block::BlockHash, lifecycle::PersistenceFault};
+    use kgi_model::{
+        block::{BlockHash, MAX_LEVEL_SIZE, MAX_LEVEL_SLOT},
+        lifecycle::PersistenceFault,
+    };
     use sqlx::{Connection, PgConnection};
     use testcontainers_modules::{
         postgres::Postgres,
@@ -888,5 +891,90 @@ mod tests {
         let invalid_daa =
             sqlx::query("UPDATE blocks SET daa_score = $1 WHERE id = 2").bind(i64::MAX).execute(database.connection_mut()).await;
         assert!(invalid_daa.is_err());
+    }
+
+    #[tokio::test]
+    async fn coordinate_and_level_size_sql_bounds_are_exact() {
+        let (_container, database_url) = fixture().await;
+        let (mut database, _) = prepared_database(&database_url).await;
+        sqlx::query("INSERT INTO block_identifiers (id, hash) VALUES (1, $1), (2, $2), (3, $3), (4, $4)")
+            .bind(hash(1).as_bytes().as_slice())
+            .bind(hash(2).as_bytes().as_slice())
+            .bind(hash(3).as_bytes().as_slice())
+            .bind(hash(4).as_bytes().as_slice())
+            .execute(database.connection_mut())
+            .await
+            .expect("coordinate-boundary identities");
+        sqlx::query("INSERT INTO levels (level, size) VALUES (1, 1), ($1, $2)")
+            .bind(i64::from(u32::MAX))
+            .bind(i32::from(MAX_LEVEL_SIZE))
+            .execute(database.connection_mut())
+            .await
+            .expect("level boundaries");
+        sqlx::query(
+            "INSERT INTO blocks (
+                 id, timestamp, daa_score, level, slot, selected_parent_id,
+                 color, is_in_vspc, blue_merge_set, red_merge_set
+             ) VALUES
+                 (1, 0, 0, 1, 0, 1, 0, FALSE, '{}', '{}'),
+                 (2, 0, 0, $1, $2, 1, 0, FALSE, '{}', '{}')",
+        )
+        .bind(i64::from(u32::MAX))
+        .bind(i32::from(MAX_LEVEL_SLOT))
+        .execute(database.connection_mut())
+        .await
+        .expect("coordinate boundaries");
+
+        let levels: Vec<(i64, i32)> = sqlx::query_as("SELECT level, size FROM levels ORDER BY level")
+            .fetch_all(database.connection_mut())
+            .await
+            .expect("level boundary round trip");
+        assert_eq!(levels, [(1, 1), (i64::from(u32::MAX), i32::from(MAX_LEVEL_SIZE))]);
+        let coordinates: Vec<(i64, i32)> = sqlx::query_as("SELECT level, slot FROM blocks ORDER BY id")
+            .fetch_all(database.connection_mut())
+            .await
+            .expect("coordinate boundary round trip");
+        assert_eq!(coordinates, [(1, 0), (i64::from(u32::MAX), i32::from(MAX_LEVEL_SLOT))]);
+
+        assert!(sqlx::query("INSERT INTO levels (level, size) VALUES (0, 1)").execute(database.connection_mut()).await.is_err());
+        assert!(
+            sqlx::query("INSERT INTO levels (level, size) VALUES ($1, 1)")
+                .bind(i64::from(u32::MAX) + 1)
+                .execute(database.connection_mut())
+                .await
+                .is_err()
+        );
+        assert!(sqlx::query("INSERT INTO levels (level, size) VALUES (2, 0)").execute(database.connection_mut()).await.is_err());
+        assert!(
+            sqlx::query("INSERT INTO levels (level, size) VALUES (2, $1)")
+                .bind(i32::from(MAX_LEVEL_SIZE) + 1)
+                .execute(database.connection_mut())
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query(
+                "INSERT INTO blocks (
+                     id, timestamp, daa_score, level, slot, selected_parent_id,
+                     color, is_in_vspc, blue_merge_set, red_merge_set
+                 ) VALUES (3, 0, 0, $1, 0, 1, 0, FALSE, '{}', '{}')",
+            )
+            .bind(i64::from(u32::MAX) + 1)
+            .execute(database.connection_mut())
+            .await
+            .is_err()
+        );
+        assert!(
+            sqlx::query(
+                "INSERT INTO blocks (
+                     id, timestamp, daa_score, level, slot, selected_parent_id,
+                     color, is_in_vspc, blue_merge_set, red_merge_set
+                 ) VALUES (4, 0, 0, 1, $1, 1, 0, FALSE, '{}', '{}')",
+            )
+            .bind(i32::from(u16::MAX))
+            .execute(database.connection_mut())
+            .await
+            .is_err()
+        );
     }
 }

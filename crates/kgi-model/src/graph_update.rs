@@ -12,8 +12,8 @@ pub struct ParentCommitted {
 /// A complete committed snapshot of one affected level.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LevelCommitted {
-    pub level: u64,
-    pub size: u64,
+    pub level: u32,
+    pub size: u16,
     pub daa_score: Option<u64>,
 }
 

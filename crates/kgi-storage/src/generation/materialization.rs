@@ -263,24 +263,22 @@ async fn attempt(
         .iter()
         .filter_map(|(_, identity)| identity.coordinate().map(BlockCoordinate::level))
         .max()
-        .map_or(Some(1), |level| level.checked_add(1))
-        .ok_or_else(|| TransactionAttemptError::Storage(StorageError::internal_failure("derived block level overflow")))?;
-    let raw_level = i64::try_from(level)
-        .map_err(|_| TransactionAttemptError::Storage(StorageError::internal_failure("derived block level exceeds BIGINT")))?;
-    let raw_slot: i64 = sqlx::query_scalar(
+        .map_or(1, |level| level.checked_add(1).expect("derived block level fits u32"));
+    let raw_level = i64::from(level);
+    let raw_slot: i32 = sqlx::query_scalar(
         "INSERT INTO levels (level, size, daa_score) VALUES ($1, 1, $2)
          ON CONFLICT (level) DO UPDATE SET size = levels.size + 1
+         WHERE levels.size < 65535
          RETURNING levels.size - 1",
     )
     .bind(raw_level)
     .bind(NO_VSPC_DAA_SCORE)
-    .fetch_one(&mut *transaction)
+    .fetch_optional(&mut *transaction)
     .await
-    .map_err(|error| TransactionAttemptError::database("block-coordinate allocation", error))?;
-    let slot = u64::try_from(raw_slot)
-        .map_err(|_| TransactionAttemptError::Storage(StorageError::internal_failure("allocated block slot is negative")))?;
-    let coordinate = BlockCoordinate::new(level, slot)
-        .ok_or_else(|| TransactionAttemptError::Storage(StorageError::internal_failure("allocated block coordinate is invalid")))?;
+    .map_err(|error| TransactionAttemptError::database("block-coordinate allocation", error))?
+    .expect("materialized level size fits u16");
+    let slot = u16::try_from(raw_slot).expect("allocated block slot fits the coordinate domain");
+    let coordinate = BlockCoordinate::new(level, slot).expect("allocated block coordinate is valid");
 
     let selected_parent_id = identities.get(&prepared.selected_parent).expect("selected parent was resolved").id;
     let own = identities.get_mut(&prepared.hash).expect("the incoming block identity was interned");
@@ -401,7 +399,7 @@ async fn load_identities(
         })?;
         let level: Option<i64> =
             row.try_get("level").map_err(|error| TransactionAttemptError::database("block-reference level decode", error))?;
-        let slot: Option<i64> =
+        let slot: Option<i32> =
             row.try_get("slot").map_err(|error| TransactionAttemptError::database("block-reference slot decode", error))?;
         let coordinate = decode_coordinate(level, slot).map_err(TransactionAttemptError::Storage)?;
         let raw_selected_parent_id: Option<i64> = row
@@ -452,19 +450,12 @@ fn seed_identities_from_cache(
 
 async fn load_level_snapshots(
     transaction: &mut Transaction<'_, Postgres>,
-    block_level: u64,
-    parent_levels: impl Iterator<Item = u64>,
+    block_level: u32,
+    parent_levels: impl Iterator<Item = u32>,
 ) -> Result<Arc<[LevelCommitted]>, TransactionAttemptError<SemanticError>> {
     let mut levels = BTreeSet::from([block_level]);
     levels.extend(parent_levels);
-    let encoded: Vec<i64> = levels
-        .iter()
-        .copied()
-        .map(|level| {
-            i64::try_from(level)
-                .map_err(|_| TransactionAttemptError::Storage(StorageError::internal_failure("snapshot level exceeds BIGINT")))
-        })
-        .collect::<Result<_, _>>()?;
+    let encoded: Vec<i64> = levels.iter().copied().map(i64::from).collect();
     let rows = sqlx::query("SELECT level, size, daa_score FROM levels WHERE level = ANY($1::BIGINT[]) ORDER BY level")
         .bind(encoded)
         .fetch_all(&mut **transaction)
@@ -479,14 +470,14 @@ async fn load_level_snapshots(
     for row in rows {
         let raw_level: i64 =
             row.try_get("level").map_err(|error| TransactionAttemptError::database("level-snapshot level decode", error))?;
-        let raw_size: i64 =
+        let raw_size: i32 =
             row.try_get("size").map_err(|error| TransactionAttemptError::database("level-snapshot size decode", error))?;
         let raw_daa: i64 =
             row.try_get("daa_score").map_err(|error| TransactionAttemptError::database("level-snapshot DAA decode", error))?;
-        let level = u64::try_from(raw_level)
-            .map_err(|_| TransactionAttemptError::Storage(StorageError::invalid_metadata("stored snapshot level is negative")))?;
-        let size = u64::try_from(raw_size)
-            .map_err(|_| TransactionAttemptError::Storage(StorageError::invalid_metadata("stored level size is negative")))?;
+        let level = u32::try_from(raw_level)
+            .map_err(|_| TransactionAttemptError::Storage(StorageError::invalid_metadata("stored snapshot level is invalid")))?;
+        let size = u16::try_from(raw_size)
+            .map_err(|_| TransactionAttemptError::Storage(StorageError::invalid_metadata("stored level size is invalid")))?;
         let daa_score =
             if raw_daa == NO_VSPC_DAA_SCORE {
                 None
@@ -500,13 +491,13 @@ async fn load_level_snapshots(
     Ok(Arc::from(snapshots))
 }
 
-fn decode_coordinate(level: Option<i64>, slot: Option<i64>) -> Result<Option<BlockCoordinate>, StorageError> {
+fn decode_coordinate(level: Option<i64>, slot: Option<i32>) -> Result<Option<BlockCoordinate>, StorageError> {
     match (level, slot) {
         (None, None) => Ok(None),
         (Some(level), Some(slot)) => {
-            let coordinate = u64::try_from(level)
+            let coordinate = u32::try_from(level)
                 .ok()
-                .and_then(|level| BlockCoordinate::new(level, u64::try_from(slot).ok()?))
+                .and_then(|level| BlockCoordinate::new(level, u16::try_from(slot).ok()?))
                 .ok_or_else(|| StorageError::invalid_metadata(format!("invalid stored block coordinate ({level}, {slot})")))?;
             Ok(Some(coordinate))
         }
@@ -536,7 +527,7 @@ mod tests {
 
     use kaspa_consensus_core::network::{NetworkId, NetworkType};
     use kgi_model::{
-        block::{BlockColor, BlockCoordinate, BlockHash, BlockPresence, CompactId, ValidatedNodeBlock},
+        block::{BlockColor, BlockCoordinate, BlockHash, BlockPresence, CompactId, MAX_LEVEL_SIZE, ValidatedNodeBlock},
         graph_update::{LevelCommitted, ParentCommitted},
         lifecycle::PersistenceFault,
     };
@@ -640,10 +631,10 @@ mod tests {
         CompactId::new(id).expect("positive generated ID")
     }
 
-    async fn insert_level(database: &mut PreparedDatabase, level: u64, size: u64, daa_score: Option<u64>) {
+    async fn insert_level(database: &mut PreparedDatabase, level: u32, size: u16, daa_score: Option<u64>) {
         sqlx::query("INSERT INTO levels (level, size, daa_score) VALUES ($1, $2, $3)")
-            .bind(i64::try_from(level).expect("test level fits BIGINT"))
-            .bind(i64::try_from(size).expect("test size fits BIGINT"))
+            .bind(i64::from(level))
+            .bind(i32::from(size))
             .bind(daa_score.map_or(i64::MAX, |score| i64::try_from(score).expect("test DAA score fits BIGINT")))
             .execute(database.connection_mut())
             .await
@@ -664,8 +655,8 @@ mod tests {
              ) VALUES ($1, 0, 1, $2, $3, $4, 0, FALSE, '{}', '{}')",
         )
         .bind(id.get())
-        .bind(i64::try_from(coordinate.level()).expect("test level fits BIGINT"))
-        .bind(i64::try_from(coordinate.slot()).expect("test slot fits BIGINT"))
+        .bind(i64::from(coordinate.level()))
+        .bind(i32::from(coordinate.slot()))
         .bind(selected_parent_id.get())
         .execute(database.connection_mut())
         .await
@@ -845,7 +836,7 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().any(|row| row.get::<i64, _>("parent_id") == boundary_parent_id.get()
             && row.get::<i64, _>("parent_level") == 0
-            && row.get::<i64, _>("parent_slot") == 0));
+            && row.get::<i32, _>("parent_slot") == 0));
 
         let (blue_ids, red_ids, color, in_vspc): (Vec<i64>, Vec<i64>, i16, bool) =
             sqlx::query_as("SELECT blue_merge_set, red_merge_set, color, is_in_vspc FROM blocks WHERE id = $1")
@@ -1127,5 +1118,79 @@ mod tests {
             .await
             .expect("connection-loss database truth");
         assert!(!persisted);
+    }
+
+    #[tokio::test]
+    async fn deriving_a_child_above_the_level_domain_panics_without_persistence() {
+        let (_container, database_url) = fixture().await;
+        let (mut database, client, _retirements) = processing_client(&database_url).await;
+        let origin_id = insert_identity(&mut database, hash(1)).await;
+        insert_level(&mut database, u32::MAX, 1, None).await;
+        let selected_parent = hash(2);
+        insert_materialized(&mut database, selected_parent, origin_id, BlockCoordinate::new(u32::MAX, 0).expect("maximum coordinate"))
+            .await;
+        let own_hash = hash(3);
+        let operation_client = Arc::clone(&client);
+        let operation = tokio::spawn(async move {
+            operation_client
+                .materialize_block(
+                    block(own_hash, selected_parent, vec![selected_parent], Vec::new(), Vec::new()),
+                    ReferencePolicy::RequireMaterialized,
+                )
+                .await
+        });
+
+        assert!(operation.await.expect_err("level overflow must panic").is_panic());
+        let persisted: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM block_identifiers WHERE hash = $1)")
+            .bind(own_hash.as_bytes().as_slice())
+            .fetch_one(database.connection_mut())
+            .await
+            .expect("level-overflow database truth");
+        assert!(!persisted);
+    }
+
+    #[tokio::test]
+    async fn exhausting_a_level_panics_and_rolls_back_every_write() {
+        let (_container, database_url) = fixture().await;
+        let (mut database, client, _retirements) = processing_client(&database_url).await;
+        let origin_id = insert_identity(&mut database, hash(1)).await;
+        insert_level(&mut database, 1, 1, None).await;
+        let selected_parent = hash(2);
+        insert_materialized(&mut database, selected_parent, origin_id, BlockCoordinate::new(1, 0).expect("coordinate")).await;
+        insert_level(&mut database, 2, MAX_LEVEL_SIZE, None).await;
+        let before: (i64, i64, i64, i32) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM block_identifiers),
+                 (SELECT COUNT(*) FROM blocks),
+                 (SELECT COUNT(*) FROM parents),
+                 (SELECT size FROM levels WHERE level = 2)",
+        )
+        .fetch_one(database.connection_mut())
+        .await
+        .expect("state before level exhaustion");
+        let own_hash = hash(3);
+        let operation_client = Arc::clone(&client);
+        let operation = tokio::spawn(async move {
+            operation_client
+                .materialize_block(
+                    block(own_hash, selected_parent, vec![selected_parent], Vec::new(), Vec::new()),
+                    ReferencePolicy::RequireMaterialized,
+                )
+                .await
+        });
+
+        assert!(operation.await.expect_err("level exhaustion must panic").is_panic());
+        let after: (i64, i64, i64, i32) = sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM block_identifiers),
+                 (SELECT COUNT(*) FROM blocks),
+                 (SELECT COUNT(*) FROM parents),
+                 (SELECT size FROM levels WHERE level = 2)",
+        )
+        .fetch_one(database.connection_mut())
+        .await
+        .expect("state after level exhaustion");
+        assert_eq!(after, before);
+        assert!(!client.has_cached_identity(own_hash));
     }
 }

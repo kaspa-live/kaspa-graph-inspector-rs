@@ -67,7 +67,7 @@ pub(crate) struct GraphDeltaTargetCapture {
     state: GraphPublicationState,
     revision: u64,
     revision_timestamp_ms: u64,
-    high_level: u64,
+    high_level: u32,
 }
 
 impl GraphDeltaTargetCapture {
@@ -92,7 +92,7 @@ impl GraphDeltaTargetCapture {
     }
 
     /// Returns the captured Head's nominal upper level.
-    pub(crate) const fn high_level(self) -> u64 {
+    pub(crate) const fn high_level(self) -> u32 {
         self.high_level
     }
 }
@@ -343,7 +343,7 @@ mod tests {
         head_view_with_depth(1)
     }
 
-    fn head_view_with_depth(max_depth: u64) -> GraphView {
+    fn head_view_with_depth(max_depth: u32) -> GraphView {
         GraphView::from_database_projection(
             max_depth,
             LevelExtent::new(1, 1).expect("valid extent"),
@@ -359,14 +359,14 @@ mod tests {
     }
 
     fn committed_block(byte: u8) -> BlockCommitted {
-        let level = u64::from(byte);
+        let level = u32::from(byte);
         let parent_level = level - 1;
         BlockCommitted {
             id: CompactId::new(i64::from(byte)).expect("positive compact ID"),
             hash: hash(byte),
             coordinate: BlockCoordinate::new(level, 0).expect("positive coordinate"),
-            timestamp: level * 10,
-            daa_score: level * 100,
+            timestamp: u64::from(level) * 10,
+            daa_score: u64::from(level) * 100,
             selected_parent_index: Some(0),
             direct_parents: Arc::from([ParentCommitted {
                 hash: hash(byte - 1),
@@ -389,7 +389,7 @@ mod tests {
             destination: hash(byte),
             removed: Arc::from([]),
             added: Arc::from([hash(byte)]),
-            level_snapshots: Arc::from([LevelCommitted { level: u64::from(byte), size: 1, daa_score }]),
+            level_snapshots: Arc::from([LevelCommitted { level: u32::from(byte), size: 1, daa_score }]),
         }
     }
 
@@ -398,7 +398,7 @@ mod tests {
             .expect("valid advancing delta")
     }
 
-    fn publication_with_atomic_mutation_hook(max_depth: u64) -> (Arc<GraphPublication>, Arc<AtomicMutationTestHook>) {
+    fn publication_with_atomic_mutation_hook(max_depth: u32) -> (Arc<GraphPublication>, Arc<AtomicMutationTestHook>) {
         let hook = Arc::new(AtomicMutationTestHook::new());
         let mut publication = GraphPublication::new(
             GraphPublicationState::Synchronizing,

@@ -1520,7 +1520,7 @@ mod tests {
         );
         assert_eq!(anchor.point.id().get(), 5);
 
-        let block: (i64, i64, i64, i64, i64, i16, bool, Vec<i64>, Vec<i64>) = sqlx::query_as(
+        let block: (i64, i64, i64, i64, i32, i16, bool, Vec<i64>, Vec<i64>) = sqlx::query_as(
             "SELECT id, timestamp, daa_score, level, slot, color, is_in_vspc, blue_merge_set, red_merge_set
              FROM blocks",
         )
@@ -1535,14 +1535,14 @@ mod tests {
                 .expect("rebuilt selected-parent ID"),
             3
         );
-        let parents: Vec<(i64, i64, i64, i64)> =
+        let parents: Vec<(i64, i64, i64, i32)> =
             sqlx::query_as("SELECT parent_id, child_level, parent_level, parent_slot FROM parents ORDER BY parent_id")
                 .fetch_all(processing.pool())
                 .await
                 .expect("rebuilt parent rows");
         assert_eq!(parents, vec![(3, 1, 0, 0), (4, 1, 0, 0)]);
         assert_eq!(
-            sqlx::query_as::<_, (i64, i64, i64)>("SELECT level, size, daa_score FROM levels")
+            sqlx::query_as::<_, (i64, i32, i64)>("SELECT level, size, daa_score FROM levels")
                 .fetch_one(processing.pool())
                 .await
                 .expect("rebuilt level"),

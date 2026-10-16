@@ -9,7 +9,7 @@ use crate::graph::{EdgeId, GraphBlock, GraphEdge, Level};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LevelChange {
     /// Level affected by the change.
-    pub level: u64,
+    pub level: u32,
     /// State before the delta, or absence.
     pub before: Option<Level>,
     /// State after the delta, or absence.
@@ -51,7 +51,7 @@ pub struct GraphDelta {
     from_revision_id: u64,
     to_revision_id: u64,
     revision_timestamp_ms: u64,
-    high_level: u64,
+    high_level: u32,
     block_changes: HashMap<BlockHash, Option<GraphBlock>>,
     edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
     level_changes: Vec<LevelChange>,
@@ -66,7 +66,7 @@ impl GraphDelta {
         from_revision_id: u64,
         to_revision_id: u64,
         revision_timestamp_ms: u64,
-        high_level: u64,
+        high_level: u32,
         block_changes: HashMap<BlockHash, Option<GraphBlock>>,
         edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
         level_changes: Vec<LevelChange>,
@@ -113,7 +113,7 @@ impl GraphDelta {
 
     /// Returns the target high level of this delta's lineage.
     #[must_use]
-    pub const fn high_level(&self) -> u64 {
+    pub const fn high_level(&self) -> u32 {
         self.high_level
     }
 
@@ -229,7 +229,7 @@ mod tests {
         }
     }
 
-    fn edge(parent: u8, child: u8, parent_level: u64, child_level: u64) -> GraphEdge {
+    fn edge(parent: u8, child: u8, parent_level: u32, child_level: u32) -> GraphEdge {
         let id = EdgeId { parent: hash(parent), child: hash(child) };
         GraphEdge {
             id,
@@ -471,7 +471,7 @@ mod tests {
                 from,
                 to,
                 to * 10,
-                to + 3,
+                u32::try_from(to + 3).expect("test level fits u32"),
                 HashMap::from([(hash(1), block_change)]),
                 HashMap::new(),
                 Vec::new(),

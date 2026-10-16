@@ -1,7 +1,7 @@
 use kgi_model::block::{BlockColor, BlockCoordinate, CompactId, Timestamp};
 use sqlx::{Postgres, Transaction};
 
-use crate::{database::timestamp_to_sql, error::StorageError, transaction::TransactionAttemptError};
+use crate::{database::timestamp_to_sql, transaction::TransactionAttemptError};
 
 pub(super) struct BlockRow<'a> {
     pub id: CompactId,
@@ -66,7 +66,7 @@ pub(super) async fn insert_block_and_parents<S>(
              child_id, parent_id, child_level, child_slot, parent_level, parent_slot
          )
          SELECT $1, relation.parent_id, $2, $3, relation.parent_level, relation.parent_slot
-         FROM UNNEST($4::BIGINT[], $5::BIGINT[], $6::BIGINT[])
+         FROM UNNEST($4::BIGINT[], $5::BIGINT[], $6::INTEGER[])
              AS relation(parent_id, parent_level, parent_slot)",
     )
     .bind(block.id.get())
@@ -81,10 +81,6 @@ pub(super) async fn insert_block_and_parents<S>(
     Ok(())
 }
 
-fn encode_coordinate<S>(coordinate: BlockCoordinate) -> Result<(i64, i64), TransactionAttemptError<S>> {
-    let level = i64::try_from(coordinate.level())
-        .map_err(|_| TransactionAttemptError::Storage(StorageError::internal_failure("block level exceeds BIGINT")))?;
-    let slot = i64::try_from(coordinate.slot())
-        .map_err(|_| TransactionAttemptError::Storage(StorageError::internal_failure("block slot exceeds BIGINT")))?;
-    Ok((level, slot))
+fn encode_coordinate<S>(coordinate: BlockCoordinate) -> Result<(i64, i32), TransactionAttemptError<S>> {
+    Ok((i64::from(coordinate.level()), i32::from(coordinate.slot())))
 }

@@ -224,10 +224,10 @@ async fn load_members(
         let id = decode_id(raw_id, "VSPC member")?;
         let raw_level: i64 =
             row.try_get("level").map_err(|error| TransactionAttemptError::database("VSPC member level decode", error))?;
-        let raw_slot: i64 =
+        let raw_slot: i32 =
             row.try_get("slot").map_err(|error| TransactionAttemptError::database("VSPC member slot decode", error))?;
         let coordinate =
-            u64::try_from(raw_level).ok().and_then(|level| BlockCoordinate::new(level, u64::try_from(raw_slot).ok()?)).ok_or_else(
+            u32::try_from(raw_level).ok().and_then(|level| BlockCoordinate::new(level, u16::try_from(raw_slot).ok()?)).ok_or_else(
                 || TransactionAttemptError::Storage(StorageError::invalid_metadata("stored VSPC member coordinate is invalid")),
             )?;
         let raw_selected_parent_id: i64 = row
@@ -437,15 +437,9 @@ async fn apply_merge_set_colors(
 
 async fn update_level_scores(
     transaction: &mut Transaction<'_, Postgres>,
-    levels: &BTreeSet<u64>,
+    levels: &BTreeSet<u32>,
 ) -> Result<Arc<[LevelCommitted]>, TransactionAttemptError<SemanticError>> {
-    let encoded: Vec<i64> = levels
-        .iter()
-        .map(|level| {
-            i64::try_from(*level)
-                .map_err(|_| TransactionAttemptError::Storage(StorageError::internal_failure("affected VSPC level exceeds BIGINT")))
-        })
-        .collect::<Result<_, _>>()?;
+    let encoded: Vec<i64> = levels.iter().copied().map(i64::from).collect();
     let rows = sqlx::query(
         "WITH updated AS (
              UPDATE levels AS level
@@ -471,14 +465,14 @@ async fn update_level_scores(
     let mut snapshots = Vec::with_capacity(rows.len());
     for row in rows {
         let raw_level: i64 = row.try_get("level").map_err(|error| TransactionAttemptError::database("VSPC level decode", error))?;
-        let raw_size: i64 = row.try_get("size").map_err(|error| TransactionAttemptError::database("VSPC level size decode", error))?;
+        let raw_size: i32 = row.try_get("size").map_err(|error| TransactionAttemptError::database("VSPC level size decode", error))?;
         let raw_daa: i64 =
             row.try_get("daa_score").map_err(|error| TransactionAttemptError::database("VSPC level DAA decode", error))?;
-        let level = u64::try_from(raw_level)
+        let level = u32::try_from(raw_level)
             .ok()
             .filter(|level| *level > 0)
             .ok_or_else(|| TransactionAttemptError::Storage(StorageError::invalid_metadata("stored VSPC level is invalid")))?;
-        let size = u64::try_from(raw_size)
+        let size = u16::try_from(raw_size)
             .ok()
             .filter(|size| *size > 0)
             .ok_or_else(|| TransactionAttemptError::Storage(StorageError::invalid_metadata("stored VSPC level size is invalid")))?;
@@ -632,7 +626,7 @@ mod tests {
         hash: BlockHash,
         selected_parent: CompactId,
         level: i64,
-        slot: i64,
+        slot: i32,
         daa_score: i64,
         color: BlockColor,
         in_vspc: bool,

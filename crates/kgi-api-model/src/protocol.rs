@@ -56,7 +56,7 @@ pub enum DeltaContinuation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HeadLevelValue {
     /// Retained level number.
-    pub level: u64,
+    pub level: u32,
     /// Complete public value at that level.
     pub value: Level,
 }
@@ -76,7 +76,7 @@ pub enum HeadLevelLookupOutcome {
     /// At least one requested level is unavailable in the retained Head image.
     LevelUnavailable {
         /// Unavailable level that prevents an all-or-nothing result.
-        requested_level: u64,
+        requested_level: u32,
     },
     /// The lookup requires a fresh view for the supplied reason.
     FreshViewRequired(FreshViewReason),

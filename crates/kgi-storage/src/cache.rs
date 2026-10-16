@@ -147,7 +147,7 @@ mod tests {
             caches.publish_identity(hash(value), CachedIdentity { id: id(i64::from(value)), materialized: true });
             caches.publish_materialized_block(
                 id(i64::from(value)),
-                CachedMaterializedBlock { coordinate: coordinate(u64::from(value)), selected_parent_id: id(4) },
+                CachedMaterializedBlock { coordinate: coordinate(u32::from(value)), selected_parent_id: id(4) },
             );
             caches.publish_merge_sets(id(i64::from(value)), CachedMergeSets { blue: vec![id(5)].into(), red: vec![id(6)].into() });
         }

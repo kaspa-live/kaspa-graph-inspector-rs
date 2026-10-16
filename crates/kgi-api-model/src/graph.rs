@@ -12,26 +12,26 @@ use thiserror::Error;
 use crate::delta::{FieldChange, GraphDelta, LevelChange};
 
 /// Complete retained level depth of the canonical Head graph.
-pub const MAX_CACHE_DEPTH: u64 = 1_000;
+pub const MAX_CACHE_DEPTH: u32 = 1_000;
 
 /// Failure to construct a canonical inclusive level extent.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum LevelExtentError {
     /// The supplied bounds are zero or not ordered from low to high.
     #[error("invalid level extent bounds {low_level}..={high_level}")]
-    InvalidBounds { low_level: u64, high_level: u64 },
+    InvalidBounds { low_level: u32, high_level: u32 },
 }
 
 /// One validated inclusive nominal graph extent.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct LevelExtent {
-    low_level: u64,
-    high_level: u64,
+    low_level: u32,
+    high_level: u32,
 }
 
 impl LevelExtent {
     /// Constructs an inclusive extent from positive ordered bounds.
-    pub const fn new(low_level: u64, high_level: u64) -> Result<Self, LevelExtentError> {
+    pub const fn new(low_level: u32, high_level: u32) -> Result<Self, LevelExtentError> {
         if low_level == 0 || low_level > high_level {
             return Err(LevelExtentError::InvalidBounds { low_level, high_level });
         }
@@ -40,25 +40,25 @@ impl LevelExtent {
 
     /// Returns the inclusive lower bound.
     #[must_use]
-    pub const fn low_level(self) -> u64 {
+    pub const fn low_level(self) -> u32 {
         self.low_level
     }
 
     /// Returns the inclusive upper bound.
     #[must_use]
-    pub const fn high_level(self) -> u64 {
+    pub const fn high_level(self) -> u32 {
         self.high_level
     }
 
     /// Returns the number of levels in the inclusive extent.
     #[must_use]
-    pub const fn depth(self) -> u64 {
+    pub const fn depth(self) -> u32 {
         self.high_level - self.low_level + 1
     }
 
     /// Returns whether the extent contains `level`, including its boundaries.
     #[must_use]
-    pub const fn contains_level(self, level: u64) -> bool {
+    pub const fn contains_level(self, level: u32) -> bool {
         self.low_level <= level && level <= self.high_level
     }
 
@@ -76,7 +76,7 @@ impl LevelExtent {
 
     /// Returns whether a child-parent edge span intersects this extent.
     #[must_use]
-    pub const fn intersects_span(self, parent_level: u64, child_level: u64) -> bool {
+    pub const fn intersects_span(self, parent_level: u32, child_level: u32) -> bool {
         child_level >= self.low_level && parent_level <= self.high_level
     }
 }
@@ -96,7 +96,7 @@ pub enum TrackingPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Level {
     /// Number of allocated slots in the level.
-    pub size: u64,
+    pub size: u16,
     /// Final committed VSPC DAA score, when the level has one.
     pub daa_score: Option<u64>,
 }
@@ -189,19 +189,19 @@ pub enum GraphDeltaApplyError {
 /// One complete canonical graph projection and its revision lineage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphView {
-    max_depth: u64,
+    max_depth: u32,
     extent: LevelExtent,
     current_revision_id: u64,
     current_revision_timestamp_ms: u64,
     tracking_policy: TrackingPolicy,
-    levels: BTreeMap<u64, StoredLevel>,
+    levels: BTreeMap<u32, StoredLevel>,
     blocks: HashMap<BlockHash, GraphBlock>,
     edges: HashMap<EdgeId, GraphEdge>,
-    block_hashes_by_level: BTreeMap<u64, HashSet<BlockHash>>,
+    block_hashes_by_level: BTreeMap<u32, HashSet<BlockHash>>,
     edge_parents_by_child: HashMap<BlockHash, HashSet<BlockHash>>,
     // Child level is the outer key and parent level the inner key, allowing
     // extraction to apply both span bounds before visiting edge IDs.
-    edge_ids_by_span: BTreeMap<u64, BTreeMap<u64, HashSet<EdgeId>>>,
+    edge_ids_by_span: BTreeMap<u32, BTreeMap<u32, HashSet<EdgeId>>>,
 }
 
 impl GraphView {
@@ -217,10 +217,10 @@ impl GraphView {
     /// level is referenced by more retained edges than fit in `u64`.
     #[must_use]
     pub fn from_database_projection(
-        max_depth: u64,
+        max_depth: u32,
         extent: LevelExtent,
         tracking_policy: TrackingPolicy,
-        levels: BTreeMap<u64, Level>,
+        levels: BTreeMap<u32, Level>,
         blocks: HashMap<BlockHash, GraphBlock>,
         edges: HashMap<EdgeId, GraphEdge>,
     ) -> Self {
@@ -254,7 +254,7 @@ impl GraphView {
 
     /// Returns the configured maximum nominal depth.
     #[must_use]
-    pub const fn max_depth(&self) -> u64 {
+    pub const fn max_depth(&self) -> u32 {
         self.max_depth
     }
 
@@ -266,13 +266,13 @@ impl GraphView {
 
     /// Returns the nominal lower level.
     #[must_use]
-    pub const fn low_level(&self) -> u64 {
+    pub const fn low_level(&self) -> u32 {
         self.extent.low_level()
     }
 
     /// Returns the nominal upper level.
     #[must_use]
-    pub const fn high_level(&self) -> u64 {
+    pub const fn high_level(&self) -> u32 {
         self.extent.high_level()
     }
 
@@ -296,12 +296,12 @@ impl GraphView {
 
     /// Returns one retained level value.
     #[must_use]
-    pub fn level(&self, level: u64) -> Option<&Level> {
+    pub fn level(&self, level: u32) -> Option<&Level> {
         self.levels.get(&level).map(|stored| &stored.value)
     }
 
     /// Iterates retained level values in ascending level order.
-    pub fn levels(&self) -> impl Iterator<Item = (u64, &Level)> {
+    pub fn levels(&self) -> impl Iterator<Item = (u32, &Level)> {
         self.levels.iter().map(|(&level, stored)| (level, &stored.value))
     }
 
@@ -746,7 +746,7 @@ impl GraphView {
         self.block_hashes_by_level.entry(level).or_default().insert(hash);
     }
 
-    fn insert_source_level(&self, target: &mut BTreeMap<u64, StoredLevel>, level: u64) {
+    fn insert_source_level(&self, target: &mut BTreeMap<u32, StoredLevel>, level: u32) {
         target.entry(level).or_insert_with(|| StoredLevel {
             value: self.levels.get(&level).expect("a coherent graph contains every nominal and edge endpoint level").value,
             usage_count: 0,
@@ -760,12 +760,12 @@ impl GraphView {
             .or_insert(StoredLevel { value: Level { size: snapshot.size, daa_score: snapshot.daa_score }, usage_count: 0 });
     }
 
-    fn increment_parent_usage(&mut self, parent_level: u64) {
+    fn increment_parent_usage(&mut self, parent_level: u32) {
         let stored = self.levels.get_mut(&parent_level).expect("a coherent graph contains every edge parent level");
         stored.usage_count = stored.usage_count.checked_add(1).expect("retained edge usage fits u64");
     }
 
-    fn decrement_parent_usage(&mut self, parent_level: u64) {
+    fn decrement_parent_usage(&mut self, parent_level: u32) {
         let stored = self.levels.get_mut(&parent_level).expect("a coherent graph contains every edge parent level");
         stored.usage_count = stored.usage_count.checked_sub(1).expect("retained parent usage is positive");
     }
@@ -874,8 +874,8 @@ impl GraphView {
     }
 }
 
-fn index_blocks_by_level(blocks: &HashMap<BlockHash, GraphBlock>) -> BTreeMap<u64, HashSet<BlockHash>> {
-    let mut index: BTreeMap<u64, HashSet<BlockHash>> = BTreeMap::new();
+fn index_blocks_by_level(blocks: &HashMap<BlockHash, GraphBlock>) -> BTreeMap<u32, HashSet<BlockHash>> {
+    let mut index: BTreeMap<u32, HashSet<BlockHash>> = BTreeMap::new();
     for (&hash, block) in blocks {
         index.entry(block.coordinate.level()).or_default().insert(hash);
     }
@@ -890,8 +890,8 @@ fn index_edge_parents_by_child(edges: &HashMap<EdgeId, GraphEdge>) -> HashMap<Bl
     index
 }
 
-fn index_edges_by_span(edges: &HashMap<EdgeId, GraphEdge>) -> BTreeMap<u64, BTreeMap<u64, HashSet<EdgeId>>> {
-    let mut index: BTreeMap<u64, BTreeMap<u64, HashSet<EdgeId>>> = BTreeMap::new();
+fn index_edges_by_span(edges: &HashMap<EdgeId, GraphEdge>) -> BTreeMap<u32, BTreeMap<u32, HashSet<EdgeId>>> {
+    let mut index: BTreeMap<u32, BTreeMap<u32, HashSet<EdgeId>>> = BTreeMap::new();
     for (&id, edge) in edges {
         index.entry(edge.child_coordinate.level()).or_default().entry(edge.parent_coordinate.level()).or_default().insert(id);
     }
@@ -928,7 +928,7 @@ impl From<&GraphBlock> for VspcProjectionMetadata {
 struct GraphMutation {
     blocks: HashMap<BlockHash, Option<GraphBlock>>,
     edges: HashMap<EdgeId, Option<GraphEdge>>,
-    levels: BTreeMap<u64, Option<Level>>,
+    levels: BTreeMap<u32, Option<Level>>,
     is_in_vspc: HashMap<BlockHash, bool>,
     colors: HashMap<BlockHash, BlockColor>,
 }
@@ -950,15 +950,15 @@ impl GraphMutation {
         self.edges.entry(id).or_insert(Some(edge));
     }
 
-    fn capture_level(&mut self, levels: &BTreeMap<u64, StoredLevel>, level: u64) {
+    fn capture_level(&mut self, levels: &BTreeMap<u32, StoredLevel>, level: u32) {
         self.levels.entry(level).or_insert_with(|| levels.get(&level).map(|stored| stored.value));
     }
 
-    fn capture_removed_level(&mut self, level: u64, value: Level) {
+    fn capture_removed_level(&mut self, level: u32, value: Level) {
         self.levels.entry(level).or_insert(Some(value));
     }
 
-    fn capture_level_value(&mut self, level: u64, value: Level) {
+    fn capture_level_value(&mut self, level: u32, value: Level) {
         self.levels.entry(level).or_insert(Some(value));
     }
 
@@ -1047,21 +1047,21 @@ mod tests {
         BlockHash::from_bytes([byte; 32])
     }
 
-    fn level_hash(level: u64) -> BlockHash {
+    fn level_hash(level: u32) -> BlockHash {
         let mut bytes = [0; 32];
-        bytes[..size_of::<u64>()].copy_from_slice(&level.to_le_bytes());
+        bytes[..size_of::<u32>()].copy_from_slice(&level.to_le_bytes());
         BlockHash::from_bytes(bytes)
     }
 
-    fn coordinate(level: u64, slot: u64) -> BlockCoordinate {
+    fn coordinate(level: u32, slot: u16) -> BlockCoordinate {
         BlockCoordinate::new(level, slot).expect("positive level")
     }
 
-    fn extent(low_level: u64, high_level: u64) -> LevelExtent {
+    fn extent(low_level: u32, high_level: u32) -> LevelExtent {
         LevelExtent::new(low_level, high_level).expect("valid extent")
     }
 
-    fn graph_block_at(byte: u8, level: u64, slot: u64) -> GraphBlock {
+    fn graph_block_at(byte: u8, level: u32, slot: u16) -> GraphBlock {
         GraphBlock {
             hash: hash(byte),
             coordinate: coordinate(level, slot),
@@ -1076,11 +1076,11 @@ mod tests {
         }
     }
 
-    fn graph_block(byte: u8, level: u64) -> GraphBlock {
+    fn graph_block(byte: u8, level: u32) -> GraphBlock {
         graph_block_at(byte, level, 0)
     }
 
-    fn graph_edge(parent_byte: u8, parent_level: u64, child_byte: u8, child_level: u64) -> GraphEdge {
+    fn graph_edge(parent_byte: u8, parent_level: u32, child_byte: u8, child_level: u32) -> GraphEdge {
         GraphEdge {
             id: EdgeId { parent: hash(parent_byte), child: hash(child_byte) },
             parent_coordinate: coordinate(parent_level, 0),
@@ -1090,8 +1090,8 @@ mod tests {
 
     fn committed_block(
         byte: u8,
-        level: u64,
-        slot: u64,
+        level: u32,
+        slot: u16,
         direct_parents: impl Into<Arc<[ParentCommitted]>>,
         level_snapshots: impl Into<Arc<[LevelCommitted]>>,
     ) -> BlockCommitted {
@@ -1131,7 +1131,7 @@ mod tests {
         from_revision_id: u64,
         to_revision_id: u64,
         revision_timestamp_ms: u64,
-        high_level: u64,
+        high_level: u32,
         block_changes: HashMap<BlockHash, Option<GraphBlock>>,
         edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
         level_changes: Vec<LevelChange>,
@@ -1166,7 +1166,11 @@ mod tests {
     }
 
     fn view(policy: TrackingPolicy) -> GraphView {
-        let levels = (1..=7).map(|level| (level, Level { size: level, daa_score: Some(level * 10) })).collect();
+        let levels = (1_u32..=7)
+            .map(|level| {
+                (level, Level { size: u16::try_from(level).expect("test size fits u16"), daa_score: Some(u64::from(level) * 10) })
+            })
+            .collect();
         let blocks = (2..=6).map(|level| (hash(level as u8), graph_block(level as u8, level))).collect();
         let edge_values = [
             graph_edge(1, 1, 2, 2),
@@ -1234,8 +1238,8 @@ mod tests {
         assert_eq!(single.high_level(), 7);
         assert_eq!(single.depth(), 1);
 
-        let complete = extent(1, u64::MAX);
-        assert_eq!(complete.depth(), u64::MAX);
+        let complete = extent(1, u32::MAX);
+        assert_eq!(complete.depth(), u32::MAX);
 
         assert_eq!(LevelExtent::new(0, 0), Err(LevelExtentError::InvalidBounds { low_level: 0, high_level: 0 }));
         assert_eq!(LevelExtent::new(0, 7), Err(LevelExtentError::InvalidBounds { low_level: 0, high_level: 7 }));
@@ -1366,7 +1370,7 @@ mod tests {
 
     #[test]
     fn narrow_extraction_visits_only_indexed_block_and_edge_candidates() {
-        let levels = (1..=MAX_CACHE_DEPTH).map(|level| (level, Level { size: 1, daa_score: Some(level) })).collect();
+        let levels = (1..=MAX_CACHE_DEPTH).map(|level| (level, Level { size: 1, daa_score: Some(u64::from(level)) })).collect();
         let blocks = (1..=MAX_CACHE_DEPTH)
             .map(|level| {
                 let hash = level_hash(level);
@@ -1375,8 +1379,8 @@ mod tests {
                     GraphBlock {
                         hash,
                         coordinate: coordinate(level, 0),
-                        timestamp: level,
-                        daa_score: level,
+                        timestamp: u64::from(level),
+                        daa_score: u64::from(level),
                         selected_parent_index: None,
                         direct_parents: Arc::from([]),
                         blue_merge_set: Arc::from([]),
@@ -1569,12 +1573,12 @@ mod tests {
         for (byte, timestamp) in [(4, 800), (5, 900)] {
             let committed = committed_block(
                 byte,
-                u64::from(byte),
+                u32::from(byte),
                 0,
-                Arc::from([ParentCommitted { hash: hash(byte - 1), coordinate: Some(coordinate(u64::from(byte - 1), 0)) }]),
+                Arc::from([ParentCommitted { hash: hash(byte - 1), coordinate: Some(coordinate(u32::from(byte - 1), 0)) }]),
                 Arc::from([
-                    LevelCommitted { level: u64::from(byte - 1), size: 1, daa_score: Some(999) },
-                    LevelCommitted { level: u64::from(byte), size: 1, daa_score: Some(u64::from(byte) * 10) },
+                    LevelCommitted { level: u32::from(byte - 1), size: 1, daa_score: Some(999) },
+                    LevelCommitted { level: u32::from(byte), size: 1, daa_score: Some(u64::from(byte) * 10) },
                 ]),
             );
             view.apply_head_block_committed(&committed, timestamp).expect("mutable Head").expect("visible update");
@@ -1721,11 +1725,11 @@ mod tests {
 
     #[test]
     fn fixed_block_projection_uses_original_event_even_when_head_has_no_effect() {
-        let head_levels = (5..=7).map(|level| (level, Level { size: 1, daa_score: Some(level * 10) })).collect();
+        let head_levels = (5_u32..=7).map(|level| (level, Level { size: 1, daa_score: Some(u64::from(level) * 10) })).collect();
         let head_blocks = (5..=7).map(|level| (hash(level as u8), graph_block(level as u8, level))).collect();
         let mut head =
             GraphView::from_database_projection(3, extent(5, 7), TrackingPolicy::Head, head_levels, head_blocks, HashMap::new());
-        let fixed_levels = (3..=5).map(|level| (level, Level { size: 1, daa_score: Some(level * 10) })).collect();
+        let fixed_levels = (3_u32..=5).map(|level| (level, Level { size: 1, daa_score: Some(u64::from(level) * 10) })).collect();
         let fixed_blocks = (3..=5).map(|level| (hash(level as u8), graph_block(level as u8, level))).collect();
         let mut fixed =
             GraphView::from_database_projection(3, extent(3, 5), TrackingPolicy::Fixed, fixed_levels, fixed_blocks, HashMap::new());
@@ -1830,7 +1834,7 @@ mod tests {
         let mut head_member = graph_block(7, 7);
         head_member.blue_merge_set = Arc::from([hash(4)]);
         head_member.red_merge_set = Arc::from([hash(3), hash(4)]);
-        let head_levels = (5..=7).map(|level| (level, Level { size: 1, daa_score: Some(level * 10) })).collect();
+        let head_levels = (5_u32..=7).map(|level| (level, Level { size: 1, daa_score: Some(u64::from(level) * 10) })).collect();
         let mut head = GraphView::from_database_projection(
             3,
             extent(5, 7),
