@@ -6,3 +6,4 @@ pub mod delta;
 pub mod graph;
 pub mod history;
 pub mod projection;
+pub mod protocol;
