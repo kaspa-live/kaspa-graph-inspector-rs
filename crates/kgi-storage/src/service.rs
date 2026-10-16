@@ -255,10 +255,11 @@ trait GenerationOpener: Send + Sync {
     async fn open_api(
         &self,
         database_url: String,
+        binding: DatabaseBinding,
         retirement_tx: RetirementSender,
         replacement_gate: Arc<ApiReplacementGate>,
     ) -> Result<Arc<ValidatedApiDbClient>, StorageError> {
-        open_api_generation(database_url, retirement_tx, replacement_gate).await
+        open_api_generation(database_url, binding, retirement_tx, replacement_gate).await
     }
 }
 
@@ -519,9 +520,10 @@ impl StorageServiceWorker {
                 self.publish_status(StorageServiceStatusState::Unavailable);
                 let database_url = self.database_url.as_str().to_owned();
                 let generation_opener = self.generation_opener.clone();
+                let binding = active.binding;
                 let retirement_tx = self.retirement_tx.clone();
                 let replacement_gate = self.replacement_gate.clone();
-                let opening = async move { generation_opener.open_api(database_url, retirement_tx, replacement_gate).await };
+                let opening = async move { generation_opener.open_api(database_url, binding, retirement_tx, replacement_gate).await };
                 tokio::pin!(opening);
                 let health = wait_for_lock_health(self.timing.clone());
                 tokio::pin!(health);
@@ -658,9 +660,10 @@ impl StorageServiceWorker {
 
         let database_url = self.database_url.as_str().to_owned();
         let generation_opener = self.generation_opener.clone();
+        let binding = active.binding;
         let retirement_tx = self.retirement_tx.clone();
         let replacement_gate = self.replacement_gate.clone();
-        let opening = async move { generation_opener.open_api(database_url, retirement_tx, replacement_gate).await };
+        let opening = async move { generation_opener.open_api(database_url, binding, retirement_tx, replacement_gate).await };
         tokio::pin!(opening);
         let health = wait_for_lock_health(self.timing.clone());
         tokio::pin!(health);
@@ -1350,7 +1353,7 @@ mod tests {
             open_validated_generations_managed,
         },
         error::{ProcessingDbError, RebuildSetupFault, StorageError, StorageRejection},
-        generation::{ValidatedApiDbClient, ValidatedDbClient},
+        generation::{DatabaseBinding, ValidatedApiDbClient, ValidatedDbClient},
         operation::RebuildFromPruningPointError,
         replacement::ApiReplacementGate,
         runtime::{RebuildSender, RetirementSender},
@@ -2906,12 +2909,13 @@ mod tests {
         async fn open_api(
             &self,
             database_url: String,
+            binding: DatabaseBinding,
             retirement_tx: RetirementSender,
             replacement_gate: Arc<ApiReplacementGate>,
         ) -> Result<Arc<ValidatedApiDbClient>, StorageError> {
             self.api_open_started.send(()).expect("API-open observer");
             self.api_open_permit.acquire().await.expect("API-open gate").forget();
-            open_api_generation(database_url, retirement_tx, replacement_gate).await
+            open_api_generation(database_url, binding, retirement_tx, replacement_gate).await
         }
     }
 
@@ -2920,6 +2924,7 @@ mod tests {
         async fn open_api(
             &self,
             _database_url: String,
+            _binding: DatabaseBinding,
             _retirement_tx: RetirementSender,
             _replacement_gate: Arc<ApiReplacementGate>,
         ) -> Result<Arc<ValidatedApiDbClient>, StorageError> {

@@ -7,6 +7,7 @@ use std::{
 };
 
 use kaspa_consensus_core::network::NetworkId;
+use kgi_api_model::projection::{GraphViewSeedOutcome, GraphViewSeedRequest};
 use kgi_core::timing::Timing;
 use kgi_model::{
     block::{BlockHash, BlockPresence, CompactId, MaterializedSyncAnchor, ValidatedNodeBlock},
@@ -32,7 +33,6 @@ use crate::cache::CachedMaterializedBlock;
 mod block_rows;
 mod interning;
 mod materialization;
-#[allow(dead_code, reason = "completed by the graph projection materialization step")]
 mod projection;
 pub(crate) mod rebuild;
 mod vspc;
@@ -372,6 +372,7 @@ impl std::fmt::Debug for ValidatedDbClient {
 /// Read-only API database capability bound to one validated pool generation.
 pub struct ValidatedApiDbClient {
     runtime: GenerationRuntime<Self>,
+    binding: DatabaseBinding,
     replacement_gate: Arc<ApiReplacementGate>,
     admission: StdMutex<()>,
     validity: watch::Sender<bool>,
@@ -384,10 +385,16 @@ impl GenerationKind for ValidatedApiDbClient {
 }
 
 impl ValidatedApiDbClient {
-    pub(crate) fn new(pool: PgPool, retirement_tx: RetirementSender, replacement_gate: Arc<ApiReplacementGate>) -> Arc<Self> {
+    pub(crate) fn new(
+        pool: PgPool,
+        binding: DatabaseBinding,
+        retirement_tx: RetirementSender,
+        replacement_gate: Arc<ApiReplacementGate>,
+    ) -> Arc<Self> {
         let (validity, _) = watch::channel(true);
         Arc::new_cyclic(|self_weak| Self {
             runtime: GenerationRuntime::new(pool, retirement_tx, self_weak.clone()),
+            binding,
             replacement_gate,
             admission: StdMutex::new(()),
             validity,
@@ -400,9 +407,13 @@ impl ValidatedApiDbClient {
         self.runtime.is_valid()
     }
 
-    #[allow(dead_code, reason = "used by API projection operations in the persistence increment")]
     pub(crate) const fn pool(&self) -> &PgPool {
         self.runtime.pool()
+    }
+
+    /// Loads one coherent database-backed graph projection and its alignment metadata.
+    pub async fn load_graph_view_seed(&self, request: GraphViewSeedRequest) -> Result<GraphViewSeedOutcome, ApiReadError> {
+        self.run_read_operation(|| projection::load(self.pool(), self.binding.genesis_hash(), request)).await
     }
 
     #[allow(dead_code, reason = "used by the permanent service lifecycle")]
@@ -442,7 +453,6 @@ impl ValidatedApiDbClient {
         }
     }
 
-    #[allow(dead_code, reason = "used by load_graph_view_seed in the next projection step")]
     async fn run_read_operation<T, F, Fut>(&self, operation: F) -> Result<T, ApiReadError>
     where
         F: FnOnce() -> Fut,
@@ -478,7 +488,6 @@ impl ValidatedApiDbClient {
         }
     }
 
-    #[allow(dead_code, reason = "used by load_graph_view_seed in the next projection step")]
     async fn finish_generation_loss<T>(&self) -> Result<T, ApiReadError> {
         self.runtime.request_operation_retirement().await.map_err(|_| ApiReadError::QueryFailed)?;
         Err(ApiReadError::GenerationLost)
@@ -500,7 +509,11 @@ impl ValidatedApiDbClient {
 
 impl std::fmt::Debug for ValidatedApiDbClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ValidatedApiDbClient").field("valid", &self.is_valid()).finish_non_exhaustive()
+        formatter
+            .debug_struct("ValidatedApiDbClient")
+            .field("binding", &self.binding)
+            .field("valid", &self.is_valid())
+            .finish_non_exhaustive()
     }
 }
 
@@ -532,13 +545,17 @@ mod tests {
         BlockHash::from_bytes([byte; 32])
     }
 
+    fn binding() -> DatabaseBinding {
+        DatabaseBinding::new(NetworkId::new(NetworkType::Mainnet), hash(0))
+    }
+
     #[tokio::test]
     async fn api_read_lease_waits_behind_replacement_and_retirement_wakes_the_waiter() {
         let pool =
             PgPoolOptions::new().connect_lazy("postgresql://postgres@localhost/kgi").expect("lazy PostgreSQL pool configuration");
         let (retirement_tx, _retirements) = retirement_channel();
         let gate = ApiReplacementGate::new();
-        let client = ValidatedApiDbClient::new(pool, retirement_tx, gate.clone());
+        let client = ValidatedApiDbClient::new(pool, binding(), retirement_tx, gate.clone());
         let attempt = gate.begin_replacement().expect("replacement closes admission");
         let exclusive =
             attempt.acquire_exclusive(&Timing::production()).await.expect("empty active set establishes replacement exclusion");
@@ -576,7 +593,7 @@ mod tests {
         let pool =
             PgPoolOptions::new().connect_lazy("postgresql://postgres@localhost/kgi").expect("lazy PostgreSQL pool configuration");
         let (retirement_tx, mut retirements) = retirement_channel();
-        let client = ValidatedApiDbClient::new(pool, retirement_tx, ApiReplacementGate::new());
+        let client = ValidatedApiDbClient::new(pool, binding(), retirement_tx, ApiReplacementGate::new());
 
         assert_eq!(client.run_read_operation(|| async { Ok::<_, ApiReadError>(7_u8) }).await, Ok(7));
         assert_eq!(
@@ -596,7 +613,7 @@ mod tests {
         let pool =
             PgPoolOptions::new().connect_lazy("postgresql://postgres@localhost/kgi").expect("lazy PostgreSQL pool configuration");
         let (retirement_tx, mut retirements) = retirement_channel();
-        let client = ValidatedApiDbClient::new(pool, retirement_tx, ApiReplacementGate::new());
+        let client = ValidatedApiDbClient::new(pool, binding(), retirement_tx, ApiReplacementGate::new());
         let operation_client = client.clone();
         let operation =
             tokio::spawn(
@@ -622,7 +639,7 @@ mod tests {
         let pool =
             PgPoolOptions::new().connect_lazy("postgresql://postgres@localhost/kgi").expect("lazy PostgreSQL pool configuration");
         let (retirement_tx, mut retirements) = retirement_channel();
-        let client = ValidatedApiDbClient::new(pool, retirement_tx, ApiReplacementGate::new());
+        let client = ValidatedApiDbClient::new(pool, binding(), retirement_tx, ApiReplacementGate::new());
         let started = Arc::new(AtomicBool::new(false));
         let operation_started = started.clone();
         assert!(client.retire());
@@ -655,7 +672,7 @@ mod tests {
             PgPoolOptions::new().connect_lazy("postgresql://postgres@localhost/kgi").expect("lazy PostgreSQL pool configuration");
         let (retirement_tx, mut retirements) = retirement_channel();
         let gate = ApiReplacementGate::new();
-        let client = ValidatedApiDbClient::new(pool, retirement_tx, gate.clone());
+        let client = ValidatedApiDbClient::new(pool, binding(), retirement_tx, gate.clone());
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel::<()>();
         let operation_client = client.clone();
