@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 15 October 2026.
+Updated 16 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -228,5 +228,27 @@ Publication, database projection reads, encoding, transport, and ApiService
 runtime behavior remain in the separately numbered increments recorded in
 [the implementation sequence](sequence.md#active-increment-6-canonical-graph-model).
 Completion validation passed workspace formatting, Cargo check, 337/337
+Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
+with warnings denied, and `git diff --check`.
+
+Implementation increment 7 is implemented: `kgi-api-model` now contains the
+API-owned projection request, anchor, resolution, unavailability, and seed
+values, while `kgi-storage` provides the generation-bound
+`ValidatedApiDbClient::load_graph_view_seed` operation. The storage projection
+resolves Head, level, block-hash, and DAA-floor scopes and constructs complete
+graph seeds inside one stable read-only PostgreSQL snapshot. Its database
+reads include nominal blocks, canonical relationships, crossing edges and
+their external endpoint levels, selected-parent indexes, current projection
+fields, the materialized-ID alignment cut, and committed VSPC sink. API reads
+participate in the replacement gate and preserve exact-generation retirement
+semantics without coupling the processing generation to API-pool failure.
+PostgreSQL integration coverage exercises the complete maximum-depth Head,
+short retained ranges, every anchor and boundary shift, stable-snapshot
+visibility, zero-, one-, and two-endpoint crossing edges, sentinel exclusion,
+ordinary misses, incoherent projections, cancellation, query and connection
+failure, exact API-generation retirement, and processing/API pool isolation.
+Publication construction and request serving remain in the later increments
+recorded in [the implementation sequence](sequence.md#remaining-reviewable-increments).
+Completion validation passed workspace formatting, Cargo check, 357/357
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.
