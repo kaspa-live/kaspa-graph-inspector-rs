@@ -460,7 +460,7 @@ mod tests {
             assert_eq!(core.view.block(&hash(2)).map(|block| block.is_in_vspc), Some(false));
             assert_eq!(core.history.current_revision_id(), 1);
             assert_eq!(core.history.len(), 1);
-            assert_eq!(core.history.entries().next().expect("block entry").estimated_raw_bytes(), 846);
+            assert_eq!(core.history.entries().next().expect("block entry").estimated_raw_bytes(), 828);
         }
 
         let vspc = vspc_added(2, Some(200));

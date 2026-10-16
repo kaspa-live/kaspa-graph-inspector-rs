@@ -779,13 +779,13 @@ weights:
 
 | Contribution | Estimated bytes |
 |---|---:|
-| Delta entry and amortized batch framing | 232 |
+| Delta entry and amortized batch framing | 230 |
 | Each distinct emitted hash dictionary entry | 68 |
-| Block upsert excluding relationship array items | 240 |
+| Block upsert excluding relationship array items | 236 |
 | Each direct-parent or merge-set `HashRef` item in a block upsert | 6 |
-| Edge upsert | 160 |
-| Level installation (`after = Some`) | 72 |
-| Level removal (`after = None`) | 40 |
+| Edge upsert | 152 |
+| Level installation (`after = Some`) | 68 |
+| Level removal (`after = None`) | 38 |
 | VSPC-membership mutation | 32 |
 | Color mutation | 25 |
 | Block or edge removal | 0 |
@@ -802,6 +802,13 @@ removals neither contribute structure nor enter the set because the settled
 delta serializer omits them. Level and field removals remain charged because
 those mutations stay on the wire. Level installation and removal use separate
 weights because the latter emits `null` instead of a complete `LevelDto`.
+
+The bounded graph level, slot, and level-size fields are JSON numbers. Relative
+to their earlier decimal-string representation, the entry framing excludes one
+pair of quotes for `high_level`, each block excludes two pairs for its
+coordinate, each edge excludes four pairs for its endpoint coordinates, and a
+level mutation excludes one or two pairs according to whether it removes or
+installs a level.
 
 The estimator remains additive across history entries. Consequently, a hash
 repeated by different entries can still be charged once per entry even though
