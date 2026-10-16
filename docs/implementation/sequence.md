@@ -127,7 +127,7 @@ and HTTP serving belong to later increments.
 Execute increment 8 as these ordered points:
 
 1. Record the private publication-module boundary, direct crate dependencies,
-   publication-identity generation, and the deferred cheap history-cost
+   publication-identity generation, and the concrete cheap history-cost
    estimator weights used by this first dependent implementation.
 2. Add the publication state, image, and kernel owner; initialize it from an
    already constructed Head `GraphView` and its matching `GraphHistory`, and

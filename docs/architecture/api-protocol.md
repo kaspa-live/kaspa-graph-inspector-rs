@@ -1216,8 +1216,9 @@ When appending a canonical Head delta, ApiService supplies its cheap
 `estimated_raw_bytes` from mutation counts and approximate field sizes for the
 cacheable wire representation. The estimate discounts the block and edge
 removals that the serializer will omit, is additive across entries, and
-performs no graph encoding or compression. Exact weights remain deferred; the
-estimate selects a candidate and never authorizes an oversized response.
+performs no graph encoding or compression. The concrete weights are recorded
+as a durable [implementation choice](../implementation/choices.md#canonical-delta-raw-byte-estimate);
+the estimate selects a candidate and never authorizes an oversized response.
 
 Once the elected builder selects the cache destination, that destination is
 fixed and does not advance with Head while the job is running. Preserve the
@@ -1741,9 +1742,6 @@ publication stops advancing, so its eligible entries remain usable and its
 missing tiers can still be built on demand while the publication remains
 addressable. Publication replacement releases the complete tier cache with
 the containing publication under the publication-lifetime contract.
-
-The estimator weights remain deferred in the
-[decision register](../decisions/deferred.md).
 
 ## Anchored graph windows — settled
 
