@@ -254,7 +254,7 @@ delta_batch_revision_span
 replay_batches_queued
 replay_entries_queued
 applied_revision_lag
-applied_time_lag_us
+applied_time_lag_ms
 replay_acceleration_ratio
 replay_deadline_misses
 fixed_level_lookup_requests

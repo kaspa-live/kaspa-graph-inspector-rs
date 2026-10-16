@@ -181,7 +181,7 @@ struct GraphView {
     max_depth: u64,
     extent: LevelExtent,
     current_revision_id: u64,
-    current_revision_timestamp_us: u64,
+    current_revision_timestamp_ms: u64,
     tracking_policy: TrackingPolicy,
     levels: LevelSet, // each retained entry also keeps derived usage_count
     blocks: BlockSet,
@@ -198,7 +198,7 @@ impl GraphView {
 struct GraphDelta {
     from_revision_id: u64,
     to_revision_id: u64,
-    revision_timestamp_us: u64,
+    revision_timestamp_ms: u64,
     high_level: u64,
     block_changes: HashMap<BlockHash, Option<GraphBlock>>,
     edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
@@ -225,7 +225,7 @@ impl GraphDelta {
     pub fn new(
         from_revision_id: u64,
         to_revision_id: u64,
-        revision_timestamp_us: u64,
+        revision_timestamp_ms: u64,
         high_level: u64,
         block_changes: HashMap<BlockHash, Option<GraphBlock>>,
         edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
@@ -236,7 +236,7 @@ impl GraphDelta {
 
     pub fn from_revision_id(&self) -> u64;
     pub fn to_revision_id(&self) -> u64;
-    pub fn revision_timestamp_us(&self) -> u64;
+    pub fn revision_timestamp_ms(&self) -> u64;
 }
 ```
 
@@ -307,7 +307,7 @@ returns a view with:
 extent              = requested extent
 max_depth           = extent.depth()
 current_revision_id = source.current_revision_id
-current_revision_timestamp_us = source.current_revision_timestamp_us
+current_revision_timestamp_ms = source.current_revision_timestamp_ms
 tracking_policy     = Frozen
 ```
 
@@ -485,10 +485,10 @@ Direct view mutation produces one-step deltas, and composition constructs its
 results through the same checked constructor. Delta application and history
 append trust these construction invariants and do not check them again.
 
-`revision_timestamp_us` is the timestamp of the target revision. The graph
+`revision_timestamp_ms` is the timestamp of the target revision. The graph
 model treats it as an opaque, nondecreasing value within one lineage. The
 [publication owner](api-publication.md#publication-and-seed-values--settled)
-supplies its publication-local clock domain. Microsecond quantization can give
+supplies its publication-local clock domain. Millisecond quantization can give
 adjacent revisions equal timestamps. Timestamp values from different
 publications are never compared.
 
@@ -535,7 +535,7 @@ extent     = LevelExtent::new(low_level, high_level)
 
 A Fixed view retains its nominal extent. Every accepted view then sets
 `current_revision_id = delta.to_revision_id` and
-`current_revision_timestamp_us = delta.revision_timestamp_us`. An error leaves
+`current_revision_timestamp_ms = delta.revision_timestamp_ms`. An error leaves
 the complete view, revision, and timestamp unchanged. Direct application of a
 Head-generated delta remains
 prohibited for internal Fixed; only a delta from the same Fixed lineage has the
@@ -805,7 +805,7 @@ compose(Delta(a,b), Delta(b,c)) = Delta(a,c)
 
 Composition requires exact equality between the left `to` and right `from`
 revisions. The result uses `a` as `from`, `c` as `to`, and delta `c`'s
-`high_level` and `revision_timestamp_us`. Composition is associative by
+`high_level` and `revision_timestamp_ms`. Composition is associative by
 graph-state effect. A composed delta must have the same graph-state effect as
 applying its constituent deltas in order. It is one replay unit whose timestamp
 therefore represents its final target revision; discarded internal timestamps

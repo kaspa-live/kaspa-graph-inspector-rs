@@ -328,7 +328,7 @@ The Head snapshot response is:
 struct HeadSnapshotResponseDto {
     publication_id: u64,
     revision: u64,
-    revision_timestamp_us: u64,
+    revision_timestamp_ms: u64,
     low_level: u64,
     high_level: u64,
     graph: GraphDataDto,
@@ -338,7 +338,7 @@ struct HeadSnapshotResponseDto {
 `low_level..=high_level` is the actual nominal block extent and can be shorter
 than the selected cache tier near the pruning-point boundary.
 `(publication_id, revision)` is the canonical delta cursor.
-`revision_timestamp_us` is that revision's publication-local monotonic
+`revision_timestamp_ms` is that revision's publication-local monotonic
 timestamp and initializes browser replay timing. The request's
 `target_depth`, selected cache tier, publication state, `TrackingPolicy`, and
 weak ETag remain outside the body.
@@ -350,7 +350,7 @@ enum GraphWindowSourceDto {
     Head {
         publication_id: u64,
         revision: u64,
-        revision_timestamp_us: u64,
+        revision_timestamp_ms: u64,
         head_high_level: u64,
     },
     Database,
@@ -367,7 +367,7 @@ struct GraphWindowResponseDto {
 JSON object shapes are:
 
 ```json
-{"type":"head","publication_id":"42","revision":"123","revision_timestamp_us":"456789","head_high_level":"900"}
+{"type":"head","publication_id":"42","revision":"123","revision_timestamp_ms":"456789","head_high_level":"900"}
 {"type":"database"}
 ```
 
@@ -452,7 +452,7 @@ struct FieldMutationDto<T> {
 struct GraphDeltaEntryDto {
     from_revision_id: u64,
     to_revision_id: u64,
-    revision_timestamp_us: u64,
+    revision_timestamp_ms: u64,
     high_level: u64,
 
     block_upserts: Vec<GraphBlockDto>,
@@ -477,7 +477,7 @@ repeat across independent serializations of the same meaning.
 
 Each entry represents one selected `GraphHistoryEntry`. It is normally an
 original one-step delta and may instead be an already composed, indivisible
-history entry. Its `revision_timestamp_us` is the publication-local timestamp
+history entry. Its `revision_timestamp_ms` is the publication-local timestamp
 of `to_revision_id`; a composed entry therefore carries its final
 constituent's timestamp. Entries are ordered and gapless. A batch never splits
 an entry or reconstructs internal boundaries discarded by earlier history
@@ -511,7 +511,7 @@ header plus these exact delta headers:
 ```http
 KGI-Publication-Id: P
 KGI-Head-Revision-Id: H
-KGI-Head-Revision-Timestamp-Us: HT
+KGI-Head-Revision-Timestamp-Ms: HT
 KGI-Delta-Outcome: complete | prefix | up-to-date | wait-for-wakeup
 KGI-Delta-Continuation: head | continue | wakeup
 ```
@@ -1654,7 +1654,7 @@ shape:
 struct CachedHeadSnapshot {
     depth: u64,
     revision: u64,
-    revision_timestamp_us: u64,
+    revision_timestamp_ms: u64,
     low_level: u64,
     high_level: u64,
     uncompressed_json_bytes: u64,

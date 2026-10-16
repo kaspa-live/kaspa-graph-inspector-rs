@@ -1008,9 +1008,11 @@ rejects equal and backward revision endpoints, exposes the accepted endpoints
 and target timestamp through read-only accessors, and offers no revision
 mutation path. Revision zero has timestamp zero. Direct revisions receive the
 publication-local elapsed timestamp sampled for their creation; adjacent
-microsecond-quantized revisions may have equal timestamps. Composition adopts
-the final constituent's timestamp. Replace a publication and verify neither
-server nor Web compares the two publication-local timestamp domains.
+millisecond-quantized revisions may have equal timestamps. Composition adopts
+the final constituent's timestamp. Sample immediately below and at a whole
+millisecond boundary to verify truncation to elapsed whole milliseconds.
+Replace a publication and verify neither server nor Web compares the two
+publication-local timestamp domains.
 
 Exercise the publication-owned writer gate by pausing between image publication
 and history append. A concurrent image capture may observe `n+1`, a history
@@ -1237,7 +1239,7 @@ Publication replacement, explicit refresh, view destruction, and shutdown
 cancel timers and release every batch.
 
 Adopt `KGI-Head-Revision-Id` and
-`KGI-Head-Revision-Timestamp-Us` only as one coherent HTTP pair. Calculate
+`KGI-Head-Revision-Timestamp-Ms` only as one coherent HTTP pair. Calculate
 revision and time lag from the last applied entry rather than the first queued
 or last received entry. Do not combine an SSE revision with an older HTTP
 timestamp. Exercise the required observability for response entry count and

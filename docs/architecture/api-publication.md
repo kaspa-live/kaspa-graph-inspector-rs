@@ -84,9 +84,11 @@ Each construction candidate also receives a fresh monotonic clock origin when
 its construction begins. The origin moves into `GraphPublication` if that
 candidate reaches `Prewarming`; it is never exposed directly. Revision zero
 has timestamp zero. Every later successful graph mutation records the elapsed
-whole microseconds from that origin as its target revision timestamp. Values
-are nondecreasing and adjacent revisions may have equal timestamps after
-quantization. A replacement publication establishes a new clock domain, so
+whole milliseconds from that origin as its target revision timestamp. This
+quantization matches browser replay and timer granularity; sub-millisecond
+distinctions have no graph semantics. Values are nondecreasing and adjacent
+revisions may have equal timestamps after quantization. A replacement
+publication establishes a new clock domain, so
 timestamps are comparable only under one `publication_id`. The
 [graph owner](api-graph.md#revision-and-history-advancement--settled) owns the
 timestamp carried by `GraphView` and `GraphDelta` and its composition rule.
@@ -170,7 +172,7 @@ For an original `BlockCommitted` or `VspcCommitted` update, the runtime:
 1. acquires `mutation` and requires the starting image and history revisions to
    be equal;
 2. acquires the image write lock and applies the original update; when it
-   produces a revision, it samples elapsed publication-local microseconds at
+   produces a revision, it samples elapsed publication-local milliseconds at
    delta creation and publishes the complete resulting view revision and
    timestamp;
 3. releases the image lock;
@@ -211,7 +213,7 @@ struct GraphDeltaTargetCapture {
     publication_id: u64,
     state: GraphPublicationState,
     revision: u64,
-    revision_timestamp_us: u64,
+    revision_timestamp_ms: u64,
     high_level: u64,
 }
 
