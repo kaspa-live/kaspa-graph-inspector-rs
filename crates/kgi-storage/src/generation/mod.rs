@@ -32,6 +32,8 @@ use crate::cache::CachedMaterializedBlock;
 mod block_rows;
 mod interning;
 mod materialization;
+#[allow(dead_code, reason = "completed by the graph projection materialization step")]
+mod projection;
 pub(crate) mod rebuild;
 mod vspc;
 
