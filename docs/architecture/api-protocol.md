@@ -79,12 +79,16 @@ Every property declared by the selected response shape is present. An
 `null`; optional properties are not omitted. Properties excluded by a selected
 discriminator variant are not part of that variant's shape.
 
-Every public `u64`, including revisions, levels, scores, timestamps, and
-publication IDs, is an unsigned decimal JSON string so browsers preserve its
-complete value. Ordered semantic collections, including direct parents and
-blue and red merge sets, preserve their order. Sets, maps, and their serialized
-collection forms remain unordered unless an endpoint-specific contract states
-otherwise; clients must not derive meaning from their traversal order.
+Every public `u64`, including revisions, scores, timestamps, and publication
+IDs, is an unsigned decimal JSON string so browsers preserve its complete
+value. Graph levels and depths are `u32`; coordinate slots and level sizes are
+`u16`. When these bounded values and other public `u32` and `u16` fields appear
+in JSON, they are numbers and are exact in browsers. Depth query parameters use
+the common unsigned decimal request text and resolve to `u32`. Ordered semantic
+collections, including direct parents and blue and red merge sets, preserve
+their order. Sets, maps, and their serialized collection forms remain unordered
+unless an endpoint-specific contract states otherwise; clients must not derive
+meaning from their traversal order.
 
 JSON is the initial v2 graph format because it requires no browser codec,
 schema generator, or second wire toolchain and lets implementation begin from
@@ -167,6 +171,9 @@ CACHED_WINDOW_REFRESH_LEVEL_DISTANCE = 40
 CACHED_WINDOW_MAX_LEVEL_DISTANCE = 100
 ```
 
+These depth and level-distance constants and their derived arithmetic use
+`u32`.
+
 With the graph-owned `MAX_CACHE_DEPTH = 1000`, the public limits leave 250
 complete levels between the oldest eligible cached-delta source and the oldest
 level of the largest client window. Anchored-window requests cap positive
@@ -244,14 +251,19 @@ The serialized graph subvalues are:
 
 ```rust
 struct LevelDto {
-    level: u64,
-    size: u64,
+    level: u32,
+    size: u16,
     daa_score: Option<u64>,
+}
+
+struct BlockCoordinateDto {
+    level: u32,
+    slot: u16,
 }
 
 struct GraphBlockDto {
     hash: HashRef,
-    coordinate: BlockCoordinate,
+    coordinate: BlockCoordinateDto,
     timestamp: u64,
     daa_score: u64,
     selected_parent_index: Option<u32>,
@@ -269,8 +281,8 @@ struct EdgeIdDto {
 
 struct GraphEdgeDto {
     id: EdgeIdDto,
-    parent_coordinate: BlockCoordinate,
-    child_coordinate: BlockCoordinate,
+    parent_coordinate: BlockCoordinateDto,
+    child_coordinate: BlockCoordinateDto,
 }
 ```
 
@@ -278,8 +290,13 @@ struct GraphEdgeDto {
 is unrelated to `HashRef` and is JSON `null` for Genesis. `LevelDto.daa_score`
 is likewise JSON `null` when the semantic value is absent. Direct parents and
 the blue and red merge sets preserve their graph-owned semantic order.
-Canonical and serialized graph values retain the full `u64` level, slot,
-level-size, timestamp, and score domains.
+Canonical and serialized graph values retain the complete graph-owned `u32`
+level, bounded `u16` slot and level-size, and `u64` timestamp and score domains.
+`BlockCoordinateDto.slot = u16::MAX` is invalid because the shared coordinate
+domain reserves that value so a full level's positive size remains `u16`.
+Every serialized level and coordinate level is positive, and every
+`LevelDto.size` is in `1..=MAX_LEVEL_SIZE`; zero or an out-of-range value is
+invalid input to the Web decoder.
 
 `BlockColor` uses this exact numeric JSON representation everywhere it appears
 in a graph body:
@@ -329,8 +346,8 @@ struct HeadSnapshotResponseDto {
     publication_id: u64,
     revision: u64,
     revision_timestamp_ms: u64,
-    low_level: u64,
-    high_level: u64,
+    low_level: u32,
+    high_level: u32,
     graph: GraphDataDto,
 }
 ```
@@ -351,7 +368,7 @@ enum GraphWindowSourceDto {
         publication_id: u64,
         revision: u64,
         revision_timestamp_ms: u64,
-        head_high_level: u64,
+        head_high_level: u32,
     },
     Database,
 }
@@ -367,7 +384,7 @@ struct GraphWindowResponseDto {
 JSON object shapes are:
 
 ```json
-{"type":"head","publication_id":"42","revision":"123","revision_timestamp_ms":"456789","head_high_level":"900"}
+{"type":"head","publication_id":"42","revision":"123","revision_timestamp_ms":"456789","head_high_level":900}
 {"type":"database"}
 ```
 
@@ -440,7 +457,7 @@ by a client to apply that replay unit:
 
 ```rust
 struct LevelMutationDto {
-    level: u64,
+    level: u32,
     value: Option<Level>,
 }
 
@@ -453,7 +470,7 @@ struct GraphDeltaEntryDto {
     from_revision_id: u64,
     to_revision_id: u64,
     revision_timestamp_ms: u64,
-    high_level: u64,
+    high_level: u32,
 
     block_upserts: Vec<GraphBlockDto>,
     edge_upserts: Vec<GraphEdgeDto>,
@@ -678,7 +695,7 @@ struct ApiErrorDto {
 enum ApiErrorDetailsDto {
     WindowAnchorUnavailable(WindowAnchorUnavailableDetailsDto),
     HeadLevelUnavailable {
-        requested_level: u64,
+        requested_level: u32,
     },
     FreshViewRequired {
         reason: FreshViewReason,
@@ -691,7 +708,7 @@ enum ApiErrorDetailsDto {
 
 enum WindowAnchorUnavailableDetailsDto {
     LevelNotRetained {
-        requested_level: u64,
+        requested_level: u32,
     },
     BlockNotMaterialized {
         requested_hash: BlockHash,
@@ -781,7 +798,7 @@ enum DeltaContinuation {
 }
 
 struct HeadLevelValue {
-    level: u64,
+    level: u32,
     value: Level,
 }
 
@@ -792,20 +809,20 @@ enum HeadLevelLookupOutcome {
         levels: Arc<[HeadLevelValue]>,
     },
     LevelUnavailable {
-        requested_level: u64,
+        requested_level: u32,
     },
     FreshViewRequired(FreshViewReason),
 }
 
 enum GraphWindowAnchor {
-    Level(u64),
+    Level(u32),
     BlockHash(BlockHash),
     DaaScore(u64),
 }
 
 enum GraphWindowAnchorUnavailable {
     LevelNotRetained {
-        requested_level: u64,
+        requested_level: u32,
     },
     BlockNotMaterialized {
         requested_hash: BlockHash,
@@ -816,9 +833,9 @@ enum GraphWindowAnchorUnavailable {
 }
 
 struct GraphWindowResolution {
-    resolved_level: u64,
-    effective_start_level: u64,
-    effective_end_level: u64,
+    resolved_level: u32,
+    effective_start_level: u32,
+    effective_end_level: u32,
 }
 
 struct SystemStatus {
@@ -1387,8 +1404,8 @@ MAX_HEAD_LEVELS_PER_REQUEST = 64
 `publication_id` and at least one `level` value are required. `level` is
 an explicitly repeated collection parameter rather than a scalar, so repeated
 occurrences are valid and form a set; repeated values have no additional
-meaning. Every value must be a positive unsigned level. Other malformed,
-unknown, or additional parameters follow the
+meaning. Every value must be a positive `u32` level. Other malformed, unknown,
+out-of-range, or additional parameters follow the
 [common request rules](#common-http-conventions--settled). The endpoint accepts
 no graph revision, anchor, depth, or `client_id`. Deduplicate repeated values
 before applying `MAX_HEAD_LEVELS_PER_REQUEST`. Exceeding it is invalid request
@@ -1586,7 +1603,7 @@ completion transport, and task execution. The canonical cached delta value is:
 struct CachedDelta {
     from_revision_id: u64,
     to_revision_id: u64,
-    high_level: u64,
+    high_level: u32,
     uncompressed_json_bytes: u64,
     gzip_body: Bytes,
 }
@@ -1653,11 +1670,11 @@ shape:
 
 ```rust
 struct CachedHeadSnapshot {
-    depth: u64,
+    depth: u32,
     revision: u64,
     revision_timestamp_ms: u64,
-    low_level: u64,
-    high_level: u64,
+    low_level: u32,
+    high_level: u32,
     uncompressed_json_bytes: u64,
     etag: HeadEtag,
     gzip_body: Bytes,
@@ -1755,11 +1772,12 @@ GET /api/v1/graph/window?max_depth=N&daa_score=Q
 ```
 
 `max_depth` and exactly one of `level`, `block_hash`, or `daa_score` are
-required. Zero or multiple anchor parameters, `level = 0`, an undecodable
-block hash, and a DAA score outside `0..=MAX_DAA_SCORE` return `400 Bad
-Request` before storage access. A positive `max_depth` is capped to
-`MAX_WINDOW_DEPTH`; zero is invalid. Other malformed, duplicate, or additional
-parameters follow the [common request rules](#common-http-conventions--settled).
+required. Zero or multiple anchor parameters, a level outside
+`1..=u32::MAX`, an undecodable block hash, and a DAA score outside
+`0..=MAX_DAA_SCORE` return `400 Bad Request` before storage access. A positive
+`max_depth` is capped to `MAX_WINDOW_DEPTH`; zero is invalid. Other malformed,
+duplicate, or additional parameters follow the
+[common request rules](#common-http-conventions--settled).
 The endpoint accepts no publication cursor, revision, `client_id`, or source
 selection parameter.
 

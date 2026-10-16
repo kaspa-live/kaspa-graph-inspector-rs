@@ -45,13 +45,13 @@ enum GraphViewSeedRequest {
     HeadPublication,
     AnchoredWindow {
         anchor: GraphWindowAnchor,
-        max_depth: u64,
+        max_depth: u32,
     },
 }
 
 struct GraphViewSeed {
     resolution: GraphWindowResolution,
-    max_depth: u64,
+    max_depth: u32,
     levels: LevelSet,
     blocks: BlockSet,
     edges: EdgeSet,
@@ -225,7 +225,7 @@ struct GraphDeltaTargetCapture {
     state: GraphPublicationState,
     revision: u64,
     revision_timestamp_ms: u64,
-    high_level: u64,
+    high_level: u32,
 }
 
 struct GraphLevelCapture {
@@ -437,12 +437,13 @@ owns the tier values, distance rules, and public selection behavior.
 
 An `Active` publication has no snapshot sink, alignment state, or database
 matching duty. Each ordinary graph update goes directly through
-`GraphView::apply`. `None` produces no revision. `Some(delta)` first publishes
-the new complete view revision and then appends and publishes the corresponding
-complete history revision. Ordinary graph updates, Live, revision advancement,
-and retained head-window movement keep the same publication ID. Only a later
-session's `reset` call or a gap or failure that prevents the Active projection from
-advancing leads to a replacement publication. API database-generation change
+`GraphView::apply`. `None` produces no revision. `Some(delta)` appends the
+corresponding complete history revision and publishes the new view and history
+together through the atomic publication core. Ordinary graph updates, Live,
+revision advancement, and retained head-window movement keep the same
+publication ID. Only a later session's `reset` call or a gap or failure that
+prevents the Active projection from advancing leads to a replacement
+publication. API database-generation change
 by itself does not invalidate Active; the
 [API database binding](api-service.md#api-database-generation-binding--settled)
 controls public database-backed reads independently, while

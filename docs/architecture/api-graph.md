@@ -34,9 +34,9 @@ the processor's source/destination continuity check. The settled
 owns how the removed/added vectors and retained block metadata update the view
 and produce a delta.
 
-`MAX_CACHE_DEPTH = 1000` complete levels. No arbitrary maximum block count may
-truncate a retained level: **every** block and relevant edge endpoint for each
-cached level is available.
+`MAX_CACHE_DEPTH: u32 = 1000` complete levels. No arbitrary maximum block count
+may truncate a retained level: **every** block and relevant edge endpoint for
+each cached level is available.
 
 The [graph-view contract](#graph-values-views-revisions-and-history--settled)
 owns edge representation, window inclusion, endpoint retention, and lifetime.
@@ -77,8 +77,8 @@ enum GraphDeltaCreationError {
 
 enum LevelExtentError {
     InvalidBounds {
-        low_level: u64,
-        high_level: u64,
+        low_level: u32,
+        high_level: u32,
     },
 }
 
@@ -121,29 +121,29 @@ enum GraphViewExtractError {
 }
 
 struct LevelExtent {
-    low_level: u64,
-    high_level: u64,
+    low_level: u32,
+    high_level: u32,
 }
 
 impl LevelExtent {
-    pub fn new(low_level: u64, high_level: u64) -> Result<Self, LevelExtentError>;
+    pub fn new(low_level: u32, high_level: u32) -> Result<Self, LevelExtentError>;
 
-    pub fn low_level(&self) -> u64;
-    pub fn high_level(&self) -> u64;
-    pub fn depth(&self) -> u64;
-    pub fn contains_level(&self, level: u64) -> bool;
+    pub fn low_level(&self) -> u32;
+    pub fn high_level(&self) -> u32;
+    pub fn depth(&self) -> u32;
+    pub fn contains_level(&self, level: u32) -> bool;
     pub fn contains_extent(&self, other: LevelExtent) -> bool;
     pub fn overlaps(&self, other: LevelExtent) -> bool;
-    pub fn intersects_span(&self, parent_level: u64, child_level: u64) -> bool;
+    pub fn intersects_span(&self, parent_level: u32, child_level: u32) -> bool;
 }
 
 struct Level {
-    size: u64,
+    size: u16,
     daa_score: Option<u64>,
 }
 
 struct LevelChange {
-    level: u64,
+    level: u32,
     before: Option<Level>,
     after: Option<Level>,
 }
@@ -178,7 +178,7 @@ struct GraphBlock {
 }
 
 struct GraphView {
-    max_depth: u64,
+    max_depth: u32,
     extent: LevelExtent,
     current_revision_id: u64,
     current_revision_timestamp_ms: u64,
@@ -189,17 +189,17 @@ struct GraphView {
 }
 
 impl GraphView {
-    pub fn max_depth(&self) -> u64;
+    pub fn max_depth(&self) -> u32;
     pub fn extent(&self) -> LevelExtent;
-    pub fn low_level(&self) -> u64;
-    pub fn high_level(&self) -> u64;
+    pub fn low_level(&self) -> u32;
+    pub fn high_level(&self) -> u32;
 }
 
 struct GraphDelta {
     from_revision_id: u64,
     to_revision_id: u64,
     revision_timestamp_ms: u64,
-    high_level: u64,
+    high_level: u32,
     block_changes: HashMap<BlockHash, Option<GraphBlock>>,
     edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
     level_changes: Vec<LevelChange>,
@@ -226,7 +226,7 @@ impl GraphDelta {
         from_revision_id: u64,
         to_revision_id: u64,
         revision_timestamp_ms: u64,
-        high_level: u64,
+        high_level: u32,
         block_changes: HashMap<BlockHash, Option<GraphBlock>>,
         edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
         level_changes: Vec<LevelChange>,
@@ -253,8 +253,8 @@ final color. `GraphBlock.hash` is absent from all three relationship vectors.
 extent. Its fields are private, and `new` is its only raw-bounds constructor.
 Construction succeeds exactly when `1 <= low_level <= high_level`; every other
 pair returns `LevelExtentError::InvalidBounds` with the supplied values. Its
-inclusive depth is `high_level - low_level + 1`, which is representable for
-every valid extent, including `[1, u64::MAX]`.
+inclusive depth is `high_level - low_level + 1`, which is representable as
+`u32` for every valid extent, including `[1, u32::MAX]`.
 
 `contains_level` includes both boundaries. `contains_extent` requires both
 boundaries of the other extent to lie inside this extent. `overlaps` is true
@@ -739,7 +739,7 @@ cap is required or permitted by this design.
 
 ```rust
 impl GraphHistory {
-    fn prune(&mut self, head_low_level: u64);
+    fn prune(&mut self, head_low_level: u32);
 
     fn oldest_available_revision(&self) -> u64;
 

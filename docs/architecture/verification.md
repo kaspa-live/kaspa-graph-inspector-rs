@@ -444,6 +444,15 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
     `i64::MAX`, `i64::MAX + 1`, and `u64::MAX` through the signed `BIGINT`
     bit-pattern encoding; upper-half negative storage values are not
     inconsistent contents.
+    Separately exercise coordinate and level-size bounds: materialized levels
+    `1` and `u32::MAX`, slots `0` and `MAX_LEVEL_SLOT`, and sizes `1` and
+    `MAX_LEVEL_SIZE` round-trip through their SQL representations. SQL rejects
+    level zero, a level above `u32::MAX`, slot `u16::MAX`, size zero, and a size
+    above `MAX_LEVEL_SIZE`. Deriving a child above `u32::MAX` and allocating
+    beyond the maximum level size each panic as internal invariants; the latter
+    leaves the transaction and all persistent state unchanged.
+    `BlockCoordinate::new` accepts `(1, 0)` and
+    `(u32::MAX, MAX_LEVEL_SLOT)` and rejects level zero and slot `u16::MAX`.
 14. Verify the storage-owned
     [processing-cache requirement](storage.md#caches-and-identity-resolution--settled):
     the forward identity, materialized-block metadata, merge-set, and
@@ -1039,7 +1048,7 @@ cannot arise from that public input.
 
 Verify the graph-owned
 [`LevelExtent`](api-graph.md#graph-values-views-revisions-and-history--settled)
-accepts inclusive single-level and `[1, u64::MAX]` extents, computes their
+accepts inclusive single-level and `[1, u32::MAX]` extents, computes their
 depth without overflow, and rejects zero or reversed bounds. Cover inclusive
 boundary behavior for level containment, extent containment, overlap, and edge
 span intersection. Verify every `GraphView` retains one such extent whose
@@ -1340,7 +1349,8 @@ block hashes, exact lowercase booleans, and lowercase kebab-case enums. Reject
 malformed or negative numeric values, duplicate scalar parameters, unknown
 parameters, mutually exclusive selections, and missing required parameters
 with `400 Bad Request`. No rejected request reaches graph construction,
-history selection, or storage.
+history selection, or storage. Level parameters accept `u32::MAX` and reject
+the next integer as outside the graph-level domain.
 
 Verify the common transport DTO rules at the final serialization boundary.
 Keep canonical `GraphView` and `GraphDelta` values intact until that boundary,
@@ -1394,9 +1404,12 @@ vectors, edge endpoints, and VSPC field targets and require one dictionary
 entry per response with consistent local references. Randomize internal
 hash-map iteration and require decoded graph equivalence without requiring
 identical encoded order, dictionary order, or reference numbers. Round-trip
-the complete `u64` domains retained by levels, coordinates, level sizes,
-timestamps, and scores; preserve ordered parent and merge-set vectors and the
-Genesis selected-parent-index absence. A cached delta must not intern a hash
+levels `1` and `u32::MAX`, slots `0` and `MAX_LEVEL_SLOT`, and level sizes `1`
+and `MAX_LEVEL_SIZE` as JSON numbers. Reject zero levels and sizes, slot
+`u16::MAX`, negative values, fractions, and values beyond each bounded domain.
+Round-trip the complete public `u64` timestamp and score domains as decimal
+strings; preserve ordered parent and merge-set vectors and the Genesis
+selected-parent-index absence. A cached delta must not intern a hash
 used only by a serializer-omitted block or edge removal. Serialization adds no
 immutable-value comparison or conflict-validation path.
 

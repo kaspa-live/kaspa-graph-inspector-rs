@@ -382,7 +382,7 @@ struct GraphCache {
 
 struct GraphCacheState {
     delta_slots: HashMap<u64, CacheSlot<CachedDelta>>,
-    head_slots: HashMap<u64, CacheSlot<CachedHeadSnapshot>>,
+    head_slots: HashMap<u32, CacheSlot<CachedHeadSnapshot>>,
     destination_heat: HashMap<u64, u64>,
 }
 

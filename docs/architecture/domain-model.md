@@ -23,6 +23,8 @@ enum BlockColor {
 
 const MAX_DAA_SCORE: u64 = i64::MAX as u64 - 1;
 const MAX_BLUE_SCORE: u64 = i64::MAX as u64;
+const MAX_LEVEL_SIZE: u16 = u16::MAX;
+const MAX_LEVEL_SLOT: u16 = MAX_LEVEL_SIZE - 1;
 
 struct ValidatedNodeBlock {
     hash: BlockHash,
@@ -55,8 +57,12 @@ struct VspcPoint {
 }
 
 struct BlockCoordinate {
-    level: u64,
-    slot: u64,
+    level: u32,
+    slot: u16,
+}
+
+impl BlockCoordinate {
+    fn new(level: u32, slot: u16) -> Option<Self>;
 }
 
 struct MaterializedSyncAnchor {
@@ -147,7 +153,19 @@ be represented.
 `BlockCoordinate` is a database-local display coordinate. Slot allocation
 order is not canonical across instances: the same block hash may have
 different coordinates in independently allocated databases. A rebuilt
-pruning point occupies `(level=1, slot=0)`.
+pruning point occupies `(level=1, slot=0)`. Level zero is reserved for the
+outside-boundary sentinel and is not a materialized coordinate. A materialized
+slot is in `0..=MAX_LEVEL_SLOT`; the unused `u16::MAX` slot value lets the
+positive number of allocated slots remain representable as `u16` through
+`MAX_LEVEL_SIZE`.
+
+`BlockCoordinate::new` accepts exactly positive levels and slots through
+`MAX_LEVEL_SLOT`. The narrower domains are intentional. Exhausting `u32`
+levels would already require at least that many materialized blocks, identities,
+and level rows, with parent relations and indexes increasing the storage
+further. Resource and operational limits are reached far earlier. Likewise,
+65,535 blocks in one level is beyond the expected graph shape, so reserving one
+slot value to keep `levels.size` in `u16` loses no useful capacity.
 
 ## Coordinate terminology — settled
 
@@ -160,8 +178,10 @@ height_groups       -> levels
 levels.size remains size
 ```
 
-`levels.size` denotes the number of allocated slots in a level, not a
-horizontal width.
+`levels.size` denotes the positive `u16` number of allocated slots in a level,
+not a horizontal width. Graph levels use `u32`. The
+[API protocol](api-protocol.md#common-transport-dto-rules--settled) owns their
+public representation.
 
 ## Identity and materiality vocabulary — settled
 

@@ -769,8 +769,8 @@ blocks(
     timestamp BIGINT NOT NULL,
     daa_score BIGINT NOT NULL
         CHECK (daa_score >= 0 AND daa_score < 9223372036854775807),
-    level BIGINT NOT NULL CHECK (level > 0),
-    slot BIGINT NOT NULL CHECK (slot >= 0),
+    level BIGINT NOT NULL CHECK (level > 0 AND level <= 4294967295),
+    slot INTEGER NOT NULL CHECK (slot >= 0 AND slot <= 65534),
     selected_parent_id BIGINT NOT NULL REFERENCES block_identifiers(id),
     color ... NOT NULL,
     is_in_vspc BOOLEAN NOT NULL,
@@ -780,8 +780,9 @@ blocks(
 );
 
 levels(
-    level BIGINT PRIMARY KEY CHECK (level > 0),
-    size BIGINT NOT NULL CHECK (size > 0),
+    level BIGINT PRIMARY KEY
+        CHECK (level > 0 AND level <= 4294967295),
+    size INTEGER NOT NULL CHECK (size > 0 AND size <= 65535),
     daa_score BIGINT NOT NULL DEFAULT 9223372036854775807
         CHECK (daa_score >= 0)
 );
@@ -790,14 +791,14 @@ parents(
     child_id BIGINT NOT NULL,
     parent_id BIGINT NOT NULL,
     child_level BIGINT NOT NULL,
-    child_slot BIGINT NOT NULL,
+    child_slot INTEGER NOT NULL,
     parent_level BIGINT NOT NULL,
-    parent_slot BIGINT NOT NULL,
+    parent_slot INTEGER NOT NULL,
     PRIMARY KEY (child_id, parent_id),
-    CHECK (child_level > 0),
-    CHECK (child_slot >= 0),
-    CHECK (parent_level >= 0),
-    CHECK (parent_slot >= 0),
+    CHECK (child_level > 0 AND child_level <= 4294967295),
+    CHECK (child_slot >= 0 AND child_slot <= 65534),
+    CHECK (parent_level >= 0 AND parent_level <= 4294967295),
+    CHECK (parent_slot >= 0 AND parent_slot <= 65534),
     CHECK (parent_level > 0 OR parent_slot = 0)
 );
 ```
@@ -809,6 +810,12 @@ retain their ordinary positive representation, while larger informational
 values appear negative only inside PostgreSQL and still round-trip exactly.
 Storage never applies signed ordering or arithmetic to this column, and a
 negative stored timestamp is not database inconsistency.
+
+PostgreSQL has no unsigned 32-bit integer, so graph levels use `BIGINT` while
+the Storage boundary checks and converts the complete domain-owned `u32`
+range. Slots and level sizes use `INTEGER` because PostgreSQL `SMALLINT` cannot
+represent their domain-owned `u16` maxima. The SQL checks exactly enforce the
+shared `MAX_LEVEL_SLOT` and `MAX_LEVEL_SIZE` bounds.
 
 `parents.child_id` and `parents.parent_id` intentionally have no foreign keys.
 The materialization transaction validates their identities and embeds both
@@ -1271,8 +1278,8 @@ struct ParentCommitted {
 }
 
 struct LevelCommitted {
-    level: u64,
-    size: u64,
+    level: u32,
+    size: u16,
     daa_score: Option<u64>,
 }
 
@@ -1430,6 +1437,7 @@ Slot allocation is atomic, conceptually:
 INSERT INTO levels(level, size, daa_score) VALUES ($1, 1, $no_vspc)
 ON CONFLICT(level)
 DO UPDATE SET size = levels.size + 1
+WHERE levels.size < 65535
 RETURNING levels.size - 1 AS slot, levels.size, levels.daa_score;
 ```
 
@@ -1438,6 +1446,13 @@ each actual materialized coordinate or the outside-boundary sentinel `(0,0)`.
 A newly created level starts with the no-VSPC DAA sentinel. Materialization at
 an existing level preserves that level's current DAA score while increasing its
 size.
+
+Deriving a child above `u32::MAX`, allocating a slot above
+`MAX_LEVEL_SLOT`, or increasing a level beyond `MAX_LEVEL_SIZE` is an
+impossible internal invariant and panics. These conditions have no typed
+storage, processing, or public API disposition. Level derivation uses checked
+addition. At the size cap the allocation statement returns no row and the
+operation panics; transaction rollback leaves persistent state unchanged.
 
 For a new insertion, construct `BlockCommitted` inside the same transaction
 from the validated block, its allocated coordinate, and every canonical direct
