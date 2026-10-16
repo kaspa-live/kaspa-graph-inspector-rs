@@ -376,6 +376,8 @@ pub struct ValidatedApiDbClient {
     replacement_gate: Arc<ApiReplacementGate>,
     admission: StdMutex<()>,
     validity: watch::Sender<bool>,
+    #[cfg(test)]
+    cleanup_handoff: StdMutex<Option<ApiReadCleanupHandoff>>,
 }
 
 impl GenerationKind for ValidatedApiDbClient {
@@ -398,6 +400,8 @@ impl ValidatedApiDbClient {
             replacement_gate,
             admission: StdMutex::new(()),
             validity,
+            #[cfg(test)]
+            cleanup_handoff: StdMutex::new(None),
         })
     }
 
@@ -489,6 +493,8 @@ impl ValidatedApiDbClient {
             }
         };
         let mut session = ApiReadSession::new(self.pool().clone(), connection, lease);
+        #[cfg(test)]
+        session.set_cleanup_handoff(self.cleanup_handoff.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take());
 
         let backend_pid = match sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(session.connection()).await {
             Ok(backend_pid) => backend_pid,
@@ -575,23 +581,49 @@ impl ValidatedApiDbClient {
     pub(crate) async fn request_retirement(&self) -> Result<(), StorageError> {
         self.runtime.request_retirement().await
     }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_cleanup(&self, reached: oneshot::Sender<()>, release: oneshot::Receiver<()>) {
+        let previous = self
+            .cleanup_handoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(ApiReadCleanupHandoff { reached, release });
+        assert!(previous.is_none(), "only one API read cleanup handoff may be installed");
+    }
+}
+
+#[cfg(test)]
+struct ApiReadCleanupHandoff {
+    reached: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
 }
 
 /// Owns every database resource covered by one replacement lease.
 ///
-/// If the caller abandons the public future, [`Drop`] transfers cleanup and the
-/// lease together so exclusive replacement cannot overtake PostgreSQL
-/// cancellation.
+/// Cancellation transfers cleanup and the lease together to an independently
+/// owned task before awaiting it. If the caller abandons the public future
+/// earlier, [`Drop`] performs the same transfer, so exclusive replacement
+/// cannot overtake PostgreSQL cancellation.
 struct ApiReadSession {
     pool: PgPool,
     connection: Option<PoolConnection<Postgres>>,
     lease: Option<ApiDbReadLease>,
     backend_pid: Option<i32>,
+    #[cfg(test)]
+    cleanup_handoff: Option<ApiReadCleanupHandoff>,
 }
 
 impl ApiReadSession {
     fn new(pool: PgPool, connection: PoolConnection<Postgres>, lease: ApiDbReadLease) -> Self {
-        Self { pool, connection: Some(connection), lease: Some(lease), backend_pid: None }
+        Self {
+            pool,
+            connection: Some(connection),
+            lease: Some(lease),
+            backend_pid: None,
+            #[cfg(test)]
+            cleanup_handoff: None,
+        }
     }
 
     fn connection(&mut self) -> &mut PgConnection {
@@ -608,6 +640,11 @@ impl ApiReadSession {
         self.backend_pid = Some(backend_pid);
     }
 
+    #[cfg(test)]
+    fn set_cleanup_handoff(&mut self, cleanup_handoff: Option<ApiReadCleanupHandoff>) {
+        self.cleanup_handoff = cleanup_handoff;
+    }
+
     async fn release(mut self) {
         let mut connection = self.connection.take().expect("API read session retains its connection");
         connection.return_to_pool().await;
@@ -615,42 +652,48 @@ impl ApiReadSession {
     }
 
     async fn cancel(mut self, cancellation: Option<PgConnection>) {
-        let connection = self.connection.take().expect("API read session retains its connection");
-        let lease = self.lease.take().expect("API read session retains its replacement lease");
-        close_cancelled_api_read(self.pool.clone(), connection, lease, self.backend_pid, cancellation).await;
+        let cleanup = self.spawn_cleanup(cancellation).expect("API read session retains its cleanup resources");
+        let _ = cleanup.await;
+    }
+
+    /// Transfers every cleanup resource synchronously before returning its task handle.
+    fn spawn_cleanup(&mut self, cancellation: Option<PgConnection>) -> Option<tokio::task::JoinHandle<()>> {
+        let (Some(connection), Some(lease)) = (self.connection.take(), self.lease.take()) else {
+            return None;
+        };
+        let pool = self.pool.clone();
+        let backend_pid = self.backend_pid;
+        #[cfg(test)]
+        let cleanup_handoff = self.cleanup_handoff.take();
+        Some(tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(ApiReadCleanupHandoff { reached, release }) = cleanup_handoff {
+                let _ = reached.send(());
+                let _ = release.await;
+            }
+            let cancellation = match (cancellation, backend_pid) {
+                (Some(cancellation), _) => Some(cancellation),
+                (None, Some(backend_pid)) => cancel_projection_backend(&pool, backend_pid).await,
+                (None, None) => None,
+            };
+            close_cancelled_api_read(connection, lease, backend_pid, cancellation).await;
+        }))
     }
 }
 
 impl Drop for ApiReadSession {
     fn drop(&mut self) {
-        let (Some(connection), Some(lease)) = (self.connection.take(), self.lease.take()) else {
-            return;
-        };
-        let pool = self.pool.clone();
-        let backend_pid = self.backend_pid;
-        tokio::spawn(async move {
-            let cancellation = match backend_pid {
-                Some(backend_pid) => cancel_projection_backend(&pool, backend_pid).await,
-                None => None,
-            };
-            close_cancelled_api_read(pool, connection, lease, backend_pid, cancellation).await;
-        });
+        drop(self.spawn_cleanup(None));
     }
 }
 
 async fn close_cancelled_api_read(
-    pool: PgPool,
     connection: PoolConnection<Postgres>,
     lease: ApiDbReadLease,
     backend_pid: Option<i32>,
     mut cancellation: Option<PgConnection>,
 ) {
     let _ = connection.close().await;
-    if cancellation.is_none()
-        && let Some(backend_pid) = backend_pid
-    {
-        cancellation = cancel_projection_backend(&pool, backend_pid).await;
-    }
     if let (Some(control), Some(backend_pid)) = (cancellation.as_mut(), backend_pid) {
         wait_for_backend_exit(control, backend_pid).await;
     }

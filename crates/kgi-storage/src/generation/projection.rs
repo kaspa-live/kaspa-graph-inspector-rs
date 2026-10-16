@@ -554,7 +554,10 @@ mod tests {
         postgres::Postgres,
         testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner},
     };
-    use tokio::time::{sleep, timeout};
+    use tokio::{
+        sync::oneshot,
+        time::{sleep, timeout},
+    };
 
     const POSTGRES_PORT: u16 = 5432;
 
@@ -1275,6 +1278,58 @@ mod tests {
         assert!(!backend_exists, "abandonment retains the lease until the backend and transaction end");
         assert!(client.is_valid());
         assert!(retirements.try_recv().is_err());
+
+        exclusive.open().expect("test reopens admission");
+        blocker.rollback().await.expect("release block-table lock");
+    }
+
+    #[tokio::test]
+    async fn abandoned_cleanup_keeps_its_lease_until_the_backend_exits() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let gate = crate::replacement::ApiReplacementGate::new();
+        let (retirement_tx, _retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(api_pool, binding(graph.blocks[0].0), retirement_tx, gate.clone());
+        let blocker = lock_blocks(&fixture.pool).await;
+        let (cleanup_reached_tx, cleanup_reached_rx) = oneshot::channel();
+        let (cleanup_release_tx, cleanup_release_rx) = oneshot::channel();
+        client.hold_next_cleanup(cleanup_reached_tx, cleanup_release_rx);
+        let operation_client = client.clone();
+        let operation =
+            tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
+        let pid = blocked_projection_pid(&fixture.pool).await;
+
+        let replacement = gate.begin_replacement().expect("replacement closes admission");
+        cleanup_reached_rx.await.expect("cleanup task receives the database resources and lease");
+        operation.abort();
+        assert!(operation.await.expect_err("projection task is abandoned during cleanup").is_cancelled());
+
+        let timing = Timing::production();
+        let exclusive = replacement.acquire_exclusive(&timing);
+        tokio::pin!(exclusive);
+        assert!(
+            timeout(Duration::from_millis(50), &mut exclusive).await.is_err(),
+            "abandoning the cleanup waiter must not release its replacement lease"
+        );
+        let backend_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+            .bind(pid)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("held cleanup backend inspection");
+        assert!(backend_exists, "the deterministic cleanup barrier retains the original backend");
+
+        cleanup_release_tx.send(()).expect("release background cleanup");
+        let exclusive = timeout(Duration::from_secs(1), &mut exclusive)
+            .await
+            .expect("background cleanup releases its database resources promptly")
+            .expect("replacement exclusion");
+        let backend_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+            .bind(pid)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("completed cleanup backend inspection");
+        assert!(!backend_exists, "exclusive replacement begins only after the detached cleanup ends");
 
         exclusive.open().expect("test reopens admission");
         blocker.rollback().await.expect("release block-table lock");
