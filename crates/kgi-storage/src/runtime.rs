@@ -14,7 +14,6 @@ pub(crate) type RetirementReceiver = mpsc::UnboundedReceiver<RetirementRequest>;
 
 pub(crate) enum RetirementTarget {
     Processing(Weak<ValidatedDbClient>),
-    #[allow(dead_code, reason = "used by API projection operations in the persistence increment")]
     Api(Weak<ValidatedApiDbClient>),
 }
 
