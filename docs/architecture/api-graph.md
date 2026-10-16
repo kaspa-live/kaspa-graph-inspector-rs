@@ -461,19 +461,22 @@ never invalidates Head or reconstructs ApiService.
 
 ## Revision and history advancement — settled
 
-The view advances before its returned delta is appended to `GraphHistory`:
+`GraphView` produces the delta retained by `GraphHistory`. The enclosing
+publication makes those two synchronous operations atomically visible:
 
 ```text
 GraphView n / GraphHistory n
-    -> apply update to GraphView
-GraphView n+1 / GraphHistory n
-    -> append GraphDelta(n,n+1)
+    -> apply update and append GraphDelta(n,n+1)
+       within one enclosing publication mutation
 GraphView n+1 / GraphHistory n+1
 ```
 
-The intermediate state is valid. A view or subview request may therefore
-observe revision `n+1` while a delta-history request can reach only revision
-`n`. There is no equality invariant between the two current revision fields.
+The sequential in-memory work inside the exclusive section is not externally
+observable. Every observable publication core has equal view and history
+revisions. `GraphView` and `GraphHistory` remain separate graph-model types and
+retain their local validation rules; the
+[publication owner](api-publication.md#publication-synchronization-and-request-capture--settled)
+owns their atomic visibility and mutation ordering.
 
 `GraphDelta::new` is the only constructor. Its revision fields are private,
 have no setters, and are exposed only through their read-only accessors. The
@@ -564,8 +567,8 @@ either a direct one-step delta or an already aggregated delta. For an aggregate,
 Consecutive stored entries remain gapless by their outer interval boundaries;
 history neither requires nor reconstructs internal revision boundaries within
 an aggregate. Once appended, a `GraphHistoryEntry` is immutable and shared by
-`Arc`. Append and pruning mutate the ordered stored collection while holding
-the publication's history write lock. A range capture clones the selected
+`Arc`. Append and pruning mutate the ordered stored collection within the
+enclosing publication's exclusive section. A range capture clones the selected
 entry Arcs into an immutable `GraphHistoryEntryList`, so later pruning cannot
 invalidate work already detached by a reader.
 
@@ -780,10 +783,12 @@ first.cumulative_estimated_bytes - first.estimated_raw_bytes
 Only stored entry boundaries are cost boundaries. An aggregate therefore
 offers one selectable right boundary, not reconstructed internal ones.
 
-After append, ApiService may prune against the current complete Head
-`low_level` before publishing the new complete history value. A history reader
-therefore observes either the previous complete value or the appended and
-pruned complete value; pruning is never exposed halfway through.
+The enclosing publication prunes against the current complete Head `low_level`
+after append and before exposing the new core. A history reader therefore
+observes either the previous complete value or the appended and pruned complete
+value; pruning is never exposed halfway through. The
+[publication owner](api-publication.md#publication-synchronization-and-request-capture--settled)
+defines the enclosing synchronization.
 
 Kaspa does not permit unbounded revision production while the graph remains
 indefinitely at one fixed level. Therefore retaining all history for every

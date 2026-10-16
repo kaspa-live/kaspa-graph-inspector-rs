@@ -26,17 +26,17 @@ enum GraphPublicationState {
     Stale,
 }
 
-struct GraphPublicationImage {
+struct GraphPublicationCore {
     state: GraphPublicationState,
     view: GraphView,
+    history: GraphHistory,
 }
 
 struct GraphPublication {
     publication_id: u64,
     revision_clock_origin: std::time::Instant,
     mutation: tokio::sync::Mutex<()>,
-    image: tokio::sync::RwLock<GraphPublicationImage>,
-    history: tokio::sync::RwLock<GraphHistory>,
+    core: tokio::sync::RwLock<GraphPublicationCore>,
     cache: Arc<GraphCache>,
     clients: DeltaClientRegistry,
 }
@@ -77,7 +77,7 @@ owns client registration and wake scheduling.
 
 When construction creates a `GraphPublication`, it initializes
 `DeltaClientRegistry` with the same publication state and current revision as
-the initial image before exposing either value. The registry therefore always
+the initial core before exposing either value. The registry therefore always
 has a coherent observation for a concurrently established SSE registration.
 
 Each construction candidate also receives a fresh monotonic clock origin when
@@ -160,48 +160,59 @@ path rather than defining another publication transition.
 
 `GraphPublication.mutation` serializes graph mutations and lifecycle-state
 transitions. It is a writer gate rather than a container for graph state.
-`image` publishes the state and complete `GraphView` together, while `history`
-publishes the independently readable `GraphHistory`. Cache and client-registry
-synchronization is private to those values. Cache work never participates in
-the graph mutation critical section. The short nonblocking client-registry
-operations described below run at its tail so SSE observation preserves graph
-and lifecycle order.
+`GraphPublication.core` publishes lifecycle state, the complete `GraphView`,
+and `GraphHistory` as one atomically observed in-memory value. Cache and
+client-registry synchronization is private to those values. Cache work never
+participates in the graph mutation critical section. The short nonblocking
+client-registry operations described below run at its tail so SSE observation
+preserves graph and lifecycle order.
 
 For an original `BlockCommitted` or `VspcCommitted` update, the runtime:
 
-1. acquires `mutation` and requires the starting image and history revisions to
-   be equal;
-2. acquires the image write lock and applies the original update; when it
-   produces a revision, it samples elapsed publication-local milliseconds at
-   delta creation and publishes the complete resulting view revision and
-   timestamp;
-3. releases the image lock;
-4. when the update returned a delta, acquires the history write lock and
-   appends and publishes that complete delta entry; and
-5. releases the history lock, calls the ApiService-owned client registry's
-   nonblocking `advance_head` with the appended revision, and then releases
-   `mutation`.
+1. acquires `mutation`, then the core write lock, and requires the starting
+   view and history revisions to be equal;
+2. applies the original update; when it produces a revision, it samples
+   elapsed publication-local milliseconds at delta creation, estimates the
+   returned delta, appends it to history, and prunes history against the
+   resulting Head extent while retaining the same core write lock;
+3. releases the core write lock; and
+4. when a delta was appended, calls the ApiService-owned client registry's
+   nonblocking `advance_head` with that revision, then releases `mutation`.
 
-A no-effect update changes neither value. A starting revision mismatch or a
-failed apply or append follows the publication-projection failure contract
-below. No next mutation can begin during the valid interval after the view has
-advanced and before its delta has reached history. Readers remain allowed in
-that interval; the graph model owns the meaning of its adjacent revisions. The
-equality check is therefore a mutation-entry precondition, not a continuously
-maintained equality invariant.
+A no-effect update changes neither graph value. The complete update from the
+first graph mutation through history append and pruning is synchronous: it
+contains no await or cancellation point, starts only after both asynchronous
+locks have been acquired, and becomes visible only when the core write lock is
+released. Dropping a caller while it waits for either lock leaves the core
+unchanged. Completion never moves into a spawned task or publication-owned
+pending mutation, so dropping an unpublished publication cannot leave mutation
+work or retained publication resources behind.
 
-A lifecycle-state transition acquires `mutation`, changes `image.state` under
-the image write lock, releases the image lock, and publishes the required state
+This sacrifices the former opportunity to expose a new view while its history
+append waited behind readers. The added capture latency is bounded by the
+synchronous in-memory append and pruning work. Database access, extraction,
+serialization, compression, and cache construction remain detached from the
+critical section, so that limited concurrency benefit does not justify an
+adjacent-revision state or cancellation-sensitive completion mechanism.
+
+The entry revision-equality check and the delta construction contract make a
+successful original update gapless with the locked history. A starting
+revision mismatch or a failed graph apply occurs before atomic advancement and
+follows the publication-projection failure contract below. History append
+mismatch after a successful update is an internal invariant failure rather
+than a permitted partially published state.
+
+A lifecycle-state transition acquires `mutation`, changes `core.state` under
+the core write lock, releases that lock, and publishes the required state
 message through the ApiService-owned client registry before releasing
-`mutation`. It does not take the history lock or change a graph revision. The
-registry operation does not await. Consequently, becoming terminally `Stale`
-waits for an in-progress graph mutation to finish, the Stale image's final view
-revision is already present in history, and its state message precedes any
-later mutation's graph wakeup.
+`mutation`. It changes no graph revision. The registry operation does not
+await. Consequently, becoming terminally `Stale` waits for an in-progress
+graph mutation to finish, its final view revision is already present in
+history, and its state message precedes any later mutation's graph wakeup.
 
-Read locks protect only bounded in-memory capture. Serialization, compression,
-cache work, database access, network delivery, and request waiting never hold
-an image or history lock. The private capture values are:
+The core read lock protects only bounded in-memory capture. Serialization,
+compression, cache work, database access, network delivery, and request
+waiting never hold it. The private capture values are:
 
 ```rust
 struct GraphViewCapture {
@@ -232,27 +243,25 @@ supplied by ApiService's
 [current-publication slot](api-service.md#reset-control-and-recovery-effects--settled).
 The slot owner defines acquisition and replacement behavior.
 
-A Head snapshot-cache job or Head-backed window holds one image read lock while
+A Head snapshot-cache job or Head-backed window holds one core read lock while
 it captures an owned `Frozen` graph view. A window performs its complete
-extraction against that same image. A level lookup similarly captures the
-revision and every requested complete level under one image read lock; an
+extraction against that same view. A level lookup similarly captures the
+revision and every requested complete level under one core read lock; an
 unavailable level produces no partial capture. Public publication identity and
 state headers are finalized separately under the
 [protocol-owned publication-context rule](api-protocol.md#publication-context-response-headers--settled).
 
 A canonical delta operation briefly captures its publication ID, state, view
-revision, revision timestamp, and high level under one image read lock,
+revision, revision timestamp, and high level under one core read lock,
 releases it, and then asks history for a range ending at the captured revision.
 The revision and timestamp form the coherent Head pair carried in the
-protocol-owned response headers. History may still be one
-revision behind that target. In that case the request uses the complete range
-currently available and the protocol reports the remaining progress through
-its ordinary continuation outcome; it neither waits for the append nor reloads
-the image. A Stale capture cannot encounter this interval because the state
-transition waits behind `mutation`.
+protocol-owned response headers. At that capture instant, history has the same
+current revision. The later core read may observe further advancement and
+pruning; range selection remains bounded by the captured target and returns its
+ordinary retained-range outcome without waiting or recapturing the view.
 
 History range capture clones the selected immutable
-`Arc<GraphHistoryEntry>` values under the history read lock. Target selection,
+`Arc<GraphHistoryEntry>` values under the core read lock. Target selection,
 budgeting, response-wide dictionary construction, JSON serialization, and gzip
 compression then proceed without the lock. Later history pruning cannot
 invalidate those captured entries.
@@ -391,8 +400,8 @@ neither cut. There is no direct `Constructing -> Active` transition.
 After both crossing updates have been applied, discard `snapshot_vspc_sink`,
 stop all snapshot-relative classification, apply every later staged graph
 update in channel order, and advance through a captured prewarming frontier.
-Assign a fresh publication ID, publish the completed view and history
-independently and atomically inside one still-unpublished
+Assign a fresh publication ID, publish the completed view and history together
+and atomically inside one still-unpublished
 `Arc<GraphPublication>`, use the sticky target state, and enter `Prewarming`.
 Neither the candidate nor its partially replayed state is externally visible.
 
@@ -558,9 +567,9 @@ semantics owned by the [graph model](api-graph.md).
 ## Publication projection failure — settled
 
 The active Head consumes original committed updates and produces deltas; it
-never applies a delta to itself. Direct Head mutation failure, history append
-revision mismatch, or another invariant failure in the publication's own
-Head/history advancement path is an API projection failure. In `Constructing`
+never applies a delta to itself. A pre-advancement Head/history revision
+mismatch, direct Head mutation failure, or another invariant failure detected
+before atomic publication advancement is an API projection failure. In `Constructing`
 or `Aligning`, abandon the unpublished candidate and invoke
 `restart_construction()`. In `Prewarming`, abandon the unpublished publication
 and detach from its cache work before invoking the same primitive. In `Active`, first mark
