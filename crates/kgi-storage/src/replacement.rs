@@ -154,12 +154,10 @@ fn ensure_current_attempt(state: &GateState, epoch: u64) -> Result<(), StorageEr
 pub(crate) struct ApiDbReadLease {
     gate: Arc<ApiReplacementGate>,
     lease_id: u64,
-    #[allow(dead_code, reason = "consumed by API database operations in the API projection increment")]
     cancellation: watch::Receiver<bool>,
 }
 
 impl ApiDbReadLease {
-    #[allow(dead_code, reason = "consumed by API database operations in the API projection increment")]
     pub(crate) async fn cancelled(&mut self) {
         if *self.cancellation.borrow() {
             return;

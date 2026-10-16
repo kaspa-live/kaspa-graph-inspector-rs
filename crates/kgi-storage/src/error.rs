@@ -9,6 +9,22 @@ use thiserror::Error;
 
 use crate::operation::VspcPathConflict;
 
+/// Closed failure domain for database-backed API graph reads.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ApiReadError {
+    /// The database-backed read failed without proving generation loss.
+    #[error("API database query failed")]
+    QueryFailed,
+
+    /// The exact API database generation was retired.
+    #[error("validated API database generation was lost")]
+    GenerationLost,
+
+    /// The database snapshot could not form one complete coherent projection.
+    #[error("API database projection is inconsistent")]
+    InconsistentProjection,
+}
+
 /// Failure while establishing the database-replacement preconditions.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum RebuildSetupFault {

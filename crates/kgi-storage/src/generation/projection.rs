@@ -1,0 +1,1459 @@
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
+
+use kgi_api_model::{
+    graph::{EdgeId, GraphBlock, GraphEdge, Level, MAX_CACHE_DEPTH},
+    projection::{
+        GraphViewSeed, GraphViewSeedOutcome, GraphViewSeedRequest, GraphWindowAnchor, GraphWindowAnchorUnavailable,
+        GraphWindowResolution, MAX_WINDOW_DEPTH,
+    },
+};
+use kgi_model::block::{BlockColor, BlockCoordinate, BlockHash, CompactId, MAX_DAA_SCORE};
+use sqlx::{Connection, PgConnection, Postgres, Row, Transaction};
+
+#[cfg(test)]
+use sqlx::PgPool;
+
+use crate::{
+    database::{NO_VSPC_DAA_SCORE, timestamp_from_sql},
+    error::{ApiReadError, sqlx_connection_lost},
+};
+
+pub(super) struct GraphProjection<'connection> {
+    transaction: Transaction<'connection, Postgres>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ProjectionScope {
+    pub resolution: GraphWindowResolution,
+    pub max_depth: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ProjectionScopeOutcome {
+    Resolved(ProjectionScope),
+    AnchorUnavailable(GraphWindowAnchorUnavailable),
+}
+
+struct PreparedGraphBlock {
+    id: CompactId,
+    coordinate: BlockCoordinate,
+    timestamp: u64,
+    daa_score: u64,
+    selected_parent_id: CompactId,
+    blue_merge_set: Vec<CompactId>,
+    red_merge_set: Vec<CompactId>,
+    color: BlockColor,
+    is_in_vspc: bool,
+    direct_parents: Vec<CompactId>,
+}
+
+struct PreparedGraphEdge {
+    child_id: CompactId,
+    parent_id: CompactId,
+    child_coordinate: BlockCoordinate,
+    parent_coordinate: BlockCoordinate,
+}
+
+pub(super) async fn load(
+    connection: &mut PgConnection,
+    genesis_hash: BlockHash,
+    request: GraphViewSeedRequest,
+) -> Result<GraphViewSeedOutcome, ApiReadError> {
+    let mut projection = GraphProjection::begin_on_connection(connection).await?;
+    let scope = match projection.resolve_scope(request).await? {
+        ProjectionScopeOutcome::Resolved(scope) => scope,
+        ProjectionScopeOutcome::AnchorUnavailable(unavailable) => {
+            projection.commit().await?;
+            return Ok(GraphViewSeedOutcome::AnchorUnavailable(unavailable));
+        }
+    };
+    let seed = projection.load_seed(scope, genesis_hash).await?;
+    projection.commit().await?;
+    Ok(GraphViewSeedOutcome::Loaded(seed))
+}
+
+impl<'connection> GraphProjection<'connection> {
+    #[cfg(test)]
+    pub(super) async fn begin(pool: &'connection PgPool) -> Result<Self, ApiReadError> {
+        let transaction = pool.begin().await.map_err(query_error)?;
+        Self::from_transaction(transaction).await
+    }
+
+    async fn begin_on_connection(connection: &'connection mut PgConnection) -> Result<Self, ApiReadError> {
+        let transaction = connection.begin().await.map_err(query_error)?;
+        Self::from_transaction(transaction).await
+    }
+
+    async fn from_transaction(transaction: Transaction<'connection, Postgres>) -> Result<Self, ApiReadError> {
+        let mut projection = Self { transaction };
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *projection.transaction)
+            .await
+            .map_err(query_error)?;
+        Ok(projection)
+    }
+
+    pub(super) async fn resolve_scope(&mut self, request: GraphViewSeedRequest) -> Result<ProjectionScopeOutcome, ApiReadError> {
+        match request {
+            GraphViewSeedRequest::HeadPublication => {
+                let high_level = self.database_head().await?.ok_or(ApiReadError::InconsistentProjection)?;
+                Ok(ProjectionScopeOutcome::Resolved(head_scope(high_level)))
+            }
+            GraphViewSeedRequest::AnchoredWindow { anchor, max_depth } => {
+                assert!(
+                    (1..=MAX_WINDOW_DEPTH).contains(&max_depth),
+                    "anchored graph projection depth must be validated and capped by the API owner"
+                );
+                let Some(resolved_level) = self.resolve_anchor(anchor).await? else {
+                    return Ok(ProjectionScopeOutcome::AnchorUnavailable(anchor_unavailable(anchor)));
+                };
+                let database_head = self.database_head().await?.ok_or(ApiReadError::InconsistentProjection)?;
+                if resolved_level > database_head {
+                    return Err(ApiReadError::InconsistentProjection);
+                }
+                Ok(ProjectionScopeOutcome::Resolved(ProjectionScope {
+                    resolution: anchored_resolution(resolved_level, database_head, max_depth),
+                    max_depth,
+                }))
+            }
+        }
+    }
+
+    pub(super) async fn commit(self) -> Result<(), ApiReadError> {
+        self.transaction.commit().await.map_err(query_error)
+    }
+
+    async fn load_seed(&mut self, scope: ProjectionScope, genesis_hash: BlockHash) -> Result<GraphViewSeed, ApiReadError> {
+        let mut prepared = self.load_nominal_blocks(scope.resolution).await?;
+        self.load_direct_parent_ids(scope.resolution, &mut prepared).await?;
+        let prepared_edges = self.load_edges(scope.resolution).await?;
+        let references = self.load_reference_hashes(&prepared, &prepared_edges).await?;
+        let blocks = finalize_blocks(prepared, &references, genesis_hash)?;
+        let edges = finalize_edges(prepared_edges, &references);
+        let levels = self.load_levels(scope.resolution, &edges).await?;
+        let (snapshot_max_materialized_id, snapshot_vspc_sink) = self.load_snapshot_metadata().await?;
+        Ok(GraphViewSeed {
+            resolution: scope.resolution,
+            max_depth: scope.max_depth,
+            levels,
+            blocks,
+            edges,
+            snapshot_max_materialized_id,
+            snapshot_vspc_sink,
+        })
+    }
+
+    async fn load_nominal_blocks(
+        &mut self,
+        resolution: GraphWindowResolution,
+    ) -> Result<HashMap<CompactId, PreparedGraphBlock>, ApiReadError> {
+        let low = level_to_sql(resolution.effective_start_level)?;
+        let high = level_to_sql(resolution.effective_end_level)?;
+        let rows = sqlx::query(
+            "SELECT block.id, block.timestamp, block.daa_score,
+                    block.level, block.slot, block.selected_parent_id, block.color,
+                    block.is_in_vspc, block.blue_merge_set, block.red_merge_set
+             FROM blocks block
+             WHERE block.level BETWEEN $1 AND $2
+             ORDER BY block.level, block.slot",
+        )
+        .bind(low)
+        .bind(high)
+        .fetch_all(&mut *self.transaction)
+        .await
+        .map_err(query_error)?;
+
+        let mut blocks = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let id = decode_id(row.try_get("id").map_err(inconsistent_decode)?)?;
+            let coordinate = decode_coordinate(
+                row.try_get("level").map_err(inconsistent_decode)?,
+                row.try_get("slot").map_err(inconsistent_decode)?,
+            )?;
+            let block = PreparedGraphBlock {
+                id,
+                coordinate,
+                timestamp: timestamp_from_sql(row.try_get("timestamp").map_err(inconsistent_decode)?),
+                daa_score: decode_daa_score(row.try_get("daa_score").map_err(inconsistent_decode)?)?,
+                selected_parent_id: decode_id(row.try_get("selected_parent_id").map_err(inconsistent_decode)?)?,
+                blue_merge_set: decode_ids(row.try_get("blue_merge_set").map_err(inconsistent_decode)?)?,
+                red_merge_set: decode_ids(row.try_get("red_merge_set").map_err(inconsistent_decode)?)?,
+                color: decode_color(row.try_get("color").map_err(inconsistent_decode)?)?,
+                is_in_vspc: row.try_get("is_in_vspc").map_err(inconsistent_decode)?,
+                direct_parents: Vec::new(),
+            };
+            let _ = blocks.insert(id, block);
+        }
+        Ok(blocks)
+    }
+
+    async fn load_reference_hashes(
+        &mut self,
+        blocks: &HashMap<CompactId, PreparedGraphBlock>,
+        edges: &[PreparedGraphEdge],
+    ) -> Result<HashMap<CompactId, BlockHash>, ApiReadError> {
+        let mut required = HashSet::new();
+        for block in blocks.values() {
+            required.insert(block.id);
+            required.extend(block.blue_merge_set.iter().copied());
+            required.extend(block.red_merge_set.iter().copied());
+            required.extend(block.direct_parents.iter().copied());
+        }
+        for edge in edges {
+            required.insert(edge.child_id);
+            required.insert(edge.parent_id);
+        }
+        let ids: Vec<_> = required.iter().map(|id| id.get()).collect();
+        let rows = sqlx::query("SELECT id, hash FROM block_identifiers WHERE id = ANY($1::BIGINT[])")
+            .bind(&ids)
+            .fetch_all(&mut *self.transaction)
+            .await
+            .map_err(query_error)?;
+        let mut references = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let id = decode_id(row.try_get("id").map_err(inconsistent_decode)?)?;
+            let hash = decode_hash(row.try_get("hash").map_err(inconsistent_decode)?)?;
+            if references.insert(id, hash).is_some() {
+                return Err(ApiReadError::InconsistentProjection);
+            }
+        }
+        if references.len() != required.len() || !required.iter().all(|id| references.contains_key(id)) {
+            return Err(ApiReadError::InconsistentProjection);
+        }
+        Ok(references)
+    }
+
+    async fn load_direct_parent_ids(
+        &mut self,
+        resolution: GraphWindowResolution,
+        blocks: &mut HashMap<CompactId, PreparedGraphBlock>,
+    ) -> Result<(), ApiReadError> {
+        let rows = sqlx::query(
+            "SELECT relation.child_id, relation.parent_id
+             FROM parents relation
+             WHERE relation.child_level BETWEEN $1 AND $2
+             ORDER BY relation.child_id, relation.parent_id",
+        )
+        .bind(level_to_sql(resolution.effective_start_level)?)
+        .bind(level_to_sql(resolution.effective_end_level)?)
+        .fetch_all(&mut *self.transaction)
+        .await
+        .map_err(query_error)?;
+
+        for row in rows {
+            let child_id = decode_id(row.try_get("child_id").map_err(inconsistent_decode)?)?;
+            let parent_id = decode_id(row.try_get("parent_id").map_err(inconsistent_decode)?)?;
+            let block = blocks.get_mut(&child_id).ok_or(ApiReadError::InconsistentProjection)?;
+            if parent_id == child_id {
+                return Err(ApiReadError::InconsistentProjection);
+            }
+            block.direct_parents.push(parent_id);
+        }
+        Ok(())
+    }
+
+    async fn load_edges(&mut self, resolution: GraphWindowResolution) -> Result<Vec<PreparedGraphEdge>, ApiReadError> {
+        let rows = sqlx::query(
+            "SELECT child_id, parent_id, child_level, child_slot, parent_level, parent_slot
+             FROM parents
+             WHERE parent_level > 0
+               AND child_level >= $1
+               AND parent_level <= $2",
+        )
+        .bind(level_to_sql(resolution.effective_start_level)?)
+        .bind(level_to_sql(resolution.effective_end_level)?)
+        .fetch_all(&mut *self.transaction)
+        .await
+        .map_err(query_error)?;
+
+        let mut edges = Vec::with_capacity(rows.len());
+        for row in rows {
+            edges.push(PreparedGraphEdge {
+                child_id: decode_id(row.try_get("child_id").map_err(inconsistent_decode)?)?,
+                parent_id: decode_id(row.try_get("parent_id").map_err(inconsistent_decode)?)?,
+                child_coordinate: decode_coordinate(
+                    row.try_get("child_level").map_err(inconsistent_decode)?,
+                    row.try_get("child_slot").map_err(inconsistent_decode)?,
+                )?,
+                parent_coordinate: decode_coordinate(
+                    row.try_get("parent_level").map_err(inconsistent_decode)?,
+                    row.try_get("parent_slot").map_err(inconsistent_decode)?,
+                )?,
+            });
+        }
+        Ok(edges)
+    }
+
+    async fn load_levels(
+        &mut self,
+        resolution: GraphWindowResolution,
+        edges: &HashMap<EdgeId, GraphEdge>,
+    ) -> Result<BTreeMap<u64, Level>, ApiReadError> {
+        let mut required: HashSet<u64> = (resolution.effective_start_level..=resolution.effective_end_level).collect();
+        for edge in edges.values() {
+            required.insert(edge.child_coordinate.level());
+            required.insert(edge.parent_coordinate.level());
+        }
+        let raw_levels: Vec<_> = required.iter().map(|level| level_to_sql(*level)).collect::<Result<_, _>>()?;
+        let rows = sqlx::query("SELECT level, size, daa_score FROM levels WHERE level = ANY($1::BIGINT[]) ORDER BY level")
+            .bind(&raw_levels)
+            .fetch_all(&mut *self.transaction)
+            .await
+            .map_err(query_error)?;
+        let mut levels = BTreeMap::new();
+        for row in rows {
+            let level = decode_positive_level(row.try_get("level").map_err(inconsistent_decode)?)?;
+            let size = u64::try_from(row.try_get::<i64, _>("size").map_err(inconsistent_decode)?)
+                .ok()
+                .filter(|size| *size > 0)
+                .ok_or(ApiReadError::InconsistentProjection)?;
+            let raw_daa: i64 = row.try_get("daa_score").map_err(inconsistent_decode)?;
+            let daa_score = if raw_daa == NO_VSPC_DAA_SCORE { None } else { Some(decode_daa_score(raw_daa)?) };
+            let _ = levels.insert(level, Level { size, daa_score });
+        }
+        if levels.len() != required.len() {
+            return Err(ApiReadError::InconsistentProjection);
+        }
+        Ok(levels)
+    }
+
+    async fn load_snapshot_metadata(&mut self) -> Result<(CompactId, BlockHash), ApiReadError> {
+        let max_id = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(id) FROM blocks")
+            .fetch_one(&mut *self.transaction)
+            .await
+            .map_err(query_error)?
+            .ok_or(ApiReadError::InconsistentProjection)
+            .and_then(decode_id)?;
+        let sink_hash = sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT identity.hash
+             FROM blocks block
+             JOIN block_identifiers identity ON identity.id = block.id
+             WHERE block.is_in_vspc
+             ORDER BY block.id DESC
+             LIMIT 1",
+        )
+        .fetch_optional(&mut *self.transaction)
+        .await
+        .map_err(query_error)?
+        .ok_or(ApiReadError::InconsistentProjection)
+        .and_then(decode_hash)?;
+        Ok((max_id, sink_hash))
+    }
+
+    async fn database_head(&mut self) -> Result<Option<u64>, ApiReadError> {
+        let level = sqlx::query_scalar::<_, i64>("SELECT level FROM blocks ORDER BY level DESC, slot DESC LIMIT 1")
+            .fetch_optional(&mut *self.transaction)
+            .await
+            .map_err(query_error)?;
+        level.map(decode_positive_level).transpose()
+    }
+
+    async fn resolve_anchor(&mut self, anchor: GraphWindowAnchor) -> Result<Option<u64>, ApiReadError> {
+        let level = match anchor {
+            GraphWindowAnchor::Level(requested_level) => {
+                assert!(requested_level > 0, "level anchors must be validated by the API owner");
+                let Ok(requested_level) = i64::try_from(requested_level) else {
+                    return Ok(None);
+                };
+                sqlx::query_scalar::<_, i64>("SELECT level FROM levels WHERE level = $1")
+                    .bind(requested_level)
+                    .fetch_optional(&mut *self.transaction)
+                    .await
+                    .map_err(query_error)?
+            }
+            GraphWindowAnchor::BlockHash(requested_hash) => sqlx::query_scalar::<_, i64>(
+                "SELECT block.level
+                     FROM block_identifiers identity
+                     JOIN blocks block ON block.id = identity.id
+                     WHERE identity.hash = $1",
+            )
+            .bind(requested_hash.as_bytes().as_slice())
+            .fetch_optional(&mut *self.transaction)
+            .await
+            .map_err(query_error)?,
+            GraphWindowAnchor::DaaScore(requested_score) => {
+                assert!(requested_score <= MAX_DAA_SCORE, "DAA-score anchors must be validated by the API owner");
+                let requested_score = i64::try_from(requested_score).expect("validated DAA score fits BIGINT");
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT level
+                     FROM levels
+                     WHERE daa_score <= $1
+                     ORDER BY daa_score DESC, level DESC
+                     LIMIT 1",
+                )
+                .bind(requested_score)
+                .fetch_optional(&mut *self.transaction)
+                .await
+                .map_err(query_error)?
+            }
+        };
+        level.map(decode_positive_level).transpose()
+    }
+}
+
+fn finalize_blocks(
+    prepared: HashMap<CompactId, PreparedGraphBlock>,
+    references: &HashMap<CompactId, BlockHash>,
+    genesis_hash: BlockHash,
+) -> Result<HashMap<BlockHash, GraphBlock>, ApiReadError> {
+    let mut blocks = HashMap::with_capacity(prepared.len());
+    for (_, prepared) in prepared {
+        let hash = references[&prepared.id];
+        let selected_parent_index = if hash == genesis_hash {
+            None
+        } else {
+            let index = prepared
+                .direct_parents
+                .iter()
+                .position(|id| *id == prepared.selected_parent_id)
+                .ok_or(ApiReadError::InconsistentProjection)?;
+            Some(u32::try_from(index).map_err(|_| ApiReadError::InconsistentProjection)?)
+        };
+
+        let blue_merge_set = resolve_references(&prepared.blue_merge_set, references);
+        let red_merge_set = resolve_references(&prepared.red_merge_set, references);
+        let direct_parents = resolve_references(&prepared.direct_parents, references);
+        let block = GraphBlock {
+            hash,
+            coordinate: prepared.coordinate,
+            timestamp: prepared.timestamp,
+            daa_score: prepared.daa_score,
+            selected_parent_index,
+            direct_parents,
+            blue_merge_set,
+            red_merge_set,
+            color: prepared.color,
+            is_in_vspc: prepared.is_in_vspc,
+        };
+        let _ = blocks.insert(block.hash, block);
+    }
+    Ok(blocks)
+}
+
+fn finalize_edges(prepared: Vec<PreparedGraphEdge>, references: &HashMap<CompactId, BlockHash>) -> HashMap<EdgeId, GraphEdge> {
+    prepared
+        .into_iter()
+        .map(|edge| {
+            let id = EdgeId { parent: references[&edge.parent_id], child: references[&edge.child_id] };
+            (id, GraphEdge { id, parent_coordinate: edge.parent_coordinate, child_coordinate: edge.child_coordinate })
+        })
+        .collect()
+}
+
+fn resolve_references(ids: &[CompactId], references: &HashMap<CompactId, BlockHash>) -> Arc<[BlockHash]> {
+    ids.iter().map(|id| references[id]).collect::<Vec<_>>().into()
+}
+
+fn decode_hash(bytes: Vec<u8>) -> Result<BlockHash, ApiReadError> {
+    BlockHash::try_from(bytes.as_slice()).map_err(|_| ApiReadError::InconsistentProjection)
+}
+
+fn decode_id(id: i64) -> Result<CompactId, ApiReadError> {
+    CompactId::new(id).ok_or(ApiReadError::InconsistentProjection)
+}
+
+fn decode_ids(ids: Vec<i64>) -> Result<Vec<CompactId>, ApiReadError> {
+    ids.into_iter().map(decode_id).collect()
+}
+
+fn decode_coordinate(level: i64, slot: i64) -> Result<BlockCoordinate, ApiReadError> {
+    let level = decode_positive_level(level)?;
+    let slot = u64::try_from(slot).map_err(|_| ApiReadError::InconsistentProjection)?;
+    BlockCoordinate::new(level, slot).ok_or(ApiReadError::InconsistentProjection)
+}
+
+fn decode_daa_score(score: i64) -> Result<u64, ApiReadError> {
+    u64::try_from(score).ok().filter(|score| *score <= MAX_DAA_SCORE).ok_or(ApiReadError::InconsistentProjection)
+}
+
+fn decode_color(color: i16) -> Result<BlockColor, ApiReadError> {
+    match color {
+        0 => Ok(BlockColor::Gray),
+        1 => Ok(BlockColor::Blue),
+        2 => Ok(BlockColor::Red),
+        _ => Err(ApiReadError::InconsistentProjection),
+    }
+}
+
+fn level_to_sql(level: u64) -> Result<i64, ApiReadError> {
+    i64::try_from(level).map_err(|_| ApiReadError::InconsistentProjection)
+}
+
+fn inconsistent_decode(_: sqlx::Error) -> ApiReadError {
+    ApiReadError::InconsistentProjection
+}
+
+fn head_scope(high_level: u64) -> ProjectionScope {
+    let low_level = high_level.saturating_sub(MAX_CACHE_DEPTH - 1).max(1);
+    ProjectionScope {
+        resolution: GraphWindowResolution {
+            resolved_level: high_level,
+            effective_start_level: low_level,
+            effective_end_level: high_level,
+        },
+        max_depth: MAX_CACHE_DEPTH,
+    }
+}
+
+fn anchored_resolution(resolved_level: u64, database_head: u64, max_depth: u64) -> GraphWindowResolution {
+    let levels_above = (max_depth - 1) / 2;
+    let levels_below = (max_depth - 1) - levels_above;
+    let mut low_level = resolved_level.saturating_sub(levels_below).max(1);
+    let mut high_level = resolved_level.saturating_add(levels_above).min(database_head);
+
+    let initial_depth = high_level - low_level + 1;
+    let unused_depth = max_depth - initial_depth;
+    high_level = high_level.saturating_add(unused_depth).min(database_head);
+
+    let shifted_depth = high_level - low_level + 1;
+    let remaining_depth = max_depth - shifted_depth;
+    low_level = low_level.saturating_sub(remaining_depth).max(1);
+
+    GraphWindowResolution { resolved_level, effective_start_level: low_level, effective_end_level: high_level }
+}
+
+const fn anchor_unavailable(anchor: GraphWindowAnchor) -> GraphWindowAnchorUnavailable {
+    match anchor {
+        GraphWindowAnchor::Level(requested_level) => GraphWindowAnchorUnavailable::LevelNotRetained { requested_level },
+        GraphWindowAnchor::BlockHash(requested_hash) => GraphWindowAnchorUnavailable::BlockNotMaterialized { requested_hash },
+        GraphWindowAnchor::DaaScore(requested_score) => GraphWindowAnchorUnavailable::NoRetainedDaaMatch { requested_score },
+    }
+}
+
+fn decode_positive_level(level: i64) -> Result<u64, ApiReadError> {
+    u64::try_from(level).ok().filter(|level| *level > 0).ok_or(ApiReadError::InconsistentProjection)
+}
+
+pub(super) fn query_error(error: sqlx::Error) -> ApiReadError {
+    if sqlx_connection_lost(&error) { ApiReadError::GenerationLost } else { ApiReadError::QueryFailed }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc, time::Duration};
+
+    use super::{GraphProjection, ProjectionScope, ProjectionScopeOutcome, anchored_resolution, head_scope};
+    use kaspa_consensus_core::{
+        blockhash::ORIGIN,
+        network::{NetworkId, NetworkType},
+    };
+    use kgi_api_model::{
+        graph::{EdgeId, MAX_CACHE_DEPTH},
+        projection::{
+            GraphViewSeedOutcome, GraphViewSeedRequest, GraphWindowAnchor, GraphWindowAnchorUnavailable, GraphWindowResolution,
+            MAX_WINDOW_DEPTH,
+        },
+    };
+    use kgi_core::timing::Timing;
+    use kgi_model::block::{BlockColor, BlockHash, CompactId};
+    use sqlx::{PgPool, Postgres as SqlxPostgres, Transaction, postgres::PgPoolOptions};
+    use testcontainers_modules::{
+        postgres::Postgres,
+        testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner},
+    };
+    use tokio::{
+        sync::oneshot,
+        time::{sleep, timeout},
+    };
+
+    const POSTGRES_PORT: u16 = 5432;
+
+    struct PostgresFixture {
+        _container: ContainerAsync<Postgres>,
+        pool: PgPool,
+        database_url: String,
+    }
+
+    struct CompleteGraph {
+        blocks: [(BlockHash, i64); 3],
+        boundary: (BlockHash, i64),
+    }
+
+    async fn fixture() -> PostgresFixture {
+        let container = Postgres::default().with_tag("17-alpine").start().await.expect("PostgreSQL fixture must start");
+        let host = container.get_host().await.expect("fixture host must resolve");
+        let port = container.get_host_port_ipv4(POSTGRES_PORT).await.expect("fixture PostgreSQL port must resolve");
+        let database_url = format!("postgresql://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
+        let pool = PgPoolOptions::new().max_connections(4).connect(&database_url).await.expect("fixture pool must connect");
+        crate::migration::MIGRATOR.run(&pool).await.expect("fixture schema migration");
+        PostgresFixture { _container: container, pool, database_url }
+    }
+
+    fn hash(byte: u8) -> BlockHash {
+        BlockHash::from_bytes([byte; 32])
+    }
+
+    fn level_hash(level: u64) -> BlockHash {
+        let mut bytes = [0; 32];
+        bytes[24..].copy_from_slice(&level.to_be_bytes());
+        BlockHash::from_bytes(bytes)
+    }
+
+    async fn insert_identity(pool: &PgPool, hash: BlockHash) -> i64 {
+        sqlx::query_scalar("INSERT INTO block_identifiers (hash) VALUES ($1) RETURNING id")
+            .bind(hash.as_bytes().as_slice())
+            .fetch_one(pool)
+            .await
+            .expect("identity insertion")
+    }
+
+    async fn insert_block(pool: &PgPool, hash: BlockHash, selected_parent_id: i64, level: i64, daa_score: Option<i64>) -> i64 {
+        let id = insert_identity(pool, hash).await;
+        sqlx::query("INSERT INTO levels (level, size, daa_score) VALUES ($1, 1, $2)")
+            .bind(level)
+            .bind(daa_score.unwrap_or(crate::database::NO_VSPC_DAA_SCORE))
+            .execute(pool)
+            .await
+            .expect("level insertion");
+        sqlx::query(
+            "INSERT INTO blocks (
+                 id, timestamp, daa_score, level, slot, selected_parent_id,
+                 color, is_in_vspc, blue_merge_set, red_merge_set
+             ) VALUES ($1, 0, $2, $3, 0, $4, 0, $5, '{}', '{}')",
+        )
+        .bind(id)
+        .bind(level * 10)
+        .bind(level)
+        .bind(selected_parent_id)
+        .bind(daa_score.is_some())
+        .execute(pool)
+        .await
+        .expect("block insertion");
+        id
+    }
+
+    async fn insert_network_binding(pool: &PgPool, genesis_hash: BlockHash) {
+        sqlx::query("INSERT INTO network_metadata (network_id, genesis_hash) VALUES ('mainnet', $1)")
+            .bind(genesis_hash.as_bytes().as_slice())
+            .execute(pool)
+            .await
+            .expect("network binding insertion");
+    }
+
+    async fn insert_parent(pool: &PgPool, child_id: i64, child_level: i64, parent_id: i64, parent_level: i64) {
+        sqlx::query(
+            "INSERT INTO parents (child_id, parent_id, child_level, child_slot, parent_level, parent_slot)
+             VALUES ($1, $2, $3, 0, $4, 0)",
+        )
+        .bind(child_id)
+        .bind(parent_id)
+        .bind(child_level)
+        .bind(parent_level)
+        .execute(pool)
+        .await
+        .expect("parent insertion");
+    }
+
+    async fn seed_scope_fixture(pool: &PgPool) -> (HashMap<u64, BlockHash>, i64) {
+        let origin_id = insert_identity(pool, hash(0)).await;
+        let mut hashes = HashMap::new();
+        let mut selected_parent_id = origin_id;
+        insert_network_binding(pool, hash(1)).await;
+        for (level, daa_score) in [(1, Some(10)), (2, None), (3, Some(30)), (4, Some(30)), (5, Some(50))] {
+            let block_hash = hash(u8::try_from(level).expect("test level fits u8"));
+            selected_parent_id = insert_block(pool, block_hash, selected_parent_id, level, daa_score).await;
+            hashes.insert(u64::try_from(level).expect("positive test level"), block_hash);
+        }
+        insert_identity(pool, hash(99)).await;
+        (hashes, selected_parent_id)
+    }
+
+    async fn seed_complete_projection_fixture(pool: &PgPool) -> CompleteGraph {
+        let origin_id = insert_identity(pool, ORIGIN).await;
+        insert_network_binding(pool, hash(1)).await;
+        let first_id = insert_block(pool, hash(1), origin_id, 1, Some(10)).await;
+        let second_id = insert_block(pool, hash(2), first_id, 2, Some(20)).await;
+        let third_id = insert_block(pool, hash(3), second_id, 3, Some(30)).await;
+        let boundary_id = insert_identity(pool, hash(9)).await;
+        insert_parent(pool, second_id, 2, first_id, 1).await;
+        insert_parent(pool, second_id, 2, boundary_id, 0).await;
+        insert_parent(pool, third_id, 3, second_id, 2).await;
+        insert_parent(pool, third_id, 3, first_id, 1).await;
+        sqlx::query("UPDATE blocks SET color = 1, is_in_vspc = TRUE, blue_merge_set = ARRAY[$2] WHERE id = $1")
+            .bind(second_id)
+            .bind(first_id)
+            .execute(pool)
+            .await
+            .expect("projection state update");
+        sqlx::query("UPDATE blocks SET color = 2, is_in_vspc = TRUE, red_merge_set = ARRAY[$2] WHERE id = $1")
+            .bind(third_id)
+            .bind(first_id)
+            .execute(pool)
+            .await
+            .expect("projection state update");
+        CompleteGraph { blocks: [(hash(1), first_id), (hash(2), second_id), (hash(3), third_id)], boundary: (hash(9), boundary_id) }
+    }
+
+    async fn seed_linear_graph(pool: &PgPool, high_level: i64) -> (BlockHash, i64) {
+        let origin_id = insert_identity(pool, ORIGIN).await;
+        let genesis_hash = level_hash(1);
+        insert_network_binding(pool, genesis_hash).await;
+        sqlx::query(
+            "INSERT INTO block_identifiers (hash)
+             SELECT decode(lpad(to_hex(generated.level), 64, '0'), 'hex')
+             FROM generate_series(1, $1) AS generated(level)
+             ORDER BY generated.level",
+        )
+        .bind(high_level)
+        .execute(pool)
+        .await
+        .expect("linear identities");
+        sqlx::query(
+            "INSERT INTO levels (level, size, daa_score)
+             SELECT generated.level, 1, generated.level
+             FROM generate_series(1, $1) AS generated(level)",
+        )
+        .bind(high_level)
+        .execute(pool)
+        .await
+        .expect("linear levels");
+        sqlx::query(
+            "INSERT INTO blocks (
+                 id, timestamp, daa_score, level, slot, selected_parent_id,
+                 color, is_in_vspc, blue_merge_set, red_merge_set
+             )
+             SELECT block_identity.id, generated.level, generated.level,
+                    generated.level, 0, COALESCE(parent_identity.id, $2),
+                    0, TRUE, ARRAY[]::BIGINT[], ARRAY[]::BIGINT[]
+             FROM generate_series(1, $1) AS generated(level)
+             JOIN block_identifiers block_identity
+               ON block_identity.hash = decode(lpad(to_hex(generated.level), 64, '0'), 'hex')
+             LEFT JOIN block_identifiers parent_identity
+               ON generated.level > 1
+              AND parent_identity.hash = decode(lpad(to_hex(generated.level - 1), 64, '0'), 'hex')
+             ORDER BY generated.level",
+        )
+        .bind(high_level)
+        .bind(origin_id)
+        .execute(pool)
+        .await
+        .expect("linear blocks");
+        sqlx::query(
+            "INSERT INTO parents (child_id, parent_id, child_level, child_slot, parent_level, parent_slot)
+             SELECT child.id, parent.id, generated.level, 0, generated.level - 1, 0
+             FROM generate_series(2, $1) AS generated(level)
+             JOIN block_identifiers child
+               ON child.hash = decode(lpad(to_hex(generated.level), 64, '0'), 'hex')
+             JOIN block_identifiers parent
+               ON parent.hash = decode(lpad(to_hex(generated.level - 1), 64, '0'), 'hex')",
+        )
+        .bind(high_level)
+        .execute(pool)
+        .await
+        .expect("linear parents");
+        let head_id = sqlx::query_scalar::<_, i64>("SELECT id FROM blocks WHERE level = $1")
+            .bind(high_level)
+            .fetch_one(pool)
+            .await
+            .expect("linear head ID");
+        (genesis_hash, head_id)
+    }
+
+    fn binding(genesis_hash: BlockHash) -> super::super::DatabaseBinding {
+        super::super::DatabaseBinding::new(NetworkId::new(NetworkType::Mainnet), genesis_hash)
+    }
+
+    fn api_client(
+        pool: PgPool,
+        genesis_hash: BlockHash,
+    ) -> (Arc<super::super::ValidatedApiDbClient>, crate::runtime::RetirementReceiver) {
+        let (retirement_tx, retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(
+            pool,
+            binding(genesis_hash),
+            retirement_tx,
+            crate::replacement::ApiReplacementGate::new(),
+        );
+        (client, retirements)
+    }
+
+    async fn lock_blocks(pool: &PgPool) -> Transaction<'_, SqlxPostgres> {
+        let mut transaction = pool.begin().await.expect("block-table lock transaction");
+        sqlx::query("LOCK TABLE blocks IN ACCESS EXCLUSIVE MODE").execute(&mut *transaction).await.expect("block-table lock");
+        transaction
+    }
+
+    async fn blocked_projection_pid(pool: &PgPool) -> i32 {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let pid = sqlx::query_scalar::<_, i32>(
+                    "SELECT pid
+                     FROM pg_stat_activity
+                     WHERE pid <> pg_backend_pid()
+                       AND query LIKE '%SELECT level FROM blocks ORDER BY level DESC%'
+                       AND wait_event_type = 'Lock'
+                     LIMIT 1",
+                )
+                .fetch_optional(pool)
+                .await
+                .expect("blocked projection inspection");
+                if let Some(pid) = pid {
+                    return pid;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("projection query must block")
+    }
+
+    fn scope(resolved_level: u64, database_head: u64, max_depth: u64) -> ProjectionScope {
+        ProjectionScope { resolution: anchored_resolution(resolved_level, database_head, max_depth), max_depth }
+    }
+
+    #[test]
+    fn head_depth_retains_the_latest_cache_extent() {
+        let high_level = 1_200;
+        let low_level = high_level - MAX_CACHE_DEPTH + 1;
+        assert_eq!(
+            head_scope(high_level),
+            ProjectionScope {
+                resolution: GraphWindowResolution {
+                    resolved_level: high_level,
+                    effective_start_level: low_level,
+                    effective_end_level: high_level,
+                },
+                max_depth: MAX_CACHE_DEPTH,
+            }
+        );
+        assert_eq!(head_scope(400).resolution.effective_start_level, 1);
+    }
+
+    #[test]
+    fn anchored_extents_allocate_even_depth_to_the_historical_side() {
+        assert_eq!(
+            scope(10, 20, 5),
+            ProjectionScope {
+                resolution: GraphWindowResolution { resolved_level: 10, effective_start_level: 8, effective_end_level: 12 },
+                max_depth: 5,
+            }
+        );
+        assert_eq!(
+            scope(10, 20, 4),
+            ProjectionScope {
+                resolution: GraphWindowResolution { resolved_level: 10, effective_start_level: 8, effective_end_level: 11 },
+                max_depth: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn anchored_extents_shift_at_both_database_boundaries() {
+        assert_eq!(
+            scope(1, 10, 5).resolution,
+            GraphWindowResolution { resolved_level: 1, effective_start_level: 1, effective_end_level: 5 }
+        );
+        assert_eq!(
+            scope(2, 10, 5).resolution,
+            GraphWindowResolution { resolved_level: 2, effective_start_level: 1, effective_end_level: 5 }
+        );
+        assert_eq!(
+            scope(9, 10, 5).resolution,
+            GraphWindowResolution { resolved_level: 9, effective_start_level: 6, effective_end_level: 10 }
+        );
+        assert_eq!(
+            scope(10, 10, 5).resolution,
+            GraphWindowResolution { resolved_level: 10, effective_start_level: 6, effective_end_level: 10 }
+        );
+        assert_eq!(
+            scope(2, 3, MAX_WINDOW_DEPTH).resolution,
+            GraphWindowResolution { resolved_level: 2, effective_start_level: 1, effective_end_level: 3 }
+        );
+    }
+
+    #[tokio::test]
+    async fn head_seed_materializes_the_complete_maximum_depth_and_crossing_context() {
+        let fixture = fixture().await;
+        let high_level = i64::try_from(MAX_CACHE_DEPTH + 5).expect("test depth fits BIGINT");
+        let (genesis_hash, head_id) = seed_linear_graph(&fixture.pool, high_level).await;
+        let (client, _) = api_client(fixture.pool, genesis_hash);
+
+        let GraphViewSeedOutcome::Loaded(seed) =
+            client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await.expect("maximum-depth Head projection")
+        else {
+            panic!("Head has no miss outcome");
+        };
+        assert_eq!(seed.max_depth, MAX_CACHE_DEPTH);
+        assert_eq!(
+            seed.resolution,
+            GraphWindowResolution {
+                resolved_level: MAX_CACHE_DEPTH + 5,
+                effective_start_level: 6,
+                effective_end_level: MAX_CACHE_DEPTH + 5,
+            }
+        );
+        assert_eq!(seed.blocks.len(), usize::try_from(MAX_CACHE_DEPTH).expect("cache depth fits usize"));
+        assert_eq!(seed.edges.len(), usize::try_from(MAX_CACHE_DEPTH).expect("cache depth fits usize"));
+        assert_eq!(seed.levels.len(), usize::try_from(MAX_CACHE_DEPTH + 1).expect("endpoint depth fits usize"));
+        assert_eq!(seed.levels.first_key_value().map(|(level, _)| *level), Some(5));
+        assert_eq!(seed.levels.last_key_value().map(|(level, _)| *level), Some(MAX_CACHE_DEPTH + 5));
+        assert_eq!(seed.snapshot_max_materialized_id, CompactId::new(head_id).expect("fixture ID is positive"));
+        assert_eq!(seed.snapshot_vspc_sink, level_hash(MAX_CACHE_DEPTH + 5));
+    }
+
+    #[tokio::test]
+    async fn stable_read_only_snapshot_resolves_every_indexed_anchor_and_extent() {
+        let fixture = fixture().await;
+        let pool = fixture.pool;
+        let (hashes, previous_id) = seed_scope_fixture(&pool).await;
+        let mut projection = GraphProjection::begin(&pool).await.expect("projection snapshot");
+
+        let isolation: String = sqlx::query_scalar("SHOW transaction_isolation")
+            .fetch_one(&mut *projection.transaction)
+            .await
+            .expect("transaction isolation");
+        let read_only: String = sqlx::query_scalar("SHOW transaction_read_only")
+            .fetch_one(&mut *projection.transaction)
+            .await
+            .expect("transaction read-only state");
+        assert_eq!(isolation, "repeatable read");
+        assert_eq!(read_only, "on");
+
+        assert_eq!(
+            projection.resolve_scope(GraphViewSeedRequest::HeadPublication).await,
+            Ok(ProjectionScopeOutcome::Resolved(head_scope(5)))
+        );
+        assert_eq!(
+            projection.resolve_scope(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(3), max_depth: 4 }).await,
+            Ok(ProjectionScopeOutcome::Resolved(scope(3, 5, 4)))
+        );
+        assert_eq!(
+            projection
+                .resolve_scope(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::BlockHash(hashes[&4]), max_depth: 3 })
+                .await,
+            Ok(ProjectionScopeOutcome::Resolved(scope(4, 5, 3)))
+        );
+        assert_eq!(
+            projection
+                .resolve_scope(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::DaaScore(30), max_depth: 3 })
+                .await,
+            Ok(ProjectionScopeOutcome::Resolved(scope(4, 5, 3)))
+        );
+        assert_eq!(
+            projection
+                .resolve_scope(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::DaaScore(100), max_depth: 3 })
+                .await,
+            Ok(ProjectionScopeOutcome::Resolved(scope(5, 5, 3)))
+        );
+
+        for (anchor, unavailable) in [
+            (GraphWindowAnchor::Level(6), GraphWindowAnchorUnavailable::LevelNotRetained { requested_level: 6 }),
+            (GraphWindowAnchor::BlockHash(hash(99)), GraphWindowAnchorUnavailable::BlockNotMaterialized { requested_hash: hash(99) }),
+            (
+                GraphWindowAnchor::BlockHash(hash(100)),
+                GraphWindowAnchorUnavailable::BlockNotMaterialized { requested_hash: hash(100) },
+            ),
+            (GraphWindowAnchor::DaaScore(9), GraphWindowAnchorUnavailable::NoRetainedDaaMatch { requested_score: 9 }),
+        ] {
+            assert_eq!(
+                projection.resolve_scope(GraphViewSeedRequest::AnchoredWindow { anchor, max_depth: 3 }).await,
+                Ok(ProjectionScopeOutcome::AnchorUnavailable(unavailable))
+            );
+        }
+
+        let level_six_hash = hash(6);
+        insert_block(&pool, level_six_hash, previous_id, 6, Some(60)).await;
+        assert_eq!(
+            projection.resolve_scope(GraphViewSeedRequest::HeadPublication).await,
+            Ok(ProjectionScopeOutcome::Resolved(head_scope(5))),
+            "the established snapshot must not observe a later commit"
+        );
+        projection.commit().await.expect("projection snapshot commit");
+
+        let mut successor = GraphProjection::begin(&pool).await.expect("successor projection snapshot");
+        assert_eq!(
+            successor.resolve_scope(GraphViewSeedRequest::HeadPublication).await,
+            Ok(ProjectionScopeOutcome::Resolved(head_scope(6)))
+        );
+        assert_eq!(
+            successor
+                .resolve_scope(GraphViewSeedRequest::AnchoredWindow {
+                    anchor: GraphWindowAnchor::BlockHash(level_six_hash),
+                    max_depth: 3,
+                })
+                .await,
+            Ok(ProjectionScopeOutcome::Resolved(scope(6, 6, 3)))
+        );
+        successor.commit().await.expect("successor projection snapshot commit");
+    }
+
+    #[tokio::test]
+    async fn resolved_scope_rows_and_alignment_metadata_share_one_snapshot() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let mut projection = GraphProjection::begin(&fixture.pool).await.expect("projection snapshot");
+        let ProjectionScopeOutcome::Resolved(scope) =
+            projection.resolve_scope(GraphViewSeedRequest::HeadPublication).await.expect("Head scope")
+        else {
+            panic!("Head has no miss outcome");
+        };
+
+        let fourth_hash = hash(4);
+        let fourth_id = insert_block(&fixture.pool, fourth_hash, graph.blocks[2].1, 4, Some(40)).await;
+        insert_parent(&fixture.pool, fourth_id, 4, graph.blocks[2].1, 3).await;
+
+        let seed = projection.load_seed(scope, graph.blocks[0].0).await.expect("stable projection rows");
+        assert_eq!(seed.resolution.effective_end_level, 3);
+        assert!(!seed.blocks.contains_key(&fourth_hash));
+        assert!(!seed.levels.contains_key(&4));
+        assert_eq!(seed.snapshot_max_materialized_id, CompactId::new(graph.blocks[2].1).expect("fixture ID is positive"));
+        assert_eq!(seed.snapshot_vspc_sink, graph.blocks[2].0);
+        projection.commit().await.expect("projection snapshot commit");
+
+        let (successor, _) = api_client(fixture.pool, graph.blocks[0].0);
+        let GraphViewSeedOutcome::Loaded(successor_seed) =
+            successor.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await.expect("successor projection")
+        else {
+            panic!("Head has no miss outcome");
+        };
+        assert_eq!(successor_seed.resolution.effective_end_level, 4);
+        assert!(successor_seed.blocks.contains_key(&fourth_hash));
+        assert_eq!(successor_seed.snapshot_max_materialized_id, CompactId::new(fourth_id).expect("fixture ID is positive"));
+        assert_eq!(successor_seed.snapshot_vspc_sink, fourth_hash);
+    }
+
+    #[tokio::test]
+    async fn api_client_loads_complete_projection_and_crossing_edge_context() {
+        let fixture = fixture().await;
+        let pool = fixture.pool;
+        let blocks = seed_complete_projection_fixture(&pool).await;
+        let (client, mut retirements) = api_client(pool, blocks.blocks[0].0);
+
+        let outcome = client
+            .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 2 })
+            .await
+            .expect("complete projection");
+        let GraphViewSeedOutcome::Loaded(seed) = outcome else {
+            panic!("level anchor must resolve");
+        };
+        assert_eq!(seed.resolution, GraphWindowResolution { resolved_level: 2, effective_start_level: 1, effective_end_level: 2 });
+        assert_eq!(seed.blocks.len(), 2);
+        let genesis = &seed.blocks[&blocks.blocks[0].0];
+        assert_eq!(genesis.selected_parent_index, None);
+        assert!(genesis.direct_parents.is_empty());
+        let second = &seed.blocks[&blocks.blocks[1].0];
+        assert_eq!(second.selected_parent_index, Some(0));
+        assert_eq!(&*second.direct_parents, &[blocks.blocks[0].0, blocks.boundary.0]);
+        assert_eq!(&*second.blue_merge_set, &[blocks.blocks[0].0]);
+        assert_eq!(second.color, BlockColor::Blue);
+        assert!(second.is_in_vspc);
+
+        assert_eq!(seed.edges.len(), 3);
+        assert!(seed.edges.contains_key(&EdgeId { parent: blocks.blocks[0].0, child: blocks.blocks[1].0 }));
+        assert!(seed.edges.contains_key(&EdgeId { parent: blocks.blocks[1].0, child: blocks.blocks[2].0 }));
+        assert!(seed.edges.contains_key(&EdgeId { parent: blocks.blocks[0].0, child: blocks.blocks[2].0 }));
+        assert!(!seed.edges.contains_key(&EdgeId { parent: blocks.boundary.0, child: blocks.blocks[1].0 }));
+        assert_eq!(seed.levels.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(seed.snapshot_max_materialized_id, CompactId::new(blocks.blocks[2].1).expect("fixture ID is positive"));
+        assert_eq!(seed.snapshot_vspc_sink, blocks.blocks[2].0);
+
+        let GraphViewSeedOutcome::Loaded(narrow) = client
+            .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 1 })
+            .await
+            .expect("narrow projection")
+        else {
+            panic!("retained level must resolve");
+        };
+        assert_eq!(narrow.blocks.keys().copied().collect::<Vec<_>>(), vec![blocks.blocks[1].0]);
+        assert_eq!(narrow.edges.len(), 3, "two one-endpoint edges and one zero-endpoint edge intersect level two");
+        assert_eq!(narrow.levels.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+
+        let GraphViewSeedOutcome::Loaded(head) =
+            client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await.expect("Head projection")
+        else {
+            panic!("Head has no miss outcome");
+        };
+        assert_eq!(head.max_depth, MAX_CACHE_DEPTH);
+        assert_eq!(head.resolution, GraphWindowResolution { resolved_level: 3, effective_start_level: 1, effective_end_level: 3 });
+        assert_eq!(head.blocks.len(), 3, "the retained range is shorter than the Head capacity");
+        let third = &head.blocks[&blocks.blocks[2].0];
+        assert_eq!(third.selected_parent_index, Some(1));
+        assert_eq!(&*third.direct_parents, &[blocks.blocks[0].0, blocks.blocks[1].0]);
+        assert_eq!(&*third.red_merge_set, &[blocks.blocks[0].0]);
+        assert_eq!(third.color, BlockColor::Red);
+        assert!(third.is_in_vspc);
+
+        for (anchor, max_depth, expected) in [
+            (
+                GraphWindowAnchor::Level(1),
+                2,
+                GraphWindowResolution { resolved_level: 1, effective_start_level: 1, effective_end_level: 2 },
+            ),
+            (
+                GraphWindowAnchor::BlockHash(blocks.blocks[2].0),
+                2,
+                GraphWindowResolution { resolved_level: 3, effective_start_level: 2, effective_end_level: 3 },
+            ),
+            (
+                GraphWindowAnchor::DaaScore(20),
+                3,
+                GraphWindowResolution { resolved_level: 2, effective_start_level: 1, effective_end_level: 3 },
+            ),
+        ] {
+            let GraphViewSeedOutcome::Loaded(anchored) = client
+                .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor, max_depth })
+                .await
+                .expect("anchored projection")
+            else {
+                panic!("fixture anchor must resolve");
+            };
+            assert_eq!(anchored.resolution, expected);
+        }
+
+        for (anchor, expected) in [
+            (GraphWindowAnchor::Level(4), GraphWindowAnchorUnavailable::LevelNotRetained { requested_level: 4 }),
+            (
+                GraphWindowAnchor::BlockHash(blocks.boundary.0),
+                GraphWindowAnchorUnavailable::BlockNotMaterialized { requested_hash: blocks.boundary.0 },
+            ),
+            (GraphWindowAnchor::DaaScore(9), GraphWindowAnchorUnavailable::NoRetainedDaaMatch { requested_score: 9 }),
+        ] {
+            assert_eq!(
+                client.load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor, max_depth: 2 }).await,
+                Ok(GraphViewSeedOutcome::AnchorUnavailable(expected))
+            );
+        }
+        assert!(retirements.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn public_miss_precedes_projection_incoherence_and_errors_do_not_retire_the_generation() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        sqlx::query(
+            "INSERT INTO parents (child_id, parent_id, child_level, child_slot, parent_level, parent_slot)
+             VALUES ($1, $2, 2, 0, 0, 0)",
+        )
+        .bind(graph.blocks[1].1)
+        .bind(i64::MAX)
+        .execute(&fixture.pool)
+        .await
+        .expect("incoherent parent fixture");
+        let (client, mut retirements) = api_client(fixture.pool, graph.blocks[0].0);
+
+        let unknown = hash(88);
+        assert_eq!(
+            client
+                .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow {
+                    anchor: GraphWindowAnchor::BlockHash(unknown),
+                    max_depth: 1,
+                })
+                .await,
+            Ok(GraphViewSeedOutcome::AnchorUnavailable(GraphWindowAnchorUnavailable::BlockNotMaterialized {
+                requested_hash: unknown
+            }))
+        );
+        assert_eq!(
+            client
+                .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 1 })
+                .await,
+            Err(crate::error::ApiReadError::InconsistentProjection)
+        );
+        assert!(client.is_valid());
+        assert!(retirements.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn postgres_query_failure_retains_the_exact_api_generation() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let (client, mut retirements) = api_client(fixture.pool.clone(), graph.blocks[0].0);
+        sqlx::query("DROP TABLE levels").execute(&fixture.pool).await.expect("query-failure fixture");
+
+        assert_eq!(
+            client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await,
+            Err(crate::error::ApiReadError::QueryFailed)
+        );
+        assert!(client.is_valid());
+        assert!(retirements.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn replacement_cancels_a_blocked_projection_before_retirement_completion() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let gate = crate::replacement::ApiReplacementGate::new();
+        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(api_pool, binding(graph.blocks[0].0), retirement_tx, gate.clone());
+        let blocker = lock_blocks(&fixture.pool).await;
+        let operation_client = client.clone();
+        let operation =
+            tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
+        let pid = blocked_projection_pid(&fixture.pool).await;
+
+        let replacement = gate.begin_replacement().expect("replacement closes admission");
+        let exclusive = timeout(Duration::from_secs(1), replacement.acquire_exclusive(&Timing::production()))
+            .await
+            .expect("blocked read cancels and releases its database resources promptly")
+            .expect("replacement exclusion");
+        let backend_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+            .bind(pid)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("cancelled backend inspection");
+        assert!(!backend_exists, "exclusive replacement begins only after the cancelled backend and transaction end");
+        let request = retirements.recv().await.expect("cancelled projection retirement request");
+        let retired = match request.target() {
+            crate::runtime::RetirementTarget::Api(generation) => generation.upgrade().expect("API generation remains alive"),
+            crate::runtime::RetirementTarget::Processing(_) => panic!("API read requested processing retirement"),
+        };
+        assert!(Arc::ptr_eq(&retired, &client));
+        assert!(!operation.is_finished());
+        assert!(retired.retire());
+        request.complete(Ok(()));
+        assert_eq!(operation.await.expect("projection task"), Err(crate::error::ApiReadError::GenerationLost));
+
+        exclusive.open().expect("test reopens admission");
+        blocker.rollback().await.expect("release block-table lock");
+    }
+
+    #[tokio::test]
+    async fn generation_retirement_cancels_the_backend_before_its_barrier() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(
+            api_pool,
+            binding(graph.blocks[0].0),
+            retirement_tx,
+            crate::replacement::ApiReplacementGate::new(),
+        );
+        let blocker = lock_blocks(&fixture.pool).await;
+        let operation_client = client.clone();
+        let operation =
+            tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
+        let pid = blocked_projection_pid(&fixture.pool).await;
+
+        assert!(client.retire());
+        let request = retirements.recv().await.expect("retired projection joins the exact-generation barrier");
+        let backend_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+            .bind(pid)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("retired backend inspection");
+        assert!(!backend_exists, "retirement reaches its barrier only after the backend and transaction end");
+        let retired = match request.target() {
+            crate::runtime::RetirementTarget::Api(generation) => generation.upgrade().expect("API generation remains alive"),
+            crate::runtime::RetirementTarget::Processing(_) => panic!("API read requested processing retirement"),
+        };
+        assert!(Arc::ptr_eq(&retired, &client));
+        assert!(!operation.is_finished());
+        request.complete(Ok(()));
+        assert_eq!(operation.await.expect("projection task"), Err(crate::error::ApiReadError::GenerationLost));
+
+        blocker.rollback().await.expect("release block-table lock");
+    }
+
+    #[tokio::test]
+    async fn abandoned_projection_keeps_its_lease_until_backend_cleanup() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let gate = crate::replacement::ApiReplacementGate::new();
+        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(api_pool, binding(graph.blocks[0].0), retirement_tx, gate.clone());
+        let blocker = lock_blocks(&fixture.pool).await;
+        let operation_client = client.clone();
+        let operation =
+            tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
+        let pid = blocked_projection_pid(&fixture.pool).await;
+
+        operation.abort();
+        assert!(operation.await.expect_err("projection task is abandoned").is_cancelled());
+        let replacement = gate.begin_replacement().expect("replacement closes admission");
+        let exclusive = timeout(Duration::from_secs(1), replacement.acquire_exclusive(&Timing::production()))
+            .await
+            .expect("abandoned read cleans up its database resources promptly")
+            .expect("replacement exclusion");
+        let backend_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+            .bind(pid)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("abandoned backend inspection");
+        assert!(!backend_exists, "abandonment retains the lease until the backend and transaction end");
+        assert!(client.is_valid());
+        assert!(retirements.try_recv().is_err());
+
+        exclusive.open().expect("test reopens admission");
+        blocker.rollback().await.expect("release block-table lock");
+    }
+
+    #[tokio::test]
+    async fn abandoned_cleanup_keeps_its_lease_until_the_backend_exits() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let gate = crate::replacement::ApiReplacementGate::new();
+        let (retirement_tx, _retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(api_pool, binding(graph.blocks[0].0), retirement_tx, gate.clone());
+        let blocker = lock_blocks(&fixture.pool).await;
+        let (cleanup_reached_tx, cleanup_reached_rx) = oneshot::channel();
+        let (cleanup_release_tx, cleanup_release_rx) = oneshot::channel();
+        client.hold_next_resource_handoff(cleanup_reached_tx, cleanup_release_rx);
+        let operation_client = client.clone();
+        let operation =
+            tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
+        let pid = blocked_projection_pid(&fixture.pool).await;
+
+        let replacement = gate.begin_replacement().expect("replacement closes admission");
+        assert_eq!(cleanup_reached_rx.await.expect("cleanup task receives the database resources and lease"), Some(pid));
+        operation.abort();
+        assert!(operation.await.expect_err("projection task is abandoned during cleanup").is_cancelled());
+
+        let timing = Timing::production();
+        let exclusive = replacement.acquire_exclusive(&timing);
+        tokio::pin!(exclusive);
+        assert!(
+            timeout(Duration::from_millis(50), &mut exclusive).await.is_err(),
+            "abandoning the cleanup waiter must not release its replacement lease"
+        );
+        let backend_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+            .bind(pid)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("held cleanup backend inspection");
+        assert!(backend_exists, "the deterministic cleanup barrier retains the original backend");
+
+        cleanup_release_tx.send(()).expect("release background cleanup");
+        let exclusive = timeout(Duration::from_secs(1), &mut exclusive)
+            .await
+            .expect("background cleanup releases its database resources promptly")
+            .expect("replacement exclusion");
+        let backend_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+            .bind(pid)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("completed cleanup backend inspection");
+        assert!(!backend_exists, "exclusive replacement begins only after the detached cleanup ends");
+
+        exclusive.open().expect("test reopens admission");
+        blocker.rollback().await.expect("release block-table lock");
+    }
+
+    #[tokio::test]
+    async fn abandoned_projection_release_keeps_its_lease_until_rollback_and_pool_return() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        sqlx::query(
+            "INSERT INTO parents (child_id, parent_id, child_level, child_slot, parent_level, parent_slot)
+             VALUES ($1, $2, 2, 0, 0, 0)",
+        )
+        .bind(graph.blocks[1].1)
+        .bind(i64::MAX)
+        .execute(&fixture.pool)
+        .await
+        .expect("incoherent parent fixture");
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let gate = crate::replacement::ApiReplacementGate::new();
+        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(api_pool, binding(graph.blocks[0].0), retirement_tx, gate.clone());
+        let (release_reached_tx, release_reached_rx) = oneshot::channel();
+        let (release_continue_tx, release_continue_rx) = oneshot::channel();
+        client.hold_next_resource_handoff(release_reached_tx, release_continue_rx);
+
+        let operation_client = client.clone();
+        let operation = tokio::spawn(async move {
+            operation_client
+                .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 1 })
+                .await
+        });
+        let pid = release_reached_rx
+            .await
+            .expect("release task receives the database resources and lease")
+            .expect("release follows backend discovery");
+        operation.abort();
+        assert!(operation.await.expect_err("projection task is abandoned during release").is_cancelled());
+
+        let replacement = gate.begin_replacement().expect("replacement closes admission");
+        let timing = Timing::production();
+        let exclusive = replacement.acquire_exclusive(&timing);
+        tokio::pin!(exclusive);
+        assert!(
+            timeout(Duration::from_millis(50), &mut exclusive).await.is_err(),
+            "abandoning the release waiter must not release its replacement lease"
+        );
+        let transaction_active: bool = sqlx::query_scalar(
+            "SELECT xact_start IS NOT NULL
+             FROM pg_stat_activity
+             WHERE pid = $1",
+        )
+        .bind(pid)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("held release transaction inspection");
+        assert!(transaction_active, "the queued rollback has not completed while release is held");
+
+        release_continue_tx.send(()).expect("release background pool return");
+        let exclusive = timeout(Duration::from_secs(1), &mut exclusive)
+            .await
+            .expect("background release returns the connection promptly")
+            .expect("replacement exclusion");
+        let transaction_released: bool = sqlx::query_scalar(
+            "SELECT state = 'idle' AND xact_start IS NULL
+             FROM pg_stat_activity
+             WHERE pid = $1",
+        )
+        .bind(pid)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("returned connection transaction inspection");
+        assert!(transaction_released, "exclusive replacement begins only after rollback and pool return");
+        assert!(client.is_valid());
+        assert!(retirements.try_recv().is_err());
+
+        exclusive.open().expect("test reopens admission");
+    }
+
+    #[tokio::test]
+    async fn api_connection_loss_retires_only_the_blocked_api_generation() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let generation_binding = binding(graph.blocks[0].0);
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let processing_pool =
+            PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated processing pool");
+        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
+        let api = super::super::ValidatedApiDbClient::new(
+            api_pool,
+            generation_binding,
+            retirement_tx.clone(),
+            crate::replacement::ApiReplacementGate::new(),
+        );
+        let processing = super::super::ValidatedDbClient::new(processing_pool, generation_binding, retirement_tx);
+        let blocker = lock_blocks(&fixture.pool).await;
+        let operation_client = api.clone();
+        let operation =
+            tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
+        let pid = blocked_projection_pid(&fixture.pool).await;
+        let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+            .bind(pid)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("terminate blocked API backend");
+        assert!(terminated);
+
+        let request = retirements.recv().await.expect("connection-loss retirement request");
+        let retired = match request.target() {
+            crate::runtime::RetirementTarget::Api(generation) => generation.upgrade().expect("API generation remains alive"),
+            crate::runtime::RetirementTarget::Processing(_) => panic!("API loss requested processing retirement"),
+        };
+        assert!(Arc::ptr_eq(&retired, &api));
+        assert!(retired.retire());
+        request.complete(Ok(()));
+        assert_eq!(operation.await.expect("projection task"), Err(crate::error::ApiReadError::GenerationLost));
+        assert!(!api.is_valid());
+        assert!(processing.is_valid());
+        assert_eq!(
+            sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(processing.pool()).await.expect("processing pool remains usable"),
+            1
+        );
+        assert!(retirements.try_recv().is_err());
+
+        blocker.rollback().await.expect("release block-table lock");
+    }
+}

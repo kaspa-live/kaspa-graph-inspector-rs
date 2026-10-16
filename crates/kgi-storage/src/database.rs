@@ -239,7 +239,7 @@ pub(crate) async fn open_validated_generations_managed(
     let processing = open_processing_generation_managed(database_url.clone(), binding, retirement_tx.clone(), rebuild_tx).await?;
 
     let api = if coherent {
-        match open_api_generation(database_url, retirement_tx, replacement_gate).await {
+        match open_api_generation(database_url, binding, retirement_tx, replacement_gate).await {
             Ok(api) => Some(api),
             Err(error) => {
                 processing.retire();
@@ -284,6 +284,7 @@ pub(crate) async fn open_processing_generation_managed(
 
 pub(crate) async fn open_api_generation(
     database_url: String,
+    binding: DatabaseBinding,
     retirement_tx: RetirementSender,
     replacement_gate: Arc<ApiReplacementGate>,
 ) -> Result<Arc<ValidatedApiDbClient>, StorageError> {
@@ -302,7 +303,7 @@ pub(crate) async fn open_api_generation(
         pool.close().await;
         return Err(error);
     }
-    Ok(ValidatedApiDbClient::new(pool, retirement_tx, replacement_gate))
+    Ok(ValidatedApiDbClient::new(pool, binding, retirement_tx, replacement_gate))
 }
 
 async fn validate_processing_pool(pool: &sqlx::PgPool) -> Result<(), StorageError> {
