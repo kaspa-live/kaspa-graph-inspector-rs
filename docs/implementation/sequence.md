@@ -87,8 +87,8 @@ do not enlarge the PR silently. Any future regrouping requires updating this
 sequence first.
 
 The former broad Step 6 is now increments 6–17, former Step 7 is increments
-18–22, and former Step 8 is increments 23–27. The active canonical graph-model
-work is increment 6, without an additional nesting level.
+18–22, and former Step 8 is increments 23–27. Increment 6 is complete; the
+active work is increment 7, without an additional nesting level.
 
 | Increment / PR | Isolated production scope | Completion evidence |
 |---|---|---|
@@ -115,32 +115,41 @@ work is increment 6, without an additional nesting level.
 | 26. Deployment and release artifacts | Complete the conventional and Docker layouts, runtime log directories, systemd and Compose examples, static-asset cache behavior, and atomic `xtask` bundle/container construction against the composed binary and Web build. | Reproducible bundle and image checks, matching binary/assets and provenance, missing-root failure, unprivileged/read-only deployment, writable logs, direct signal delivery, and atomic failure cleanup. |
 | 27. Full-stack acceptance | Add only the remaining cross-component fixtures and acceptance coverage needed to prove the focused verification contract across node RPC, PostgreSQL, recovery, API/Web, packaging, logging, and resource isolation; update implementation status with the final evidence. | Full Rust, PostgreSQL, Vitest, deterministic and complete-stack Playwright, parity, packaging, shutdown, and load/isolation suites pass from a clean checkout. |
 
-### Active increment 6: canonical graph model
+### Active increment 7: API graph projection reads
 
-Increment 6 is exactly one reviewable PR. It implements the canonical in-memory
-graph model in `kgi-api-model`; publication runtime, storage seed reads,
-ApiService control and resource ownership, response caching and encoding,
-HTTP/SSE delivery, and top-crate HTTP composition belong to the separately
-numbered increments above.
+Increment 7 is exactly one reviewable PR. It adds the API-owned projection
+request and result values to `kgi-api-model` and implements the
+[`ValidatedApiDbClient` graph-seed read](../architecture/storage.md#api-graph-projection-reads--settled)
+in `kgi-storage`. Publication construction, ApiService control, encoding,
+transport, and HTTP serving belong to later increments.
 
-Execute increment 6 as these ordered points:
+Execute increment 7 as these ordered points:
 
-1. Record the graph-model module and collection choices, then add the
-   foundational graph values and checked `GraphDelta` construction.
-2. Implement seeded `GraphView` construction and frozen subview extraction.
-3. Implement Head `BlockCommitted` mutation, edge retention, external-level
-   maintenance, and bounded pruning.
-4. Implement VSPC projection and Fixed-view update and terminal-freeze behavior.
-5. Implement delta application and gapless composition.
-6. Implement `GraphHistory` append, cumulative estimates, level-scoped pruning,
-   and retained-range selection.
-7. Update implementation status and run formatting, workspace unit and
+1. Record the projection module and collection choices, then add the
+   API-owned window anchor, resolution, unavailability, seed-request,
+   seed-outcome, and seed values in `kgi-api-model`.
+2. Add the closed `ApiReadError` boundary and
+   `ValidatedApiDbClient::load_graph_view_seed`, including API replacement-read
+   admission, cancellation, and exact-generation retirement behavior.
+3. Implement the read-only stable-snapshot projection transaction, indexed
+   level, block-hash, and DAA-floor anchor resolution, and Head and anchored
+   extent selection.
+4. Materialize the complete graph projection and construction metadata,
+   including nominal blocks, crossing edges, endpoint levels, canonical block
+   relationships, selected-parent indexes, current projection fields, the
+   materialized-ID cut, and committed VSPC sink. Reject structurally incomplete
+   results without returning a partial seed.
+5. Add PostgreSQL integration coverage for every seed and anchor shape,
+   boundary shifting, short retained ranges, stable-snapshot consistency,
+   projection coherence, ordinary misses, cancellation, API-generation loss,
+   and processing/API pool isolation.
+6. Update implementation status and run formatting, workspace unit and
    integration tests through Nextest, Cargo doctests, Cargo check, Clippy with
    warnings denied, and `git diff --check`.
 
-This increment adds no placeholder publication, storage, cache, encoding,
-router, or SSE API. Its production scope is `kgi-api-model`; the graph model's
-focused tests provide its completion evidence.
+This increment adds no publication worker, response cache, encoding scheduler,
+router, HTTP path, or SSE behavior. Its production scope is `kgi-api-model`
+and `kgi-storage`.
 
 ## Cross-increment ordering
 
