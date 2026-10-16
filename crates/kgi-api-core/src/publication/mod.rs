@@ -1,17 +1,21 @@
 #![allow(dead_code, reason = "the isolated publication kernel is integrated by later API increments")]
 
 mod error;
+mod estimate;
 
 use std::time::Instant;
 
 use kgi_api_model::{
+    delta::GraphDelta,
     graph::{GraphView, TrackingPolicy},
     history::GraphHistory,
 };
+use kgi_model::graph_update::{BlockCommitted, VspcCommitted};
 use rand::{RngCore, rngs::OsRng};
 use tokio::sync::{Mutex, RwLock};
 
 pub(crate) use self::error::PublicationProjectionError;
+use self::estimate::estimate_raw_delta_bytes;
 
 /// Externally meaningful lifecycle state of one graph publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,8 +84,64 @@ impl GraphPublication {
         self.revision_timestamp_ms_at(Instant::now())
     }
 
+    /// Applies one committed block and publishes any resulting history entry.
+    ///
+    /// Returns the newly published target revision, or `None` when the update
+    /// has no retained effect and advances neither the image nor its history.
+    pub(crate) async fn apply_block_committed(&self, committed: &BlockCommitted) -> Result<Option<u64>, PublicationProjectionError> {
+        self.apply_original_update(OriginalUpdate::Block(committed)).await
+    }
+
+    /// Applies one committed VSPC transition and publishes any resulting history entry.
+    ///
+    /// Returns the newly published target revision, or `None` when the update
+    /// has no retained effect and advances neither the image nor its history.
+    pub(crate) async fn apply_vspc_committed(&self, committed: &VspcCommitted) -> Result<Option<u64>, PublicationProjectionError> {
+        self.apply_original_update(OriginalUpdate::Vspc(committed)).await
+    }
+
+    async fn apply_original_update(&self, update: OriginalUpdate<'_>) -> Result<Option<u64>, PublicationProjectionError> {
+        let _mutation = self.mutation.lock().await;
+
+        let image_revision = self.image.read().await.view.current_revision_id();
+        let history_revision = self.history.read().await.current_revision_id();
+        if image_revision != history_revision {
+            return Err(PublicationProjectionError::RevisionMismatch { image_revision, history_revision });
+        }
+
+        let mut image = self.image.write().await;
+        assert_ne!(image.state, GraphPublicationState::Stale, "a Stale publication is not mutated");
+        let delta = update.apply(&mut image.view, self.revision_timestamp_ms())?;
+        let Some(delta) = delta else {
+            return Ok(None);
+        };
+        let target_revision = delta.to_revision_id();
+        let head_low_level = image.view.low_level();
+        drop(image);
+
+        let estimated_raw_bytes = estimate_raw_delta_bytes(&delta);
+        let mut history = self.history.write().await;
+        history.append(delta, estimated_raw_bytes)?;
+        history.prune(head_low_level);
+        Ok(Some(target_revision))
+    }
+
     fn revision_timestamp_ms_at(&self, now: Instant) -> u64 {
         revision_timestamp_ms_at(self.revision_clock_origin, now)
+    }
+}
+
+enum OriginalUpdate<'a> {
+    Block(&'a BlockCommitted),
+    Vspc(&'a VspcCommitted),
+}
+
+impl OriginalUpdate<'_> {
+    fn apply(self, view: &mut GraphView, revision_timestamp_ms: u64) -> Result<Option<GraphDelta>, PublicationProjectionError> {
+        match self {
+            Self::Block(committed) => Ok(view.apply_head_block_committed(committed, revision_timestamp_ms)?),
+            Self::Vspc(committed) => Ok(view.apply_head_vspc_committed(committed, revision_timestamp_ms)?),
+        }
     }
 }
 
@@ -108,6 +168,7 @@ fn sample_nonzero_publication_id(mut sample: impl FnMut() -> u64) -> u64 {
 mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
+        sync::Arc,
         time::Duration,
     };
 
@@ -115,18 +176,65 @@ mod tests {
         delta::GraphDelta,
         graph::{Level, LevelExtent},
     };
+    use kgi_model::{
+        block::{BlockColor, BlockCoordinate, BlockHash, CompactId},
+        graph_update::{BlockCommitted, LevelCommitted, ParentCommitted, VspcCommitted},
+    };
 
     use super::*;
 
     fn head_view() -> GraphView {
+        head_view_with_depth(1)
+    }
+
+    fn head_view_with_depth(max_depth: u64) -> GraphView {
         GraphView::from_database_projection(
-            1,
+            max_depth,
             LevelExtent::new(1, 1).expect("valid extent"),
             TrackingPolicy::Head,
             BTreeMap::from([(1, Level { size: 1, daa_score: None })]),
             HashMap::new(),
             HashMap::new(),
         )
+    }
+
+    fn hash(byte: u8) -> BlockHash {
+        BlockHash::from_bytes([byte; 32])
+    }
+
+    fn committed_block(byte: u8) -> BlockCommitted {
+        let level = u64::from(byte);
+        let parent_level = level - 1;
+        BlockCommitted {
+            id: CompactId::new(i64::from(byte)).expect("positive compact ID"),
+            hash: hash(byte),
+            coordinate: BlockCoordinate::new(level, 0).expect("positive coordinate"),
+            timestamp: level * 10,
+            daa_score: level * 100,
+            selected_parent_index: Some(0),
+            direct_parents: Arc::from([ParentCommitted {
+                hash: hash(byte - 1),
+                coordinate: Some(BlockCoordinate::new(parent_level, 0).expect("positive parent coordinate")),
+            }]),
+            blue_merge_set: Arc::from([]),
+            red_merge_set: Arc::from([]),
+            color: BlockColor::Gray,
+            is_in_vspc: false,
+            level_snapshots: Arc::from([
+                LevelCommitted { level: parent_level, size: 1, daa_score: None },
+                LevelCommitted { level, size: 1, daa_score: None },
+            ]),
+        }
+    }
+
+    fn vspc_added(byte: u8, daa_score: Option<u64>) -> VspcCommitted {
+        VspcCommitted {
+            source: hash(byte - 1),
+            destination: hash(byte),
+            removed: Arc::from([]),
+            added: Arc::from([hash(byte)]),
+            level_snapshots: Arc::from([LevelCommitted { level: u64::from(byte), size: 1, daa_score }]),
+        }
     }
 
     fn advanced_delta() -> GraphDelta {
@@ -165,6 +273,72 @@ mod tests {
 
         assert_eq!(publication.image.read().await.view.current_revision_id(), 1);
         assert_eq!(publication.history.read().await.current_revision_id(), 1);
+    }
+
+    #[tokio::test]
+    async fn original_updates_advance_image_and_history_and_noops_advance_neither() {
+        let origin = Instant::now().checked_sub(Duration::from_millis(10)).expect("valid fixture origin");
+        let publication =
+            GraphPublication::new(GraphPublicationState::Synchronizing, origin, head_view_with_depth(2), GraphHistory::new())
+                .expect("matching candidate");
+
+        assert_eq!(publication.apply_block_committed(&committed_block(2)).await.expect("block update"), Some(1));
+        {
+            let image = publication.image.read().await;
+            assert_eq!(image.view.current_revision_id(), 1);
+            assert!(image.view.current_revision_timestamp_ms() >= 10);
+            assert_eq!(image.view.block(&hash(2)).map(|block| block.is_in_vspc), Some(false));
+        }
+        {
+            let history = publication.history.read().await;
+            assert_eq!(history.current_revision_id(), 1);
+            assert_eq!(history.len(), 1);
+            assert_eq!(history.entries().next().expect("block entry").estimated_raw_bytes(), 846);
+        }
+
+        let vspc = vspc_added(2, Some(200));
+        assert_eq!(publication.apply_vspc_committed(&vspc).await.expect("VSPC update"), Some(2));
+        assert_eq!(publication.image.read().await.view.block(&hash(2)).map(|block| block.is_in_vspc), Some(true));
+        assert_eq!(publication.history.read().await.current_revision_id(), 2);
+
+        assert_eq!(publication.apply_vspc_committed(&vspc).await.expect("VSPC no-op"), None);
+        assert_eq!(publication.image.read().await.view.current_revision_id(), 2);
+        assert_eq!(publication.history.read().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn starting_revision_mismatch_refuses_before_applying_the_update() {
+        let publication =
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view(), GraphHistory::new())
+                .expect("matching candidate");
+        publication.history.write().await.append(advanced_delta(), 1).expect("fixture history drift");
+
+        assert_eq!(
+            publication.apply_vspc_committed(&vspc_added(2, None)).await,
+            Err(PublicationProjectionError::RevisionMismatch { image_revision: 0, history_revision: 1 })
+        );
+        assert_eq!(publication.image.read().await.view.current_revision_id(), 0);
+        assert!(publication.image.read().await.view.block(&hash(2)).is_none());
+    }
+
+    #[tokio::test]
+    async fn history_prunes_only_after_a_delta_high_level_leaves_the_head_window() {
+        let publication =
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view_with_depth(2), GraphHistory::new())
+                .expect("matching candidate");
+
+        for byte in 2..=4 {
+            assert_eq!(
+                publication.apply_block_committed(&committed_block(byte)).await.expect("block update"),
+                Some(u64::from(byte - 1))
+            );
+        }
+
+        let history = publication.history.read().await;
+        assert_eq!(history.current_revision_id(), 3);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.oldest_available_revision(), 1);
+        assert_eq!(history.entries().next().expect("oldest retained entry").delta().high_level(), 3);
     }
 
     #[test]
