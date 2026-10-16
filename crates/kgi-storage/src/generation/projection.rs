@@ -520,7 +520,7 @@ fn query_error(error: sqlx::Error) -> ApiReadError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc, time::Duration};
 
     use super::{GraphProjection, ProjectionScope, ProjectionScopeOutcome, anchored_resolution, head_scope};
     use kaspa_consensus_core::{
@@ -534,27 +534,46 @@ mod tests {
             MAX_WINDOW_DEPTH,
         },
     };
+    use kgi_core::timing::Timing;
     use kgi_model::block::{BlockColor, BlockHash, CompactId};
-    use sqlx::{PgPool, postgres::PgPoolOptions};
+    use sqlx::{PgPool, Postgres as SqlxPostgres, Transaction, postgres::PgPoolOptions};
     use testcontainers_modules::{
         postgres::Postgres,
         testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner},
     };
+    use tokio::time::{sleep, timeout};
 
     const POSTGRES_PORT: u16 = 5432;
 
-    async fn fixture() -> (ContainerAsync<Postgres>, PgPool) {
+    struct PostgresFixture {
+        _container: ContainerAsync<Postgres>,
+        pool: PgPool,
+        database_url: String,
+    }
+
+    struct CompleteGraph {
+        blocks: [(BlockHash, i64); 3],
+        boundary: (BlockHash, i64),
+    }
+
+    async fn fixture() -> PostgresFixture {
         let container = Postgres::default().with_tag("17-alpine").start().await.expect("PostgreSQL fixture must start");
         let host = container.get_host().await.expect("fixture host must resolve");
         let port = container.get_host_port_ipv4(POSTGRES_PORT).await.expect("fixture PostgreSQL port must resolve");
         let database_url = format!("postgresql://postgres:postgres@{host}:{port}/postgres?sslmode=disable");
         let pool = PgPoolOptions::new().max_connections(4).connect(&database_url).await.expect("fixture pool must connect");
         crate::migration::MIGRATOR.run(&pool).await.expect("fixture schema migration");
-        (container, pool)
+        PostgresFixture { _container: container, pool, database_url }
     }
 
     fn hash(byte: u8) -> BlockHash {
         BlockHash::from_bytes([byte; 32])
+    }
+
+    fn level_hash(level: u64) -> BlockHash {
+        let mut bytes = [0; 32];
+        bytes[24..].copy_from_slice(&level.to_be_bytes());
+        BlockHash::from_bytes(bytes)
     }
 
     async fn insert_identity(pool: &PgPool, hash: BlockHash) -> i64 {
@@ -626,14 +645,17 @@ mod tests {
         (hashes, selected_parent_id)
     }
 
-    async fn seed_complete_projection_fixture(pool: &PgPool) -> [(BlockHash, i64); 3] {
+    async fn seed_complete_projection_fixture(pool: &PgPool) -> CompleteGraph {
         let origin_id = insert_identity(pool, ORIGIN).await;
         insert_network_binding(pool, hash(1)).await;
         let first_id = insert_block(pool, hash(1), origin_id, 1, Some(10)).await;
         let second_id = insert_block(pool, hash(2), first_id, 2, Some(20)).await;
         let third_id = insert_block(pool, hash(3), second_id, 3, Some(30)).await;
+        let boundary_id = insert_identity(pool, hash(9)).await;
         insert_parent(pool, second_id, 2, first_id, 1).await;
+        insert_parent(pool, second_id, 2, boundary_id, 0).await;
         insert_parent(pool, third_id, 3, second_id, 2).await;
+        insert_parent(pool, third_id, 3, first_id, 1).await;
         sqlx::query("UPDATE blocks SET color = 1, is_in_vspc = TRUE, blue_merge_set = ARRAY[$2] WHERE id = $1")
             .bind(second_id)
             .bind(first_id)
@@ -646,7 +668,120 @@ mod tests {
             .execute(pool)
             .await
             .expect("projection state update");
-        [(hash(1), first_id), (hash(2), second_id), (hash(3), third_id)]
+        CompleteGraph { blocks: [(hash(1), first_id), (hash(2), second_id), (hash(3), third_id)], boundary: (hash(9), boundary_id) }
+    }
+
+    async fn seed_linear_graph(pool: &PgPool, high_level: i64) -> (BlockHash, i64) {
+        let origin_id = insert_identity(pool, ORIGIN).await;
+        let genesis_hash = level_hash(1);
+        insert_network_binding(pool, genesis_hash).await;
+        sqlx::query(
+            "INSERT INTO block_identifiers (hash)
+             SELECT decode(lpad(to_hex(generated.level), 64, '0'), 'hex')
+             FROM generate_series(1, $1) AS generated(level)
+             ORDER BY generated.level",
+        )
+        .bind(high_level)
+        .execute(pool)
+        .await
+        .expect("linear identities");
+        sqlx::query(
+            "INSERT INTO levels (level, size, daa_score)
+             SELECT generated.level, 1, generated.level
+             FROM generate_series(1, $1) AS generated(level)",
+        )
+        .bind(high_level)
+        .execute(pool)
+        .await
+        .expect("linear levels");
+        sqlx::query(
+            "INSERT INTO blocks (
+                 id, timestamp, daa_score, level, slot, selected_parent_id,
+                 color, is_in_vspc, blue_merge_set, red_merge_set
+             )
+             SELECT block_identity.id, generated.level, generated.level,
+                    generated.level, 0, COALESCE(parent_identity.id, $2),
+                    0, TRUE, ARRAY[]::BIGINT[], ARRAY[]::BIGINT[]
+             FROM generate_series(1, $1) AS generated(level)
+             JOIN block_identifiers block_identity
+               ON block_identity.hash = decode(lpad(to_hex(generated.level), 64, '0'), 'hex')
+             LEFT JOIN block_identifiers parent_identity
+               ON generated.level > 1
+              AND parent_identity.hash = decode(lpad(to_hex(generated.level - 1), 64, '0'), 'hex')
+             ORDER BY generated.level",
+        )
+        .bind(high_level)
+        .bind(origin_id)
+        .execute(pool)
+        .await
+        .expect("linear blocks");
+        sqlx::query(
+            "INSERT INTO parents (child_id, parent_id, child_level, child_slot, parent_level, parent_slot)
+             SELECT child.id, parent.id, generated.level, 0, generated.level - 1, 0
+             FROM generate_series(2, $1) AS generated(level)
+             JOIN block_identifiers child
+               ON child.hash = decode(lpad(to_hex(generated.level), 64, '0'), 'hex')
+             JOIN block_identifiers parent
+               ON parent.hash = decode(lpad(to_hex(generated.level - 1), 64, '0'), 'hex')",
+        )
+        .bind(high_level)
+        .execute(pool)
+        .await
+        .expect("linear parents");
+        let head_id = sqlx::query_scalar::<_, i64>("SELECT id FROM blocks WHERE level = $1")
+            .bind(high_level)
+            .fetch_one(pool)
+            .await
+            .expect("linear head ID");
+        (genesis_hash, head_id)
+    }
+
+    fn binding(genesis_hash: BlockHash) -> super::super::DatabaseBinding {
+        super::super::DatabaseBinding::new(NetworkId::new(NetworkType::Mainnet), genesis_hash)
+    }
+
+    fn api_client(
+        pool: PgPool,
+        genesis_hash: BlockHash,
+    ) -> (Arc<super::super::ValidatedApiDbClient>, crate::runtime::RetirementReceiver) {
+        let (retirement_tx, retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(
+            pool,
+            binding(genesis_hash),
+            retirement_tx,
+            crate::replacement::ApiReplacementGate::new(),
+        );
+        (client, retirements)
+    }
+
+    async fn lock_blocks(pool: &PgPool) -> Transaction<'_, SqlxPostgres> {
+        let mut transaction = pool.begin().await.expect("block-table lock transaction");
+        sqlx::query("LOCK TABLE blocks IN ACCESS EXCLUSIVE MODE").execute(&mut *transaction).await.expect("block-table lock");
+        transaction
+    }
+
+    async fn blocked_projection_pid(pool: &PgPool) -> i32 {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let pid = sqlx::query_scalar::<_, i32>(
+                    "SELECT pid
+                     FROM pg_stat_activity
+                     WHERE pid <> pg_backend_pid()
+                       AND query LIKE '%SELECT level FROM blocks ORDER BY level DESC%'
+                       AND wait_event_type = 'Lock'
+                     LIMIT 1",
+                )
+                .fetch_optional(pool)
+                .await
+                .expect("blocked projection inspection");
+                if let Some(pid) = pid {
+                    return pid;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("projection query must block")
     }
 
     fn scope(resolved_level: u64, database_head: u64, max_depth: u64) -> ProjectionScope {
@@ -714,8 +849,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_seed_materializes_the_complete_maximum_depth_and_crossing_context() {
+        let fixture = fixture().await;
+        let high_level = i64::try_from(MAX_CACHE_DEPTH + 5).expect("test depth fits BIGINT");
+        let (genesis_hash, head_id) = seed_linear_graph(&fixture.pool, high_level).await;
+        let (client, _) = api_client(fixture.pool, genesis_hash);
+
+        let GraphViewSeedOutcome::Loaded(seed) =
+            client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await.expect("maximum-depth Head projection")
+        else {
+            panic!("Head has no miss outcome");
+        };
+        assert_eq!(seed.max_depth, MAX_CACHE_DEPTH);
+        assert_eq!(
+            seed.resolution,
+            GraphWindowResolution {
+                resolved_level: MAX_CACHE_DEPTH + 5,
+                effective_start_level: 6,
+                effective_end_level: MAX_CACHE_DEPTH + 5,
+            }
+        );
+        assert_eq!(seed.blocks.len(), usize::try_from(MAX_CACHE_DEPTH).expect("cache depth fits usize"));
+        assert_eq!(seed.edges.len(), usize::try_from(MAX_CACHE_DEPTH).expect("cache depth fits usize"));
+        assert_eq!(seed.levels.len(), usize::try_from(MAX_CACHE_DEPTH + 1).expect("endpoint depth fits usize"));
+        assert_eq!(seed.levels.first_key_value().map(|(level, _)| *level), Some(5));
+        assert_eq!(seed.levels.last_key_value().map(|(level, _)| *level), Some(MAX_CACHE_DEPTH + 5));
+        assert_eq!(seed.snapshot_max_materialized_id, CompactId::new(head_id).expect("fixture ID is positive"));
+        assert_eq!(seed.snapshot_vspc_sink, level_hash(MAX_CACHE_DEPTH + 5));
+    }
+
+    #[tokio::test]
     async fn stable_read_only_snapshot_resolves_every_indexed_anchor_and_extent() {
-        let (_container, pool) = fixture().await;
+        let fixture = fixture().await;
+        let pool = fixture.pool;
         let (hashes, previous_id) = seed_scope_fixture(&pool).await;
         let mut projection = GraphProjection::begin(&pool).await.expect("projection snapshot");
 
@@ -799,16 +965,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolved_scope_rows_and_alignment_metadata_share_one_snapshot() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let mut projection = GraphProjection::begin(&fixture.pool).await.expect("projection snapshot");
+        let ProjectionScopeOutcome::Resolved(scope) =
+            projection.resolve_scope(GraphViewSeedRequest::HeadPublication).await.expect("Head scope")
+        else {
+            panic!("Head has no miss outcome");
+        };
+
+        let fourth_hash = hash(4);
+        let fourth_id = insert_block(&fixture.pool, fourth_hash, graph.blocks[2].1, 4, Some(40)).await;
+        insert_parent(&fixture.pool, fourth_id, 4, graph.blocks[2].1, 3).await;
+
+        let seed = projection.load_seed(scope, graph.blocks[0].0).await.expect("stable projection rows");
+        assert_eq!(seed.resolution.effective_end_level, 3);
+        assert!(!seed.blocks.contains_key(&fourth_hash));
+        assert!(!seed.levels.contains_key(&4));
+        assert_eq!(seed.snapshot_max_materialized_id, CompactId::new(graph.blocks[2].1).expect("fixture ID is positive"));
+        assert_eq!(seed.snapshot_vspc_sink, graph.blocks[2].0);
+        projection.commit().await.expect("projection snapshot commit");
+
+        let (successor, _) = api_client(fixture.pool, graph.blocks[0].0);
+        let GraphViewSeedOutcome::Loaded(successor_seed) =
+            successor.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await.expect("successor projection")
+        else {
+            panic!("Head has no miss outcome");
+        };
+        assert_eq!(successor_seed.resolution.effective_end_level, 4);
+        assert!(successor_seed.blocks.contains_key(&fourth_hash));
+        assert_eq!(successor_seed.snapshot_max_materialized_id, CompactId::new(fourth_id).expect("fixture ID is positive"));
+        assert_eq!(successor_seed.snapshot_vspc_sink, fourth_hash);
+    }
+
+    #[tokio::test]
     async fn api_client_loads_complete_projection_and_crossing_edge_context() {
-        let (_container, pool) = fixture().await;
+        let fixture = fixture().await;
+        let pool = fixture.pool;
         let blocks = seed_complete_projection_fixture(&pool).await;
-        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
-        let client = super::super::ValidatedApiDbClient::new(
-            pool,
-            super::super::DatabaseBinding::new(NetworkId::new(NetworkType::Mainnet), blocks[0].0),
-            retirement_tx,
-            crate::replacement::ApiReplacementGate::new(),
-        );
+        let (client, mut retirements) = api_client(pool, blocks.blocks[0].0);
 
         let outcome = client
             .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 2 })
@@ -819,22 +1015,225 @@ mod tests {
         };
         assert_eq!(seed.resolution, GraphWindowResolution { resolved_level: 2, effective_start_level: 1, effective_end_level: 2 });
         assert_eq!(seed.blocks.len(), 2);
-        let genesis = &seed.blocks[&blocks[0].0];
+        let genesis = &seed.blocks[&blocks.blocks[0].0];
         assert_eq!(genesis.selected_parent_index, None);
         assert!(genesis.direct_parents.is_empty());
-        let second = &seed.blocks[&blocks[1].0];
+        let second = &seed.blocks[&blocks.blocks[1].0];
         assert_eq!(second.selected_parent_index, Some(0));
-        assert_eq!(&*second.direct_parents, &[blocks[0].0]);
-        assert_eq!(&*second.blue_merge_set, &[blocks[0].0]);
+        assert_eq!(&*second.direct_parents, &[blocks.blocks[0].0, blocks.boundary.0]);
+        assert_eq!(&*second.blue_merge_set, &[blocks.blocks[0].0]);
         assert_eq!(second.color, BlockColor::Blue);
         assert!(second.is_in_vspc);
 
-        assert_eq!(seed.edges.len(), 2);
-        assert!(seed.edges.contains_key(&EdgeId { parent: blocks[0].0, child: blocks[1].0 }));
-        assert!(seed.edges.contains_key(&EdgeId { parent: blocks[1].0, child: blocks[2].0 }));
+        assert_eq!(seed.edges.len(), 3);
+        assert!(seed.edges.contains_key(&EdgeId { parent: blocks.blocks[0].0, child: blocks.blocks[1].0 }));
+        assert!(seed.edges.contains_key(&EdgeId { parent: blocks.blocks[1].0, child: blocks.blocks[2].0 }));
+        assert!(seed.edges.contains_key(&EdgeId { parent: blocks.blocks[0].0, child: blocks.blocks[2].0 }));
+        assert!(!seed.edges.contains_key(&EdgeId { parent: blocks.boundary.0, child: blocks.blocks[1].0 }));
         assert_eq!(seed.levels.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
-        assert_eq!(seed.snapshot_max_materialized_id, CompactId::new(blocks[2].1).expect("fixture ID is positive"));
-        assert_eq!(seed.snapshot_vspc_sink, blocks[2].0);
+        assert_eq!(seed.snapshot_max_materialized_id, CompactId::new(blocks.blocks[2].1).expect("fixture ID is positive"));
+        assert_eq!(seed.snapshot_vspc_sink, blocks.blocks[2].0);
+
+        let GraphViewSeedOutcome::Loaded(narrow) = client
+            .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 1 })
+            .await
+            .expect("narrow projection")
+        else {
+            panic!("retained level must resolve");
+        };
+        assert_eq!(narrow.blocks.keys().copied().collect::<Vec<_>>(), vec![blocks.blocks[1].0]);
+        assert_eq!(narrow.edges.len(), 3, "two one-endpoint edges and one zero-endpoint edge intersect level two");
+        assert_eq!(narrow.levels.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+
+        let GraphViewSeedOutcome::Loaded(head) =
+            client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await.expect("Head projection")
+        else {
+            panic!("Head has no miss outcome");
+        };
+        assert_eq!(head.max_depth, MAX_CACHE_DEPTH);
+        assert_eq!(head.resolution, GraphWindowResolution { resolved_level: 3, effective_start_level: 1, effective_end_level: 3 });
+        assert_eq!(head.blocks.len(), 3, "the retained range is shorter than the Head capacity");
+        let third = &head.blocks[&blocks.blocks[2].0];
+        assert_eq!(third.selected_parent_index, Some(1));
+        assert_eq!(&*third.direct_parents, &[blocks.blocks[0].0, blocks.blocks[1].0]);
+        assert_eq!(&*third.red_merge_set, &[blocks.blocks[0].0]);
+        assert_eq!(third.color, BlockColor::Red);
+        assert!(third.is_in_vspc);
+
+        for (anchor, max_depth, expected) in [
+            (
+                GraphWindowAnchor::Level(1),
+                2,
+                GraphWindowResolution { resolved_level: 1, effective_start_level: 1, effective_end_level: 2 },
+            ),
+            (
+                GraphWindowAnchor::BlockHash(blocks.blocks[2].0),
+                2,
+                GraphWindowResolution { resolved_level: 3, effective_start_level: 2, effective_end_level: 3 },
+            ),
+            (
+                GraphWindowAnchor::DaaScore(20),
+                3,
+                GraphWindowResolution { resolved_level: 2, effective_start_level: 1, effective_end_level: 3 },
+            ),
+        ] {
+            let GraphViewSeedOutcome::Loaded(anchored) = client
+                .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor, max_depth })
+                .await
+                .expect("anchored projection")
+            else {
+                panic!("fixture anchor must resolve");
+            };
+            assert_eq!(anchored.resolution, expected);
+        }
+
+        for (anchor, expected) in [
+            (GraphWindowAnchor::Level(4), GraphWindowAnchorUnavailable::LevelNotRetained { requested_level: 4 }),
+            (
+                GraphWindowAnchor::BlockHash(blocks.boundary.0),
+                GraphWindowAnchorUnavailable::BlockNotMaterialized { requested_hash: blocks.boundary.0 },
+            ),
+            (GraphWindowAnchor::DaaScore(9), GraphWindowAnchorUnavailable::NoRetainedDaaMatch { requested_score: 9 }),
+        ] {
+            assert_eq!(
+                client.load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor, max_depth: 2 }).await,
+                Ok(GraphViewSeedOutcome::AnchorUnavailable(expected))
+            );
+        }
         assert!(retirements.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn public_miss_precedes_projection_incoherence_and_errors_do_not_retire_the_generation() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        sqlx::query(
+            "INSERT INTO parents (child_id, parent_id, child_level, child_slot, parent_level, parent_slot)
+             VALUES ($1, $2, 2, 0, 0, 0)",
+        )
+        .bind(graph.blocks[1].1)
+        .bind(i64::MAX)
+        .execute(&fixture.pool)
+        .await
+        .expect("incoherent parent fixture");
+        let (client, mut retirements) = api_client(fixture.pool, graph.blocks[0].0);
+
+        let unknown = hash(88);
+        assert_eq!(
+            client
+                .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow {
+                    anchor: GraphWindowAnchor::BlockHash(unknown),
+                    max_depth: 1,
+                })
+                .await,
+            Ok(GraphViewSeedOutcome::AnchorUnavailable(GraphWindowAnchorUnavailable::BlockNotMaterialized {
+                requested_hash: unknown
+            }))
+        );
+        assert_eq!(
+            client
+                .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 1 })
+                .await,
+            Err(crate::error::ApiReadError::InconsistentProjection)
+        );
+        assert!(client.is_valid());
+        assert!(retirements.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn postgres_query_failure_retains_the_exact_api_generation() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let (client, mut retirements) = api_client(fixture.pool.clone(), graph.blocks[0].0);
+        sqlx::query("DROP TABLE levels").execute(&fixture.pool).await.expect("query-failure fixture");
+
+        assert_eq!(
+            client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await,
+            Err(crate::error::ApiReadError::QueryFailed)
+        );
+        assert!(client.is_valid());
+        assert!(retirements.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn replacement_cancels_a_blocked_projection_before_retirement_completion() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let gate = crate::replacement::ApiReplacementGate::new();
+        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(api_pool, binding(graph.blocks[0].0), retirement_tx, gate.clone());
+        let blocker = lock_blocks(&fixture.pool).await;
+        let operation_client = client.clone();
+        let operation =
+            tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
+        let _pid = blocked_projection_pid(&fixture.pool).await;
+
+        let replacement = gate.begin_replacement().expect("replacement closes admission");
+        let exclusive = timeout(Duration::from_secs(1), replacement.acquire_exclusive(&Timing::production()))
+            .await
+            .expect("blocked read releases its lease promptly")
+            .expect("replacement exclusion");
+        let request = retirements.recv().await.expect("cancelled projection retirement request");
+        let retired = match request.target() {
+            crate::runtime::RetirementTarget::Api(generation) => generation.upgrade().expect("API generation remains alive"),
+            crate::runtime::RetirementTarget::Processing(_) => panic!("API read requested processing retirement"),
+        };
+        assert!(Arc::ptr_eq(&retired, &client));
+        assert!(!operation.is_finished());
+        assert!(retired.retire());
+        request.complete(Ok(()));
+        assert_eq!(operation.await.expect("projection task"), Err(crate::error::ApiReadError::GenerationLost));
+
+        exclusive.open().expect("test reopens admission");
+        blocker.rollback().await.expect("release block-table lock");
+    }
+
+    #[tokio::test]
+    async fn api_connection_loss_retires_only_the_blocked_api_generation() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let generation_binding = binding(graph.blocks[0].0);
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let processing_pool =
+            PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated processing pool");
+        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
+        let api = super::super::ValidatedApiDbClient::new(
+            api_pool,
+            generation_binding,
+            retirement_tx.clone(),
+            crate::replacement::ApiReplacementGate::new(),
+        );
+        let processing = super::super::ValidatedDbClient::new(processing_pool, generation_binding, retirement_tx);
+        let blocker = lock_blocks(&fixture.pool).await;
+        let operation_client = api.clone();
+        let operation =
+            tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
+        let pid = blocked_projection_pid(&fixture.pool).await;
+        let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+            .bind(pid)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("terminate blocked API backend");
+        assert!(terminated);
+
+        let request = retirements.recv().await.expect("connection-loss retirement request");
+        let retired = match request.target() {
+            crate::runtime::RetirementTarget::Api(generation) => generation.upgrade().expect("API generation remains alive"),
+            crate::runtime::RetirementTarget::Processing(_) => panic!("API loss requested processing retirement"),
+        };
+        assert!(Arc::ptr_eq(&retired, &api));
+        assert!(retired.retire());
+        request.complete(Ok(()));
+        assert_eq!(operation.await.expect("projection task"), Err(crate::error::ApiReadError::GenerationLost));
+        assert!(!api.is_valid());
+        assert!(processing.is_valid());
+        assert_eq!(
+            sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(processing.pool()).await.expect("processing pool remains usable"),
+            1
+        );
+        assert!(retirements.try_recv().is_err());
+
+        blocker.rollback().await.expect("release block-table lock");
     }
 }
