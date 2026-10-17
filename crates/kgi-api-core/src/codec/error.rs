@@ -230,22 +230,27 @@ mod tests {
     #[test]
     fn errors_without_details_emit_explicit_null_and_safe_messages() {
         let cases = [
-            (ApiErrorDto::invalid_request(), "invalid-request", "invalid-request"),
-            (ApiErrorDto::method_not_allowed(), "invalid-request", "method-not-allowed"),
-            (ApiErrorDto::gzip_required(), "not-acceptable", "gzip-required"),
-            (ApiErrorDto::route_not_found(), "not-found", "route-not-found"),
-            (ApiErrorDto::client_registration_required(), "conflict", "client-registration-required"),
-            (ApiErrorDto::capacity_exhausted(), "busy", "capacity-exhausted"),
-            (ApiErrorDto::service_unavailable(), "unavailable", "service-unavailable"),
-            (ApiErrorDto::encoding_timeout(), "unavailable", "encoding-timeout"),
-            (ApiErrorDto::internal_error(), "internal", "internal-error"),
+            (ApiErrorDto::invalid_request(), "invalid-request", "invalid-request", "The request is invalid."),
+            (ApiErrorDto::method_not_allowed(), "invalid-request", "method-not-allowed", "The requested method is not allowed."),
+            (ApiErrorDto::gzip_required(), "not-acceptable", "gzip-required", "Graph requests require gzip support."),
+            (ApiErrorDto::route_not_found(), "not-found", "route-not-found", "The requested route was not found."),
+            (
+                ApiErrorDto::client_registration_required(),
+                "conflict",
+                "client-registration-required",
+                "A current client registration is required.",
+            ),
+            (ApiErrorDto::capacity_exhausted(), "busy", "capacity-exhausted", "Request capacity is exhausted."),
+            (ApiErrorDto::service_unavailable(), "unavailable", "service-unavailable", "The service is temporarily unavailable."),
+            (ApiErrorDto::encoding_timeout(), "unavailable", "encoding-timeout", "Graph encoding timed out."),
+            (ApiErrorDto::internal_error(), "internal", "internal-error", "An internal error occurred."),
         ];
 
-        for (error, category, code) in cases {
+        for (error, category, code, message) in cases {
             let encoded = value(&error);
             assert_eq!(encoded["category"], category);
             assert_eq!(encoded["code"], code);
-            assert!(encoded["message"].as_str().is_some_and(|message| !message.is_empty()));
+            assert_eq!(encoded["message"], message);
             assert_eq!(encoded["details"], Value::Null);
         }
     }
@@ -265,13 +270,15 @@ mod tests {
             json!({ "reason": "block-not-materialized", "requested_hash": "ab".repeat(32) })
         );
         assert_eq!(
-            value(&ApiErrorDto::window_anchor_unavailable(GraphWindowAnchorUnavailable::NoRetainedDaaMatch { requested_score: 17 }))["details"],
-            json!({ "reason": "no-retained-daa-match", "requested_score": "17" })
+            value(&ApiErrorDto::window_anchor_unavailable(GraphWindowAnchorUnavailable::NoRetainedDaaMatch {
+                requested_score: u64::MAX,
+            }))["details"],
+            json!({ "reason": "no-retained-daa-match", "requested_score": u64::MAX.to_string() })
         );
-        assert_eq!(value(&ApiErrorDto::head_level_unavailable(19))["details"], json!({ "requested_level": 19 }));
+        assert_eq!(value(&ApiErrorDto::head_level_unavailable(u32::MAX))["details"], json!({ "requested_level": u32::MAX }));
         assert_eq!(
-            value(&ApiErrorDto::graph_response_too_large(23, 29))["details"],
-            json!({ "max_uncompressed_bytes": "23", "actual_uncompressed_bytes": "29" })
+            value(&ApiErrorDto::graph_response_too_large(u64::MAX - 1, u64::MAX))["details"],
+            json!({ "max_uncompressed_bytes": (u64::MAX - 1).to_string(), "actual_uncompressed_bytes": u64::MAX.to_string() })
         );
     }
 

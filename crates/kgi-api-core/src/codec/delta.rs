@@ -108,7 +108,10 @@ impl GraphDeltaBatchDto {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::Arc,
+    };
 
     use kgi_api_model::{
         delta::{FieldChange, GraphDelta, LevelChange},
@@ -143,6 +146,21 @@ mod tests {
         }
     }
 
+    fn colored_block(byte: u8, color: BlockColor) -> GraphBlock {
+        GraphBlock {
+            hash: hash(byte),
+            coordinate: coordinate(4, u16::from(byte - 1)),
+            timestamp: u64::from(byte),
+            daa_score: u64::from(byte),
+            selected_parent_index: None,
+            direct_parents: Arc::from([]),
+            blue_merge_set: Arc::from([]),
+            red_merge_set: Arc::from([]),
+            color,
+            is_in_vspc: false,
+        }
+    }
+
     fn edge(parent: u8, child: u8) -> GraphEdge {
         GraphEdge {
             id: EdgeId { parent: hash(parent), child: hash(child) },
@@ -157,6 +175,69 @@ mod tests {
         assert!(!text.contains(": "));
         assert!(!text.contains(", "));
         serde_json::from_slice(&bytes).expect("delta value")
+    }
+
+    fn entries_for(delta: GraphDelta) -> kgi_api_model::history::GraphHistoryEntryList {
+        let target = delta.to_revision_id();
+        let mut history = GraphHistory::new();
+        history.append(delta, 1).expect("history entry");
+        match history.range(0, target).expect("retained range") {
+            GraphHistoryRange::Deltas { entries, .. } => entries,
+            GraphHistoryRange::UpToDate { .. } => panic!("range contains a delta"),
+        }
+    }
+
+    fn decoded_colors(value: &Value, field: &str) -> BTreeMap<String, u64> {
+        let hashes = value["hashes"].as_array().expect("hash dictionary");
+        value["deltas"][0][field]
+            .as_array()
+            .expect("color-bearing values")
+            .iter()
+            .map(|item| {
+                let reference = item["hash"].as_u64().expect("hash reference") as usize;
+                let color = item["color"].as_u64().expect("block color");
+                (hashes[reference].as_str().expect("hash text").to_owned(), color)
+            })
+            .collect()
+    }
+
+    fn decoded_color_mutations(value: &Value) -> BTreeMap<String, u64> {
+        let hashes = value["hashes"].as_array().expect("hash dictionary");
+        value["deltas"][0]["color_mutations"]
+            .as_array()
+            .expect("color mutations")
+            .iter()
+            .map(|mutation| {
+                let reference = mutation["hash"].as_u64().expect("hash reference") as usize;
+                let color = mutation["value"].as_u64().expect("color value");
+                (hashes[reference].as_str().expect("hash text").to_owned(), color)
+            })
+            .collect()
+    }
+
+    fn assert_no_internal_fields(value: &Value) {
+        const FORBIDDEN: &[&str] = &[
+            "compact_id",
+            "tracking_policy",
+            "estimated_raw_bytes",
+            "cumulative_estimated_bytes",
+            "generation_id",
+            "max_depth",
+            "target_depth",
+            "publication_state",
+            "state",
+        ];
+
+        match value {
+            Value::Array(values) => values.iter().for_each(assert_no_internal_fields),
+            Value::Object(fields) => {
+                for (name, value) in fields {
+                    assert!(!FORBIDDEN.contains(&name.as_str()), "internal field {name} reached delta JSON");
+                    assert_no_internal_fields(value);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn retained_entries() -> (GraphHistory, kgi_api_model::history::GraphHistoryEntryList) {
@@ -263,6 +344,7 @@ mod tests {
         assert_eq!(first.level_changes()[1].before, Some(Level { size: 2, daa_score: Some(12) }));
         assert_eq!(first.is_in_vspc_changes().get(&hash(1)).map(|change| change.before), Some(false));
         assert_eq!(first.color_changes().get(&hash(1)).map(|change| change.before), Some(BlockColor::Gray));
+        assert_no_internal_fields(&encoded);
     }
 
     #[test]
@@ -301,5 +383,30 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn unordered_delta_collections_preserve_decoded_colors_through_both_paths() {
+        let encode = |reverse: bool| {
+            let mut colors = vec![(1, BlockColor::Gray), (2, BlockColor::Blue), (3, BlockColor::Red)];
+            if reverse {
+                colors.reverse();
+            }
+            let block_changes = colors.iter().map(|&(byte, color)| (hash(byte), Some(colored_block(byte, color)))).collect();
+            let color_changes =
+                colors.into_iter().map(|(byte, color)| (hash(byte), FieldChange { before: BlockColor::Gray, after: color })).collect();
+            let delta = GraphDelta::new(0, 1, 1, 4, block_changes, HashMap::new(), Vec::new(), HashMap::new(), color_changes)
+                .expect("color delta");
+            encoded_value(&GraphDeltaBatchDto::from_entries(&entries_for(delta)))
+        };
+
+        let first = encode(false);
+        let second = encode(true);
+        let expected = BTreeMap::from([("01".repeat(32), 0), ("02".repeat(32), 1), ("03".repeat(32), 2)]);
+
+        assert_eq!(decoded_colors(&first, "block_upserts"), expected);
+        assert_eq!(decoded_colors(&second, "block_upserts"), expected);
+        assert_eq!(decoded_color_mutations(&first), expected);
+        assert_eq!(decoded_color_mutations(&second), expected);
     }
 }

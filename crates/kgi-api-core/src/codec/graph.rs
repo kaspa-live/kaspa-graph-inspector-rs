@@ -313,6 +313,134 @@ mod tests {
         serde_json::from_slice(&bytes).expect("JSON value")
     }
 
+    fn decoded_hash(hashes: &[Value], reference: &Value) -> Value {
+        hashes[reference.as_u64().expect("hash reference") as usize].clone()
+    }
+
+    fn decoded_hashes(hashes: &[Value], references: &Value) -> Vec<Value> {
+        references.as_array().expect("hash references").iter().map(|reference| decoded_hash(hashes, reference)).collect()
+    }
+
+    fn normalized_graph(value: &Value) -> Value {
+        let hashes = value["hashes"].as_array().expect("hash dictionary");
+        let mut levels = value["levels"].as_array().expect("levels").clone();
+        levels.sort_by_key(|level| level["level"].as_u64().expect("level number"));
+
+        let mut blocks: Vec<_> = value["blocks"]
+            .as_array()
+            .expect("blocks")
+            .iter()
+            .map(|block| {
+                json!({
+                    "hash": decoded_hash(hashes, &block["hash"]),
+                    "coordinate": block["coordinate"],
+                    "timestamp": block["timestamp"],
+                    "daa_score": block["daa_score"],
+                    "selected_parent_index": block["selected_parent_index"],
+                    "direct_parents": decoded_hashes(hashes, &block["direct_parents"]),
+                    "blue_merge_set": decoded_hashes(hashes, &block["blue_merge_set"]),
+                    "red_merge_set": decoded_hashes(hashes, &block["red_merge_set"]),
+                    "color": block["color"],
+                    "is_in_vspc": block["is_in_vspc"]
+                })
+            })
+            .collect();
+        blocks.sort_by(|left, right| left["hash"].as_str().cmp(&right["hash"].as_str()));
+
+        let mut edges: Vec<_> = value["edges"]
+            .as_array()
+            .expect("edges")
+            .iter()
+            .map(|edge| {
+                json!({
+                    "id": {
+                        "parent": decoded_hash(hashes, &edge["id"]["parent"]),
+                        "child": decoded_hash(hashes, &edge["id"]["child"])
+                    },
+                    "parent_coordinate": edge["parent_coordinate"],
+                    "child_coordinate": edge["child_coordinate"]
+                })
+            })
+            .collect();
+        edges.sort_by(|left, right| {
+            let left = (left["id"]["parent"].as_str().expect("parent hash"), left["id"]["child"].as_str().expect("child hash"));
+            let right = (right["id"]["parent"].as_str().expect("parent hash"), right["id"]["child"].as_str().expect("child hash"));
+            left.cmp(&right)
+        });
+
+        json!({ "levels": levels, "blocks": blocks, "edges": edges })
+    }
+
+    fn assert_no_internal_fields(value: &Value) {
+        const FORBIDDEN: &[&str] = &[
+            "compact_id",
+            "tracking_policy",
+            "estimated_raw_bytes",
+            "cumulative_estimated_bytes",
+            "generation_id",
+            "max_depth",
+            "target_depth",
+            "publication_state",
+            "state",
+        ];
+
+        match value {
+            Value::Array(values) => values.iter().for_each(assert_no_internal_fields),
+            Value::Object(fields) => {
+                for (name, value) in fields {
+                    assert!(!FORBIDDEN.contains(&name.as_str()), "internal field {name} reached graph JSON");
+                    assert_no_internal_fields(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn unordered_graph(reverse: bool) -> GraphView {
+        let mut block_values = vec![(1, BlockColor::Gray), (2, BlockColor::Blue), (3, BlockColor::Red)];
+        let mut edge_values = vec![(10, 1), (10, 2), (10, 3)];
+        if reverse {
+            block_values.reverse();
+            edge_values.reverse();
+        }
+
+        let blocks = block_values
+            .into_iter()
+            .map(|(byte, color)| {
+                let block_hash = hash(byte);
+                let block = GraphBlock {
+                    hash: block_hash,
+                    coordinate: coordinate(2, u16::from(byte - 1)),
+                    timestamp: u64::from(byte),
+                    daa_score: u64::from(byte),
+                    selected_parent_index: Some(0),
+                    direct_parents: Arc::from([hash(10)]),
+                    blue_merge_set: Arc::from([hash(10)]),
+                    red_merge_set: Arc::from([]),
+                    color,
+                    is_in_vspc: byte == 1,
+                };
+                (block_hash, block)
+            })
+            .collect();
+        let edges = edge_values
+            .into_iter()
+            .map(|(parent, child)| {
+                let id = EdgeId { parent: hash(parent), child: hash(child) };
+                (id, GraphEdge { id, parent_coordinate: coordinate(1, 0), child_coordinate: coordinate(2, u16::from(child - 1)) })
+            })
+            .collect();
+
+        GraphView::from_database_projection(
+            2,
+            LevelExtent::new(2, 2).expect("test extent"),
+            TrackingPolicy::Fixed,
+            BTreeMap::from([(1, Level { size: 1, daa_score: Some(0) }), (2, Level { size: 3, daa_score: None })]),
+            blocks,
+            edges,
+        )
+    }
+
     #[test]
     fn complete_graph_reuses_hashes_and_preserves_relationship_order() {
         let encoded = encoded_value(GraphDataDto::from_view(&graph_view(TrackingPolicy::Fixed)).encode().expect("graph JSON"));
@@ -399,6 +527,7 @@ mod tests {
         assert_eq!(encoded["high_level"], 2);
         assert!(encoded.get("target_depth").is_none());
         assert!(encoded.get("state").is_none());
+        assert_no_internal_fields(&encoded);
 
         let window = GraphWindowResponseDto::from_head(
             &capture,
@@ -441,6 +570,30 @@ mod tests {
             ])
         );
         assert!(encoded.get("hashes").is_none());
+    }
+
+    #[test]
+    fn null_and_zero_remain_distinct_in_complete_level_values() {
+        let levels = [
+            HeadLevelValue { level: 1, value: Level { size: 1, daa_score: None } },
+            HeadLevelValue { level: 2, value: Level { size: 1, daa_score: Some(0) } },
+        ];
+        let encoded = encoded_value(HeadLevelLookupResponseDto::from_complete(0, 0, &levels).encode().expect("levels JSON"));
+
+        assert_eq!(encoded["levels"][0]["daa_score"], Value::Null);
+        assert_eq!(encoded["levels"][1]["daa_score"], "0");
+    }
+
+    #[test]
+    fn unordered_graph_traversal_preserves_decoded_meaning_and_all_colors() {
+        let first = encoded_value(GraphDataDto::from_view(&unordered_graph(false)).encode().expect("first graph JSON"));
+        let second = encoded_value(GraphDataDto::from_view(&unordered_graph(true)).encode().expect("second graph JSON"));
+        let first = normalized_graph(&first);
+        let second = normalized_graph(&second);
+
+        assert_eq!(first, second);
+        let colors: Vec<_> = first["blocks"].as_array().expect("blocks").iter().map(|block| block["color"].clone()).collect();
+        assert_eq!(colors, vec![json!(0), json!(1), json!(2)]);
     }
 
     #[test]
