@@ -805,7 +805,7 @@ weights because the latter emits `null` instead of a complete `LevelDto`.
 
 The bounded graph level, slot, and level-size fields are JSON numbers. Relative
 to their earlier decimal-string representation, the entry framing excludes one
-pair of quotes for `high_level`, each block excludes two pairs for its
+pair of quotes for `head_level`, each block excludes two pairs for its
 coordinate, each edge excludes four pairs for its endpoint coordinates, and a
 level mutation excludes one or two pairs according to whether it removes or
 installs a level.

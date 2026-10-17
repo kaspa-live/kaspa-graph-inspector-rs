@@ -444,13 +444,13 @@ side of an index invariant.
 `DestinationHeat` owns its count and level index as one value. After each
 successful canonical delta delivery, it saturatingly increments the actual
 destination revision. The first stored observation also appends that
-revision once to the vector at the delivered delta's target `high_level`.
+revision once to the vector at the delivered delta's `head_level`.
 Later deliveries of the same revision update only its count. Its level index
 is separate from the completed-delta index because heat and completed entries
 have different protocol-owned retention distances.
 
 When a delta candidate completes, the orchestration task first
-compares its target `high_level` with the containing publication's then-current
+compares its `head_level` with the containing publication's then-current
 Head. An aged candidate clears the matching running slot and completes its
 existing waiters without cache insertion. An eligible candidate atomically
 installs its completed source-keyed slot and appends that source revision to

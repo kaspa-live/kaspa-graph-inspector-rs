@@ -1055,10 +1055,10 @@ span intersection. Verify every `GraphView` retains one such extent whose
 depth does not exceed its positive configured `max_depth` and that its bound
 accessors expose that same value.
 
-Verify `GraphDelta::new` rejects a zero lineage `high_level`, preserves its
-existing non-forward-revision rejection, and gives revision ordering precedence
-when both inputs are invalid. Direct mutation and composition continue to
-construct positive lineage bounds.
+Verify `GraphDelta::new` rejects a zero lineage `head_level` with
+`ZeroHeadLevel`, preserves its existing non-forward-revision rejection, and
+gives revision ordering precedence when both inputs are invalid. Direct
+mutation and composition continue to construct positive lineage bounds.
 
 Verify every subview extract inherits its source revision and revision
 timestamp with
@@ -1078,9 +1078,9 @@ counters; and absence of source mutation, delta production, or history.
 
 Level-change cases cover create, update, remove, and no-net-change composition;
 application of `after` without validating `before`; a size-only external-level
-mutation; and DAA score changes. Verify each delta carries the `high_level` of
+mutation; and DAA score changes. Verify each delta carries the `head_level` of
 the lineage that owns its revision interval and carries no lower coverage
-object. Retain all Head deltas whose `high_level` remains in the retained head
+object. Retain all Head deltas whose `head_level` remains in the retained head
 window, including multiple revisions at one level, and make them eligible for
 pruning only after that level leaves the window. Cover indivisible aggregated
 entries, longest-prefix pruning, derived oldest available revision, and
@@ -1184,7 +1184,7 @@ retained endpoint levels, and membership or color changes for retained blocks.
 Cover crossing edges with neither endpoint block present and mutations entirely
 outside the extent. A filtered entry with no visible mutation must still
 advance the browser applied cursor and timestamp and adopt the canonical
-entry's Head high level without changing either fixed bound.
+entry's `head_level` without changing either fixed bound.
 
 While successive target Heads still contain the complete fixed extent, verify
 omitted canonical block and edge removals do not remove fixed objects. Then
@@ -1491,7 +1491,7 @@ Delta cases cover Frozen and revision compatibility as the only application
 checks, direct target-state installation, Head bound recalculation, fixed-bound
 retention, and equality between sequential application and a directly or
 incrementally composed interval. Cover associative graph-state effects across
-three adjacent intervals; later-value, insertion-folding, final `high_level`,
+three adjacent intervals; later-value, insertion-folding, final `head_level`,
 and final target-timestamp selection; and rejection of nongapless composition.
 Protocol selection must reject a publication mismatch before history work.
 
@@ -1582,7 +1582,7 @@ continuation, wake boundary, and retry delay remain outside those bytes. Wrap
 one cached batch body with different valid request-specific publication and
 coherent Head revision/timestamp headers without
 serializing, compressing, or decompressing it. Verify that `CachedDelta`
-retains the first and last boundaries, final `high_level`, checked
+retains the first and last boundaries, final `head_level`, checked
 uncompressed JSON byte count, and final gzip body without duplicating entry
 timestamps or count as semantic fields. Verify
 one immutable outgoing entry per source revision and

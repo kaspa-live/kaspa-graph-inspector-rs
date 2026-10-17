@@ -470,7 +470,7 @@ struct GraphDeltaEntryDto {
     from_revision_id: u64,
     to_revision_id: u64,
     revision_timestamp_ms: u64,
-    high_level: u32,
+    head_level: u32,
 
     block_upserts: Vec<GraphBlockDto>,
     edge_upserts: Vec<GraphEdgeDto>,
@@ -517,7 +517,7 @@ the shared dictionary. It omits each canonical change's composition-only
 serialization boundary is the sole omission point.
 
 All mutation collections in an entry may be empty while its revision interval,
-timestamp, and `high_level` still advance. The batch carries no auxiliary
+timestamp, and `head_level` still advance. The batch carries no auxiliary
 endpoint-level context. A Fixed browser view obtains a complete level absent
 from its own projection through the separately owned
 [Head-level lookup](#fixed-window-reuse-of-canonical-head-deltas--settled).
@@ -1142,12 +1142,12 @@ previously cached short entry in both modes. Synchronizing and Stale do not
 defer at this gate.
 
 After that gate, ApiService looks up an exact completed `CachedDelta` by `F`
-before consulting history. A completed hit whose target `high_level` remains
-inside `MAX_CACHE_LEVEL_DISTANCE` is served directly. Its source revision need
-not remain a retained history boundary: revision identifies the exact cached
-transition and its replay continuity, while the cached target `high_level`
-alone owns structural retention. A defensively observed aged completed value
-is removed and treated as a miss.
+before consulting history. A completed hit whose `head_level` remains inside
+`MAX_CACHE_LEVEL_DISTANCE` is served directly. Its source revision need not
+remain a retained history boundary: revision identifies the exact cached
+transition and its replay continuity, while the cached `head_level` alone owns
+structural retention. A defensively observed aged completed value is removed
+and treated as a miss.
 
 On a completed-cache miss, ApiService calls the graph-owned
 [`GraphHistory::range`](api-graph.md#retained-history-range) operation. It owns
@@ -1177,7 +1177,7 @@ internal invariant failure governed by the common `500 internal-error`
 response rather than a client cursor-recovery outcome.
 
 Before joining a job or constructing a delta-to-Head response after a cache
-miss, use the first selected stored entry's `delta.high_level` as the
+miss, use the first selected stored entry's `delta.head_level` as the
 deliberately approximate source-level boundary.
 
 If the source boundary's distance behind the publication Head reaches or
@@ -1360,7 +1360,7 @@ The serialized cached Head-delta body omits block and edge removals. Under the
 strict [public graph-limit bound](#public-graph-limits-and-identity--settled),
 the publication removal frontier cannot reach any
 block or child-owned edge retained by an eligible client window. The client
-uses each serialized entry's `high_level` according to its view policy. A
+uses each serialized entry's `head_level` according to its view policy. A
 Head-following client advances its lower bound and removes objects that leave it; the
 [Web contract](web.md#fixed-views--settled) owns
 the fixed-window reaction. VSPC membership and color changes remain ordinary
@@ -1611,7 +1611,7 @@ delta value is:
 struct CachedDelta {
     from_revision_id: u64,
     to_revision_id: u64,
-    high_level: u32,
+    head_level: u32,
     uncompressed_json_bytes: u64,
     gzip_body: Bytes,
 }
@@ -1622,7 +1622,7 @@ struct CachedDelta {
 `uncompressed_json_bytes` is the byte length checked against the hard response
 limit before compression; `gzip_body.len()` is the transferred body size. The
 cached `from_revision_id` and `to_revision_id` are the first and last entry
-boundaries, and `high_level` is the last entry's target Head level. The entry
+boundaries, and `head_level` is the last entry's target Head level. The entry
 timestamps and count remain inside the immutable encoded body; they need no
 second semantic representation in `CachedDelta`. The
 cached value contains no publication ID, publication state, sampled Head
@@ -1641,7 +1641,7 @@ HTTP-only delta-to-current requests and are keyed by source revision. At most
 one logical job runs for a source revision. Concurrent requests attach to that
 job even if Head advances after its target was captured. Success completes
 every waiter. It publishes one `CachedDelta` at the source key only when the
-candidate's target `high_level` remains inside `MAX_CACHE_LEVEL_DISTANCE` at
+candidate's `head_level` remains inside `MAX_CACHE_LEVEL_DISTANCE` at
 completion; an aged candidate remains a successful response for its existing
 waiters but is not inserted into the cache.
 Failure returns the same request-local error to every waiter, removes the job,
@@ -1655,8 +1655,8 @@ owns preservation and release of publication-scoped cache state across Stale
 and replacement. The
 [ApiService task contract](api-service.md#api-task-ownership-and-completion--settled)
 owns job completion and terminal cancellation. While the publication remains
-installed or is retained as Stale, prune a `CachedDelta` when its target
-`high_level` is more than `MAX_CACHE_LEVEL_DISTANCE` behind that publication's
+installed or is retained as Stale, prune a `CachedDelta` when its `head_level`
+is more than `MAX_CACHE_LEVEL_DISTANCE` behind that publication's
 Head. Source-history retention never prunes a completed cache entry. Revision
 boundaries key exact lookup and preserve gapless replay; target level alone
 owns cache retention. This structural bound replaces an independent
