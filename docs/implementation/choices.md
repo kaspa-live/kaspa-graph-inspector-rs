@@ -859,3 +859,22 @@ Represent the protocol-owned semantic Head validator identity with the private
 publication ID, snapshot revision, and one canonical `LevelExtent`. The
 eventual validator formatting and HTTP header handling remain outside this
 codec increment.
+
+## 17 October 2026: API graph encoding foundation
+
+### Compression implementation
+
+Use `flate2` with gzip compression level `6` for the single settled graph
+transfer representation. Set the gzip modification time to zero so equivalent
+detached JSON input produces deterministic compressed bytes. This resolves the
+exact-quality implementation choice deferred by the
+[API protocol](../architecture/api-protocol.md#graph-http-compression--settled)
+without changing cache identity or protocol semantics.
+
+Place capped JSON serialization and gzip construction in the private
+`kgi_api_core::encoding` module. Serialize through a limit-enforcing writer so
+the hard uncompressed response bound is detected before allocating an
+arbitrarily oversized JSON buffer, and retain the successful compressed body
+as shared immutable `bytes::Bytes`. The bounded encoding scheduler introduced
+by the same increment remains the sole production caller and the sole
+submitter of this work to Tokio's blocking executor.

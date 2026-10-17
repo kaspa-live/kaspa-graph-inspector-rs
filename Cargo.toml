@@ -23,8 +23,10 @@ edition = "2024"
 [workspace.dependencies]
 arc-swap = "1.9.2"
 async-trait = "0.1.88"
+bytes = "1.12.1"
 clap = { version = "4.5.35", features = ["derive", "string", "cargo"] }
 ctrlc = { version = "3.4.1", features = ["termination"] }
+flate2 = "1.1.10"
 kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }
 kaspa-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }
 kaspa-grpc-client = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v2.1.0" }
