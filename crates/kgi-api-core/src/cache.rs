@@ -801,6 +801,10 @@ mod tests {
     }
 
     fn cached_head(depth: u32, revision: u64, high_level: u32) -> Arc<CachedHeadSnapshot> {
+        cached_head_with_body(depth, revision, high_level, Bytes::from(vec![u8::try_from(revision).unwrap_or(u8::MAX)]))
+    }
+
+    fn cached_head_with_body(depth: u32, revision: u64, high_level: u32, gzip_body: Bytes) -> Arc<CachedHeadSnapshot> {
         let low_level = high_level.saturating_sub(depth - 1).max(1);
         let extent = LevelExtent::new(low_level, high_level).expect("cached Head extent is valid");
         Arc::new(CachedHeadSnapshot::new(
@@ -811,7 +815,7 @@ mod tests {
             high_level,
             23,
             HeadEtagInput::new(7, revision, extent),
-            Bytes::from(vec![u8::try_from(revision).unwrap_or(u8::MAX)]),
+            gzip_body,
         ))
     }
 
@@ -1307,6 +1311,115 @@ mod tests {
         let rejected = job(delta(&cache, &jobs, 34, 17, |_| async { Ok(cached_delta(34, 35)) }));
         assert!(!Arc::ptr_eq(&running, &rejected));
         assert_eq!(rejected.wait(CancellationToken::new()).await, Err(CacheWaitError::Build(CacheBuildError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn tracker_shutdown_cancels_unobserved_prewarming_work_preserves_the_old_value_and_rejects_replacement() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        let previous = cached_head(PREWARMED_HEAD_WINDOW_DEPTH, 1, 100);
+        seed_head(&cache, previous.clone());
+
+        let access = cache
+            .head(
+                &jobs,
+                PREWARMED_HEAD_WINDOW_DEPTH,
+                |_, _| async { std::future::pending::<Result<Arc<CachedHeadSnapshot>, CacheBuildError>>().await },
+                || async { 140 },
+            )
+            .await;
+        assert!(matches!(&access.access, CacheAccess::Completed(value) if Arc::ptr_eq(value, &previous)));
+        drop(access);
+        let running = cache
+            .lock_state()
+            .head_slots
+            .get(&PREWARMED_HEAD_WINDOW_DEPTH)
+            .and_then(|slot| slot.running.clone())
+            .expect("demand starts one tracked prewarming refresh");
+
+        jobs.shutdown().await;
+        assert_eq!(running.wait(CancellationToken::new()).await, Err(CacheWaitError::Build(CacheBuildError::Cancelled)));
+        assert!(cache.lock_state().head_slots.get(&PREWARMED_HEAD_WINDOW_DEPTH).is_some_and(|slot| {
+            slot.running.is_none() && slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &previous))
+        }));
+
+        let rejected = cache
+            .head(
+                &jobs,
+                PREWARMED_HEAD_WINDOW_DEPTH,
+                |_, _| async { panic!("a closed tracker cannot run new prewarming work") },
+                || async { 200 },
+            )
+            .await;
+        assert_eq!(rejected.resolve(CancellationToken::new()).await, Err(CacheWaitError::Build(CacheBuildError::Cancelled)));
+        assert!(cache.lock_state().head_slots.get(&PREWARMED_HEAD_WINDOW_DEPTH).is_some_and(|slot| {
+            slot.running.is_none() && slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &previous))
+        }));
+    }
+
+    #[tokio::test]
+    async fn completed_delta_and_head_hits_share_body_allocations_past_cache_release() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+
+        let delta_body = Bytes::from(vec![1, 2, 3, 4]);
+        let builder_delta_body = delta_body.clone();
+        let completed_delta =
+            job(delta(
+                &cache,
+                &jobs,
+                7,
+                17,
+                move |_| async move { Ok(Arc::new(CachedDelta::new(7, 11, 17, 23, builder_delta_body))) },
+            ))
+            .wait(CancellationToken::new())
+            .await
+            .expect("delta construction completes");
+        let delta_hit = match delta(&cache, &jobs, 7, 17, |_| async { panic!("a completed delta cannot rebuild") }) {
+            CacheAccess::Completed(value) => value,
+            CacheAccess::Job(_) => panic!("the completed delta is reused"),
+        };
+        assert!(Arc::ptr_eq(&completed_delta, &delta_hit));
+        assert_eq!(completed_delta.gzip_body().as_ptr(), delta_hit.gzip_body().as_ptr());
+        let retained_delta_body = delta_hit.gzip_body().clone();
+
+        let head_body = Bytes::from(vec![5, 6, 7, 8]);
+        let builder_head_body = head_body.clone();
+        let completed_head = cache
+            .head(
+                &jobs,
+                50,
+                move |depth, _| {
+                    let body = builder_head_body.clone();
+                    async move { Ok(cached_head_with_body(depth, 13, 17, body)) }
+                },
+                || async { 17 },
+            )
+            .await
+            .resolve(CancellationToken::new())
+            .await
+            .expect("Head construction completes");
+        let head_hit = cache
+            .head(&jobs, 50, |_, _| async { panic!("a completed Head tier cannot rebuild") }, || async { 17 })
+            .await
+            .resolve(CancellationToken::new())
+            .await
+            .expect("Head hit completes");
+        assert!(Arc::ptr_eq(&completed_head, &head_hit));
+        assert_eq!(completed_head.gzip_body().as_ptr(), head_hit.gzip_body().as_ptr());
+        let retained_head_body = head_hit.gzip_body().clone();
+
+        jobs.shutdown().await;
+        drop(completed_delta);
+        drop(delta_hit);
+        drop(delta_body);
+        drop(completed_head);
+        drop(head_hit);
+        drop(head_body);
+        drop(cache);
+
+        assert_eq!(retained_delta_body.as_ref(), [1, 2, 3, 4]);
+        assert_eq!(retained_head_body.as_ref(), [5, 6, 7, 8]);
     }
 
     #[tokio::test]
