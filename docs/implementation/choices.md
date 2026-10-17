@@ -898,3 +898,19 @@ already active blocking call remains tracked through completion and its result
 is discarded. Terminal shutdown closes the tracker after rejecting admission
 and completing queued and active waiters with the shutdown result, then joins
 the still-running blocking owners.
+
+### Cache kernel placement and task tracking
+
+Place the publication-local response cache, typed cached values, generic slot
+and job primitives, and shared waiter transport in the private
+`kgi_api_core::cache` module. `GraphPublication` creates and durably owns its
+cache `Arc`; orchestration tasks retain only a weak cache reference and their
+exact running job. A small service-level `CacheJobTracker` combines the
+`TaskTracker` required by the ApiService contract with the cache-job
+cancellation root that the later service lifecycle will own.
+
+Use Tokio `watch` for one retained pending-or-terminal job state. This lets
+independent request cancellation detach one receiver, preserves the terminal
+result after every current receiver has gone, and avoids a separate waiter
+collection. Cache insertion or exact running-slot removal occurs under the
+short standard mutex before `send_replace` publishes that terminal value.

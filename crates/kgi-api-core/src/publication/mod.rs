@@ -3,7 +3,7 @@
 mod error;
 mod estimate;
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use kgi_api_model::{
     delta::GraphDelta,
@@ -13,6 +13,8 @@ use kgi_api_model::{
 use kgi_model::graph_update::{BlockCommitted, VspcCommitted};
 use rand::{RngCore, rngs::OsRng};
 use tokio::sync::{Mutex, RwLock};
+
+use crate::cache::GraphCache;
 
 pub(crate) use self::error::PublicationProjectionError;
 use self::estimate::estimate_raw_delta_bytes;
@@ -103,6 +105,7 @@ pub(crate) struct GraphPublication {
     revision_clock_origin: Instant,
     mutation: Mutex<()>,
     core: RwLock<GraphPublicationCore>,
+    cache: Arc<GraphCache>,
     #[cfg(test)]
     atomic_mutation_test_hook: Option<std::sync::Arc<AtomicMutationTestHook>>,
 }
@@ -166,6 +169,7 @@ impl GraphPublication {
             revision_clock_origin,
             mutation: Mutex::new(()),
             core: RwLock::new(GraphPublicationCore { state: initial_state, view, history }),
+            cache: Arc::new(GraphCache::new()),
             #[cfg(test)]
             atomic_mutation_test_hook: None,
         })
@@ -174,6 +178,11 @@ impl GraphPublication {
     /// Returns this publication's immutable random identity.
     pub(crate) const fn publication_id(&self) -> u64 {
         self.publication_id
+    }
+
+    /// Returns this publication's response cache.
+    pub(crate) fn cache(&self) -> Arc<GraphCache> {
+        self.cache.clone()
     }
 
     /// Samples whole milliseconds elapsed in this publication's clock domain.
@@ -701,6 +710,22 @@ mod tests {
             .expect("second publication");
 
         assert_ne!(first.publication_id(), second.publication_id());
+    }
+
+    #[test]
+    fn publication_is_the_durable_owner_of_its_response_cache() {
+        let publication =
+            GraphPublication::new(GraphPublicationState::Live, Instant::now(), head_view(), GraphHistory::new()).expect("publication");
+        let cache = Arc::downgrade(&publication.cache);
+        assert_eq!(Arc::strong_count(&publication.cache), 1);
+
+        let temporary = publication.cache();
+        assert_eq!(Arc::strong_count(&publication.cache), 2);
+        drop(temporary);
+        assert_eq!(Arc::strong_count(&publication.cache), 1);
+
+        drop(publication);
+        assert!(cache.upgrade().is_none());
     }
 
     #[test]
