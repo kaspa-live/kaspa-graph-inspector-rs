@@ -156,9 +156,9 @@ impl GraphHistory {
         Ok(())
     }
 
-    /// Removes the longest prefix whose target level precedes `head_low_level`.
+    /// Removes the longest prefix whose target Head level precedes `head_low_level`.
     pub fn prune(&mut self, head_low_level: u32) {
-        while self.entries.front().is_some_and(|entry| entry.delta.high_level() < head_low_level) {
+        while self.entries.front().is_some_and(|entry| entry.delta.head_level() < head_low_level) {
             self.entries.pop_front();
         }
     }
@@ -237,8 +237,8 @@ mod tests {
 
     use super::*;
 
-    fn delta(from: u64, to: u64, high_level: u32) -> GraphDelta {
-        GraphDelta::new(from, to, to * 10, high_level, HashMap::new(), HashMap::new(), Vec::new(), HashMap::new(), HashMap::new())
+    fn delta(from: u64, to: u64, head_level: u32) -> GraphDelta {
+        GraphDelta::new(from, to, to * 10, head_level, HashMap::new(), HashMap::new(), Vec::new(), HashMap::new(), HashMap::new())
             .expect("valid fixture delta")
     }
 

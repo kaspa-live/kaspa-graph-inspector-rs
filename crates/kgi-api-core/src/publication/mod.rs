@@ -69,7 +69,7 @@ pub(crate) struct GraphDeltaTargetCapture {
     state: GraphPublicationState,
     revision: u64,
     revision_timestamp_ms: u64,
-    high_level: u32,
+    head_level: u32,
 }
 
 impl GraphDeltaTargetCapture {
@@ -93,9 +93,9 @@ impl GraphDeltaTargetCapture {
         self.revision_timestamp_ms
     }
 
-    /// Returns the captured Head's nominal upper level.
-    pub(crate) const fn high_level(self) -> u32 {
-        self.high_level
+    /// Returns the captured Head level.
+    pub(crate) const fn head_level(self) -> u32 {
+        self.head_level
     }
 }
 
@@ -234,7 +234,7 @@ impl GraphPublication {
             state: core.state,
             revision: core.view.current_revision_id(),
             revision_timestamp_ms: core.view.current_revision_timestamp_ms(),
-            high_level: core.view.high_level(),
+            head_level: core.view.high_level(),
         }
     }
 
@@ -506,7 +506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_prunes_only_after_a_delta_high_level_leaves_the_head_window() {
+    async fn history_prunes_only_after_a_delta_head_level_leaves_the_head_window() {
         let publication =
             GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view_with_depth(2), GraphHistory::new())
                 .expect("matching candidate");
@@ -522,7 +522,7 @@ mod tests {
         assert_eq!(core.history.current_revision_id(), 3);
         assert_eq!(core.history.len(), 2);
         assert_eq!(core.history.oldest_available_revision(), 1);
-        assert_eq!(core.history.entries().next().expect("oldest retained entry").delta().high_level(), 3);
+        assert_eq!(core.history.entries().next().expect("oldest retained entry").delta().head_level(), 3);
     }
 
     #[tokio::test]
@@ -644,7 +644,7 @@ mod tests {
         assert_eq!(live.state(), GraphPublicationState::Live);
         assert_eq!(live.revision(), initial.revision());
         assert_eq!(live.revision_timestamp_ms(), initial.revision_timestamp_ms());
-        assert_eq!(live.high_level(), initial.high_level());
+        assert_eq!(live.head_level(), initial.head_level());
         assert_eq!(publication.core.read().await.history.current_revision_id(), initial.revision());
 
         assert!(publication.transition_stale().await);
@@ -653,7 +653,7 @@ mod tests {
         assert_eq!(stale.state(), GraphPublicationState::Stale);
         assert_eq!(stale.revision(), initial.revision());
         assert_eq!(stale.revision_timestamp_ms(), initial.revision_timestamp_ms());
-        assert_eq!(stale.high_level(), initial.high_level());
+        assert_eq!(stale.head_level(), initial.head_level());
         assert_eq!(publication.core.read().await.history.current_revision_id(), initial.revision());
 
         let direct_live = GraphPublication::new(GraphPublicationState::Live, Instant::now(), head_view(), GraphHistory::new())

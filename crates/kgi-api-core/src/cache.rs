@@ -18,7 +18,7 @@ use crate::{codec::HeadEtagInput, encoding::scheduler::EncodingSchedulerError};
 pub(crate) struct CachedDelta {
     from_revision_id: u64,
     to_revision_id: u64,
-    high_level: u32,
+    head_level: u32,
     uncompressed_json_bytes: u64,
     gzip_body: Bytes,
 }
@@ -28,11 +28,11 @@ impl CachedDelta {
     pub(crate) const fn new(
         from_revision_id: u64,
         to_revision_id: u64,
-        high_level: u32,
+        head_level: u32,
         uncompressed_json_bytes: u64,
         gzip_body: Bytes,
     ) -> Self {
-        Self { from_revision_id, to_revision_id, high_level, uncompressed_json_bytes, gzip_body }
+        Self { from_revision_id, to_revision_id, head_level, uncompressed_json_bytes, gzip_body }
     }
 
     /// Returns the exact source revision represented by this entry.
@@ -46,8 +46,8 @@ impl CachedDelta {
     }
 
     /// Returns the last entry's target Head level.
-    pub(crate) const fn high_level(&self) -> u32 {
-        self.high_level
+    pub(crate) const fn head_level(&self) -> u32 {
+        self.head_level
     }
 
     /// Returns the complete uncompressed JSON byte count.
@@ -231,8 +231,8 @@ impl GraphCache {
     }
 
     /// Records one successfully delivered canonical delta at its actual destination.
-    pub(crate) fn record_delta_delivery(&self, destination_revision: u64, destination_high_level: u32) {
-        self.lock_state().deltas.record_delivery(destination_revision, destination_high_level);
+    pub(crate) fn record_delta_delivery(&self, destination_revision: u64, destination_head_level: u32) {
+        self.lock_state().deltas.record_delivery(destination_revision, destination_head_level);
     }
 
     /// Prunes complete delta and destination-heat buckets behind their structural bounds.
@@ -286,7 +286,7 @@ struct GraphCacheState {
 #[derive(Default)]
 struct DeltaCache {
     slots_by_source: HashMap<u64, CacheSlot<CachedDelta>>,
-    sources_by_target_level: BTreeMap<u32, Vec<u64>>,
+    sources_by_head_level: BTreeMap<u32, Vec<u64>>,
     destination_heat: DestinationHeat,
 }
 
@@ -316,9 +316,9 @@ impl DeltaCache {
         {
             if let Ok((value, head_high_level)) = result {
                 assert_eq!(value.source_revision_id(), source_revision, "a completed delta remains keyed by its captured source");
-                if head_high_level.saturating_sub(value.high_level()) <= MAX_CACHE_LEVEL_DISTANCE {
+                if head_high_level.saturating_sub(value.head_level()) <= MAX_CACHE_LEVEL_DISTANCE {
                     slot.completed = Some(value.clone());
-                    self.sources_by_target_level.entry(value.high_level()).or_default().push(source_revision);
+                    self.sources_by_head_level.entry(value.head_level()).or_default().push(source_revision);
                 }
             }
             slot.running = None;
@@ -329,14 +329,14 @@ impl DeltaCache {
         }
     }
 
-    fn record_delivery(&mut self, destination_revision: u64, destination_high_level: u32) {
-        self.destination_heat.record(destination_revision, destination_high_level);
+    fn record_delivery(&mut self, destination_revision: u64, destination_head_level: u32) {
+        self.destination_heat.record(destination_revision, destination_head_level);
     }
 
     fn prune(&mut self, head_high_level: u32) {
-        let retained_target_level = head_high_level.saturating_sub(MAX_CACHE_LEVEL_DISTANCE);
-        let retained = self.sources_by_target_level.split_off(&retained_target_level);
-        let expired = std::mem::replace(&mut self.sources_by_target_level, retained);
+        let retained_head_level = head_high_level.saturating_sub(MAX_CACHE_LEVEL_DISTANCE);
+        let retained = self.sources_by_head_level.split_off(&retained_head_level);
+        let expired = std::mem::replace(&mut self.sources_by_head_level, retained);
         for source_revisions in expired.into_values() {
             for source_revision in source_revisions {
                 self.slots_by_source.remove(&source_revision);
@@ -353,12 +353,12 @@ struct DestinationHeat {
 }
 
 impl DestinationHeat {
-    fn record(&mut self, destination_revision: u64, destination_high_level: u32) {
+    fn record(&mut self, destination_revision: u64, destination_head_level: u32) {
         if let Some(count) = self.counts_by_revision.get_mut(&destination_revision) {
             *count = count.saturating_add(1);
         } else {
             self.counts_by_revision.insert(destination_revision, 1);
-            self.revisions_by_level.entry(destination_high_level).or_default().push(destination_revision);
+            self.revisions_by_level.entry(destination_head_level).or_default().push(destination_revision);
         }
     }
 
@@ -481,8 +481,8 @@ mod tests {
         cached_delta_at(source, target, 17)
     }
 
-    fn cached_delta_at(source: u64, target: u64, high_level: u32) -> Arc<CachedDelta> {
-        Arc::new(CachedDelta::new(source, target, high_level, 23, Bytes::from_static(b"gzip")))
+    fn cached_delta_at(source: u64, target: u64, head_level: u32) -> Arc<CachedDelta> {
+        Arc::new(CachedDelta::new(source, target, head_level, 23, Bytes::from_static(b"gzip")))
     }
 
     fn delta<F, Fut>(
@@ -656,12 +656,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn target_level_index_prunes_complete_expired_buckets_only() {
+    async fn head_level_index_prunes_complete_expired_buckets_only() {
         let cache = Arc::new(GraphCache::new());
         let jobs = CacheJobTracker::new();
-        for (source, target, high_level) in [(5, 8, 20), (13, 16, 20), (21, 24, 21)] {
+        for (source, target, head_level) in [(5, 8, 20), (13, 16, 20), (21, 24, 21)] {
             let completed =
-                job(delta(&cache, &jobs, source, 520, move |_| async move { Ok(cached_delta_at(source, target, high_level)) }));
+                job(delta(&cache, &jobs, source, 520, move |_| async move { Ok(cached_delta_at(source, target, head_level)) }));
             completed.wait(CancellationToken::new()).await.expect("fixture entry completes");
         }
 
@@ -669,14 +669,14 @@ mod tests {
         {
             let state = cache.lock_state();
             assert_eq!(state.deltas.slots_by_source.len(), 3, "distance 500 and younger buckets remain retained");
-            assert_eq!(state.deltas.sources_by_target_level.keys().copied().collect::<Vec<_>>(), [20, 21]);
+            assert_eq!(state.deltas.sources_by_head_level.keys().copied().collect::<Vec<_>>(), [20, 21]);
         }
 
         cache.prune_deltas(521);
         {
             let state = cache.lock_state();
             assert_eq!(state.deltas.slots_by_source.keys().copied().collect::<Vec<_>>(), [21]);
-            assert_eq!(state.deltas.sources_by_target_level.keys().copied().collect::<Vec<_>>(), [21]);
+            assert_eq!(state.deltas.sources_by_head_level.keys().copied().collect::<Vec<_>>(), [21]);
         }
         jobs.shutdown().await;
     }
@@ -707,7 +707,7 @@ mod tests {
         {
             let state = cache.lock_state();
             assert!(!state.deltas.slots_by_source.contains_key(&3));
-            assert!(!state.deltas.sources_by_target_level.contains_key(&20));
+            assert!(!state.deltas.sources_by_head_level.contains_key(&20));
         }
 
         let replacement = job(delta(&cache, &jobs, 3, 521, |_| async { Ok(cached_delta_at(3, 7, 521)) }));
