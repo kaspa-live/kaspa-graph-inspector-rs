@@ -209,8 +209,10 @@ impl GraphHistory {
     }
 }
 
-// Gapless append preserves strictly increasing stored left boundaries, so an
-// exact boundary can be classified without visiting newer history entries.
+/// Locates an exact retained left boundary with bounded inspection.
+///
+/// Gapless append preserves strictly increasing stored left boundaries, so
+/// classification does not need to visit newer history entries.
 fn find_boundary_index(entries: &VecDeque<Arc<GraphHistoryEntry>>, revision_id: u64, mut inspect: impl FnMut()) -> Option<usize> {
     let mut low = 0;
     let mut high = entries.len();

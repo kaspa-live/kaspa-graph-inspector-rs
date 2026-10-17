@@ -287,6 +287,8 @@ impl GraphPublication {
         let estimated_raw_bytes = estimate_raw_delta_bytes(&delta);
         core.history.append(delta, estimated_raw_bytes).expect("a successful Head update extends the locked history");
         core.history.prune(head_low_level);
+        let head_high_level = core.view.high_level();
+        self.cache.prune_deltas(head_high_level);
         Ok(Some(target_revision))
     }
 
@@ -336,6 +338,7 @@ mod tests {
         time::Duration,
     };
 
+    use bytes::Bytes;
     use kgi_api_model::{
         delta::GraphDelta,
         graph::{GraphViewUpdateError, Level, LevelExtent},
@@ -347,6 +350,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::cache::{CacheAccess, CacheJobTracker, CachedDelta};
 
     fn head_view() -> GraphView {
         head_view_with_depth(1)
@@ -519,6 +523,39 @@ mod tests {
         assert_eq!(core.history.len(), 2);
         assert_eq!(core.history.oldest_available_revision(), 1);
         assert_eq!(core.history.entries().next().expect("oldest retained entry").delta().high_level(), 3);
+    }
+
+    #[tokio::test]
+    async fn history_pruning_preserves_a_structurally_eligible_source_keyed_delta() {
+        let publication =
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view_with_depth(2), GraphHistory::new())
+                .expect("matching candidate");
+        assert_eq!(publication.apply_block_committed(&committed_block(2)).await.expect("block update"), Some(1));
+
+        let cache = publication.cache();
+        let jobs = CacheJobTracker::new();
+        let CacheAccess::Job(initial) = cache.delta(
+            &jobs,
+            0,
+            |_| async { Ok(Arc::new(CachedDelta::new(0, 1, 2, 4, Bytes::from_static(b"gzip")))) },
+            || async { 2 },
+        ) else {
+            panic!("the first source access starts a job");
+        };
+        initial.wait(tokio_util::sync::CancellationToken::new()).await.expect("fixture cache entry completes");
+        assert!(matches!(
+            cache.delta(&jobs, 0, |_| async { panic!("retained source must hit") }, || async { 2 }),
+            CacheAccess::Completed(_)
+        ));
+
+        assert_eq!(publication.apply_block_committed(&committed_block(3)).await.expect("block update"), Some(2));
+        assert_eq!(publication.apply_block_committed(&committed_block(4)).await.expect("block update"), Some(3));
+
+        match cache.delta(&jobs, 0, |_| async { panic!("source-history pruning does not prune a completed delta") }, || async { 4 }) {
+            CacheAccess::Completed(hit) => assert_eq!(hit.to_revision_id(), 1),
+            CacheAccess::Job(_) => panic!("the completed source remains cached until target-level pruning"),
+        }
+        jobs.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -6,6 +6,12 @@ use kgi_model::lifecycle::{NodeServiceStatus, ProcessingStatus, StorageServiceSt
 
 use crate::{graph::Level, history::GraphHistoryEntryList};
 
+/// Maximum number of Head levels a cached delta target may trail its publication.
+pub const MAX_CACHE_LEVEL_DISTANCE: u32 = 500;
+
+/// Maximum number of Head levels a heated delta destination may trail its publication.
+pub const HOT_DESTINATION_LEVEL_DISTANCE: u32 = 250;
+
 /// Reason a request must abandon its current graph lineage or source cursor.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FreshViewReason {
