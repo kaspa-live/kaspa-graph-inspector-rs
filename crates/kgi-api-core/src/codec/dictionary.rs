@@ -5,6 +5,8 @@ use kgi_model::block::BlockHash;
 use super::scalar::{BlockHashDto, HashRef};
 
 /// One response-local first-occurrence hash dictionary under construction.
+// If duplicate hash storage becomes material for large responses, replace this
+// Vec-plus-map pair with an IndexSet<BlockHash> whose insertion index is HashRef.
 #[derive(Default)]
 pub(super) struct HashDictionary {
     hashes: Vec<BlockHashDto>,
