@@ -373,17 +373,20 @@ through request guards rather than duplicate task handles.
 
 ApiService owns the runtime synchronization inside the protocol-owned
 `GraphCache`. It uses a small custom publication-local cache rather than a
-general cache library:
+general cache library. `GraphCache` privately synchronizes one
+`GraphCacheState`; the concrete synchronization primitive is an implementation
+choice:
 
 ```rust
-struct GraphCache {
-    state: std::sync::Mutex<GraphCacheState>,
-}
-
 struct GraphCacheState {
-    delta_slots: HashMap<u64, CacheSlot<CachedDelta>>,
+    deltas: DeltaCache,
     head_slots: HashMap<u32, CacheSlot<CachedHeadSnapshot>>,
     destination_heat: HashMap<u64, u64>,
+}
+
+struct DeltaCache {
+    slots_by_source: HashMap<u64, CacheSlot<CachedDelta>>,
+    sources_by_target_level: BTreeMap<u32, Vec<u64>>,
 }
 
 struct CacheSlot<T> {
@@ -404,23 +407,51 @@ struct CacheJob<T> {
 Key meaning, entry eligibility, covering-tier selection, and checks which must
 precede cache lookup belong to the
 [protocol cache contract](api-protocol.md#publication-scoped-head-response-cache--settled).
-After those checks, one short cache critical section applies the required slot
-operation atomically. A miss joins the running job or installs a `Pending` job
-and designates that caller as its only builder. Head selection may instead
-return an eligible completed covering entry while installing the required
-selected-tier or refresh job in another slot. The pending slot is installed
-before the builder performs cache-build target selection, build-input
-retention, extraction, serialization, or compression. This prevents a
-concurrent miss burst from duplicating preparation or encoding work. The
-builder releases the cache lock before every such operation and spawns one
-tracked orchestration task with a child of `ApiCancellation::cache_jobs`.
+After those checks, one short cache-state critical section applies the required
+slot operation atomically. A miss joins the running job or installs a
+`Pending` job and designates that caller as its only builder. Head selection
+may instead return an eligible completed covering entry while installing the
+required selected-tier or refresh job in another slot. The pending slot is
+installed before the builder performs cache-build target selection,
+build-input retention, extraction, serialization, or compression. This
+prevents a concurrent miss burst from duplicating preparation or encoding
+work. The builder leaves the cache-state critical section before every such
+operation and spawns one tracked orchestration task with a child of
+`ApiCancellation::cache_jobs`.
 
 A source-keyed delta job captures its immutable history-entry Arcs and fixed
 target. A Head snapshot tier job captures one immutable Frozen extraction.
 The mandatory tier-50 Prewarming job and later demand-triggered tier jobs use
 the same tracked scheduler and final response construction path. Every job
 holds only detached immutable inputs during JSON serialization and gzip and no
-publication-core or cache-state lock.
+publication-core or cache-state guard.
+
+`DeltaCache` is a nested value accessed only within the enclosing
+`GraphCache` state critical section. It is not another synchronization or
+lifecycle owner. It alone mutates the two collections: `slots_by_source`
+supplies exact source lookup and single-flight ownership, while
+`sources_by_target_level` supplies structural eviction without scanning
+retained slots. Its private operations own access, completed insertion,
+completion without insertion, failed-job removal, and target-level prefix
+eviction so callers cannot update only one side of the index invariant.
+
+When a delta candidate completes, the orchestration task first
+compares its target `high_level` with the containing publication's then-current
+Head. An aged candidate clears the matching running slot and completes its
+existing waiters without cache insertion. An eligible candidate atomically
+installs its completed source-keyed slot and appends that source revision to
+the vector at its target-level key. Completed delta entries are immutable and
+never promoted or replaced while retained, so no ordinary operation removes
+one source from the middle of a target-level vector.
+
+After Head advancement, derive the inclusive retained boundary with
+`head_high_level.saturating_sub(MAX_CACHE_LEVEL_DISTANCE)`. Repeatedly remove
+the first `BTreeMap` bucket while its target-level key is below that boundary,
+then remove exactly those bucketed source revisions from `slots_by_source`.
+Multiple entries targeting the same level share one vector. Running-only slots
+have no completed target and do not enter the eviction index. This work is
+proportional to expired buckets and entries and performs no retained-slot scan
+or history lookup.
 
 For a Head-tier job, successful encoding is one candidate attempt rather than
 terminal job completion. The orchestration task applies the protocol-owned
@@ -439,26 +470,29 @@ shared job. The job may finish and populate its originating publication cache
 after its last current waiter disappears. Publication replacement likewise
 does not cancel a job holding captured immutable inputs or remaining waiters.
 
-On delta success or an eligible Head-tier success, the job upgrades its
-`Weak<GraphCache>`, locks the cache, and verifies that the applicable running
-slot still points to that exact job. It then installs the shared completed
-`Arc`, clears the running slot, releases the lock, and publishes the same
-terminal result through `watch`. A Head-tier refresh atomically replaces only
-that tier. On failure or terminal cancellation, it clears the matching running
-slot while preserving any prior completed entry, releases the lock, and then
-publishes one shared result. Job completion uses
+On eligible delta success or an eligible Head-tier success, the job upgrades
+its `Weak<GraphCache>`, enters the cache-state critical section, and verifies
+that the applicable running slot still points to that exact job. It then
+installs the shared completed `Arc`, updates the applicable delta eviction
+index, clears the running slot, leaves the critical section, and publishes the
+same terminal result through `watch`. A Head-tier refresh atomically replaces
+only that tier. An aged delta success clears the matching running slot without
+insertion and publishes its successful terminal result after leaving the
+critical section. On failure or terminal cancellation, it clears the matching
+running slot while preserving any prior completed entry, leaves the critical
+section, and then publishes one shared result. Job completion uses
 `watch::Sender::send_replace`, so the terminal value is stored even if every
 current waiter has already detached. A later request may therefore retry
 without rejoining the failed job. If the originating cache can no longer be
 upgraded, the job skips insertion but still completes its existing receivers.
 
-The cache mutex protects only map operations, counter changes, and pointer
-identity checks. No guard may cross an `.await`, extraction, history capture,
-serialization, compression, response delivery, or waiter suspension. The
-custom slots are required because completed-value reuse, exact running-job
-identity, weak publication-local insertion, destination heat, and structural
-eviction form one cache protocol; a general-purpose cache would not replace
-that synchronization.
+Cache-state synchronization protects only map and eviction-index operations,
+counter changes, and pointer identity checks. No guard may cross an `.await`,
+extraction, history capture, serialization, compression, response delivery,
+or waiter suspension. The custom slots are required because completed-value
+reuse, exact running-job identity, weak publication-local insertion,
+destination heat, and structural eviction form one cache protocol; a
+general-purpose cache would not replace that synchronization.
 
 The unpublished publication runtime consumes the result of its mandatory
 Prewarming job under the

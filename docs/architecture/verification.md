@@ -1589,6 +1589,12 @@ one immutable outgoing entry per source revision and
 convergence of distinct sources on a heated destination. Exercise an
 SSE-coordinated and an HTTP-only request from the same source and verify both
 reuse the same cache entry or join the same job.
+After constructing a completed cache entry, prune its exact source boundary
+from `GraphHistory` while its target remains within
+`MAX_CACHE_LEVEL_DISTANCE`; the exact cache hit must still succeed without a
+history range lookup. Remove that cache entry and repeat the request to verify
+that the miss follows the ordinary `StartPruned` or `StartUnavailable`
+history outcome.
 
 For a Live publication and preferred interval 15, cover no-delta waiting at
 Head distances one through fourteen; target eligibility beginning at
@@ -1705,10 +1711,15 @@ history entries. Cancelling one request detaches only that waiter. Once the old
 publication has no remaining runtime, slot, request, or SSE reference, its
 cache and client registry are released; a detached job may complete its
 remaining waiters, but its weak cache insertion must then fail harmlessly.
-Terminal ApiService shutdown cancels and joins unfinished jobs. Evict an entry
-when its source revision leaves history and when its target level falls more
-than `MAX_CACHE_LEVEL_DISTANCE` behind Head; either miss reconstructs an
-equivalent response. At
+Terminal ApiService shutdown cancels and joins unfinished jobs. Retaining or
+pruning a source history boundary must not evict a completed delta. At target
+distance exactly `MAX_CACHE_LEVEL_DISTANCE`, retain it; one level later, evict
+the complete target-level bucket and every source revision indexed there while
+leaving younger buckets untouched. Cover multiple source revisions in one
+bucket and advancement with no expired bucket. Pause a delta job until its
+target ages beyond the limit, then verify that its existing waiters receive the
+successful result while neither the completed slot nor its target-level index
+entry is installed. At
 `DELTA_RELOAD_LEVEL_DISTANCE`, require a fresh window before starting a job.
 Historical DB
 windows bypass this cache.
@@ -1970,9 +1981,9 @@ and weak insertion both before and after the origin cache is dropped. Verify
 that one short cache critical section elects exactly one builder, installs its
 pending job after required pre-cache checks and before cache-build target
 selection or build-input retention, and lets every concurrent miss join that
-job. No cache mutex guard may survive
-into capture, extraction, an `.await`, encoding, delivery, or waiter
-suspension. On success, require completed insertion before the shared `watch`
+job. No cache-state guard may survive into capture, extraction, an `.await`,
+encoding, delivery, or waiter suspension. On success, require completed
+insertion before the shared `watch`
 result; on failure, require matching-job removal before the shared error so an
 immediate retry starts new work. A cancelled receiver must not alter the job,
 and a dropped origin cache must prevent insertion without preventing receiver

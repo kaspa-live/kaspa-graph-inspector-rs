@@ -144,10 +144,12 @@ Execute increment 10 as these ordered points:
    capture or target selection; complete through exact-job pointer checks,
    weak cache insertion, shared immutable results, and removal-before-error.
    Attach the cache to `GraphPublication` as its sole durable strong owner.
-4. Implement source-revision-keyed delta slots, immutable cached delta values,
-   saturating destination heat, and structural eviction by retained-history
-   availability and target-level distance. Leave delta target selection,
-   continuation, request outcomes, and client rearming to increment 15.
+4. Implement the source-keyed delta lookup and target-level eviction index
+   specified by the
+   [ApiService cache owner](../architecture/api-service.md#cache-and-encoding-jobs),
+   immutable cached delta values, and saturating destination heat. Leave delta
+   target selection, continuation, request outcomes, and client rearming to
+   increment 15.
 5. Implement derived Head tiers and their exact selected-versus-covering reuse
    order, current-Head eligibility, demand-triggered refresh, preservation of
    the previous completed value during refresh, and completion-time hard-age
