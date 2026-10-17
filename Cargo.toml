@@ -50,6 +50,7 @@ sqlx = { version = "0.9.0", default-features = false, features = [
 testcontainers-modules = { version = "0.15.0", default-features = false, features = ["postgres", "ring"] }
 thiserror = "2.0.18"
 tokio = { version = "1.42.1", features = ["macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
 toml = "0.8.8"
 url = "2.5.8"
 

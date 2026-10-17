@@ -11,6 +11,7 @@ flate2.workspace = true
 kaspa-consensus-core.workspace = true
 kgi-api-ingress = { path = "../kgi-api-ingress" }
 kgi-api-model = { path = "../kgi-api-model" }
+kgi-core = { path = "../kgi-core" }
 kgi-model = { path = "../kgi-model" }
 kgi-storage = { path = "../kgi-storage" }
 rand.workspace = true
@@ -18,6 +19,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true

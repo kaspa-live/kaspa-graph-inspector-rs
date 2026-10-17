@@ -7,6 +7,8 @@ use flate2::{Compression, GzBuilder};
 use serde::Serialize;
 use thiserror::Error;
 
+pub(crate) mod scheduler;
+
 /// Maximum complete uncompressed JSON body accepted for a graph response.
 pub(crate) const MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 

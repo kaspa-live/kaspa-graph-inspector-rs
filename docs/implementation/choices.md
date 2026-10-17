@@ -878,3 +878,23 @@ arbitrarily oversized JSON buffer, and retain the successful compressed body
 as shared immutable `bytes::Bytes`. The bounded encoding scheduler introduced
 by the same increment remains the sole production caller and the sole
 submitter of this work to Tokio's blocking executor.
+
+### Scheduler admission and execution
+
+Represent the encoding scheduler's short synchronous state with one standard
+mutex, FIFO queues for priority and historical work, a reservation-ID set, and
+an active-job map. Admission starts work directly when an applicable active
+slot is free; otherwise it occupies one of the bounded queued-or-reserved
+positions. Completing an active job dispatches priority work before historical
+work while enforcing the historical sublimit. This avoids a permanent
+dispatcher task without changing the limits and priority owned by the
+[ApiService task contract](../architecture/api-service.md#cache-and-encoding-jobs).
+
+Track the small async owner of every active blocking call with a scheduler-
+private `TaskTracker`. The production blocking adapter delegates only to
+`tokio::task::spawn_blocking`; tests replace that adapter with a controlled
+executor. Request cancellation or queue timeout removes queued work, while an
+already active blocking call remains tracked through completion and its result
+is discarded. Terminal shutdown closes the tracker after rejecting admission
+and completing queued and active waiters with the shutdown result, then joins
+the still-running blocking owners.
