@@ -1,5 +1,6 @@
 #![allow(dead_code, reason = "the isolated codec foundation is integrated by later API increments")]
 
+pub(crate) mod delta;
 pub(crate) mod error;
 pub(crate) mod graph;
 pub(crate) mod lifecycle;
