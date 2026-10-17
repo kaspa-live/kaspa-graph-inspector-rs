@@ -732,7 +732,7 @@ module-qualified and add no crate-root re-exports. This module contains owned
 cross-crate values only; SQL rows, database errors, transactions, generation
 state, and publication runtime state remain in their owning crates.
 
-Represent one detached graph seed with `BTreeMap<u64, Level>` for numerically
+Represent one detached graph seed with `BTreeMap<u32, Level>` for numerically
 ordered levels, `HashMap<BlockHash, GraphBlock>` for blocks, and
 `HashMap<EdgeId, GraphEdge>` for edges. These are the same owned collection
 shapes accepted by `GraphView::from_database_projection`, so Storage can detach
