@@ -7,13 +7,13 @@ use kgi_model::block::{BlockHash, CompactId};
 use crate::graph::{EdgeId, GraphBlock, GraphEdge, Level};
 
 /// Maximum nominal depth accepted for an anchored graph window.
-pub const MAX_WINDOW_DEPTH: u64 = 250;
+pub const MAX_WINDOW_DEPTH: u32 = 250;
 
 /// Anchor used to resolve one fixed graph window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GraphWindowAnchor {
     /// Resolve the exact retained level.
-    Level(u64),
+    Level(u32),
     /// Resolve the level of one materialized block.
     BlockHash(BlockHash),
     /// Resolve the current-VSPC floor at or below one DAA score.
@@ -26,7 +26,7 @@ pub enum GraphWindowAnchorUnavailable {
     /// The requested level is not retained.
     LevelNotRetained {
         /// Exact level requested by the caller.
-        requested_level: u64,
+        requested_level: u32,
     },
     /// The requested hash does not identify a materialized block.
     BlockNotMaterialized {
@@ -44,11 +44,11 @@ pub enum GraphWindowAnchorUnavailable {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GraphWindowResolution {
     /// Level selected by the request anchor.
-    pub resolved_level: u64,
+    pub resolved_level: u32,
     /// Inclusive lower level returned for the window.
-    pub effective_start_level: u64,
+    pub effective_start_level: u32,
     /// Inclusive upper level returned for the window.
-    pub effective_end_level: u64,
+    pub effective_end_level: u32,
 }
 
 /// Request for one coherent database-backed graph projection.
@@ -61,7 +61,7 @@ pub enum GraphViewSeedRequest {
         /// Anchor resolved inside the projection snapshot.
         anchor: GraphWindowAnchor,
         /// Effective positive nominal depth already capped by the API owner.
-        max_depth: u64,
+        max_depth: u32,
     },
 }
 
@@ -71,9 +71,9 @@ pub struct GraphViewSeed {
     /// Anchor resolution and effective nominal extent of this projection.
     pub resolution: GraphWindowResolution,
     /// Maximum nominal depth assigned to the resulting graph view.
-    pub max_depth: u64,
+    pub max_depth: u32,
     /// Complete nominal and retained edge-endpoint levels.
-    pub levels: BTreeMap<u64, Level>,
+    pub levels: BTreeMap<u32, Level>,
     /// Complete materialized blocks inside the nominal extent.
     pub blocks: HashMap<BlockHash, GraphBlock>,
     /// Complete child-parent edges whose spans intersect the nominal extent.

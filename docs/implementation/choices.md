@@ -732,7 +732,7 @@ module-qualified and add no crate-root re-exports. This module contains owned
 cross-crate values only; SQL rows, database errors, transactions, generation
 state, and publication runtime state remain in their owning crates.
 
-Represent one detached graph seed with `BTreeMap<u64, Level>` for numerically
+Represent one detached graph seed with `BTreeMap<u32, Level>` for numerically
 ordered levels, `HashMap<BlockHash, GraphBlock>` for blocks, and
 `HashMap<EdgeId, GraphEdge>` for edges. These are the same owned collection
 shapes accepted by `GraphView::from_database_projection`, so Storage can detach
@@ -779,13 +779,13 @@ weights:
 
 | Contribution | Estimated bytes |
 |---|---:|
-| Delta entry and amortized batch framing | 232 |
+| Delta entry and amortized batch framing | 230 |
 | Each distinct emitted hash dictionary entry | 68 |
-| Block upsert excluding relationship array items | 240 |
+| Block upsert excluding relationship array items | 236 |
 | Each direct-parent or merge-set `HashRef` item in a block upsert | 6 |
-| Edge upsert | 160 |
-| Level installation (`after = Some`) | 72 |
-| Level removal (`after = None`) | 40 |
+| Edge upsert | 152 |
+| Level installation (`after = Some`) | 68 |
+| Level removal (`after = None`) | 38 |
 | VSPC-membership mutation | 32 |
 | Color mutation | 25 |
 | Block or edge removal | 0 |
@@ -803,6 +803,13 @@ delta serializer omits them. Level and field removals remain charged because
 those mutations stay on the wire. Level installation and removal use separate
 weights because the latter emits `null` instead of a complete `LevelDto`.
 
+The bounded graph level, slot, and level-size fields are JSON numbers. Relative
+to their earlier decimal-string representation, the entry framing excludes one
+pair of quotes for `high_level`, each block excludes two pairs for its
+coordinate, each edge excludes four pairs for its endpoint coordinates, and a
+level mutation excludes one or two pairs according to whether it removes or
+installs a level.
+
 The estimator remains additive across history entries. Consequently, a hash
 repeated by different entries can still be charged once per entry even though
 the later batch serializer shares one response-local dictionary. This bounded
@@ -815,3 +822,40 @@ publication-lifetime workload rationale as cumulative history overflow. A
 later composed history entry obtains its estimate by adding its constituent
 entry estimates rather than re-estimating the composed mutation maps, so
 composition cancellation cannot retroactively change planning cost.
+
+## 16 October 2026: graph wire codec foundation
+
+### Module and dependency boundary
+
+Place representation-independent public protocol values in the later public
+`kgi_api_model::protocol` module. Place transport DTOs, response-local hash
+substitution, and JSON conversion in the private `kgi_api_core::codec` module,
+with no crate-root re-exports. Canonical graph and protocol values do not
+derive Serde traits and retain no serialization dependency; the codec alone
+constructs private serializable representations at the boundary owned by the
+[API protocol](../architecture/api-protocol.md#common-transport-dto-rules--settled).
+
+Add direct workspace dependencies on `serde` and `serde_json` to
+`kgi-api-core`. Serde derives the private DTO encoders, while `serde_json`
+produces the compact JSON bytes and supports exact schema tests. These
+dependencies remain absent from `kgi-api-model`.
+
+Add a direct `kaspa-consensus-core` dependency to `kgi-api-core` when status
+DTO conversion is introduced. The shared semantic status continues to carry
+the `kgi-model`-owned `ValidatedNodeStatus`; the codec names the upstream
+`NetworkType` only to exhaustively construct the protocol-owned structural
+network value without parsing or depending on a display string. This creates
+no dependency on NodeService or `kgi-node`.
+
+### Representation and Head validator identity
+
+Start the internal graph-payload `representation_version` at `1` and store it
+as a private `u32`. Changing the version remains governed by the API protocol;
+the integer width and initial value are implementation choices and do not add
+a public response field.
+
+Represent the protocol-owned semantic Head validator identity with the private
+`HeadEtagInput` value. It contains the current representation version,
+publication ID, snapshot revision, and one canonical `LevelExtent`. The
+eventual validator formatting and HTTP header handling remain outside this
+codec increment.

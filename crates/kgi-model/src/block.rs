@@ -17,6 +17,12 @@ pub const MAX_DAA_SCORE: u64 = i64::MAX as u64 - 1;
 /// Highest blue score representable by KGI.
 pub const MAX_BLUE_SCORE: u64 = i64::MAX as u64;
 
+/// Greatest positive number of blocks representable in one graph level.
+pub const MAX_LEVEL_SIZE: u16 = u16::MAX;
+
+/// Greatest allocated zero-based slot in one graph level.
+pub const MAX_LEVEL_SLOT: u16 = MAX_LEVEL_SIZE - 1;
+
 /// Database-local positive block identifier.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -150,24 +156,24 @@ impl VspcPoint {
 /// Database-local display position of a materialized block.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BlockCoordinate {
-    level: u64,
-    slot: u64,
+    level: u32,
+    slot: u16,
 }
 
 impl BlockCoordinate {
-    /// Creates a coordinate when `level` is positive.
+    /// Creates a coordinate when `level` is positive and `slot` is allocatable.
     #[must_use]
-    pub const fn new(level: u64, slot: u64) -> Option<Self> {
-        if level > 0 { Some(Self { level, slot }) } else { None }
+    pub const fn new(level: u32, slot: u16) -> Option<Self> {
+        if level > 0 && slot <= MAX_LEVEL_SLOT { Some(Self { level, slot }) } else { None }
     }
 
     #[must_use]
-    pub const fn level(self) -> u64 {
+    pub const fn level(self) -> u32 {
         self.level
     }
 
     #[must_use]
-    pub const fn slot(self) -> u64 {
+    pub const fn slot(self) -> u16 {
         self.slot
     }
 }
@@ -212,11 +218,13 @@ mod tests {
     }
 
     #[test]
-    fn materialized_coordinate_requires_a_positive_level() {
+    fn materialized_coordinate_enforces_level_and_slot_domains() {
         assert_eq!(BlockCoordinate::new(0, 0), None);
         let coordinate = BlockCoordinate::new(1, 0).expect("level one is valid");
         assert_eq!(coordinate.level(), 1);
         assert_eq!(coordinate.slot(), 0);
+        assert_eq!(BlockCoordinate::new(u32::MAX, MAX_LEVEL_SLOT), Some(BlockCoordinate { level: u32::MAX, slot: MAX_LEVEL_SLOT }));
+        assert_eq!(BlockCoordinate::new(1, u16::MAX), None);
     }
 
     #[test]

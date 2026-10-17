@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 16 October 2026.
+Updated 17 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -271,5 +271,25 @@ publication-local millisecond timestamps, detached frozen views,
 retained history surviving pruning, fresh publication identities, and typed
 projection failures.
 Completion validation passed workspace formatting, Cargo check, 377/377
+Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
+with warnings denied, and `git diff --check`.
+
+Implementation increment 9 is implemented: representation-independent public
+API outcomes and status values live in `kgi-api-model`, while private
+`kgi-api-core` DTOs provide the sole Serde boundary for graph responses,
+canonical delta batches, common errors, lifecycle and status observations,
+window sources, and SSE control payloads. Complete graph bodies and ordered
+delta batches use first-occurrence response-local hash dictionaries; ordered
+parent and merge-set vectors remain ordered, unordered graph collections carry
+no wire-order meaning, and serializer-only block and edge removals are omitted
+before interning their hashes. Public `u64` values use decimal JSON strings,
+bounded graph values use numeric `u32` and `u16` fields, absent semantic values
+remain explicit `null`, and colors use the protocol-owned numeric codes. The
+canonical graph and retained history remain serialization-free and unchanged.
+The internal representation version and semantic Head-ETag input are present
+for later cache integration. Encoding scheduling, compression, response-size
+enforcement, caching, logical request operations, HTTP routing, and response
+delivery remain in later increments.
+Completion validation passed workspace formatting, Cargo check, 402/402
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.

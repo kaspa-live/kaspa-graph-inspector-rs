@@ -4,8 +4,8 @@ CREATE TABLE block_identifiers (
 );
 
 CREATE TABLE levels (
-    level BIGINT PRIMARY KEY CHECK (level > 0),
-    size BIGINT NOT NULL CHECK (size > 0),
+    level BIGINT PRIMARY KEY CHECK (level > 0 AND level <= 4294967295),
+    size INTEGER NOT NULL CHECK (size > 0 AND size <= 65535),
     daa_score BIGINT NOT NULL DEFAULT 9223372036854775807 CHECK (daa_score >= 0)
 );
 
@@ -13,8 +13,8 @@ CREATE TABLE blocks (
     id BIGINT PRIMARY KEY REFERENCES block_identifiers(id),
     timestamp BIGINT NOT NULL,
     daa_score BIGINT NOT NULL CHECK (daa_score >= 0 AND daa_score < 9223372036854775807),
-    level BIGINT NOT NULL CHECK (level > 0),
-    slot BIGINT NOT NULL CHECK (slot >= 0),
+    level BIGINT NOT NULL CHECK (level > 0 AND level <= 4294967295),
+    slot INTEGER NOT NULL CHECK (slot >= 0 AND slot <= 65534),
     selected_parent_id BIGINT NOT NULL REFERENCES block_identifiers(id),
     color SMALLINT NOT NULL CHECK (color BETWEEN 0 AND 2),
     is_in_vspc BOOLEAN NOT NULL,
@@ -26,10 +26,10 @@ CREATE TABLE blocks (
 CREATE TABLE parents (
     child_id BIGINT NOT NULL,
     parent_id BIGINT NOT NULL,
-    child_level BIGINT NOT NULL CHECK (child_level > 0),
-    child_slot BIGINT NOT NULL CHECK (child_slot >= 0),
-    parent_level BIGINT NOT NULL CHECK (parent_level >= 0),
-    parent_slot BIGINT NOT NULL CHECK (parent_slot >= 0),
+    child_level BIGINT NOT NULL CHECK (child_level > 0 AND child_level <= 4294967295),
+    child_slot INTEGER NOT NULL CHECK (child_slot >= 0 AND child_slot <= 65534),
+    parent_level BIGINT NOT NULL CHECK (parent_level >= 0 AND parent_level <= 4294967295),
+    parent_slot INTEGER NOT NULL CHECK (parent_slot >= 0 AND parent_slot <= 65534),
     PRIMARY KEY (child_id, parent_id),
     CHECK (parent_level > 0 OR parent_slot = 0)
 );

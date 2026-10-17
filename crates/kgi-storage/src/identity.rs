@@ -123,15 +123,15 @@ fn decode_identity(row: &sqlx::postgres::PgRow) -> Result<StoredIdentity, Storag
     let id = CompactId::new(raw_id)
         .ok_or_else(|| StorageError::invalid_metadata(format!("stored compact ID is not positive: {raw_id}")))?;
     let level: Option<i64> = row.try_get("level").map_err(|error| StorageError::database("block level decode", error))?;
-    let slot: Option<i64> = row.try_get("slot").map_err(|error| StorageError::database("block slot decode", error))?;
+    let slot: Option<i32> = row.try_get("slot").map_err(|error| StorageError::database("block slot decode", error))?;
     let raw_selected_parent_id: Option<i64> =
         row.try_get("selected_parent_id").map_err(|error| StorageError::database("selected-parent ID decode", error))?;
     let block = match (level, slot, raw_selected_parent_id) {
         (None, None, None) => None,
         (Some(level), Some(slot), Some(raw_selected_parent_id)) => {
-            let coordinate = u64::try_from(level)
+            let coordinate = u32::try_from(level)
                 .ok()
-                .and_then(|level| BlockCoordinate::new(level, u64::try_from(slot).ok()?))
+                .and_then(|level| BlockCoordinate::new(level, u16::try_from(slot).ok()?))
                 .ok_or_else(|| StorageError::invalid_metadata(format!("invalid block coordinate ({level}, {slot})")))?;
             let selected_parent_id = CompactId::new(raw_selected_parent_id).ok_or_else(|| {
                 StorageError::invalid_metadata(format!("stored selected-parent ID is not positive: {raw_selected_parent_id}"))

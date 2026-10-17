@@ -28,7 +28,7 @@ pub(super) struct GraphProjection<'connection> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ProjectionScope {
     pub resolution: GraphWindowResolution,
-    pub max_depth: u64,
+    pub max_depth: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,8 +291,8 @@ impl<'connection> GraphProjection<'connection> {
         &mut self,
         resolution: GraphWindowResolution,
         edges: &HashMap<EdgeId, GraphEdge>,
-    ) -> Result<BTreeMap<u64, Level>, ApiReadError> {
-        let mut required: HashSet<u64> = (resolution.effective_start_level..=resolution.effective_end_level).collect();
+    ) -> Result<BTreeMap<u32, Level>, ApiReadError> {
+        let mut required: HashSet<u32> = (resolution.effective_start_level..=resolution.effective_end_level).collect();
         for edge in edges.values() {
             required.insert(edge.child_coordinate.level());
             required.insert(edge.parent_coordinate.level());
@@ -306,7 +306,7 @@ impl<'connection> GraphProjection<'connection> {
         let mut levels = BTreeMap::new();
         for row in rows {
             let level = decode_positive_level(row.try_get("level").map_err(inconsistent_decode)?)?;
-            let size = u64::try_from(row.try_get::<i64, _>("size").map_err(inconsistent_decode)?)
+            let size = u16::try_from(row.try_get::<i32, _>("size").map_err(inconsistent_decode)?)
                 .ok()
                 .filter(|size| *size > 0)
                 .ok_or(ApiReadError::InconsistentProjection)?;
@@ -343,7 +343,7 @@ impl<'connection> GraphProjection<'connection> {
         Ok((max_id, sink_hash))
     }
 
-    async fn database_head(&mut self) -> Result<Option<u64>, ApiReadError> {
+    async fn database_head(&mut self) -> Result<Option<u32>, ApiReadError> {
         let level = sqlx::query_scalar::<_, i64>("SELECT level FROM blocks ORDER BY level DESC, slot DESC LIMIT 1")
             .fetch_optional(&mut *self.transaction)
             .await
@@ -351,15 +351,12 @@ impl<'connection> GraphProjection<'connection> {
         level.map(decode_positive_level).transpose()
     }
 
-    async fn resolve_anchor(&mut self, anchor: GraphWindowAnchor) -> Result<Option<u64>, ApiReadError> {
+    async fn resolve_anchor(&mut self, anchor: GraphWindowAnchor) -> Result<Option<u32>, ApiReadError> {
         let level = match anchor {
             GraphWindowAnchor::Level(requested_level) => {
                 assert!(requested_level > 0, "level anchors must be validated by the API owner");
-                let Ok(requested_level) = i64::try_from(requested_level) else {
-                    return Ok(None);
-                };
                 sqlx::query_scalar::<_, i64>("SELECT level FROM levels WHERE level = $1")
-                    .bind(requested_level)
+                    .bind(i64::from(requested_level))
                     .fetch_optional(&mut *self.transaction)
                     .await
                     .map_err(query_error)?
@@ -459,9 +456,9 @@ fn decode_ids(ids: Vec<i64>) -> Result<Vec<CompactId>, ApiReadError> {
     ids.into_iter().map(decode_id).collect()
 }
 
-fn decode_coordinate(level: i64, slot: i64) -> Result<BlockCoordinate, ApiReadError> {
+fn decode_coordinate(level: i64, slot: i32) -> Result<BlockCoordinate, ApiReadError> {
     let level = decode_positive_level(level)?;
-    let slot = u64::try_from(slot).map_err(|_| ApiReadError::InconsistentProjection)?;
+    let slot = u16::try_from(slot).map_err(|_| ApiReadError::InconsistentProjection)?;
     BlockCoordinate::new(level, slot).ok_or(ApiReadError::InconsistentProjection)
 }
 
@@ -478,15 +475,15 @@ fn decode_color(color: i16) -> Result<BlockColor, ApiReadError> {
     }
 }
 
-fn level_to_sql(level: u64) -> Result<i64, ApiReadError> {
-    i64::try_from(level).map_err(|_| ApiReadError::InconsistentProjection)
+fn level_to_sql(level: u32) -> Result<i64, ApiReadError> {
+    Ok(i64::from(level))
 }
 
 fn inconsistent_decode(_: sqlx::Error) -> ApiReadError {
     ApiReadError::InconsistentProjection
 }
 
-fn head_scope(high_level: u64) -> ProjectionScope {
+fn head_scope(high_level: u32) -> ProjectionScope {
     let low_level = high_level.saturating_sub(MAX_CACHE_DEPTH - 1).max(1);
     ProjectionScope {
         resolution: GraphWindowResolution {
@@ -498,7 +495,7 @@ fn head_scope(high_level: u64) -> ProjectionScope {
     }
 }
 
-fn anchored_resolution(resolved_level: u64, database_head: u64, max_depth: u64) -> GraphWindowResolution {
+fn anchored_resolution(resolved_level: u32, database_head: u32, max_depth: u32) -> GraphWindowResolution {
     let levels_above = (max_depth - 1) / 2;
     let levels_below = (max_depth - 1) - levels_above;
     let mut low_level = resolved_level.saturating_sub(levels_below).max(1);
@@ -523,8 +520,8 @@ const fn anchor_unavailable(anchor: GraphWindowAnchor) -> GraphWindowAnchorUnava
     }
 }
 
-fn decode_positive_level(level: i64) -> Result<u64, ApiReadError> {
-    u64::try_from(level).ok().filter(|level| *level > 0).ok_or(ApiReadError::InconsistentProjection)
+fn decode_positive_level(level: i64) -> Result<u32, ApiReadError> {
+    u32::try_from(level).ok().filter(|level| *level > 0).ok_or(ApiReadError::InconsistentProjection)
 }
 
 pub(super) fn query_error(error: sqlx::Error) -> ApiReadError {
@@ -586,9 +583,9 @@ mod tests {
         BlockHash::from_bytes([byte; 32])
     }
 
-    fn level_hash(level: u64) -> BlockHash {
+    fn level_hash(level: u32) -> BlockHash {
         let mut bytes = [0; 32];
-        bytes[24..].copy_from_slice(&level.to_be_bytes());
+        bytes[28..].copy_from_slice(&level.to_be_bytes());
         BlockHash::from_bytes(bytes)
     }
 
@@ -647,7 +644,7 @@ mod tests {
         .expect("parent insertion");
     }
 
-    async fn seed_scope_fixture(pool: &PgPool) -> (HashMap<u64, BlockHash>, i64) {
+    async fn seed_scope_fixture(pool: &PgPool) -> (HashMap<u32, BlockHash>, i64) {
         let origin_id = insert_identity(pool, hash(0)).await;
         let mut hashes = HashMap::new();
         let mut selected_parent_id = origin_id;
@@ -655,7 +652,7 @@ mod tests {
         for (level, daa_score) in [(1, Some(10)), (2, None), (3, Some(30)), (4, Some(30)), (5, Some(50))] {
             let block_hash = hash(u8::try_from(level).expect("test level fits u8"));
             selected_parent_id = insert_block(pool, block_hash, selected_parent_id, level, daa_score).await;
-            hashes.insert(u64::try_from(level).expect("positive test level"), block_hash);
+            hashes.insert(u32::try_from(level).expect("positive test level"), block_hash);
         }
         insert_identity(pool, hash(99)).await;
         (hashes, selected_parent_id)
@@ -800,7 +797,7 @@ mod tests {
         .expect("projection query must block")
     }
 
-    fn scope(resolved_level: u64, database_head: u64, max_depth: u64) -> ProjectionScope {
+    fn scope(resolved_level: u32, database_head: u32, max_depth: u32) -> ProjectionScope {
         ProjectionScope { resolution: anchored_resolution(resolved_level, database_head, max_depth), max_depth }
     }
 
@@ -867,7 +864,7 @@ mod tests {
     #[tokio::test]
     async fn head_seed_materializes_the_complete_maximum_depth_and_crossing_context() {
         let fixture = fixture().await;
-        let high_level = i64::try_from(MAX_CACHE_DEPTH + 5).expect("test depth fits BIGINT");
+        let high_level = i64::from(MAX_CACHE_DEPTH + 5);
         let (genesis_hash, head_id) = seed_linear_graph(&fixture.pool, high_level).await;
         let (client, _) = api_client(fixture.pool, genesis_hash);
 

@@ -2920,11 +2920,14 @@ dependencies = [
 name = "kgi-api-core"
 version = "0.1.0"
 dependencies = [
+ "kaspa-consensus-core",
  "kgi-api-ingress",
  "kgi-api-model",
  "kgi-model",
  "kgi-storage",
  "rand 0.8.8",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
 ]

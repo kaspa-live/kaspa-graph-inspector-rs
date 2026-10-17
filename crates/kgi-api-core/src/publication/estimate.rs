@@ -3,13 +3,13 @@ use std::collections::HashSet;
 use kgi_api_model::delta::GraphDelta;
 use kgi_model::block::BlockHash;
 
-const ENTRY_AND_BATCH_FRAMING_BYTES: u64 = 232;
+const ENTRY_AND_BATCH_FRAMING_BYTES: u64 = 230;
 const DISTINCT_HASH_BYTES: u64 = 68;
-const BLOCK_UPSERT_BYTES: u64 = 240;
+const BLOCK_UPSERT_BYTES: u64 = 236;
 const BLOCK_RELATIONSHIP_BYTES: u64 = 6;
-const EDGE_UPSERT_BYTES: u64 = 160;
-const LEVEL_INSTALLATION_BYTES: u64 = 72;
-const LEVEL_REMOVAL_BYTES: u64 = 40;
+const EDGE_UPSERT_BYTES: u64 = 152;
+const LEVEL_INSTALLATION_BYTES: u64 = 68;
+const LEVEL_REMOVAL_BYTES: u64 = 38;
 const MEMBERSHIP_MUTATION_BYTES: u64 = 32;
 const COLOR_MUTATION_BYTES: u64 = 25;
 
@@ -112,7 +112,7 @@ mod tests {
         )
         .expect("valid delta");
 
-        assert_eq!(estimate_raw_delta_bytes(&delta), 1_245);
+        assert_eq!(estimate_raw_delta_bytes(&delta), 1_225);
     }
 
     #[test]
