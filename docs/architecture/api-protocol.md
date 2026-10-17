@@ -1232,8 +1232,9 @@ choice in the first region; ties prefer a destination with an outgoing
 completed cache entry or running job and then the youngest revision. Requests
 received from a revision are measured for observability, but that count never
 contributes to heat. Do not separately count continuation states. A heat entry
-becomes ineligible when its revision leaves retained history or its boundary
-leaves the moving heat region.
+is eligible only while its revision remains a retained complete history
+boundary and its level remains inside the moving heat region. The ApiService
+cache owner defines physical pruning of stored heat counters.
 
 When appending a canonical Head delta, ApiService supplies its cheap
 `estimated_raw_bytes` from mutation counts and approximate field sizes for the
@@ -1647,21 +1648,21 @@ Failure returns the same request-local error to every waiter, removes the job,
 and permits a later request to start another job. Each successfully delivered
 waiter increments the actual destination's heat independently. A completed
 entry is never promoted as Head advances; later requests from its exact source
-reuse it until structural eviction.
+reuse it until structural pruning.
 
 The [publication lifecycle](api-publication.md#publication-state-and-revision--settled)
 owns preservation and release of publication-scoped cache state across Stale
 and replacement. The
 [ApiService task contract](api-service.md#api-task-ownership-and-completion--settled)
 owns job completion and terminal cancellation. While the publication remains
-installed or is retained as Stale, evict a `CachedDelta` when its target
+installed or is retained as Stale, prune a `CachedDelta` when its target
 `high_level` is more than `MAX_CACHE_LEVEL_DISTANCE` behind that publication's
-Head. Source-history retention never evicts a completed cache entry. Revision
+Head. Source-history retention never prunes a completed cache entry. Revision
 boundaries key exact lookup and preserve gapless replay; target level alone
 owns cache retention. This structural bound replaces an independent
 encoded-byte cache cap.
 
-An encoded-cache miss or eviction never changes graph correctness. Reconstruct
+An encoded-cache miss or pruning never changes graph correctness. Reconstruct
 the response from retained `GraphHistory` when its exact source remains
 available; otherwise require a fresh applicable view through the ordinary
 history-miss outcome. Historical

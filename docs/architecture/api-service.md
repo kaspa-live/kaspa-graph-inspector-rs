@@ -381,12 +381,17 @@ choice:
 struct GraphCacheState {
     deltas: DeltaCache,
     head_slots: HashMap<u32, CacheSlot<CachedHeadSnapshot>>,
-    destination_heat: HashMap<u64, u64>,
 }
 
 struct DeltaCache {
     slots_by_source: HashMap<u64, CacheSlot<CachedDelta>>,
     sources_by_target_level: BTreeMap<u32, Vec<u64>>,
+    destination_heat: DestinationHeat,
+}
+
+struct DestinationHeat {
+    counts_by_revision: HashMap<u64, u64>,
+    revisions_by_level: BTreeMap<u32, Vec<u64>>,
 }
 
 struct CacheSlot<T> {
@@ -428,12 +433,21 @@ publication-core or cache-state guard.
 
 `DeltaCache` is a nested value accessed only within the enclosing
 `GraphCache` state critical section. It is not another synchronization or
-lifecycle owner. It alone mutates the two collections: `slots_by_source`
-supplies exact source lookup and single-flight ownership, while
-`sources_by_target_level` supplies structural eviction without scanning
-retained slots. Its private operations own access, completed insertion,
-completion without insertion, failed-job removal, and target-level prefix
-eviction so callers cannot update only one side of the index invariant.
+lifecycle owner. It alone mutates the source-keyed slots, their target-level
+pruning index, and destination heat. `slots_by_source` supplies exact source
+lookup and single-flight ownership, while `sources_by_target_level` supplies
+structural pruning without scanning retained slots. Its private operations own
+access, completed insertion, completion without insertion, failed-job
+removal, and target-level prefix pruning so callers cannot update only one
+side of an index invariant.
+
+`DestinationHeat` owns its count and level index as one value. After each
+successful canonical delta delivery, it saturatingly increments the actual
+destination revision. The first stored observation also appends that
+revision once to the vector at the delivered delta's target `high_level`.
+Later deliveries of the same revision update only its count. Its level index
+is separate from the completed-delta index because heat and completed entries
+have different protocol-owned retention distances.
 
 When a delta candidate completes, the orchestration task first
 compares its target `high_level` with the containing publication's then-current
@@ -449,9 +463,16 @@ After Head advancement, derive the inclusive retained boundary with
 the first `BTreeMap` bucket while its target-level key is below that boundary,
 then remove exactly those bucketed source revisions from `slots_by_source`.
 Multiple entries targeting the same level share one vector. Running-only slots
-have no completed target and do not enter the eviction index. This work is
+have no completed target and do not enter the pruning index. This work is
 proportional to expired buckets and entries and performs no retained-slot scan
 or history lookup.
+
+Prune destination heat through its own level index in the same way, using
+`HOT_DESTINATION_LEVEL_DISTANCE` as its inclusive retained distance. Remove
+each expired level bucket and its indexed revision counters. A revision that
+has ceased to be a retained complete history boundary is already ineligible
+for target selection; its counter may remain physically stored until this
+bounded level pruning removes it.
 
 For a Head-tier job, successful encoding is one candidate attempt rather than
 terminal job completion. The orchestration task applies the protocol-owned
@@ -473,7 +494,7 @@ does not cancel a job holding captured immutable inputs or remaining waiters.
 On eligible delta success or an eligible Head-tier success, the job upgrades
 its `Weak<GraphCache>`, enters the cache-state critical section, and verifies
 that the applicable running slot still points to that exact job. It then
-installs the shared completed `Arc`, updates the applicable delta eviction
+installs the shared completed `Arc`, updates the applicable delta pruning
 index, clears the running slot, leaves the critical section, and publishes the
 same terminal result through `watch`. A Head-tier refresh atomically replaces
 only that tier. An aged delta success clears the matching running slot without
@@ -486,12 +507,12 @@ current waiter has already detached. A later request may therefore retry
 without rejoining the failed job. If the originating cache can no longer be
 upgraded, the job skips insertion but still completes its existing receivers.
 
-Cache-state synchronization protects only map and eviction-index operations,
+Cache-state synchronization protects only map and pruning-index operations,
 counter changes, and pointer identity checks. No guard may cross an `.await`,
 extraction, history capture, serialization, compression, response delivery,
 or waiter suspension. The custom slots are required because completed-value
 reuse, exact running-job identity, weak publication-local insertion,
-destination heat, and structural eviction form one cache protocol; a
+destination heat, and structural pruning form one cache protocol; a
 general-purpose cache would not replace that synchronization.
 
 The unpublished publication runtime consumes the result of its mandatory
@@ -924,7 +945,7 @@ V2 exposes these operational measurements:
   lanes;
 - active and rejected SSE clients, per-client buffer high-water marks, graph
   wakeup coalescing, and slow-client disconnects;
-- encoded-response cache hits, misses, evictions, and coalesced identical
+- encoded-response cache hits, misses, pruned entries, and coalesced identical
   requests, including raw requested Head depth, selected Head tier, tier age,
   larger-tier fallback, tier-job joins, construction and refresh duration,
   construction failure, and hard-age prewarming retries;

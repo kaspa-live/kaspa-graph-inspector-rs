@@ -144,8 +144,8 @@ Execute increment 10 as these ordered points:
    capture or target selection; complete through exact-job pointer checks,
    weak cache insertion, shared immutable results, and removal-before-error.
    Attach the cache to `GraphPublication` as its sole durable strong owner.
-4. Implement the source-keyed delta lookup and target-level eviction index
-   specified by the
+4. Implement the source-keyed delta lookup and the separate target-level
+   pruning indexes for completed deltas and destination heat specified by the
    [ApiService cache owner](../architecture/api-service.md#cache-and-encoding-jobs),
    immutable cached delta values, and saturating destination heat. Leave delta
    target selection, continuation, request outcomes, and client rearming to
@@ -159,7 +159,7 @@ Execute increment 10 as these ordered points:
    work, reject new work during shutdown, cancel queued work, drain active
    blocking work, and join all tracked completion. Cover priority, saturation,
    single-flight, weak insertion, no-waiter completion, shared-body allocation,
-   tier selection, hard-age retry, structural eviction, size and gzip failure,
+   tier selection, hard-age retry, structural pruning, size and gzip failure,
    and scheduler shutdown; then update implementation status and run the full
    Rust validation suite.
 

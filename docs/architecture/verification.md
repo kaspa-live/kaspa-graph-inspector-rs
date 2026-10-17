@@ -1712,8 +1712,8 @@ publication has no remaining runtime, slot, request, or SSE reference, its
 cache and client registry are released; a detached job may complete its
 remaining waiters, but its weak cache insertion must then fail harmlessly.
 Terminal ApiService shutdown cancels and joins unfinished jobs. Retaining or
-pruning a source history boundary must not evict a completed delta. At target
-distance exactly `MAX_CACHE_LEVEL_DISTANCE`, retain it; one level later, evict
+pruning a source history boundary must not prune a completed delta. At target
+distance exactly `MAX_CACHE_LEVEL_DISTANCE`, retain it; one level later, prune
 the complete target-level bucket and every source revision indexed there while
 leaving younger buckets untouched. Cover multiple source revisions in one
 bucket and advancement with no expired bucket. Pause a delta job until its
@@ -1989,6 +1989,14 @@ immediate retry starts new work. A cancelled receiver must not alter the job,
 and a dropped origin cache must prevent insertion without preventing receiver
 completion. Exercise completion after every waiter has detached and require
 `send_replace` to retain the terminal job value without restoring a cache slot.
+Exercise `DestinationHeat` through successful delivery accounting: repeated
+deliveries to one revision saturatingly change one counter without duplicating
+its level-index entry, and distinct destinations at one level share one bucket.
+At distance exactly `HOT_DESTINATION_LEVEL_DISTANCE`, retain the bucket; one
+level later, prune the bucket and all its revision counters while leaving
+younger heat untouched. A destination that ceases to be a retained complete
+history boundary must become ineligible for selection immediately even though
+its stored counter may remain until level pruning.
 
 Verify all cache orchestration tasks are registered in the ApiService task
 tracker. Include tier-keyed Head snapshot jobs and mandatory `Prewarming` work
