@@ -87,8 +87,8 @@ do not enlarge the PR silently. Any future regrouping requires updating this
 sequence first.
 
 The former broad Step 6 is now increments 6–17, former Step 7 is increments
-18–22, and former Step 8 is increments 23–27. Increments 6–8 are complete;
-the active work is increment 9, without an additional nesting level.
+18–22, and former Step 8 is increments 23–27. Increments 6–9 are complete;
+the active work is increment 10, without an additional nesting level.
 
 | Increment / PR | Isolated production scope | Completion evidence |
 |---|---|---|
@@ -115,56 +115,60 @@ the active work is increment 9, without an additional nesting level.
 | 26. Deployment and release artifacts | Complete the conventional and Docker layouts, runtime log directories, systemd and Compose examples, static-asset cache behavior, and atomic `xtask` bundle/container construction against the composed binary and Web build. | Reproducible bundle and image checks, matching binary/assets and provenance, missing-root failure, unprivileged/read-only deployment, writable logs, direct signal delivery, and atomic failure cleanup. |
 | 27. Full-stack acceptance | Add only the remaining cross-component fixtures and acceptance coverage needed to prove the focused verification contract across node RPC, PostgreSQL, recovery, API/Web, packaging, logging, and resource isolation; update implementation status with the final evidence. | Full Rust, PostgreSQL, Vitest, deterministic and complete-stack Playwright, parity, packaging, shutdown, and load/isolation suites pass from a clean checkout. |
 
-### Active increment 9: graph wire values and codec
+### Active increment 10: encoding scheduler and response cache
 
-Increment 9 is exactly one reviewable PR. It implements the representation
-boundary owned by the
-[API protocol](../architecture/api-protocol.md#common-transport-dto-rules--settled)
-over the canonical graph model and projection values completed by increments
-6 and 7. It supplies detached JSON-ready values for later cache, logical
-operation, and transport increments without introducing any of those runtime
-owners.
+Increment 10 is exactly one reviewable PR. It implements the bounded graph
+encoding and publication-local response-reuse infrastructure owned by the
+[ApiService task contract](../architecture/api-service.md#cache-and-encoding-jobs)
+and the [API protocol cache
+contract](../architecture/api-protocol.md#publication-scoped-head-response-cache--settled).
+It builds on the detached graph DTOs from increment 9 without adding logical
+request outcomes, database-backed historical operations, client wakeup state,
+or HTTP transport.
 
-Execute increment 9 as these ordered points:
+Execute increment 10 as these ordered points:
 
-1. Record the public-semantic and private-wire module boundaries, direct
-   Serde dependencies, the initial internal representation-version value, and
-   the protocol-required semantic Head-ETag input. Keep serialization
-   dependencies out of the canonical graph types.
-2. Add the remaining representation-independent protocol values to
-   `kgi-api-model`, including fresh-view reasons, delta outcomes and
-   continuation, retained Head-level lookup values and outcomes, and the
-   composite system-status value. Reuse the existing projection anchor,
-   resolution, and unavailable-anchor values without duplicating them.
-3. Add private `kgi-api-core` DTOs and compact JSON conversion for scalar,
-   lifecycle, status, common-error, window-source, and SSE-control shapes.
-   Apply the protocol-owned scalar, optional-value, enum, hash, and color
-   representations without adding serialization behavior to domain types.
-4. Implement complete graph, Head snapshot, anchored-window, and retained
-   Head-level DTO construction. Apply the protocol-owned response-local hash
-   dictionary and ordered-versus-unordered collection semantics at this sole
-   conversion boundary.
-5. Implement canonical delta-batch projection over an ordered
-   `GraphHistoryEntryList`. Apply the protocol-owned target-value projection
-   and wire-only omissions while leaving canonical deltas unchanged.
-6. Add focused schema and codec tests for every DTO variant, discriminator,
-   explicit-null case, enum spelling, full-width integer, color code, shared
-   dictionary path, unordered traversal equivalence, omitted removal, safe
-   common error, and semantic ETag input. Prove serialization exposes no
-   `CompactId`, tracking policy, history cost, generation identity, or other
-   internal-only field.
-7. Update implementation status and run formatting, workspace unit and
-   integration tests through Nextest, Cargo doctests, Cargo check, Clippy with
-   warnings denied, and `git diff --check`.
+1. Add the private encoding foundation and its direct dependencies. Serialize
+   detached graph DTOs, enforce the complete uncompressed JSON limit before
+   compression, produce immutable gzip `Bytes`, and record the selected gzip
+   quality as the deferred implementation choice. Cover exact-limit success,
+   oversized rejection, serialization failure, and compression failure.
+2. Implement the bounded encoding scheduler as the sole production submitter
+   of graph JSON and gzip work to `spawn_blocking`. Enforce the four-job total,
+   two-job historical sublimit, thirty-two queued-or-reserved job bound,
+   publication/Head priority, historical pre-reservation, queue timeout,
+   request cancellation, and completed terminal shutdown. Use an instrumented
+   blocking executor for deterministic scheduling tests.
+3. Implement `GraphCache`, typed completed/running slots, watch-backed shared
+   jobs, and tracked orchestration. Install a pending job before build-input
+   capture or target selection; complete through exact-job pointer checks,
+   weak cache insertion, shared immutable results, and removal-before-error.
+   Attach the cache to `GraphPublication` as its sole durable strong owner.
+4. Implement the source-keyed delta lookup and the separate target-level
+   pruning indexes for completed deltas and destination heat specified by the
+   [ApiService cache owner](../architecture/api-service.md#cache-and-encoding-jobs),
+   immutable cached delta values, and saturating destination heat. Leave delta
+   target selection, continuation, request outcomes, and client rearming to
+   increment 15.
+5. Implement derived Head tiers and their exact selected-versus-covering reuse
+   order, current-Head eligibility, demand-triggered refresh, preservation of
+   the previous completed value during refresh, and completion-time hard-age
+   retry through the same pending single-flight job.
+6. Complete lifecycle and verification coverage. Track every cache
+   orchestration task, detach a cancelled waiter without cancelling shared
+   work, reject new work during shutdown, cancel queued work, drain active
+   blocking work, and join all tracked completion. Cover priority, saturation,
+   single-flight, weak insertion, no-waiter completion, shared-body allocation,
+   tier selection, hard-age retry, structural pruning, size and gzip failure,
+   and scheduler shutdown; then update implementation status and run the full
+   Rust validation suite.
 
-This increment adds no encoding scheduler, gzip execution, response-size
-enforcement, `GraphCache`, cache single-flight, heat selection, client wake
-registry, SSE mailbox, publication runtime, logical request operation, Axum
-router, request parser, HTTP header mapping, or response delivery behavior.
-Its production scope is shared semantic values in `kgi-api-model` and the
-private DTO/codec boundary in `kgi-api-core`; canonical graph values change
-only if focused codec testing exposes a defect in their owned read-only
-accessors.
+This increment adds no client wake registry, SSE mailbox, API database binding,
+publication construction runtime, logical Head or delta request operation,
+historical database read, Axum router, request parser, HTTP header mapping, or
+response delivery behavior. Cache values and jobs remain private to
+`kgi-api-core`; later increments provide their lifecycle owner and public
+operation integration.
 
 ## Cross-increment ordering
 

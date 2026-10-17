@@ -410,8 +410,8 @@ impl GraphView {
         }
 
         if self.tracking_policy == TrackingPolicy::Head {
-            let target_low = delta.high_level().saturating_sub(self.max_depth - 1).max(1);
-            self.extent = LevelExtent::new(target_low, delta.high_level()).expect("delta lineage high level is positive");
+            let target_low = delta.head_level().saturating_sub(self.max_depth - 1).max(1);
+            self.extent = LevelExtent::new(target_low, delta.head_level()).expect("delta lineage Head level is positive");
         }
         self.current_revision_id = delta.to_revision_id();
         self.current_revision_timestamp_ms = delta.revision_timestamp_ms();
@@ -694,7 +694,7 @@ impl GraphView {
             changes.is_in_vspc,
             changes.colors,
         )
-        .expect("graph mutation constructs a forward delta with a positive high level");
+        .expect("graph mutation constructs a forward delta with a positive Head level");
         self.current_revision_id = next_revision;
         self.current_revision_timestamp_ms = revision_timestamp_ms;
 
@@ -1131,7 +1131,7 @@ mod tests {
         from_revision_id: u64,
         to_revision_id: u64,
         revision_timestamp_ms: u64,
-        high_level: u32,
+        head_level: u32,
         block_changes: HashMap<BlockHash, Option<GraphBlock>>,
         edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
         level_changes: Vec<LevelChange>,
@@ -1142,7 +1142,7 @@ mod tests {
             from_revision_id,
             to_revision_id,
             revision_timestamp_ms,
-            high_level,
+            head_level,
             block_changes,
             edge_changes,
             level_changes,
@@ -1490,7 +1490,7 @@ mod tests {
         assert_eq!(delta.from_revision_id(), 0);
         assert_eq!(delta.to_revision_id(), 1);
         assert_eq!(delta.revision_timestamp_ms(), 700);
-        assert_eq!(delta.high_level(), 4);
+        assert_eq!(delta.head_level(), 4);
         assert_eq!(delta.block_changes().get(&hash(4)), Some(&Some(block.clone())));
         assert!(delta.edge_changes().get(&first_edge).is_some_and(Option::is_some));
         assert!(delta.edge_changes().get(&second_edge).is_some_and(Option::is_some));
@@ -1611,7 +1611,7 @@ mod tests {
                 after: Some(Level { size: 9, daa_score: Some(30) }),
             }]
         );
-        assert_eq!(delta.high_level(), 5);
+        assert_eq!(delta.head_level(), 5);
         assert_eq!(view.current_revision_id(), 3);
         assert_eq!(view.current_revision_timestamp_ms(), 1_000);
 
@@ -1682,7 +1682,7 @@ mod tests {
 
         assert_eq!(delta.from_revision_id(), 0);
         assert_eq!(delta.to_revision_id(), 1);
-        assert_eq!(delta.high_level(), 5);
+        assert_eq!(delta.head_level(), 5);
         assert!(delta.block_changes().is_empty());
         assert!(delta.edge_changes().is_empty());
         assert_eq!(delta.is_in_vspc_changes().get(&hash(2)), Some(&FieldChange { before: true, after: false }));
@@ -1755,7 +1755,7 @@ mod tests {
         assert!(fixed.edge(&EdgeId { parent: hash(2), child: hash(24) }).is_some());
         assert_eq!(fixed.level(2), Some(&Level { size: 1, daa_score: Some(20) }));
         assert_eq!(fixed.level(4), Some(&Level { size: 2, daa_score: Some(40) }));
-        assert_eq!(delta.high_level(), 5);
+        assert_eq!(delta.head_level(), 5);
 
         let above_fixed = committed_block(
             26,

@@ -139,8 +139,8 @@ entries
 ```
 
 Additional entries arise from unusual source cursors, response-budget
-fallbacks, and reconnect bursts. Structural eviction removes them when their
-source leaves retained history or their target becomes too far behind Head.
+fallbacks, and reconnect bursts. Structural pruning removes them when their
+target becomes too far behind Head.
 
 ## Expected network effect
 

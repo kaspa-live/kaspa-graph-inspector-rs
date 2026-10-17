@@ -32,9 +32,9 @@ pub enum GraphDeltaCreationError {
     #[error("graph delta target revision {to_revision_id} does not follow source revision {from_revision_id}")]
     NonForwardRevision { from_revision_id: u64, to_revision_id: u64 },
 
-    /// A delta lineage cannot have the reserved zero high level.
-    #[error("graph delta high level must be positive")]
-    ZeroHighLevel,
+    /// A delta lineage cannot have the reserved zero Head level.
+    #[error("graph delta Head level must be positive")]
+    ZeroHeadLevel,
 }
 
 /// Failure to compose two canonical graph-delta intervals.
@@ -51,7 +51,7 @@ pub struct GraphDelta {
     from_revision_id: u64,
     to_revision_id: u64,
     revision_timestamp_ms: u64,
-    high_level: u32,
+    head_level: u32,
     block_changes: HashMap<BlockHash, Option<GraphBlock>>,
     edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
     level_changes: Vec<LevelChange>,
@@ -66,7 +66,7 @@ impl GraphDelta {
         from_revision_id: u64,
         to_revision_id: u64,
         revision_timestamp_ms: u64,
-        high_level: u32,
+        head_level: u32,
         block_changes: HashMap<BlockHash, Option<GraphBlock>>,
         edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
         level_changes: Vec<LevelChange>,
@@ -76,15 +76,15 @@ impl GraphDelta {
         if to_revision_id <= from_revision_id {
             return Err(GraphDeltaCreationError::NonForwardRevision { from_revision_id, to_revision_id });
         }
-        if high_level == 0 {
-            return Err(GraphDeltaCreationError::ZeroHighLevel);
+        if head_level == 0 {
+            return Err(GraphDeltaCreationError::ZeroHeadLevel);
         }
 
         Ok(Self {
             from_revision_id,
             to_revision_id,
             revision_timestamp_ms,
-            high_level,
+            head_level,
             block_changes,
             edge_changes,
             level_changes,
@@ -111,10 +111,10 @@ impl GraphDelta {
         self.revision_timestamp_ms
     }
 
-    /// Returns the target high level of this delta's lineage.
+    /// Returns the target Head level of this delta's lineage.
     #[must_use]
-    pub const fn high_level(&self) -> u32 {
-        self.high_level
+    pub const fn head_level(&self) -> u32 {
+        self.head_level
     }
 
     /// Returns the absolute block changes.
@@ -179,7 +179,7 @@ impl GraphDelta {
             self.from_revision_id,
             next.to_revision_id,
             next.revision_timestamp_ms,
-            next.high_level,
+            next.head_level,
             block_changes,
             edge_changes,
             level_changes,
@@ -268,12 +268,12 @@ mod tests {
     }
 
     #[test]
-    fn constructor_rejects_zero_high_level_after_revision_ordering() {
+    fn constructor_rejects_zero_head_level_after_revision_ordering() {
         let empty = || (HashMap::new(), HashMap::new(), Vec::new(), HashMap::new(), HashMap::new());
         let (blocks, edges, levels, membership, colors) = empty();
         assert_eq!(
             GraphDelta::new(8, 9, 77, 0, blocks, edges, levels, membership, colors),
-            Err(GraphDeltaCreationError::ZeroHighLevel)
+            Err(GraphDeltaCreationError::ZeroHeadLevel)
         );
 
         let (blocks, edges, levels, membership, colors) = empty();
@@ -292,7 +292,7 @@ mod tests {
         assert_eq!(delta.from_revision_id(), 8);
         assert_eq!(delta.to_revision_id(), 9);
         assert_eq!(delta.revision_timestamp_ms(), 77);
-        assert_eq!(delta.high_level(), 4);
+        assert_eq!(delta.head_level(), 4);
         assert_eq!(delta.block_changes().get(&block_hash), Some(&Some(block(block_hash))));
         assert_eq!(delta.edge_changes().get(&edge_id).and_then(Option::as_ref).map(|edge| edge.id), Some(edge_id));
         assert_eq!(delta.level_changes(), &[LevelChange { level: 4, before: None, after: Some(Level { size: 1, daa_score: None }) }]);
@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(delta.from_revision_id(), 4);
         assert_eq!(delta.to_revision_id(), 7);
         assert_eq!(delta.revision_timestamp_ms(), 88);
-        assert_eq!(delta.high_level(), 12);
+        assert_eq!(delta.head_level(), 12);
         assert!(delta.block_changes().is_empty());
         assert!(delta.edge_changes().is_empty());
         assert!(delta.level_changes().is_empty());
@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(composed.from_revision_id(), 5);
         assert_eq!(composed.to_revision_id(), 9);
         assert_eq!(composed.revision_timestamp_ms(), 90);
-        assert_eq!(composed.high_level(), 7);
+        assert_eq!(composed.head_level(), 7);
         assert_eq!(composed.block_changes().get(&hash(1)), Some(&Some(right_block_1)));
         assert_eq!(composed.block_changes().get(&hash(2)), Some(&None));
         assert_eq!(composed.block_changes().get(&hash(3)), Some(&Some(block(hash(3)))));

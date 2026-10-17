@@ -805,7 +805,7 @@ weights because the latter emits `null` instead of a complete `LevelDto`.
 
 The bounded graph level, slot, and level-size fields are JSON numbers. Relative
 to their earlier decimal-string representation, the entry framing excludes one
-pair of quotes for `high_level`, each block excludes two pairs for its
+pair of quotes for `head_level`, each block excludes two pairs for its
 coordinate, each edge excludes four pairs for its endpoint coordinates, and a
 level mutation excludes one or two pairs according to whether it removes or
 installs a level.
@@ -859,3 +859,58 @@ Represent the protocol-owned semantic Head validator identity with the private
 publication ID, snapshot revision, and one canonical `LevelExtent`. The
 eventual validator formatting and HTTP header handling remain outside this
 codec increment.
+
+## 17 October 2026: API graph encoding foundation
+
+### Compression implementation
+
+Use `flate2` with gzip compression level `6` for the single settled graph
+transfer representation. Set the gzip modification time to zero so equivalent
+detached JSON input produces deterministic compressed bytes. This resolves the
+exact-quality implementation choice deferred by the
+[API protocol](../architecture/api-protocol.md#graph-http-compression--settled)
+without changing cache identity or protocol semantics.
+
+Place capped JSON serialization and gzip construction in the private
+`kgi_api_core::encoding` module. Serialize through a limit-enforcing writer so
+the hard uncompressed response bound is detected before allocating an
+arbitrarily oversized JSON buffer, and retain the successful compressed body
+as shared immutable `bytes::Bytes`. The bounded encoding scheduler introduced
+by the same increment remains the sole production caller and the sole
+submitter of this work to Tokio's blocking executor.
+
+### Scheduler admission and execution
+
+Represent the encoding scheduler's short synchronous state with one standard
+mutex, FIFO queues for priority and historical work, a reservation-ID set, and
+an active-job map. Admission starts work directly when an applicable active
+slot is free; otherwise it occupies one of the bounded queued-or-reserved
+positions. Completing an active job dispatches priority work before historical
+work while enforcing the historical sublimit. This avoids a permanent
+dispatcher task without changing the limits and priority owned by the
+[ApiService task contract](../architecture/api-service.md#cache-and-encoding-jobs).
+
+Track the small async owner of every active blocking call with a scheduler-
+private `TaskTracker`. The production blocking adapter delegates only to
+`tokio::task::spawn_blocking`; tests replace that adapter with a controlled
+executor. Request cancellation or queue timeout removes queued work, while an
+already active blocking call remains tracked through completion and its result
+is discarded. Terminal shutdown closes the tracker after rejecting admission
+and completing queued and active waiters with the shutdown result, then joins
+the still-running blocking owners.
+
+### Cache kernel placement and task tracking
+
+Place the publication-local response cache, typed cached values, generic slot
+and job primitives, and shared waiter transport in the private
+`kgi_api_core::cache` module. `GraphPublication` creates and durably owns its
+cache `Arc`; orchestration tasks retain only a weak cache reference and their
+exact running job. A small service-level `CacheJobTracker` combines the
+`TaskTracker` required by the ApiService contract with the cache-job
+cancellation root that the later service lifecycle will own.
+
+Use Tokio `watch` for one retained pending-or-terminal job state. This lets
+independent request cancellation detach one receiver, preserves the terminal
+result after every current receiver has gone, and avoids a separate waiter
+collection. Cache insertion or exact running-slot removal occurs under the
+short standard mutex before `send_replace` publishes that terminal value.

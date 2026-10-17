@@ -1055,10 +1055,10 @@ span intersection. Verify every `GraphView` retains one such extent whose
 depth does not exceed its positive configured `max_depth` and that its bound
 accessors expose that same value.
 
-Verify `GraphDelta::new` rejects a zero lineage `high_level`, preserves its
-existing non-forward-revision rejection, and gives revision ordering precedence
-when both inputs are invalid. Direct mutation and composition continue to
-construct positive lineage bounds.
+Verify `GraphDelta::new` rejects a zero lineage `head_level` with
+`ZeroHeadLevel`, preserves its existing non-forward-revision rejection, and
+gives revision ordering precedence when both inputs are invalid. Direct
+mutation and composition continue to construct positive lineage bounds.
 
 Verify every subview extract inherits its source revision and revision
 timestamp with
@@ -1078,9 +1078,9 @@ counters; and absence of source mutation, delta production, or history.
 
 Level-change cases cover create, update, remove, and no-net-change composition;
 application of `after` without validating `before`; a size-only external-level
-mutation; and DAA score changes. Verify each delta carries the `high_level` of
+mutation; and DAA score changes. Verify each delta carries the `head_level` of
 the lineage that owns its revision interval and carries no lower coverage
-object. Retain all Head deltas whose `high_level` remains in the retained head
+object. Retain all Head deltas whose `head_level` remains in the retained head
 window, including multiple revisions at one level, and make them eligible for
 pruning only after that level leaves the window. Cover indivisible aggregated
 entries, longest-prefix pruning, derived oldest available revision, and
@@ -1184,7 +1184,7 @@ retained endpoint levels, and membership or color changes for retained blocks.
 Cover crossing edges with neither endpoint block present and mutations entirely
 outside the extent. A filtered entry with no visible mutation must still
 advance the browser applied cursor and timestamp and adopt the canonical
-entry's Head high level without changing either fixed bound.
+entry's `head_level` without changing either fixed bound.
 
 While successive target Heads still contain the complete fixed extent, verify
 omitted canonical block and edge removals do not remove fixed objects. Then
@@ -1491,7 +1491,7 @@ Delta cases cover Frozen and revision compatibility as the only application
 checks, direct target-state installation, Head bound recalculation, fixed-bound
 retention, and equality between sequential application and a directly or
 incrementally composed interval. Cover associative graph-state effects across
-three adjacent intervals; later-value, insertion-folding, final `high_level`,
+three adjacent intervals; later-value, insertion-folding, final `head_level`,
 and final target-timestamp selection; and rejection of nongapless composition.
 Protocol selection must reject a publication mismatch before history work.
 
@@ -1582,13 +1582,19 @@ continuation, wake boundary, and retry delay remain outside those bytes. Wrap
 one cached batch body with different valid request-specific publication and
 coherent Head revision/timestamp headers without
 serializing, compressing, or decompressing it. Verify that `CachedDelta`
-retains the first and last boundaries, final `high_level`, checked
+retains the first and last boundaries, final `head_level`, checked
 uncompressed JSON byte count, and final gzip body without duplicating entry
 timestamps or count as semantic fields. Verify
 one immutable outgoing entry per source revision and
 convergence of distinct sources on a heated destination. Exercise an
 SSE-coordinated and an HTTP-only request from the same source and verify both
 reuse the same cache entry or join the same job.
+After constructing a completed cache entry, prune its exact source boundary
+from `GraphHistory` while its target remains within
+`MAX_CACHE_LEVEL_DISTANCE`; the exact cache hit must still succeed without a
+history range lookup. Remove that cache entry and repeat the request to verify
+that the miss follows the ordinary `StartPruned` or `StartUnavailable`
+history outcome.
 
 For a Live publication and preferred interval 15, cover no-delta waiting at
 Head distances one through fourteen; target eligibility beginning at
@@ -1705,10 +1711,15 @@ history entries. Cancelling one request detaches only that waiter. Once the old
 publication has no remaining runtime, slot, request, or SSE reference, its
 cache and client registry are released; a detached job may complete its
 remaining waiters, but its weak cache insertion must then fail harmlessly.
-Terminal ApiService shutdown cancels and joins unfinished jobs. Evict an entry
-when its source revision leaves history and when its target level falls more
-than `MAX_CACHE_LEVEL_DISTANCE` behind Head; either miss reconstructs an
-equivalent response. At
+Terminal ApiService shutdown cancels and joins unfinished jobs. Retaining or
+pruning a source history boundary must not prune a completed delta. At target
+distance exactly `MAX_CACHE_LEVEL_DISTANCE`, retain it; one level later, prune
+the complete target-level bucket and every source revision indexed there while
+leaving younger buckets untouched. Cover multiple source revisions in one
+bucket and advancement with no expired bucket. Pause a delta job until its
+target ages beyond the limit, then verify that its existing waiters receive the
+successful result while neither the completed slot nor its target-level index
+entry is installed. At
 `DELTA_RELOAD_LEVEL_DISTANCE`, require a fresh window before starting a job.
 Historical DB
 windows bypass this cache.
@@ -1970,14 +1981,22 @@ and weak insertion both before and after the origin cache is dropped. Verify
 that one short cache critical section elects exactly one builder, installs its
 pending job after required pre-cache checks and before cache-build target
 selection or build-input retention, and lets every concurrent miss join that
-job. No cache mutex guard may survive
-into capture, extraction, an `.await`, encoding, delivery, or waiter
-suspension. On success, require completed insertion before the shared `watch`
+job. No cache-state guard may survive into capture, extraction, an `.await`,
+encoding, delivery, or waiter suspension. On success, require completed
+insertion before the shared `watch`
 result; on failure, require matching-job removal before the shared error so an
 immediate retry starts new work. A cancelled receiver must not alter the job,
 and a dropped origin cache must prevent insertion without preventing receiver
 completion. Exercise completion after every waiter has detached and require
 `send_replace` to retain the terminal job value without restoring a cache slot.
+Exercise `DestinationHeat` through successful delivery accounting: repeated
+deliveries to one revision saturatingly change one counter without duplicating
+its level-index entry, and distinct destinations at one level share one bucket.
+At distance exactly `HOT_DESTINATION_LEVEL_DISTANCE`, retain the bucket; one
+level later, prune the bucket and all its revision counters while leaving
+younger heat untouched. A destination that ceases to be a retained complete
+history boundary must become ineligible for selection immediately even though
+its stored counter may remain until level pruning.
 
 Verify all cache orchestration tasks are registered in the ApiService task
 tracker. Include tier-keyed Head snapshot jobs and mandatory `Prewarming` work
