@@ -175,9 +175,9 @@ These depth and level-distance constants and their derived arithmetic use
 `u32`.
 
 With the graph-owned `MAX_CACHE_DEPTH = 1000`, the public limits leave 250
-complete levels between the oldest eligible cached-delta source and the oldest
-level of the largest client window. Anchored-window requests cap positive
-depth to `MAX_WINDOW_DEPTH` and report the effective range. A Head
+complete levels beyond the oldest level needed by a maximum-depth client
+window at the oldest eligible cached-delta target. Anchored-window requests
+cap positive depth to `MAX_WINDOW_DEPTH` and report the effective range. A Head
 `target_depth` must instead be in `1..=MAX_WINDOW_DEPTH`; an oversized value is
 invalid request input and cannot fall back to the database. The
 [graph model](api-graph.md) owns `MAX_CACHE_DEPTH` and complete-level retention.
@@ -470,7 +470,7 @@ struct GraphDeltaEntryDto {
     from_revision_id: u64,
     to_revision_id: u64,
     revision_timestamp_ms: u64,
-    high_level: u32,
+    head_level: u32,
 
     block_upserts: Vec<GraphBlockDto>,
     edge_upserts: Vec<GraphEdgeDto>,
@@ -517,7 +517,7 @@ the shared dictionary. It omits each canonical change's composition-only
 serialization boundary is the sole omission point.
 
 All mutation collections in an entry may be empty while its revision interval,
-timestamp, and `high_level` still advance. The batch carries no auxiliary
+timestamp, and `head_level` still advance. The batch carries no auxiliary
 endpoint-level context. A Fixed browser view obtains a complete level absent
 from its own projection through the separately owned
 [Head-level lookup](#fixed-window-reuse-of-canonical-head-deltas--settled).
@@ -1120,12 +1120,39 @@ publication-local `client_id` before the equality or forward-range result is
 selected.
 A publication in `Synchronizing`, `Live`, or terminal `Stale` state is
 otherwise eligible. Stale history no longer advances, but clients may catch up
-through its final stalled Head. For an eligible request ApiService calls the
-graph-owned
-[`GraphHistory::range`](api-graph.md#retained-history-range)
-operation, which owns retained-entry selection and target extension across an
-indivisible aggregate and returns the selected gapless
-`GraphHistoryEntryList`.
+through its final stalled Head.
+
+Define:
+
+```text
+DELTA_RELOAD_LEVEL_DISTANCE = 400
+HOT_DESTINATION_LEVEL_DISTANCE = 250
+DELTA_CONVERGENCE_REVISION_INTERVAL = 15
+MAX_DELTA_CONVERGENCE_REVISION_INTERVAL = 30
+```
+
+For a remaining request with source `F` below captured Head `H`, apply the Live
+wake gate before cache or history work. Return
+`WaitForWakeup { wake_at_revision_id: F.saturating_add(I) }` when
+`0 < H - F < I`, where `I` is `DELTA_CONVERGENCE_REVISION_INTERVAL`.
+It constructs and delivers no delta. For an SSE-coordinated request it also
+replaces the client's wake boundary with that value and clears `wake_sent`;
+an HTTP-only request has no registry state to update. This rule suppresses a
+previously cached short entry in both modes. Synchronizing and Stale do not
+defer at this gate.
+
+After that gate, ApiService looks up an exact completed `CachedDelta` by `F`
+before consulting history. A completed hit whose `head_level` remains inside
+`MAX_CACHE_LEVEL_DISTANCE` is served directly. Its source revision need not
+remain a retained history boundary: revision identifies the exact cached
+transition and its replay continuity, while the cached `head_level` alone owns
+structural retention. A defensively observed aged completed value is removed
+and treated as a miss.
+
+On a completed-cache miss, ApiService calls the graph-owned
+[`GraphHistory::range`](api-graph.md#retained-history-range) operation. It owns
+retained-entry selection and target extension across an indivisible aggregate
+and returns the selected gapless `GraphHistoryEntryList`.
 
 Public outcomes map as follows:
 
@@ -1137,9 +1164,9 @@ Public outcomes map as follows:
   `ClientRegistrationRequired` before cache or history work, and the same
   outcome replaces a selected success when that registration no longer exists
   at response completion;
-- `GraphHistoryRangeError::StartPruned` returns
+- on a completed-cache miss, `GraphHistoryRangeError::StartPruned` returns
   `FreshViewRequired(StartPruned)`;
-- `GraphHistoryRangeError::StartUnavailable` returns
+- on a completed-cache miss, `GraphHistoryRangeError::StartUnavailable` returns
   `FreshViewRequired(StartUnavailable)`; and
 - `GraphHistoryRange::UpToDate` returns `DeltaResponseOutcome::UpToDate`.
 
@@ -1149,17 +1176,9 @@ internal range-call safeguard; observing it after the public comparison is an
 internal invariant failure governed by the common `500 internal-error`
 response rather than a client cursor-recovery outcome.
 
-Before cache lookup, joining a job, or constructing a delta-to-Head response,
-use the first selected stored
-entry's `delta.high_level` as the deliberately approximate source-level
-boundary. Define:
-
-```text
-DELTA_RELOAD_LEVEL_DISTANCE = 400
-HOT_DESTINATION_LEVEL_DISTANCE = 250
-DELTA_CONVERGENCE_REVISION_INTERVAL = 15
-MAX_DELTA_CONVERGENCE_REVISION_INTERVAL = 30
-```
+Before joining a job or constructing a delta-to-Head response after a cache
+miss, use the first selected stored entry's `delta.head_level` as the
+deliberately approximate source-level boundary.
 
 If the source boundary's distance behind the publication Head reaches or
 exceeds `DELTA_RELOAD_LEVEL_DISTANCE`, return
@@ -1171,25 +1190,15 @@ distance is half of it.
 Wake-boundary addition saturates at `u64::MAX`; revision arithmetic never
 wraps.
 
-Both intervals are measured in graph revisions rather than time and are
-initial tuning values. `DELTA_CONVERGENCE_REVISION_INTERVAL` is the preferred
-response span and wake boundary. Heat may extend a selected destination up to
+Both convergence intervals are measured in graph revisions rather than time
+and are initial tuning values. `DELTA_CONVERGENCE_REVISION_INTERVAL` is the
+preferred response span and wake boundary. Heat may extend a selected destination up to
 `MAX_DELTA_CONVERGENCE_REVISION_INTERVAL` so clients converge on a shared
 younger cache point without creating an unbounded replay unit. Budget fallback,
 a nearer captured Head or Stale terminal Head, and an existing nearer cache
 boundary can produce a shorter interval. An indivisible composed history entry
 can cross the maximum because the protocol never splits it. In the rules below,
 `I` denotes the preferred interval and `M` the maximum interval.
-
-After the distance gate and before cache lookup, a Live delta-to-current
-request with source `F` and Head `H` returns
-`WaitForWakeup { wake_at_revision_id: F.saturating_add(I) }` when
-`0 < H - F < I`.
-It constructs and delivers no delta. For an SSE-coordinated request it also
-replaces the client's wake boundary with that value and clears `wake_sent`;
-an HTTP-only request has no registry state to update. This rule suppresses a
-previously cached short entry in both modes. Synchronizing and Stale do not
-defer at this gate.
 
 For an eligible `GraphHistoryRange::Deltas`, ApiService uses the entries'
 cumulative estimated costs to find the youngest complete boundary `Y` under
@@ -1198,11 +1207,8 @@ the first complete stored entry remains the candidate for the mandatory hard
 uncompressed-JSON-size check. From that affordable prefix, let `C` be the
 youngest complete boundary no later than `F.saturating_add(M)`. If the first
 stored entry itself crosses that boundary, its indivisible right boundary is
-`C`. A completed cache entry keyed by the request's source revision is
-immutable and is served directly; every entry built under this contract
-already observes that maximum except for an indivisible aggregate. On a cache
-miss, delta-to-current target selection uses the approximate source-level
-distance:
+`C`. Delta-to-current target selection on this completed-cache miss uses the
+approximate source-level distance:
 
 1. At or inside `HOT_DESTINATION_LEVEL_DISTANCE`, use heat-oriented selection.
    When `C >= F.saturating_add(I)`, let `P` be the first complete boundary at
@@ -1226,8 +1232,9 @@ choice in the first region; ties prefer a destination with an outgoing
 completed cache entry or running job and then the youngest revision. Requests
 received from a revision are measured for observability, but that count never
 contributes to heat. Do not separately count continuation states. A heat entry
-becomes ineligible when its revision leaves retained history or its boundary
-leaves the moving heat region.
+is eligible only while its revision remains a retained complete history
+boundary and its level remains inside the moving heat region. The ApiService
+cache owner defines physical pruning of stored heat counters.
 
 When appending a canonical Head delta, ApiService supplies its cheap
 `estimated_raw_bytes` from mutation counts and approximate field sizes for the
@@ -1353,7 +1360,7 @@ The serialized cached Head-delta body omits block and edge removals. Under the
 strict [public graph-limit bound](#public-graph-limits-and-identity--settled),
 the publication removal frontier cannot reach any
 block or child-owned edge retained by an eligible client window. The client
-uses each serialized entry's `high_level` according to its view policy. A
+uses each serialized entry's `head_level` according to its view policy. A
 Head-following client advances its lower bound and removes objects that leave it; the
 [Web contract](web.md#fixed-views--settled) owns
 the fixed-window reaction. VSPC membership and color changes remain ordinary
@@ -1596,14 +1603,15 @@ already supplies it. `GraphCache` contains tier-keyed Head snapshot entries and
 jobs, source-keyed delta entries and jobs, and destination-response heat
 counters. Heat and request-source counters saturate rather than wrap. The
 [ApiService task contract](api-service.md#api-task-ownership-and-completion--settled)
-owns the cache's concrete slot collections, mutual exclusion, single-flight
-completion transport, and task execution. The canonical cached delta value is:
+owns the cache's concrete slot collections, synchronized atomic operations,
+single-flight completion transport, and task execution. The canonical cached
+delta value is:
 
 ```rust
 struct CachedDelta {
     from_revision_id: u64,
     to_revision_id: u64,
-    high_level: u32,
+    head_level: u32,
     uncompressed_json_bytes: u64,
     gzip_body: Bytes,
 }
@@ -1614,7 +1622,7 @@ struct CachedDelta {
 `uncompressed_json_bytes` is the byte length checked against the hard response
 limit before compression; `gzip_body.len()` is the transferred body size. The
 cached `from_revision_id` and `to_revision_id` are the first and last entry
-boundaries, and `high_level` is the last entry's target Head level. The entry
+boundaries, and `head_level` is the last entry's target Head level. The entry
 timestamps and count remain inside the immutable encoded body; they need no
 second semantic representation in `CachedDelta`. The
 cached value contains no publication ID, publication state, sampled Head
@@ -1625,32 +1633,39 @@ that lightweight HTTP wrapper is also retained is an implementation detail.
 
 Every `CachedDelta` is individually bounded by
 `MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES`. `GraphCache` has no independent total
-encoded-byte cap; publication lifetime, retained source boundaries, and target
-level distance provide its structural bound.
+encoded-byte cap; publication lifetime and target-level distance provide its
+structural bound.
 
 The delta cache and its single-flight job map serve both SSE-coordinated and
 HTTP-only delta-to-current requests and are keyed by source revision. At most
 one logical job runs for a source revision. Concurrent requests attach to that
-job even if Head advances after its target was captured. Success publishes one
-`CachedDelta` at the source key and completes every waiter.
+job even if Head advances after its target was captured. Success completes
+every waiter. It publishes one `CachedDelta` at the source key only when the
+candidate's `head_level` remains inside `MAX_CACHE_LEVEL_DISTANCE` at
+completion; an aged candidate remains a successful response for its existing
+waiters but is not inserted into the cache.
 Failure returns the same request-local error to every waiter, removes the job,
 and permits a later request to start another job. Each successfully delivered
 waiter increments the actual destination's heat independently. A completed
 entry is never promoted as Head advances; later requests from its exact source
-reuse it until structural eviction.
+reuse it until structural pruning.
 
 The [publication lifecycle](api-publication.md#publication-state-and-revision--settled)
 owns preservation and release of publication-scoped cache state across Stale
 and replacement. The
 [ApiService task contract](api-service.md#api-task-ownership-and-completion--settled)
 owns job completion and terminal cancellation. While the publication remains
-installed or is retained as Stale, evict a `CachedDelta` when its
-source revision is no longer retained or its target `high_level` is more than
-`MAX_CACHE_LEVEL_DISTANCE` behind that publication's Head. These structural
-bounds replace an independent encoded-byte cache cap.
+installed or is retained as Stale, prune a `CachedDelta` when its `head_level`
+is more than `MAX_CACHE_LEVEL_DISTANCE` behind that publication's
+Head. Source-history retention never prunes a completed cache entry. Revision
+boundaries key exact lookup and preserve gapless replay; target level alone
+owns cache retention. This structural bound replaces an independent
+encoded-byte cache cap.
 
-An encoded-cache miss or eviction affects performance only: reconstruct the
-response from the current `GraphView` or retained `GraphHistory`. Historical
+An encoded-cache miss or pruning never changes graph correctness. Reconstruct
+the response from retained `GraphHistory` when its exact source remains
+available; otherwise require a fresh applicable view through the ordinary
+history-miss outcome. Historical
 database-backed windows and Head-level lookup are serialized, size-checked,
 compressed once, delivered, and discarded. They and SSE remain uncached in
 v2; the lookup also bypasses cache single-flight. Cache work cannot affect
@@ -1920,9 +1935,8 @@ The public API has conceptually:
   network and node server information.
 
 The graph wire format and mandatory gzip delivery are the settled
-representations defined above. Only exact gzip quality remains deferred in the
-[decision register](../decisions/deferred.md). HTTP methods and common route
-and request syntax follow the settled conventions above.
+representations defined above. HTTP methods and common route and request
+syntax follow the settled conventions above.
 
 Every graph response that references hashes carries its hash dictionary; the
 Head-level lookup references none. A window extracted from a

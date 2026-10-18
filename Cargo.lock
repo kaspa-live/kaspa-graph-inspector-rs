@@ -2920,9 +2920,13 @@ dependencies = [
 name = "kgi-api-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
+ "flate2",
  "kaspa-consensus-core",
  "kgi-api-ingress",
  "kgi-api-model",
+ "kgi-core",
  "kgi-model",
  "kgi-storage",
  "rand 0.8.8",
@@ -2930,6 +2934,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -5095,6 +5100,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

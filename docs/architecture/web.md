@@ -218,7 +218,7 @@ that identifier without reconnecting again.
 Under the API-owned
 [cached Head-delta wire contract](api-protocol.md#canonical-head-delta-responses--settled),
 a Head-following view advances its local bounds from each replay entry's
-`high_level` and its window depth, removes blocks below the resulting
+`head_level` and its window depth, removes blocks below the resulting
 `low_level`, and
 removes an edge when its child leaves the window. A fixed view instead follows
 the filtering contract below. These are browser reactions to the API contract
@@ -288,7 +288,7 @@ already group work, while another scheduler would deliberately increase cursor
 lag and exposure to Head-history expiry.
 
 Replay a canonical batch entry by entry. Before filtering an entry, derive
-its target Head lower bound from that entry's `high_level` and
+its target Head lower bound from that entry's `head_level` and
 `MAX_CACHE_DEPTH`. If the target Head no longer contains the complete fixed
 extent, do not apply that entry or any later queued entry. Keep every earlier
 successfully replayed entry, preserve the last coherent image and applied
@@ -312,7 +312,7 @@ Canonical block and edge removals are absent from every wire entry and the
 Fixed image does not infer them. Containment ensures that no object required by
 the Fixed image has crossed the Head removal frontier. A filtered candidate
 with no visible mutation still advances the fixed image's applied revision and
-revision timestamp and adopts the entry's `high_level` as its known source Head
+revision timestamp and adopts the entry's `head_level` as its known source Head
 level; it never moves the fixed bounds.
 
 A retained added edge can reference an endpoint level absent from both the

@@ -225,7 +225,7 @@ struct GraphDeltaTargetCapture {
     state: GraphPublicationState,
     revision: u64,
     revision_timestamp_ms: u64,
-    high_level: u32,
+    head_level: u32,
 }
 
 struct GraphLevelCapture {

@@ -72,7 +72,7 @@ enum GraphDeltaCreationError {
         from_revision_id: u64,
         to_revision_id: u64,
     },
-    ZeroHighLevel,
+    ZeroHeadLevel,
 }
 
 enum LevelExtentError {
@@ -199,7 +199,7 @@ struct GraphDelta {
     from_revision_id: u64,
     to_revision_id: u64,
     revision_timestamp_ms: u64,
-    high_level: u32,
+    head_level: u32,
     block_changes: HashMap<BlockHash, Option<GraphBlock>>,
     edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
     level_changes: Vec<LevelChange>,
@@ -226,7 +226,7 @@ impl GraphDelta {
         from_revision_id: u64,
         to_revision_id: u64,
         revision_timestamp_ms: u64,
-        high_level: u32,
+        head_level: u32,
         block_changes: HashMap<BlockHash, Option<GraphBlock>>,
         edge_changes: HashMap<EdgeId, Option<GraphEdge>>,
         level_changes: Vec<LevelChange>,
@@ -237,6 +237,7 @@ impl GraphDelta {
     pub fn from_revision_id(&self) -> u64;
     pub fn to_revision_id(&self) -> u64;
     pub fn revision_timestamp_ms(&self) -> u64;
+    pub fn head_level(&self) -> u32;
 }
 ```
 
@@ -272,7 +273,7 @@ the canonical in-memory graph model. Its public transport representation
 remains under the [API protocol](api-protocol.md).
 
 Head mutation and Head delta application derive positive ordered bounds from a
-positive `max_depth` and positive lineage high level. Their extent construction
+positive `max_depth` and positive `head_level`. Their extent construction
 therefore cannot fail and adds no `LevelExtentError` to either update result.
 
 A `GraphView` has no clock origin,
@@ -481,7 +482,7 @@ owns their atomic visibility and mutation ordering.
 `GraphDelta::new` is the only constructor. Its revision fields are private,
 have no setters, and are exposed only through their read-only accessors. The
 constructor rejects `to_revision_id <= from_revision_id` with
-`NonForwardRevision`, and rejects `high_level == 0` with `ZeroHighLevel`.
+`NonForwardRevision`, and rejects `head_level == 0` with `ZeroHeadLevel`.
 Revision ordering is checked first, so an input violating both invariants
 returns `NonForwardRevision`.
 Direct view mutation produces one-step deltas, and composition constructs its
@@ -531,7 +532,7 @@ color maps therefore supersede projection values carried by a block upsert in
 the same delta. In the final phase, a Head view sets:
 
 ```text
-high_level = delta.high_level
+high_level = delta.head_level
 low_level  = max(1, high_level - max_depth + 1)
 extent     = LevelExtent::new(low_level, high_level)
 ```
@@ -578,14 +579,14 @@ The estimate is planning metadata rather than graph state or a wire field.
 Composition cancellations, response-local hash deduplication, and compression
 may make it differ from the final encoded size.
 
-`GraphDelta.high_level` is the high level of the revision lineage that owns the
-delta at `to_revision_id`. A canonical Head delta therefore carries the target
-Head high level. A delta from an internal Fixed lineage carries that Fixed
-view's high level. The field is retained in history, included in the API delta
-payload, provides the semantic key for Head-history pruning, and exposes the
-lineage high level without requiring derivation from mutation contents. A delta
-does not carry `low_level` or a separate coverage object; explicit graph
-mutations drive a Head view's lower-bound changes.
+`GraphDelta.head_level` is the high level of the revision lineage that owns
+the delta at `to_revision_id`. A canonical Head delta therefore carries the
+target Head level. A delta from an internal Fixed lineage carries that Fixed
+view's target high level. The field is retained in history, included in the
+API delta payload, provides the semantic key for Head-history pruning, and
+exposes the lineage's target level without requiring derivation from mutation
+contents. A delta does not carry `low_level` or a separate coverage object;
+explicit graph mutations drive a Head view's lower-bound changes.
 
 In canonical and internal lineage deltas, `level_changes` contains only levels
 whose `size` or `daa_score` actually changed. There, `None` represents absence,
@@ -754,11 +755,11 @@ impl GraphHistory {
 Pruning removes the longest stored prefix for which:
 
 ```text
-delta.high_level < head_low_level
+delta.head_level < head_low_level
 ```
 
 It never removes a middle entry. An aggregated stored delta is indivisible and
-uses the `high_level` of its final constituent: retain the whole aggregate
+uses the `head_level` of its final constituent: retain the whole aggregate
 until that level leaves the Head extent, then remove the whole aggregate. This
 may retain older constituent history longer than necessary and is safe.
 Pruning changes neither current field. If entries remain,
@@ -810,7 +811,7 @@ compose(Delta(a,b), Delta(b,c)) = Delta(a,c)
 
 Composition requires exact equality between the left `to` and right `from`
 revisions. The result uses `a` as `from`, `c` as `to`, and delta `c`'s
-`high_level` and `revision_timestamp_ms`. Composition is associative by
+`head_level` and `revision_timestamp_ms`. Composition is associative by
 graph-state effect. A composed delta must have the same graph-state effect as
 applying its constituent deltas in order. It is one replay unit whose timestamp
 therefore represents its final target revision; discarded internal timestamps

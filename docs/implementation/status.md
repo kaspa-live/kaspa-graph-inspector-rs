@@ -98,8 +98,9 @@ installation files, and the file-log directory model remain unimplemented.
 
 The public [graph wire format](../architecture/api-protocol.md#common-transport-dto-rules--settled)
 and [mandatory gzip delivery path](../architecture/api-protocol.md#graph-http-compression--settled)
-are settled. Exact gzip quality remains deferred; optional later binary-format
-benchmarking does not block implementation.
+are settled. The private encoding implementation uses `flate2` quality 6 with
+a zero modification time, as recorded in the implementation choices; optional
+later binary-format benchmarking does not block implementation.
 
 The first production tranche is complete through graph-update ingress commit
 `4ed0d2f`. Its initial module
@@ -291,5 +292,24 @@ for later cache integration. Encoding scheduling, compression, response-size
 enforcement, caching, logical request operations, HTTP routing, and response
 delivery remain in later increments.
 Completion validation passed workspace formatting, Cargo check, 402/402
+Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
+with warnings denied, and `git diff --check`.
+
+Implementation increment 10 is implemented: `kgi-api-core` now contains the
+bounded encoding scheduler, capped JSON serialization and deterministic gzip
+construction, publication-local graph response cache, source-keyed delta and
+destination-heat indexes, and the five derived Head cache tiers. Cache jobs
+share immutable terminal values, remain tracked independently of individual
+waiters, use weak publication-local insertion, and preserve prior Head values
+through refresh and failed replacement. Focused tests cover encoding limits
+and failures, scheduler priority and saturation, request cancellation and
+terminal draining, delta and Head single-flight, no-waiter and dropped-cache
+completion, shared body allocations, structural pruning, exact Head selection,
+soft refresh, hard-age retry, and prewarming cancellation during cache-job
+shutdown. Logical request operations, client wakeup state, publication
+construction, HTTP routing, and response delivery remain in the later
+increments recorded in
+[the implementation sequence](sequence.md#remaining-reviewable-increments).
+Completion validation passed workspace formatting, Cargo check, 436/436
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.

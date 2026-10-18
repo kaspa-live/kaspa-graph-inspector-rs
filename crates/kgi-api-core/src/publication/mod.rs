@@ -3,7 +3,7 @@
 mod error;
 mod estimate;
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use kgi_api_model::{
     delta::GraphDelta,
@@ -13,6 +13,8 @@ use kgi_api_model::{
 use kgi_model::graph_update::{BlockCommitted, VspcCommitted};
 use rand::{RngCore, rngs::OsRng};
 use tokio::sync::{Mutex, RwLock};
+
+use crate::cache::GraphCache;
 
 pub(crate) use self::error::PublicationProjectionError;
 use self::estimate::estimate_raw_delta_bytes;
@@ -67,7 +69,7 @@ pub(crate) struct GraphDeltaTargetCapture {
     state: GraphPublicationState,
     revision: u64,
     revision_timestamp_ms: u64,
-    high_level: u32,
+    head_level: u32,
 }
 
 impl GraphDeltaTargetCapture {
@@ -91,9 +93,9 @@ impl GraphDeltaTargetCapture {
         self.revision_timestamp_ms
     }
 
-    /// Returns the captured Head's nominal upper level.
-    pub(crate) const fn high_level(self) -> u32 {
-        self.high_level
+    /// Returns the captured Head level.
+    pub(crate) const fn head_level(self) -> u32 {
+        self.head_level
     }
 }
 
@@ -103,6 +105,7 @@ pub(crate) struct GraphPublication {
     revision_clock_origin: Instant,
     mutation: Mutex<()>,
     core: RwLock<GraphPublicationCore>,
+    cache: Arc<GraphCache>,
     #[cfg(test)]
     atomic_mutation_test_hook: Option<std::sync::Arc<AtomicMutationTestHook>>,
 }
@@ -166,6 +169,7 @@ impl GraphPublication {
             revision_clock_origin,
             mutation: Mutex::new(()),
             core: RwLock::new(GraphPublicationCore { state: initial_state, view, history }),
+            cache: Arc::new(GraphCache::new()),
             #[cfg(test)]
             atomic_mutation_test_hook: None,
         })
@@ -174,6 +178,11 @@ impl GraphPublication {
     /// Returns this publication's immutable random identity.
     pub(crate) const fn publication_id(&self) -> u64 {
         self.publication_id
+    }
+
+    /// Returns this publication's response cache.
+    pub(crate) fn cache(&self) -> Arc<GraphCache> {
+        self.cache.clone()
     }
 
     /// Samples whole milliseconds elapsed in this publication's clock domain.
@@ -225,7 +234,7 @@ impl GraphPublication {
             state: core.state,
             revision: core.view.current_revision_id(),
             revision_timestamp_ms: core.view.current_revision_timestamp_ms(),
-            high_level: core.view.high_level(),
+            head_level: core.view.high_level(),
         }
     }
 
@@ -278,6 +287,8 @@ impl GraphPublication {
         let estimated_raw_bytes = estimate_raw_delta_bytes(&delta);
         core.history.append(delta, estimated_raw_bytes).expect("a successful Head update extends the locked history");
         core.history.prune(head_low_level);
+        let head_high_level = core.view.high_level();
+        self.cache.prune_deltas(head_high_level);
         Ok(Some(target_revision))
     }
 
@@ -327,6 +338,7 @@ mod tests {
         time::Duration,
     };
 
+    use bytes::Bytes;
     use kgi_api_model::{
         delta::GraphDelta,
         graph::{GraphViewUpdateError, Level, LevelExtent},
@@ -338,6 +350,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::cache::{CacheAccess, CacheJobTracker, CachedDelta};
 
     fn head_view() -> GraphView {
         head_view_with_depth(1)
@@ -493,7 +506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_prunes_only_after_a_delta_high_level_leaves_the_head_window() {
+    async fn history_prunes_only_after_a_delta_head_level_leaves_the_head_window() {
         let publication =
             GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view_with_depth(2), GraphHistory::new())
                 .expect("matching candidate");
@@ -509,7 +522,40 @@ mod tests {
         assert_eq!(core.history.current_revision_id(), 3);
         assert_eq!(core.history.len(), 2);
         assert_eq!(core.history.oldest_available_revision(), 1);
-        assert_eq!(core.history.entries().next().expect("oldest retained entry").delta().high_level(), 3);
+        assert_eq!(core.history.entries().next().expect("oldest retained entry").delta().head_level(), 3);
+    }
+
+    #[tokio::test]
+    async fn history_pruning_preserves_a_structurally_eligible_source_keyed_delta() {
+        let publication =
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view_with_depth(2), GraphHistory::new())
+                .expect("matching candidate");
+        assert_eq!(publication.apply_block_committed(&committed_block(2)).await.expect("block update"), Some(1));
+
+        let cache = publication.cache();
+        let jobs = CacheJobTracker::new();
+        let CacheAccess::Job(initial) = cache.delta(
+            &jobs,
+            0,
+            |_| async { Ok(Arc::new(CachedDelta::new(0, 1, 2, 4, Bytes::from_static(b"gzip")))) },
+            || async { 2 },
+        ) else {
+            panic!("the first source access starts a job");
+        };
+        initial.wait(tokio_util::sync::CancellationToken::new()).await.expect("fixture cache entry completes");
+        assert!(matches!(
+            cache.delta(&jobs, 0, |_| async { panic!("retained source must hit") }, || async { 2 }),
+            CacheAccess::Completed(_)
+        ));
+
+        assert_eq!(publication.apply_block_committed(&committed_block(3)).await.expect("block update"), Some(2));
+        assert_eq!(publication.apply_block_committed(&committed_block(4)).await.expect("block update"), Some(3));
+
+        match cache.delta(&jobs, 0, |_| async { panic!("source-history pruning does not prune a completed delta") }, || async { 4 }) {
+            CacheAccess::Completed(hit) => assert_eq!(hit.to_revision_id(), 1),
+            CacheAccess::Job(_) => panic!("the completed source remains cached until target-level pruning"),
+        }
+        jobs.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -598,7 +644,7 @@ mod tests {
         assert_eq!(live.state(), GraphPublicationState::Live);
         assert_eq!(live.revision(), initial.revision());
         assert_eq!(live.revision_timestamp_ms(), initial.revision_timestamp_ms());
-        assert_eq!(live.high_level(), initial.high_level());
+        assert_eq!(live.head_level(), initial.head_level());
         assert_eq!(publication.core.read().await.history.current_revision_id(), initial.revision());
 
         assert!(publication.transition_stale().await);
@@ -607,7 +653,7 @@ mod tests {
         assert_eq!(stale.state(), GraphPublicationState::Stale);
         assert_eq!(stale.revision(), initial.revision());
         assert_eq!(stale.revision_timestamp_ms(), initial.revision_timestamp_ms());
-        assert_eq!(stale.high_level(), initial.high_level());
+        assert_eq!(stale.head_level(), initial.head_level());
         assert_eq!(publication.core.read().await.history.current_revision_id(), initial.revision());
 
         let direct_live = GraphPublication::new(GraphPublicationState::Live, Instant::now(), head_view(), GraphHistory::new())
@@ -701,6 +747,22 @@ mod tests {
             .expect("second publication");
 
         assert_ne!(first.publication_id(), second.publication_id());
+    }
+
+    #[test]
+    fn publication_is_the_durable_owner_of_its_response_cache() {
+        let publication =
+            GraphPublication::new(GraphPublicationState::Live, Instant::now(), head_view(), GraphHistory::new()).expect("publication");
+        let cache = Arc::downgrade(&publication.cache);
+        assert_eq!(Arc::strong_count(&publication.cache), 1);
+
+        let temporary = publication.cache();
+        assert_eq!(Arc::strong_count(&publication.cache), 2);
+        drop(temporary);
+        assert_eq!(Arc::strong_count(&publication.cache), 1);
+
+        drop(publication);
+        assert!(cache.upgrade().is_none());
     }
 
     #[test]
