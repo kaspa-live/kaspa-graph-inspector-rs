@@ -131,7 +131,7 @@ Execute increment 10 as these ordered points:
 1. Add the private encoding foundation and its direct dependencies. Serialize
    detached graph DTOs, enforce the complete uncompressed JSON limit before
    compression, produce immutable gzip `Bytes`, and record the selected gzip
-   quality as the deferred implementation choice. Cover exact-limit success,
+   quality as a durable implementation choice. Cover exact-limit success,
    oversized rejection, serialization failure, and compression failure.
 2. Implement the bounded encoding scheduler as the sole production submitter
    of graph JSON and gzip work to `spawn_blocking`. Enforce the four-job total,

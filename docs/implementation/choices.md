@@ -866,10 +866,9 @@ codec increment.
 
 Use `flate2` with gzip compression level `6` for the single settled graph
 transfer representation. Set the gzip modification time to zero so equivalent
-detached JSON input produces deterministic compressed bytes. This resolves the
-exact-quality implementation choice deferred by the
-[API protocol](../architecture/api-protocol.md#graph-http-compression--settled)
-without changing cache identity or protocol semantics.
+detached JSON input produces deterministic compressed bytes. This records the
+protocol-permitted exact-quality implementation tuning choice without changing
+cache identity or protocol semantics.
 
 Place capped JSON serialization and gzip construction in the private
 `kgi_api_core::encoding` module. Serialize through a limit-enforcing writer so

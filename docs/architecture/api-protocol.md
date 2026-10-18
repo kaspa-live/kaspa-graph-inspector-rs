@@ -1935,9 +1935,8 @@ The public API has conceptually:
   network and node server information.
 
 The graph wire format and mandatory gzip delivery are the settled
-representations defined above. Only exact gzip quality remains deferred in the
-[decision register](../decisions/deferred.md). HTTP methods and common route
-and request syntax follow the settled conventions above.
+representations defined above. HTTP methods and common route and request
+syntax follow the settled conventions above.
 
 Every graph response that references hashes carries its hash dictionary; the
 Head-level lookup references none. A window extracted from a
