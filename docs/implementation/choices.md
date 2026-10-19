@@ -931,3 +931,12 @@ checking and durable registry storage remain responsibilities of the later
 registry implementation. Identifier generation accepts `&mut impl RngCore`,
 allowing production randomness and deterministic collision fixtures to share
 the same path without a global random source or test-only encoding logic.
+
+### Mailbox admission boundary
+
+Represent required-message admission with const-generic fixed arrays. The
+caller transfers the complete one- or three-message batch only after one
+capacity check under the mailbox mutex, avoiding an intermediate collection
+and making partial insertion structurally unavailable. Return a small private
+`Closed`/`Full` result so the later registry can apply one removal policy while
+tests can still distinguish the rejected mailbox condition.

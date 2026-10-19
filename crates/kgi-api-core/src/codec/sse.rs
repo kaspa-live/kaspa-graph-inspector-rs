@@ -42,6 +42,16 @@ impl PublicationWakeupDto {
         Self { publication_id: publication_id.into(), revision: revision.into() }
     }
 
+    /// Returns the publication whose graph advanced.
+    pub(crate) const fn publication_id(self) -> u64 {
+        self.publication_id.get()
+    }
+
+    /// Returns the latest graph revision available to the client.
+    pub(crate) const fn revision(self) -> u64 {
+        self.revision.get()
+    }
+
     /// Serializes this payload as compact JSON.
     pub(crate) fn encode(self) -> Result<Vec<u8>, serde_json::Error> {
         to_json_bytes(&self)
