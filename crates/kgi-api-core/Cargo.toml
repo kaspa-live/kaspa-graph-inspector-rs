@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
 bytes.workspace = true
 flate2.workspace = true
 kaspa-consensus-core.workspace = true

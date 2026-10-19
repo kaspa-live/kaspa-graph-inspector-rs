@@ -12,7 +12,7 @@ pub(crate) const PUBLICATION_WAKEUP_EVENT: &str = "publication-wakeup";
 pub(crate) const PUBLICATION_STATE_EVENT: &str = "publication-state";
 
 /// Payload assigning one opaque SSE client identifier.
-#[derive(Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct ClientRegistrationDto {
     client_id: String,
 }

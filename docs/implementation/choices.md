@@ -913,3 +913,21 @@ independent request cancellation detach one receiver, preserves the terminal
 result after every current receiver has gone, and avoids a separate waiter
 collection. Cache insertion or exact running-slot removal occurs under the
 short standard mutex before `send_replace` publishes that terminal value.
+
+## 19 October 2026: API client scheduling foundation
+
+### Module and identifier implementation
+
+Place the publication-local client registry, connection mailbox, and their
+private scheduling values in the private `kgi_api_core::client` module. Keep
+the serializable SSE payloads in `kgi_api_core::codec::sse`; the scheduling
+module composes those DTOs without moving wire representation into registry
+state. Add no crate-root re-exports.
+
+Use the `base64` crate's `URL_SAFE_NO_PAD` engine to encode the protocol-owned
+random `u64` client value. A small private `ClientIdentifier` temporarily
+couples the raw candidate with canonical wire conversion while collision
+checking and durable registry storage remain responsibilities of the later
+registry implementation. Identifier generation accepts `&mut impl RngCore`,
+allowing production randomness and deterministic collision fixtures to share
+the same path without a global random source or test-only encoding logic.
