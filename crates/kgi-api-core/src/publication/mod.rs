@@ -14,7 +14,7 @@ use kgi_model::graph_update::{BlockCommitted, VspcCommitted};
 use rand::{RngCore, rngs::OsRng};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::cache::GraphCache;
+use crate::{cache::GraphCache, client::SseClientRegistry};
 
 pub(crate) use self::error::PublicationProjectionError;
 use self::estimate::estimate_raw_delta_bytes;
@@ -106,6 +106,7 @@ pub(crate) struct GraphPublication {
     mutation: Mutex<()>,
     core: RwLock<GraphPublicationCore>,
     cache: Arc<GraphCache>,
+    clients: SseClientRegistry,
     #[cfg(test)]
     atomic_mutation_test_hook: Option<std::sync::Arc<AtomicMutationTestHook>>,
 }
@@ -164,12 +165,14 @@ impl GraphPublication {
             "candidate revision timestamp belongs to the publication clock"
         );
 
+        let publication_id = random_nonzero_publication_id();
         Ok(Self {
-            publication_id: random_nonzero_publication_id(),
+            publication_id,
             revision_clock_origin,
             mutation: Mutex::new(()),
             core: RwLock::new(GraphPublicationCore { state: initial_state, view, history }),
             cache: Arc::new(GraphCache::new()),
+            clients: SseClientRegistry::new(publication_id, initial_state, view_revision),
             #[cfg(test)]
             atomic_mutation_test_hook: None,
         })
@@ -185,6 +188,11 @@ impl GraphPublication {
         self.cache.clone()
     }
 
+    /// Returns this publication's client-registration and wake registry.
+    pub(crate) const fn client_registry(&self) -> &SseClientRegistry {
+        &self.clients
+    }
+
     /// Samples whole milliseconds elapsed in this publication's clock domain.
     pub(crate) fn revision_timestamp_ms(&self) -> u64 {
         self.revision_timestamp_ms_at(Instant::now())
@@ -196,6 +204,9 @@ impl GraphPublication {
         let mut core = self.core.write().await;
         assert_eq!(core.state, GraphPublicationState::Synchronizing, "only a Synchronizing publication becomes Live");
         core.state = GraphPublicationState::Live;
+        let revision = core.view.current_revision_id();
+        drop(core);
+        self.clients.publish_state(GraphPublicationState::Live, revision);
     }
 
     /// Makes a visible publication terminally Stale.
@@ -209,6 +220,9 @@ impl GraphPublication {
             return false;
         }
         core.state = GraphPublicationState::Stale;
+        let revision = core.view.current_revision_id();
+        drop(core);
+        self.clients.publish_state(GraphPublicationState::Stale, revision);
         true
     }
 
@@ -265,7 +279,7 @@ impl GraphPublication {
     }
 
     async fn apply_original_update(&self, update: OriginalUpdate<'_>) -> Result<Option<u64>, PublicationProjectionError> {
-        let _mutation = self.mutation.lock().await;
+        let mutation = self.mutation.lock().await;
         let mut core = self.core.write().await;
         let view_revision = core.view.current_revision_id();
         let history_revision = core.history.current_revision_id();
@@ -288,6 +302,9 @@ impl GraphPublication {
         core.history.append(delta, estimated_raw_bytes).expect("a successful Head update extends the locked history");
         core.history.prune(head_low_level);
         let head_high_level = core.view.high_level();
+        drop(core);
+        self.clients.advance_head(target_revision);
+        drop(mutation);
         self.cache.prune_deltas(head_high_level);
         Ok(Some(target_revision))
     }
@@ -350,7 +367,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::cache::{CacheAccess, CacheJobTracker, CachedDelta};
+    use crate::{
+        cache::{CacheAccess, CacheJobTracker, CachedDelta},
+        client::{DeltaCompletionResult, DeltaScheduleAction, SseMailbox, SseMessage},
+        codec::sse::{PublicationStateDto, PublicationWakeupDto},
+    };
 
     fn head_view() -> GraphView {
         head_view_with_depth(1)
@@ -438,6 +459,21 @@ mod tests {
             assert_eq!(core.history.current_revision_id(), 0);
             drop(core);
             assert!(publication.mutation.try_lock().is_ok());
+
+            let mailbox = Arc::new(SseMailbox::new());
+            let identifier = publication
+                .client_registry()
+                .register(0, &mailbox, tokio_util::sync::CancellationToken::new())
+                .expect("initial registration succeeds");
+            assert_eq!(mailbox.recv().await, Some(SseMessage::ClientRegistration(identifier.registration())));
+            assert_eq!(
+                mailbox.recv().await,
+                Some(SseMessage::PublicationState(PublicationStateDto::new(publication.publication_id(), 0, state)))
+            );
+            assert_eq!(
+                mailbox.recv().await,
+                Some(SseMessage::PublicationWakeup(PublicationWakeupDto::new(publication.publication_id(), 0)))
+            );
         }
     }
 
@@ -456,6 +492,26 @@ mod tests {
         let core = publication.core.read().await;
         assert_eq!(core.view.current_revision_id(), 1);
         assert_eq!(core.history.current_revision_id(), 1);
+        drop(core);
+
+        let mailbox = Arc::new(SseMailbox::new());
+        publication
+            .client_registry()
+            .register(0, &mailbox, tokio_util::sync::CancellationToken::new())
+            .expect("registration succeeds");
+        mailbox.recv().await.expect("client-registration message");
+        assert_eq!(
+            mailbox.recv().await,
+            Some(SseMessage::PublicationState(PublicationStateDto::new(
+                publication.publication_id(),
+                1,
+                GraphPublicationState::Synchronizing,
+            )))
+        );
+        assert_eq!(
+            mailbox.recv().await,
+            Some(SseMessage::PublicationWakeup(PublicationWakeupDto::new(publication.publication_id(), 1)))
+        );
     }
 
     #[tokio::test]
@@ -464,8 +520,26 @@ mod tests {
         let publication =
             GraphPublication::new(GraphPublicationState::Synchronizing, origin, head_view_with_depth(2), GraphHistory::new())
                 .expect("matching candidate");
+        let mailbox = Arc::new(SseMailbox::new());
+        let identifier = publication
+            .client_registry()
+            .register(0, &mailbox, tokio_util::sync::CancellationToken::new())
+            .expect("registration succeeds");
+        for _ in 0..3 {
+            mailbox.recv().await.expect("initial registration message");
+        }
+        assert_eq!(
+            publication
+                .client_registry()
+                .complete_delta(identifier, DeltaScheduleAction::Replace { wake_at_revision_id: 1, wake_sent: false }),
+            DeltaCompletionResult::Accepted
+        );
 
         assert_eq!(publication.apply_block_committed(&committed_block(2)).await.expect("block update"), Some(1));
+        assert_eq!(
+            mailbox.recv().await,
+            Some(SseMessage::PublicationWakeup(PublicationWakeupDto::new(publication.publication_id(), 1)))
+        );
         {
             let core = publication.core.read().await;
             assert_eq!(core.view.current_revision_id(), 1);
@@ -477,7 +551,17 @@ mod tests {
         }
 
         let vspc = vspc_added(2, Some(200));
+        assert_eq!(
+            publication
+                .client_registry()
+                .complete_delta(identifier, DeltaScheduleAction::Replace { wake_at_revision_id: 2, wake_sent: false }),
+            DeltaCompletionResult::Accepted
+        );
         assert_eq!(publication.apply_vspc_committed(&vspc).await.expect("VSPC update"), Some(2));
+        assert_eq!(
+            mailbox.recv().await,
+            Some(SseMessage::PublicationWakeup(PublicationWakeupDto::new(publication.publication_id(), 2)))
+        );
         let core = publication.core.read().await;
         assert_eq!(core.view.block(&hash(2)).map(|block| block.is_in_vspc), Some(true));
         assert_eq!(core.history.current_revision_id(), 2);
@@ -638,8 +722,24 @@ mod tests {
             GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view(), GraphHistory::new())
                 .expect("matching candidate");
         let initial = publication.capture_delta_target().await;
+        let mailbox = Arc::new(SseMailbox::new());
+        publication
+            .client_registry()
+            .register(initial.revision(), &mailbox, tokio_util::sync::CancellationToken::new())
+            .expect("registration succeeds");
+        for _ in 0..3 {
+            mailbox.recv().await.expect("initial registration message");
+        }
 
         publication.transition_live().await;
+        assert_eq!(
+            mailbox.recv().await,
+            Some(SseMessage::PublicationState(PublicationStateDto::new(
+                publication.publication_id(),
+                initial.revision(),
+                GraphPublicationState::Live,
+            )))
+        );
         let live = publication.capture_delta_target().await;
         assert_eq!(live.state(), GraphPublicationState::Live);
         assert_eq!(live.revision(), initial.revision());
@@ -648,6 +748,14 @@ mod tests {
         assert_eq!(publication.core.read().await.history.current_revision_id(), initial.revision());
 
         assert!(publication.transition_stale().await);
+        assert_eq!(
+            mailbox.recv().await,
+            Some(SseMessage::PublicationState(PublicationStateDto::new(
+                publication.publication_id(),
+                initial.revision(),
+                GraphPublicationState::Stale,
+            )))
+        );
         assert!(!publication.transition_stale().await);
         let stale = publication.capture_delta_target().await;
         assert_eq!(stale.state(), GraphPublicationState::Stale);
