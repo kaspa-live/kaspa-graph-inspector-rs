@@ -1,16 +1,19 @@
 #![allow(dead_code, reason = "the client scheduling foundation is completed by later increment points")]
 
 use std::{
-    collections::VecDeque,
-    sync::{Mutex, Weak},
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex, Weak},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::RngCore;
+use rand::{RngCore, rngs::OsRng};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::codec::sse::{ClientRegistrationDto, PublicationStateDto, PublicationWakeupDto};
+use crate::{
+    codec::sse::{ClientRegistrationDto, PublicationStateDto, PublicationWakeupDto},
+    publication::GraphPublicationState,
+};
 
 /// Maximum number of SSE clients registered with one publication.
 pub(crate) const MAX_SSE_CLIENTS: usize = 1_024;
@@ -69,6 +72,34 @@ struct SseMailboxState {
     queue: VecDeque<SseMailboxItem>,
 }
 
+impl SseMailboxState {
+    fn coalesce_graph_wakeup(&mut self, wakeup: PublicationWakeupDto) -> bool {
+        let publication_id = wakeup.publication_id();
+        let Some(index) = self
+            .queue
+            .iter()
+            .position(|item| matches!(item, SseMailboxItem::GraphWakeup(queued) if queued.publication_id() == publication_id))
+        else {
+            return false;
+        };
+        self.queue.remove(index);
+        self.queue.push_back(SseMailboxItem::GraphWakeup(wakeup));
+        true
+    }
+
+    fn remove_graph_wakeup(&mut self, publication_id: u64) -> bool {
+        let Some(index) = self
+            .queue
+            .iter()
+            .position(|item| matches!(item, SseMailboxItem::GraphWakeup(queued) if queued.publication_id() == publication_id))
+        else {
+            return false;
+        };
+        self.queue.remove(index);
+        true
+    }
+}
+
 /// Reason one synchronous mailbox admission was rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SseMailboxAdmissionError {
@@ -117,15 +148,7 @@ impl SseMailbox {
             return Err(SseMailboxAdmissionError::Closed);
         }
 
-        let publication_id = wakeup.publication_id();
-        if let Some(index) = state
-            .queue
-            .iter()
-            .position(|item| matches!(item, SseMailboxItem::GraphWakeup(queued) if queued.publication_id() == publication_id))
-        {
-            state.queue.remove(index);
-            state.queue.push_back(SseMailboxItem::GraphWakeup(wakeup));
-        } else {
+        if !state.coalesce_graph_wakeup(wakeup) {
             if state.queue.len() == SSE_CLIENT_BUFFER_CAPACITY {
                 return Err(SseMailboxAdmissionError::Full);
             }
@@ -137,18 +160,23 @@ impl SseMailbox {
         Ok(())
     }
 
+    /// Updates an ordinary wakeup only while it remains queued.
+    pub(crate) fn coalesce_graph_wakeup(&self, wakeup: PublicationWakeupDto) -> Result<bool, SseMailboxAdmissionError> {
+        let mut state = self.lock_state();
+        if state.closed {
+            return Err(SseMailboxAdmissionError::Closed);
+        }
+        let coalesced = state.coalesce_graph_wakeup(wakeup);
+        drop(state);
+        if coalesced {
+            self.ready.notify_one();
+        }
+        Ok(coalesced)
+    }
+
     /// Removes a still-queued ordinary wakeup for one publication.
     pub(crate) fn remove_graph_wakeup(&self, publication_id: u64) -> bool {
-        let mut state = self.lock_state();
-        let Some(index) = state
-            .queue
-            .iter()
-            .position(|item| matches!(item, SseMailboxItem::GraphWakeup(queued) if queued.publication_id() == publication_id))
-        else {
-            return false;
-        };
-        state.queue.remove(index);
-        true
+        self.lock_state().remove_graph_wakeup(publication_id)
     }
 
     /// Closes admission and wakes the receiver so it can drain and finish.
@@ -187,12 +215,197 @@ impl SseMailbox {
     }
 }
 
-/// Publication-local wake scheduling state for one live registration.
-struct DeltaClientRegistration {
+/// Publication-local delta-wakeup schedule for one SSE client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeltaWakeSchedule {
     wake_at_revision_id: u64,
     wake_sent: bool,
+}
+
+/// Publication-local state retained for one live SSE client.
+struct SseClientRegistration {
+    schedule: DeltaWakeSchedule,
     mailbox: Weak<SseMailbox>,
     disconnect: CancellationToken,
+}
+
+struct SseClientRegistryState {
+    publication_state: GraphPublicationState,
+    head_revision_id: u64,
+    clients: HashMap<u64, SseClientRegistration>,
+}
+
+/// Publication-local registry of live SSE client wake schedules.
+pub(crate) struct SseClientRegistry {
+    state: Mutex<SseClientRegistryState>,
+}
+
+/// Failure to establish one publication-local SSE registration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SseClientRegistrationError {
+    /// The publication has reached its settled live-client bound.
+    Capacity,
+    /// The complete initial message batch could not enter the mailbox.
+    Mailbox(SseMailboxAdmissionError),
+}
+
+impl SseClientRegistry {
+    /// Creates an empty registry coherent with one publication core.
+    pub(crate) fn new(publication_state: GraphPublicationState, head_revision_id: u64) -> Self {
+        Self {
+            state: Mutex::new(SseClientRegistryState {
+                publication_state,
+                head_revision_id,
+                clients: HashMap::with_capacity(MAX_SSE_CLIENTS),
+            }),
+        }
+    }
+
+    /// Registers one connection and atomically admits its initial message batch.
+    pub(crate) fn register(
+        &self,
+        publication_id: u64,
+        client_revision_id: u64,
+        mailbox: &Arc<SseMailbox>,
+        disconnect: CancellationToken,
+    ) -> Result<ClientIdentifier, SseClientRegistrationError> {
+        self.register_with(publication_id, client_revision_id, mailbox, disconnect, &mut OsRng)
+    }
+
+    /// Removes one connection's exact registration.
+    ///
+    /// Returns whether that registration still existed and was removed.
+    pub(crate) fn remove(&self, identifier: ClientIdentifier) -> bool {
+        self.lock_state().clients.remove(&identifier.key()).is_some()
+    }
+
+    /// Publishes one required lifecycle observation to every live registration.
+    pub(crate) fn publish_state(&self, publication_id: u64, publication_state: GraphPublicationState, revision: u64) {
+        let mut cancellations = Vec::new();
+        {
+            let mut state = self.lock_state();
+            assert_eq!(state.head_revision_id, revision, "publication state observes the latest published Head");
+            state.publication_state = publication_state;
+            let message = SseMessage::PublicationState(PublicationStateDto::new(publication_id, revision, publication_state));
+            state.clients.retain(|_, registration| {
+                let Some(mailbox) = registration.mailbox.upgrade() else {
+                    cancellations.push(registration.disconnect.clone());
+                    return false;
+                };
+                if mailbox.admit_required([message.clone()]).is_err() {
+                    cancellations.push(registration.disconnect.clone());
+                    return false;
+                }
+                true
+            });
+        }
+        Self::cancel_connections(cancellations);
+    }
+
+    /// Records a published Head revision and schedules every eligible client.
+    pub(crate) fn advance_head(&self, publication_id: u64, revision: u64) {
+        let mut cancellations = Vec::new();
+        {
+            let mut state = self.lock_state();
+            assert!(revision >= state.head_revision_id, "publication Head revision does not regress");
+            state.head_revision_id = revision;
+            state.clients.retain(|_, registration| {
+                let Some(mailbox) = registration.mailbox.upgrade() else {
+                    cancellations.push(registration.disconnect.clone());
+                    return false;
+                };
+
+                let wakeup = PublicationWakeupDto::new(publication_id, revision);
+                let admitted = if registration.schedule.wake_sent {
+                    mailbox.coalesce_graph_wakeup(wakeup).map(|_| ())
+                } else if revision >= registration.schedule.wake_at_revision_id {
+                    mailbox.admit_graph_wakeup(wakeup)
+                } else {
+                    Ok(())
+                };
+                if admitted.is_err() {
+                    cancellations.push(registration.disconnect.clone());
+                    return false;
+                }
+                if !registration.schedule.wake_sent && revision >= registration.schedule.wake_at_revision_id {
+                    registration.schedule.wake_sent = true;
+                }
+                true
+            });
+        }
+        Self::cancel_connections(cancellations);
+    }
+
+    fn register_with(
+        &self,
+        publication_id: u64,
+        client_revision_id: u64,
+        mailbox: &Arc<SseMailbox>,
+        disconnect: CancellationToken,
+        random: &mut impl RngCore,
+    ) -> Result<ClientIdentifier, SseClientRegistrationError> {
+        let mut cancellations = Vec::new();
+        let result = {
+            let mut state = self.lock_state();
+            state.clients.retain(|_, registration| {
+                if registration.mailbox.upgrade().is_none() {
+                    cancellations.push(registration.disconnect.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+
+            if state.clients.len() == MAX_SSE_CLIENTS {
+                Err(SseClientRegistrationError::Capacity)
+            } else {
+                let identifier = loop {
+                    let candidate = ClientIdentifier::generate(random);
+                    if !state.clients.contains_key(&candidate.key()) {
+                        break candidate;
+                    }
+                };
+                let batch = [
+                    SseMessage::ClientRegistration(identifier.registration()),
+                    SseMessage::PublicationState(PublicationStateDto::new(
+                        publication_id,
+                        state.head_revision_id,
+                        state.publication_state,
+                    )),
+                    SseMessage::PublicationWakeup(PublicationWakeupDto::new(publication_id, state.head_revision_id)),
+                ];
+                match mailbox.admit_required(batch) {
+                    Ok(()) => {
+                        state.clients.insert(
+                            identifier.key(),
+                            SseClientRegistration {
+                                schedule: DeltaWakeSchedule { wake_at_revision_id: client_revision_id, wake_sent: true },
+                                mailbox: Arc::downgrade(mailbox),
+                                disconnect,
+                            },
+                        );
+                        Ok(identifier)
+                    }
+                    Err(error) => {
+                        cancellations.push(disconnect);
+                        Err(SseClientRegistrationError::Mailbox(error))
+                    }
+                }
+            }
+        };
+        Self::cancel_connections(cancellations);
+        result
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, SseClientRegistryState> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn cancel_connections(cancellations: Vec<CancellationToken>) {
+        for cancellation in cancellations {
+            cancellation.cancel();
+        }
+    }
 }
 
 /// Scheduling update selected by a completed logical delta operation.
@@ -224,7 +437,10 @@ mod tests {
         publication::GraphPublicationState,
     };
 
-    use super::{ClientIdentifier, MAX_SSE_CLIENTS, SSE_CLIENT_BUFFER_CAPACITY, SseMailbox, SseMailboxAdmissionError, SseMessage};
+    use super::{
+        ClientIdentifier, MAX_SSE_CLIENTS, SSE_CLIENT_BUFFER_CAPACITY, SseClientRegistrationError, SseClientRegistry, SseMailbox,
+        SseMailboxAdmissionError, SseMessage,
+    };
 
     fn required_registration(value: usize) -> SseMessage {
         SseMessage::ClientRegistration(ClientRegistrationDto::new(format!("client-{value}")))
@@ -371,5 +587,211 @@ mod tests {
         mailbox.admit_required([required_state(1)]).expect("state message fits");
 
         assert_eq!(receiver.await.expect("receiver task joins"), Some(required_state(1)));
+    }
+
+    #[tokio::test]
+    async fn registration_installs_one_coherent_initial_batch_and_schedule() {
+        let registry = SseClientRegistry::new(GraphPublicationState::Synchronizing, 9);
+        let mailbox = Arc::new(SseMailbox::new());
+        let disconnect = tokio_util::sync::CancellationToken::new();
+        let mut random = StepRng::new(41, 1);
+
+        let identifier = registry.register_with(7, 3, &mailbox, disconnect.clone(), &mut random).expect("registration succeeds");
+
+        assert_eq!(identifier.key(), 41);
+        assert_eq!(mailbox.recv().await, Some(SseMessage::ClientRegistration(identifier.registration())));
+        assert_eq!(
+            mailbox.recv().await,
+            Some(SseMessage::PublicationState(PublicationStateDto::new(7, 9, GraphPublicationState::Synchronizing)))
+        );
+        assert_eq!(mailbox.recv().await, Some(SseMessage::PublicationWakeup(wakeup(7, 9))));
+        let state = registry.lock_state();
+        let registration = state.clients.get(&identifier.key()).expect("registration was installed");
+        assert_eq!(registration.schedule.wake_at_revision_id, 3);
+        assert!(registration.schedule.wake_sent);
+        assert!(registration.mailbox.upgrade().is_some());
+        assert!(!disconnect.is_cancelled());
+    }
+
+    #[test]
+    fn registration_regenerates_a_colliding_identifier() {
+        let registry = SseClientRegistry::new(GraphPublicationState::Live, 9);
+        let first_mailbox = Arc::new(SseMailbox::new());
+        let second_mailbox = Arc::new(SseMailbox::new());
+        let mut first_random = StepRng::new(41, 1);
+        let mut colliding_random = StepRng::new(41, 1);
+
+        let first = registry
+            .register_with(7, 3, &first_mailbox, tokio_util::sync::CancellationToken::new(), &mut first_random)
+            .expect("first registration succeeds");
+        let second = registry
+            .register_with(7, 3, &second_mailbox, tokio_util::sync::CancellationToken::new(), &mut colliding_random)
+            .expect("collision is regenerated");
+
+        assert_eq!(first.key(), 41);
+        assert_eq!(second.key(), 42);
+    }
+
+    #[test]
+    fn registration_accepts_the_final_client_and_rejects_the_next() {
+        let registry = SseClientRegistry::new(GraphPublicationState::Live, 9);
+        let mut random = StepRng::new(0, 1);
+        let mut mailboxes = Vec::with_capacity(MAX_SSE_CLIENTS);
+
+        for _ in 0..MAX_SSE_CLIENTS {
+            let mailbox = Arc::new(SseMailbox::new());
+            registry
+                .register_with(7, 3, &mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
+                .expect("client within the bound is admitted");
+            mailboxes.push(mailbox);
+        }
+
+        let saturated = Arc::new(SseMailbox::new());
+        assert_eq!(
+            registry.register_with(7, 3, &saturated, tokio_util::sync::CancellationToken::new(), &mut random),
+            Err(SseClientRegistrationError::Capacity)
+        );
+        assert_eq!(registry.lock_state().clients.len(), MAX_SSE_CLIENTS);
+    }
+
+    #[test]
+    fn failed_initial_batch_installs_no_registration() {
+        let registry = SseClientRegistry::new(GraphPublicationState::Live, 9);
+        let mailbox = Arc::new(SseMailbox::new());
+        for value in 0..6 {
+            mailbox.admit_required([required_registration(value)]).expect("fixture item fits");
+        }
+        let mut random = StepRng::new(41, 1);
+        let disconnect = tokio_util::sync::CancellationToken::new();
+
+        assert_eq!(
+            registry.register_with(7, 3, &mailbox, disconnect.clone(), &mut random),
+            Err(SseClientRegistrationError::Mailbox(SseMailboxAdmissionError::Full))
+        );
+        assert!(registry.lock_state().clients.is_empty());
+        assert_eq!(mailbox.lock_state().queue.len(), 6);
+        assert!(disconnect.is_cancelled());
+    }
+
+    #[test]
+    fn stale_weak_registration_is_removed_and_cancelled_on_the_next_operation() {
+        let registry = SseClientRegistry::new(GraphPublicationState::Synchronizing, 9);
+        let mailbox = Arc::new(SseMailbox::new());
+        let disconnect = tokio_util::sync::CancellationToken::new();
+        let mut random = StepRng::new(41, 1);
+        registry.register_with(7, 3, &mailbox, disconnect.clone(), &mut random).expect("registration succeeds");
+        drop(mailbox);
+
+        registry.publish_state(7, GraphPublicationState::Live, 9);
+
+        assert!(registry.lock_state().clients.is_empty());
+        assert!(disconnect.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_message_failure_removes_and_cancels_the_registration() {
+        let registry = SseClientRegistry::new(GraphPublicationState::Synchronizing, 9);
+        let mailbox = Arc::new(SseMailbox::new());
+        let disconnect = tokio_util::sync::CancellationToken::new();
+        let mut random = StepRng::new(41, 1);
+        registry.register_with(7, 3, &mailbox, disconnect.clone(), &mut random).expect("registration succeeds");
+        for value in 0..5 {
+            mailbox.admit_required([required_registration(value)]).expect("fixture item fits");
+        }
+
+        registry.publish_state(7, GraphPublicationState::Live, 9);
+
+        {
+            let state = registry.lock_state();
+            assert_eq!(state.publication_state, GraphPublicationState::Live);
+            assert!(state.clients.is_empty());
+        }
+        assert!(disconnect.is_cancelled());
+        for expected in [
+            SseMessage::ClientRegistration(ClientIdentifier(41).registration()),
+            SseMessage::PublicationState(PublicationStateDto::new(7, 9, GraphPublicationState::Synchronizing)),
+            SseMessage::PublicationWakeup(wakeup(7, 9)),
+        ] {
+            assert_eq!(mailbox.recv().await, Some(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn head_advancement_schedules_once_then_coalesces_only_while_queued() {
+        let registry = SseClientRegistry::new(GraphPublicationState::Live, 9);
+        let mailbox = Arc::new(SseMailbox::new());
+        let mut random = StepRng::new(41, 1);
+        let identifier = registry
+            .register_with(7, 3, &mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
+            .expect("registration succeeds");
+        for _ in 0..3 {
+            mailbox.recv().await.expect("initial batch item");
+        }
+        {
+            let mut state = registry.lock_state();
+            let registration = state.clients.get_mut(&identifier.key()).expect("registration exists");
+            registration.schedule.wake_at_revision_id = 12;
+            registration.schedule.wake_sent = false;
+        }
+
+        registry.advance_head(7, 11);
+        assert!(mailbox.lock_state().queue.is_empty());
+        registry.advance_head(7, 12);
+        registry.publish_state(7, GraphPublicationState::Live, 12);
+        registry.advance_head(7, 13);
+
+        assert_eq!(mailbox.recv().await, Some(required_state(12)));
+        assert_eq!(mailbox.recv().await, Some(SseMessage::PublicationWakeup(wakeup(7, 13))));
+        assert!(registry.lock_state().clients[&identifier.key()].schedule.wake_sent);
+
+        registry.advance_head(7, 14);
+        assert!(mailbox.lock_state().queue.is_empty());
+    }
+
+    #[test]
+    fn failed_wakeup_admission_removes_and_cancels_the_registration() {
+        let registry = SseClientRegistry::new(GraphPublicationState::Live, 9);
+        let mailbox = Arc::new(SseMailbox::new());
+        let disconnect = tokio_util::sync::CancellationToken::new();
+        let mut random = StepRng::new(41, 1);
+        let identifier = registry.register_with(7, 3, &mailbox, disconnect.clone(), &mut random).expect("registration succeeds");
+        {
+            let mut mailbox_state = mailbox.lock_state();
+            mailbox_state.queue.clear();
+        }
+        for value in 0..SSE_CLIENT_BUFFER_CAPACITY {
+            mailbox.admit_required([required_registration(value)]).expect("fixture item fits");
+        }
+        {
+            let mut state = registry.lock_state();
+            let registration = state.clients.get_mut(&identifier.key()).expect("registration exists");
+            registration.schedule.wake_at_revision_id = 10;
+            registration.schedule.wake_sent = false;
+        }
+
+        registry.advance_head(7, 10);
+
+        assert!(registry.lock_state().clients.is_empty());
+        assert!(disconnect.is_cancelled());
+    }
+
+    #[test]
+    fn disconnect_removes_only_the_exact_registration() {
+        let registry = SseClientRegistry::new(GraphPublicationState::Live, 9);
+        let first_mailbox = Arc::new(SseMailbox::new());
+        let second_mailbox = Arc::new(SseMailbox::new());
+        let mut random = StepRng::new(41, 1);
+        let first = registry
+            .register_with(7, 3, &first_mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
+            .expect("first registration succeeds");
+        let second = registry
+            .register_with(7, 3, &second_mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
+            .expect("second registration succeeds");
+
+        assert!(registry.remove(first));
+        assert!(!registry.remove(first));
+        let state = registry.lock_state();
+        assert!(!state.clients.contains_key(&first.key()));
+        assert!(state.clients.contains_key(&second.key()));
     }
 }

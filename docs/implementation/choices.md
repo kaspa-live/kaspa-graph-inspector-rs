@@ -938,7 +938,7 @@ Represent required-message admission with const-generic fixed arrays. The
 caller transfers the complete one- or three-message batch only after one
 capacity check under the mailbox mutex, avoiding an intermediate collection
 and making partial insertion structurally unavailable. Return a small private
-`Closed`/`Full` result so the later registry can apply one removal policy while
+`Closed`/`Full` result so the registry can apply one removal policy while
 tests can still distinguish the rejected mailbox condition.
 
 ### Registry randomness and deferred disconnects
@@ -952,3 +952,27 @@ Collect cancellation-token clones while holding registry and mailbox locks,
 then cancel them only after the registry guard has left scope. This keeps
 slow-client and stale-weak cleanup synchronous without allowing cancellation
 observers to re-enter registry work under its mutex.
+
+### Registry and mailbox synchronization
+
+Use separate standard-library mutexes for `SseClientRegistryState` and each
+`SseMailboxState`. Registry operations are synchronous, bounded by the client
+limit, and mutate both publication observation and registration state; a Tokio
+mutex would introduce an await into nonawaiting publication tails, while an
+`RwLock` or concurrent map would not preserve those compound transitions.
+Keep publication state, latest Head, and registrations in one registry state.
+Keep mailbox closure and queue contents in one mailbox state so close and
+admission cannot linearize independently.
+
+Retain Tokio `Notify` solely as the single receiver's readiness hint. An MPSC
+channel would duplicate the authoritative queue and prevent queued-wakeup
+coalescing and repositioning, while `watch` would not preserve required-message
+order. The receiver registers its notification future before inspecting the
+queue and never treats a notification as message state.
+
+For an operation touching both domains, acquire registry state before mailbox
+state. The receiver acquires only mailbox state, and disconnect cleanup
+acquires only registry state. Publication replacement will acquire two registry
+states in stable address order before the shared mailbox; no path acquires a
+registry while retaining a mailbox guard. Readiness notification and connection
+cancellation occur after releasing the applicable state guards.
