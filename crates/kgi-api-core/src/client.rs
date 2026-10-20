@@ -837,6 +837,45 @@ mod tests {
         assert!(!disconnect.is_cancelled());
     }
 
+    #[tokio::test]
+    async fn registration_linearized_before_lifecycle_change_receives_both_states_in_order() {
+        let registry = SseClientRegistry::new(7, GraphPublicationState::Synchronizing, 9);
+        let mailbox = Arc::new(SseMailbox::new());
+        let identifier = registry
+            .register_with(3, &mailbox, tokio_util::sync::CancellationToken::new(), &mut StepRng::new(41, 1))
+            .expect("registration succeeds");
+
+        registry.publish_state(GraphPublicationState::Live, 9);
+
+        for expected in [
+            SseMessage::ClientRegistration(identifier.registration()),
+            SseMessage::PublicationState(PublicationStateDto::new(7, 9, GraphPublicationState::Synchronizing)),
+            SseMessage::PublicationWakeup(wakeup(7, 9)),
+            SseMessage::PublicationState(PublicationStateDto::new(7, 9, GraphPublicationState::Live)),
+        ] {
+            assert_eq!(mailbox.recv().await, Some(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_change_linearized_before_registration_is_observed_in_the_initial_batch() {
+        let registry = SseClientRegistry::new(7, GraphPublicationState::Synchronizing, 9);
+        registry.publish_state(GraphPublicationState::Live, 9);
+        let mailbox = Arc::new(SseMailbox::new());
+        let identifier = registry
+            .register_with(3, &mailbox, tokio_util::sync::CancellationToken::new(), &mut StepRng::new(41, 1))
+            .expect("registration succeeds");
+
+        for expected in [
+            SseMessage::ClientRegistration(identifier.registration()),
+            SseMessage::PublicationState(PublicationStateDto::new(7, 9, GraphPublicationState::Live)),
+            SseMessage::PublicationWakeup(wakeup(7, 9)),
+        ] {
+            assert_eq!(mailbox.recv().await, Some(expected));
+        }
+        assert!(mailbox.lock_state().queue.is_empty());
+    }
+
     #[test]
     fn registration_regenerates_a_colliding_identifier() {
         let registry = SseClientRegistry::new(7, GraphPublicationState::Live, 9);
