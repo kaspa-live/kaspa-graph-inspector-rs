@@ -960,7 +960,9 @@ Use separate standard-library mutexes for `SseClientRegistryState` and each
 limit, and mutate both publication observation and registration state; a Tokio
 mutex would introduce an await into nonawaiting publication tails, while an
 `RwLock` or concurrent map would not preserve those compound transitions.
-Keep publication state, latest Head, and registrations in one registry state.
+Keep immutable publication identity, publication state, latest Head, and
+registrations in one registry state. Registry operations derive publication
+identity from that state rather than accepting a caller-supplied value.
 Keep mailbox closure and queue contents in one mailbox state so close and
 admission cannot linearize independently.
 
