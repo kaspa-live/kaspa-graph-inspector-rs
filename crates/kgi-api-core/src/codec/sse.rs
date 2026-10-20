@@ -12,7 +12,7 @@ pub(crate) const PUBLICATION_WAKEUP_EVENT: &str = "publication-wakeup";
 pub(crate) const PUBLICATION_STATE_EVENT: &str = "publication-state";
 
 /// Payload assigning one opaque SSE client identifier.
-#[derive(Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct ClientRegistrationDto {
     client_id: String,
 }
@@ -40,6 +40,16 @@ impl PublicationWakeupDto {
     /// Constructs one publication-wakeup payload.
     pub(crate) fn new(publication_id: u64, revision: u64) -> Self {
         Self { publication_id: publication_id.into(), revision: revision.into() }
+    }
+
+    /// Returns the publication whose graph advanced.
+    pub(crate) const fn publication_id(self) -> u64 {
+        self.publication_id.get()
+    }
+
+    /// Returns the latest graph revision available to the client.
+    pub(crate) const fn revision(self) -> u64 {
+        self.revision.get()
     }
 
     /// Serializes this payload as compact JSON.

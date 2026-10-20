@@ -913,3 +913,68 @@ independent request cancellation detach one receiver, preserves the terminal
 result after every current receiver has gone, and avoids a separate waiter
 collection. Cache insertion or exact running-slot removal occurs under the
 short standard mutex before `send_replace` publishes that terminal value.
+
+## 19 October 2026: API client scheduling foundation
+
+### Module and identifier implementation
+
+Place the publication-local client registry, connection mailbox, and their
+private scheduling values in the private `kgi_api_core::client` module. Keep
+the serializable SSE payloads in `kgi_api_core::codec::sse`; the scheduling
+module composes those DTOs without moving wire representation into registry
+state. Add no crate-root re-exports.
+
+Use the `base64` crate's `URL_SAFE_NO_PAD` engine to encode the protocol-owned
+random `u64` client value. A small private `ClientIdentifier` temporarily
+couples the raw candidate with canonical wire conversion while collision
+checking and durable storage remain inside the registry implementation.
+Identifier generation accepts `&mut impl RngCore`,
+allowing production randomness and deterministic collision fixtures to share
+the same path without a global random source or test-only encoding logic.
+
+### Mailbox admission boundary
+
+Represent required-message admission with const-generic fixed arrays. The
+caller transfers the complete one- or three-message batch only after one
+capacity check under the mailbox mutex, avoiding an intermediate collection
+and making partial insertion structurally unavailable. Return a small private
+`Closed`/`Full` result so the registry can apply one removal policy while
+tests can still distinguish the rejected mailbox condition.
+
+### Registry randomness and deferred disconnects
+
+Use `OsRng` directly for production registration and keep the shared
+`register_with` path generic over `RngCore` for deterministic collision tests.
+The registry does not retain a random generator or add a second synchronization
+domain around it.
+
+Collect cancellation-token clones while holding registry and mailbox locks,
+then cancel them only after the registry guard has left scope. This keeps
+slow-client and stale-weak cleanup synchronous without allowing cancellation
+observers to re-enter registry work under its mutex.
+
+### Registry and mailbox synchronization
+
+Use separate standard-library mutexes for `SseClientRegistryState` and each
+`SseMailboxState`. Registry operations are synchronous, bounded by the client
+limit, and mutate both publication observation and registration state; a Tokio
+mutex would introduce an await into nonawaiting publication tails, while an
+`RwLock` or concurrent map would not preserve those compound transitions.
+Keep immutable publication identity, publication state, latest Head, and
+registrations in one registry state. Registry operations derive publication
+identity from that state rather than accepting a caller-supplied value.
+Keep mailbox closure and queue contents in one mailbox state so close and
+admission cannot linearize independently.
+
+Retain Tokio `Notify` solely as the single receiver's readiness hint. An MPSC
+channel would duplicate the authoritative queue and prevent queued-wakeup
+coalescing and repositioning, while `watch` would not preserve required-message
+order. The receiver registers its notification future before inspecting the
+queue and never treats a notification as message state.
+
+For an operation touching both domains, acquire registry state before mailbox
+state. The receiver acquires only mailbox state, and disconnect cleanup
+acquires only registry state. Publication replacement will acquire two registry
+states in stable address order before the shared mailbox; no path acquires a
+registry while retaining a mailbox guard. Readiness notification and connection
+cancellation occur after releasing the applicable state guards.

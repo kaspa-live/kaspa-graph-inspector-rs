@@ -23,6 +23,7 @@ edition = "2024"
 [workspace.dependencies]
 arc-swap = "1.9.2"
 async-trait = "0.1.88"
+base64 = "0.22.1"
 bytes = "1.12.1"
 clap = { version = "4.5.35", features = ["derive", "string", "cargo"] }
 ctrlc = { version = "3.4.1", features = ["termination"] }

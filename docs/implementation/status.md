@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 17 October 2026.
+Updated 20 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -311,5 +311,22 @@ construction, HTTP routing, and response delivery remain in the later
 increments recorded in
 [the implementation sequence](sequence.md#remaining-reviewable-increments).
 Completion validation passed workspace formatting, Cargo check, 436/436
+Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
+with warnings denied, and `git diff --check`.
+
+Implementation increment 11 is implemented: each `GraphPublication` now owns
+its publication-local SSE client registry and each connection owns one bounded,
+ordered mailbox. The registry provides atomic initial and replacement batches,
+fresh opaque identifiers, lifecycle observations, coalesced Head wakeups,
+completion-time schedule replacement, exact disconnect removal, and slow or
+stale client cleanup. Registry scans are synchronous under one state mutex;
+mailbox readiness contains no message state, and the design creates neither
+per-client tasks nor timers. Publication construction, original-update tails,
+and lifecycle transitions keep registry state aligned with the publication
+core under the shared mutation order. Focused tests cover capacity and
+identifier collisions, atomic admission, mailbox ordering and closure,
+Head/rearm and registration/lifecycle linearizations in both orders,
+replacement, stale weak registrations, and maximum-revision saturation.
+Completion validation passed workspace formatting, Cargo check, 470/470
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.

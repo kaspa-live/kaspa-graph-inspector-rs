@@ -38,7 +38,7 @@ struct GraphPublication {
     mutation: tokio::sync::Mutex<()>,
     core: tokio::sync::RwLock<GraphPublicationCore>,
     cache: Arc<GraphCache>,
-    clients: DeltaClientRegistry,
+    clients: SseClientRegistry,
 }
 
 enum GraphViewSeedRequest {
@@ -66,7 +66,7 @@ enum GraphViewSeedOutcome {
 ```
 
 Only `GraphPublication` has a `publication_id`. Each publication receives a
-fresh random nonzero `u64`. `GraphCache` and `DeltaClientRegistry` are private
+fresh random nonzero `u64`. `GraphCache` and `SseClientRegistry` are private
 runtime state. The publication retains the cache's sole durable strong `Arc`;
 cache jobs retain only `Weak<GraphCache>`.
 
@@ -76,7 +76,7 @@ owns cache entry identities and Head response-cache policy, while the
 owns client registration and wake scheduling.
 
 When construction creates a `GraphPublication`, it initializes
-`DeltaClientRegistry` with the same publication state and current revision as
+`SseClientRegistry` with the same publication state and current revision as
 the initial core before exposing either value. The registry therefore always
 has a coherent observation for a concurrently established SSE registration.
 

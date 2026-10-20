@@ -1009,17 +1009,17 @@ always the authoritative graph cursor, including after retry or reconnect.
 The publication-local scheduling value is conceptually:
 
 ```rust
-struct DeltaClientWakeState {
+struct DeltaWakeSchedule {
     wake_at_revision_id: u64,
     wake_sent: bool,
 }
 ```
 
-`DeltaClientRegistry` is the publication-local mapping from each live opaque
-identifier to exactly one such scheduling value. The
-[ApiService task contract](api-service.md#client-wake-registry-and-sse-mailbox)
-owns its concrete collection, synchronization, mailbox, and readiness
-primitive.
+Each publication logically associates every live opaque identifier with
+exactly one such scheduling value. The
+[ApiService task contract](api-service.md#sse-client-registry-and-mailbox)
+owns the concrete `SseClientRegistry`, its collection and synchronization,
+and the mailbox synchronization and readiness requirements.
 
 No current or highest graph revision is stored in this value. Registration
 initializes the boundary from the client-supplied cursor and marks the
