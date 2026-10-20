@@ -558,32 +558,23 @@ Already running blocking serialization or compression cannot be interrupted
 safely; the bounded active jobs finish, their output is discarded, and the
 scheduler then completes.
 
-### Client wake registry and SSE mailbox
+### SSE client registry and mailbox
 
-ApiService implements each publication's protocol-owned client scheduling with
-one small synchronous registry and one ordered mailbox per SSE connection:
+ApiService implements each publication's protocol-owned SSE client
+coordination with one small nonawaiting registry and one ordered mailbox per
+SSE connection:
 
 ```rust
-struct DeltaClientRegistry {
-    state: std::sync::Mutex<DeltaClientRegistryState>,
-}
-
-struct DeltaClientRegistryState {
+struct SseClientRegistryState {
     publication_state: GraphPublicationState,
     head_revision_id: u64,
-    clients: HashMap<u64, DeltaClientRegistration>,
+    clients: HashMap<u64, SseClientRegistration>,
 }
 
-struct DeltaClientRegistration {
-    wake_at_revision_id: u64,
-    wake_sent: bool,
+struct SseClientRegistration {
+    schedule: DeltaWakeSchedule,
     mailbox: Weak<SseMailbox>,
     disconnect: tokio_util::sync::CancellationToken,
-}
-
-struct SseMailbox {
-    state: std::sync::Mutex<SseMailboxState>,
-    ready: tokio::sync::Notify,
 }
 
 struct SseMailboxState {
@@ -608,6 +599,11 @@ enum DeltaCompletionResult {
 }
 ```
 
+`SseClientRegistry` owns synchronized `SseClientRegistryState`.
+Each `SseMailbox` owns synchronized `SseMailboxState` and asynchronous receiver
+readiness. The exact synchronization and readiness primitives, internal state
+subdivision, and any lock ordering are implementation choices.
+
 The map key is the random `u64` whose wire encoding is owned by the
 [publication protocol](api-protocol.md#publication-wire-observation--settled).
 The registry's publication-wide Head revision is the latest revision already
@@ -616,49 +612,41 @@ and an HTTP response rearming a client and is not a per-client highest revision.
 Each SSE connection owns the strong `Arc<SseMailbox>`, while the registry
 retains only a weak reference and the connection-local cancellation token.
 
-Registry operations and mailbox mutation use only short synchronous critical
-sections. The sole lock order is registry then mailbox. The mailbox receiver
-takes only its mailbox lock, and disconnect cleanup takes only the registry
-lock. No lock guard crosses an `.await`. `Notify` is a readiness hint for the
-single receiver; the bounded queue remains the sole owner of message ordering
-and contents.
+Registry operations and mailbox mutation linearize through short, nonawaiting
+state transitions. An operation spanning registry and mailbox state preserves
+the atomic behavior defined below and must be deadlock free. No synchronization
+guard crosses an `.await`. Asynchronous readiness is only a hint for the single
+receiver; the bounded queue remains the sole owner of message ordering and
+contents.
 
 Registration generates and collision-checks its random key while serialized
-by the registry, admits the complete protocol-owned initial message batch, and
-then inserts the registration. The initial schedule is already marked sent.
-Publication replacement removes the old registration and any still-queued
-ordinary wakeup for that old publication before performing the same operation
-against the replacement registry and mailbox. Required old messages already
-in the mailbox retain their order. Failure to admit a required batch installs
-no partial registration.
+by the registry, admits the complete protocol-owned initial registration state
+and message batch, and then inserts the registration. Publication replacement
+executes the protocol-owned removal and new-registration sequence as one
+serialized operation against the applicable registries and mailbox. Failure to
+admit a required batch installs no partial registration.
 
 A lifecycle notification records the new publication state, then attempts its
-required message against every registered mailbox in the same registry
-critical section. Registration racing before that operation receives the old
-initial state followed by the new message; registration racing after it
-receives the new state in its initial batch. Failed weak upgrades and clients
-whose mailbox rejects required admission are removed; their connection tokens
-are cancelled after releasing the locks.
+required message against every registered mailbox as one serialized registry
+operation. This supplies the before-or-after race ordering required by the
+[publication wire contract](api-protocol.md#publication-wire-observation--settled).
+Failed weak upgrades and clients whose mailbox
+rejects required admission are removed; their connection tokens are cancelled
+after the registry operation completes.
 
 After the publication core atomically publishes a new graph revision,
-`advance_head` first records the revision and then linearly scans registrations.
-For an unsent boundary already reached, it queues the ordinary graph wakeup and
-marks it sent. For a sent schedule whose ordinary wakeup is still queued, it
-coalesces that item to the newer revision. A delta response completion acquires
-the registry once and looks up the supplied identifier. Absence returns
-`RegistrationMissing`
-without changing another registration. Presence applies the protocol-selected
-schedule action and returns `Accepted`; the final Stale-Head action validates
-the registration without installing a schedule. Rearming removes any
-still-queued ordinary wakeup, replaces the schedule, and compares its boundary
-with the registry's current Head before releasing the registry lock. If the new
-unsent boundary is already reached, it queues the wakeup immediately and marks
-it sent. The HTTP handler commits its successful response only after
-`Accepted`; `RegistrationMissing` maps to the protocol-owned
-`ClientRegistrationRequired` outcome. Head advancement before or after
-rearming therefore cannot lose the notification. An ordinary wakeup already
-taken by the SSE task cannot be withdrawn and may arrive after rearming; this
-is harmless under the protocol's non-exactly-once SSE contract.
+`advance_head` records the revision and linearly scans registrations as one
+serialized registry operation. It applies the protocol-owned graph-wakeup and
+coalescing rules to each applicable `DeltaWakeSchedule`. A delta response
+completion likewise runs as one atomic registry operation and looks up the
+supplied identifier. Absence returns `RegistrationMissing` without changing
+another registration. Presence applies the protocol-selected schedule action
+and returns `Accepted`. The HTTP handler commits its successful response only
+after `Accepted`; it maps `RegistrationMissing` through the protocol-owned
+completion disposition. These operations provide the linearization required
+by the
+[delta continuation contract](api-protocol.md#canonical-head-delta-responses--settled)
+without independently defining its scheduling semantics.
 
 The scan is bounded by `MAX_SSE_CLIENTS`. With the initial 1,024-client limit,
 a direct scan avoids a second boundary index and its rearm, replacement, and

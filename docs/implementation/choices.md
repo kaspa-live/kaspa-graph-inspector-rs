@@ -927,8 +927,8 @@ state. Add no crate-root re-exports.
 Use the `base64` crate's `URL_SAFE_NO_PAD` engine to encode the protocol-owned
 random `u64` client value. A small private `ClientIdentifier` temporarily
 couples the raw candidate with canonical wire conversion while collision
-checking and durable registry storage remain responsibilities of the later
-registry implementation. Identifier generation accepts `&mut impl RngCore`,
+checking and durable storage remain inside the registry implementation.
+Identifier generation accepts `&mut impl RngCore`,
 allowing production randomness and deterministic collision fixtures to share
 the same path without a global random source or test-only encoding logic.
 
@@ -940,3 +940,15 @@ capacity check under the mailbox mutex, avoiding an intermediate collection
 and making partial insertion structurally unavailable. Return a small private
 `Closed`/`Full` result so the later registry can apply one removal policy while
 tests can still distinguish the rejected mailbox condition.
+
+### Registry randomness and deferred disconnects
+
+Use `OsRng` directly for production registration and keep the shared
+`register_with` path generic over `RngCore` for deterministic collision tests.
+The registry does not retain a random generator or add a second synchronization
+domain around it.
+
+Collect cancellation-token clones while holding registry and mailbox locks,
+then cancel them only after the registry guard has left scope. This keeps
+slow-client and stale-weak cleanup synchronous without allowing cancellation
+observers to re-enter registry work under its mutex.

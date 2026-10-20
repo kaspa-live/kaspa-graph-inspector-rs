@@ -97,7 +97,7 @@ the active work is increment 11, without an additional nesting level.
 | 8. Publication state and mutation kernel | Implement `GraphPublication` state, writer serialization, atomic view/history advancement, immutable captures, lifecycle transitions, and projection-failure detection in `kgi-api-core`. Do not yet construct publications from Storage or expose request serving. | Deterministic writer-gate and atomic-core tests for state ordering, cancellation, no-effect updates, capture coherence, pruning-safe history handles, and failure isolation. |
 | 9. Graph wire values and codec | Add the remaining public protocol values and the DTO conversion/serialization boundary, including response-local hash dictionaries, decimal-string integers, delta-entry projection, common errors, status DTOs, and semantic ETag inputs. Reuse the seed and anchor values introduced by increment 7. Keep scheduling, gzip execution, cache retention, and HTTP routing out of this PR. | Codec and schema tests covering every DTO variant, exact null/discriminator rules, dictionary reuse, unordered traversal equivalence, omitted wire removals, full-width integers, colors, and safe errors. |
 | 10. Encoding scheduler and response cache | Implement the bounded blocking encoding scheduler, JSON size enforcement and gzip execution, publication-local single-flight cache slots, Head tiers, source-keyed delta entries, heat bookkeeping, weak insertion, and tracked cache-job completion. | Deterministic queue, priority, cancellation, hard-age retry, tier selection, single-flight, weak-cache, shared-body, size-limit, gzip-failure, and scheduler-shutdown tests. |
-| 11. Client wake registry and SSE mailboxes | Implement the publication-local client registry and bounded ordered mailbox independently of Axum transport. Cover registration, lifecycle messages, graph-wakeup scheduling and coalescing, completion-time rearming, replacement, disconnect, and slow-client removal. | Race tests for atomic required batches, state-before-wakeup ordering, Head/rearm linearization, stale registrations, replacement sequences, queue bounds, and closure. |
+| 11. SSE client registry and mailboxes | Implement the publication-local client registry and bounded ordered mailbox independently of Axum transport. Cover registration, lifecycle messages, graph-wakeup scheduling and coalescing, completion-time rearming, replacement, disconnect, and slow-client removal. | Race tests for atomic required batches, state-before-wakeup ordering, Head/rearm linearization, stale registrations, replacement sequences, queue bounds, and closure. |
 | 12. API database binding | Implement `ApiDbState`, ordered exact-generation updates, public-read admission, construction-side waiting, Rebuild gating, and terminal stop behavior. Do not add seed construction or public request handlers. | Tests for stale and repeated events, invalid handles, waiting and wakeup, Rebuild disable/reopen authority, generation turnover, and stop/update races. |
 | 13. Publication runtime | Implement the session-bound `PublicationRuntime`: PreSeal handling, database seeding, staging, dual-cut alignment, prewarming, activation requests, gap reconstruction, projection-failure reconstruction, quiescent receiver closure, and its completed shutdown barrier. | Deterministic state-machine tests for every construction state, both alignment cuts, idle-source waits, overflow and gap cuts, sticky Live, supersession, prewarm retry, database failure classes, worker failure, and cancellation with no surviving task. |
 | 14. ApiService lifecycle and publication installation | Implement ApiService's event path, runtime generation fence, reset/current-publication slots, publication installation, cancellation roots, status aggregation, and terminal service barrier. This PR integrates increments 8–13 but adds no Axum router. | Control-level tests for Resync/Rebuild reset, predecessor overlap and join, superseded installation, publication replacement, database-read reopening, unexpected worker failure, shutdown from every runtime state, task/resource release, and idempotence. |
@@ -115,11 +115,11 @@ the active work is increment 11, without an additional nesting level.
 | 26. Deployment and release artifacts | Complete the conventional and Docker layouts, runtime log directories, systemd and Compose examples, static-asset cache behavior, and atomic `xtask` bundle/container construction against the composed binary and Web build. | Reproducible bundle and image checks, matching binary/assets and provenance, missing-root failure, unprivileged/read-only deployment, writable logs, direct signal delivery, and atomic failure cleanup. |
 | 27. Full-stack acceptance | Add only the remaining cross-component fixtures and acceptance coverage needed to prove the focused verification contract across node RPC, PostgreSQL, recovery, API/Web, packaging, logging, and resource isolation; update implementation status with the final evidence. | Full Rust, PostgreSQL, Vitest, deterministic and complete-stack Playwright, parity, packaging, shutdown, and load/isolation suites pass from a clean checkout. |
 
-### Active increment 11: client wake registry and SSE mailboxes
+### Active increment 11: SSE client registry and mailboxes
 
 Increment 11 is exactly one reviewable PR. It implements the publication-local
-client scheduling state owned by the [ApiService task
-contract](../architecture/api-service.md#client-wake-registry-and-sse-mailbox)
+SSE client coordination state owned by the [ApiService task
+contract](../architecture/api-service.md#sse-client-registry-and-mailbox)
 and the logical observation rules owned by the [API protocol
 contract](../architecture/api-protocol.md#publication-wire-observation). It
 builds on `GraphPublication` without adding Axum transport or the logical delta
@@ -127,8 +127,8 @@ operation that consumes completion-time rearming.
 
 Execute increment 11 as these ordered points:
 
-1. Add the private client-scheduling foundation in `kgi-api-core`: the settled
-   capacity constants, canonical opaque registration identifiers with a
+1. Add the private SSE client coordination foundation in `kgi-api-core`: the
+   settled capacity constants, canonical opaque registration identifiers with a
    deterministic test seam, mailbox items, registration state, and internal
    scheduling results. Keep transport parsing and SSE framing outside this
    layer.
@@ -137,7 +137,7 @@ Execute increment 11 as these ordered points:
    wakeup repositioning behind required messages, targeted wakeup removal,
    closure, draining, and one `Notify`-driven asynchronous receive path. Hold
    no mailbox lock across an await.
-3. Implement `DeltaClientRegistry` with coherent initial publication state and
+3. Implement `SseClientRegistry` with coherent initial publication state and
    Head revision, the settled client bound, collision-checked registration,
    weak mailbox ownership, stale weak-reference removal, lifecycle-message
    publication, Head advancement, and connection cancellation after registry
