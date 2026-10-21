@@ -628,9 +628,7 @@ second error result competing with that reliable event path.
 BlockProcessor. BlockProcessor emits it under its
 [PP-boundary contract](block-processing.md#pp-boundary-phase-behavior--settled).
 ProcessingSession observes it before permitting Catchup and propagates the
-milestone to Supervisor. BlockProcessor has already enqueued `PublishPostSeal` to its
-lifecycle-marker worker under its
-[marker-delivery contract](block-processing.md#graph-lifecycle-marker-delivery--settled).
+milestone to Supervisor.
 Supervisor only downgrades both desired and active recovery to `Resync`.
 Duplicate or invalid-state milestone delivery reports
 `Ownership(InvalidLifecycleControl)`. Entering Live satisfies
@@ -717,6 +715,38 @@ pool, cache, event, and replacement-gate churn without strengthening session
 isolation. ApiService's database generation remains independent of processing
 sessions under its focused lifecycle.
 
+### Graph lifecycle-marker worker — settled
+
+Each ProcessingSession owns one small graph lifecycle-marker worker for its
+session-scoped `GraphUpdateProducer`. The worker is part of the inert component
+graph, starts with the launched session tree, and accepts exactly these two
+commands, each at most once and in FIFO order:
+
+```text
+Catchup
+Live
+```
+
+The reliable local handoff records command acceptance without waiting for
+graph-update delivery. The worker invokes `publish_catchup` and `publish_live`
+serially. The [API ingress owner](api-ingress.md#in-process-graph-update-feed--settled)
+defines their atomic gate transition, channel delivery, interleaving, gap, and
+receiver-closure semantics. In particular, Catchup needs no completed-delivery
+acknowledgement before ProcessingSession continues recovery activation.
+
+ProcessingSession hands off Catchup when the [Catchup trigger](#catchup-trigger)
+is satisfied and hands off Live during [global Live admission](#live-admission).
+The worker owns only its producer clone and retains no validated RPC or DB
+generation. Unexpected worker or command-path loss while the worker should be
+live follows the existing ownership-fault policy. Receiver closure follows the
+graph-update-feed exception and does not create a processing fault.
+
+Shutdown closes the local command input. The worker drains accepted commands
+and exits after delivery, or exits when ApiService replacement or shutdown
+drops the session receiver. ProcessingSession joins it within the consuming
+session barrier. This permits lossless Live delivery to wait for graph-channel
+capacity without blocking either processor or the session coordinator.
+
 The session prepares one common structure for Resync and Rebuild:
 
 ```rust
@@ -751,8 +781,9 @@ VspcProcessor from the same `PreparedSync`: BlockProcessor receives the
 committed anchor and seal threshold, while VspcProcessor receives the same
 anchor. Only after both
 initializations complete does ProcessingSession launch the processor tasks and
-their descendants. It completes the mode-specific initial marker and milestone
-handoffs described by the processor owners before returning `Started`.
+their descendants together with the lifecycle-marker worker. It completes the
+mode-specific initial milestone handoffs described by the processor owners
+before returning `Started`.
 Failure during that final launch and handoff interval returns `Failed`; the
 consuming shutdown barrier joins any tasks already launched. The components
 need no pre-start admission gate, Begin
@@ -931,9 +962,8 @@ For every processing run, Supervisor creates one fresh paired
 `GraphUpdateProducer` and `GraphUpdateReceiver`. It calls `ApiService::reset`
 with the receiver and current `RecoveryMode`, then passes the producer as a
 direct `ProcessingSession::new` argument. ProcessingSession retains that
-producer within its inert component graph; it never invokes ApiService or
-produces lifecycle markers. BlockProcessor consumes its clone under the linked
-marker contract.
+producer within its inert component graph and owns lifecycle-marker delivery
+through its private worker; it never invokes ApiService.
 
 The session order is:
 
@@ -943,7 +973,7 @@ ApiService::reset(graph_updates, recovery_mode)
     -> install Active(session)
     -> await session.start()
     -> Started
-    -> GraphUpdate::PublishPostSeal
+    -> GraphUpdate::Catchup
     -> GraphUpdate::Live
 ```
 
@@ -953,9 +983,8 @@ The [API publication lifecycle](api-publication.md#head-publication-lifecycle-an
 owns lifecycle-marker consumption and publication effects, while its
 [reconstruction contract](api-publication.md#universal-api-reconstruction--settled)
 owns the reaction to a reported gap. This document owns Supervisor's `reset`
-call point and processor command ordering;
-[BlockProcessor](block-processing.md#graph-lifecycle-marker-delivery--settled)
-owns marker-command enqueue points. `reset` returns after runtime replacement
+call point, processor command ordering, and the session-owned marker worker.
+`reset` returns after runtime replacement
 and predecessor-runtime shutdown; processing never waits for construction or
 publication completion.
 
@@ -975,9 +1004,7 @@ ProcessingSession.
 For ordinary Resync, Supervisor calls `reset(Resync)` and then
 constructs, installs, and starts a Resync ProcessingSession. After successful
 reconciliation, ProcessingSession initializes BlockProcessor in PostSeal and
-launches the complete component graph; only after its
-[marker behavior](block-processing.md#graph-lifecycle-marker-delivery--settled)
-has accepted the `PublishPostSeal` command does `start` return `Started`. If
+launches the complete component graph. If
 reconciliation instead returns `RequireRebuild`, Supervisor completely shuts
 down that Resync session and starts the distinct Rebuild attempt with another
 `reset` call; no special API invalidation is required.
@@ -993,26 +1020,23 @@ excludes API database phases before `rebuild_from_pruning_point` changes data.
 After component initialization and task launch, ProcessingSession permits no
 Catchup until it
 observes BlockProcessor's definitely committed `PpBoundarySealed` event and forwards it
-to Supervisor. The BlockProcessor seal contract owns its preceding marker
-command enqueue.
+to Supervisor.
 For Genesis, BlockProcessor emits that milestone during its initial task startup
 under its
 [PP-boundary contract](block-processing.md#pp-boundary-phase-behavior--settled).
 ProcessingSession handles it through the same forwarding path, including
 Supervisor's `Rebuild -> Resync` downgrade.
 
-`PpBoundarySealed` has no API database-generation role. StorageService
-owns the replacement-generation lifecycle, and Supervisor forwards its events
-independently. `PublishPostSeal` may arrive before Supervisor has forwarded the
-storage-produced `Published` event; the publication runtime then keeps
-construction pending until a current generation is available. The API owner
-alone opens public database-backed reads when the replacement graph publication
-becomes Active.
+`PpBoundarySealed` has no API database-generation or publication-construction
+role. StorageService owns the replacement-generation lifecycle, and Supervisor
+forwards its events independently. The replacement `Published` event may arrive
+before Catchup; ApiService retains that generation while publication
+construction remains idle. The API owner alone opens public database-backed
+reads when the replacement graph publication becomes Active.
 
-When the global Live conditions are satisfied, ProcessingSession sends the existing
-processor Live commands and emits `EnteredLive`. The BlockProcessor marker
-contract owns the effect of its Live command; Supervisor does not produce the
-marker.
+When the global Live conditions are satisfied, ProcessingSession sends the
+processor Live commands, hands Live to its marker worker, and emits
+`EnteredLive`. Supervisor does not produce the API marker.
 
 ## Resync block/VSPC pump — settled
 
@@ -1074,14 +1098,15 @@ Before starting a session:
 4. await the startup outcome while continuing to service Supervisor-owned
    lifecycle inputs. `Started` proves that the complete component graph was
    initialized and launched before any synchronization or session-data
-   producer. Initial Resync startup accepts the `PublishPostSeal` worker
-   command before returning `Started`, while non-Genesis Rebuild waits for its
-   later seal point.
+   producer. Neither Resync nor Rebuild starts publication construction before
+   Catchup.
 
-Before Catchup:
+When Catchup eligibility is established:
 
-1. send Catchup commands, including lower bounds, to both processors;
-2. invoke the run's exact `ValidatedRpcClient` subscription activation with
+1. reliably hand the Catchup command to the session's lifecycle-marker worker,
+   without waiting for graph-update delivery;
+2. send Catchup commands, including lower bounds, to both processors;
+3. invoke the run's exact `ValidatedRpcClient` subscription activation with
    the fresh BlockProcessor and VspcProcessor notification senders and the
    current session's reliable fault endpoint as direct arguments.
 
@@ -1124,14 +1149,17 @@ subtraction between the returned sample and the marker. Use
 owns its checked construction and admissibility.
 
 If the marker is `Present`, the fresh score is not lower, and the gap is at
-most the threshold, queue both Catchup commands and complete subscription
-activation before dispatching the entire held page under Catchup. If the gap
-is larger, replace the marker with the fresh sink, reset it to `Unknown`, and
-remain in Resync. Re-evaluate immediately when the replacement is already in
-the held page. Otherwise continue scanning. Remember a marker already seen by
-GetBlocks when its VSPC state has not caught up, and reconsider eligibility at
-a later complete page boundary. A removed marker or decreasing score is
-replaced and cannot authorize Catchup.
+most the threshold, hand Catchup to the lifecycle-marker worker, queue both
+processor Catchup commands, and complete subscription activation before
+dispatching the entire held page under Catchup. The marker handoff does not
+wait for delivery; the API-ingress ordering rule ensures every graph commit is
+covered by either the later seed or the opened stream. If the gap is larger,
+replace the marker with the fresh sink, reset it to `Unknown`, and remain in
+Resync. Re-evaluate immediately when the replacement is already in the held
+page. Otherwise continue scanning. Remember a marker already seen by GetBlocks
+when its VSPC state has not caught up, and reconsider eligibility at a later
+complete page boundary. A removed marker or decreasing score is replaced and
+cannot authorize Catchup.
 
 Failure of either sink-sample call applies its typed lifecycle disposition to
 the complete recovery attempt. In particular, a failed refresh does not
@@ -1229,17 +1257,21 @@ page boundary. It does not certify that KGI has copied the node's entire
 retained body DAG or that no callback was dropped during subscription
 activation.
 
-When the predicate becomes true, the producer gate is open and every graph
-update causally establishing it has already completed its offer. Only then
-perform the transition in order:
+When the predicate becomes true, every graph update causally establishing it
+has already completed its offer. The Catchup marker may already have opened
+the producer gate, or it may still be accepted in the marker-worker FIFO. In
+the latter case those completed offers were suppressed before the publication
+cut and will be covered by its later seed. Perform the transition in order:
 
 1. stop issuing synthetic RPC requests and stop/join both synthetic producers;
 2. successfully enqueue VspcProcessor's existing Live command;
 3. successfully enqueue BlockProcessor's existing Live command;
-4. emit `EnteredLive`.
+4. reliably hand Live to the session's lifecycle-marker worker; and
+5. emit `EnteredLive`.
 
-The [BlockProcessor marker contract](block-processing.md#graph-lifecycle-marker-delivery--settled)
-owns the API effect of its Live command.
+The marker worker may still be waiting for graph-update-channel capacity when
+`EnteredLive` is emitted. Its FIFO nevertheless preserves Catchup before Live,
+and every causal update establishing Live was offered before the marker command.
 `EnteredLive` remains the Supervisor milestone for recovery intent and retry
 state; it has no API-marker role.
 
@@ -1303,9 +1335,9 @@ ProcessingSession's consuming `shutdown` performs this barrier in order:
 4. if component tasks were launched, send terminal `Shutdown` to both
    processors; otherwise drop the complete inert component graph;
 5. await every launched processor acknowledgement, including its
-   teardown-barrier descendants and BlockProcessor's marker worker; the
-   concurrent ApiService reset or shutdown drops the old graph receiver if an
-   accepted lossless marker has not completed;
+   teardown-barrier descendants, then close and join ProcessingSession's marker
+   worker; the concurrent ApiService reset or shutdown drops the old graph
+   receiver if an accepted lossless marker has not completed;
 6. release every processing-session clone of the validated RPC and DB handles;
 7. drop the remaining session-owned channels and state; and
 8. complete the barrier, after which Supervisor publishes `Idle` unless it is

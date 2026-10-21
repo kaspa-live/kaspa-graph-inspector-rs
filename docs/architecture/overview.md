@@ -49,10 +49,10 @@ Supervisor
 │   └───────────────────────────► Arc<ValidatedApiDbClient> (one API generation)
 ├── private processing-session slot
 │   └── ProcessingSession, while active
+│       ├── lifecycle-marker worker
 │       ├── BlockProcessor
 │       │   ├── OrphanManager
 │       │   │   └── DependencyResolver
-│       │   └── lifecycle-marker worker
 │       └── VspcProcessor
 └── Arc<ApiService> ────────────► GraphPublication
                                   ├── Head GraphView / GraphHistory
@@ -65,7 +65,7 @@ NotificationRouter (implements Notify)
 BlockProcessor ── PersistedBlock ──► OrphanManager, VspcProcessor
 BlockProcessor/VspcProcessor
     ── per-session ordered graph updates ──► ApiService
-BlockProcessor ── lifecycle markers ──► ApiService
+ProcessingSession ── lifecycle markers ──► ApiService
 ProcessingSession ── lifecycle milestones ──► Supervisor
 NodeService ── ordered RPC generation events ──► Supervisor
 StorageService ── ordered DB generation events ──► Supervisor
@@ -78,9 +78,9 @@ Supervisor constructs at most one uniquely owned, non-reusable
 `ProcessingSession` from current service generations. The
 [processing lifecycle](processing-lifecycle.md#processingsession--settled) owns
 the private slot's states and transitions. The active session owns both
-processors and all session channels and tasks; `BlockProcessor` owns
-OrphanManager and its lifecycle-marker worker, and OrphanManager owns
-DependencyResolver. Supervisor invokes public control methods on the three
+processors, its lifecycle-marker worker, and all session channels and tasks;
+`BlockProcessor` owns OrphanManager, and OrphanManager owns DependencyResolver.
+Supervisor invokes public control methods on the three
 long-lived services and the current session. Internal owners may retain
 explicit child-worker command protocols. Child fault and milestone delivery
 follows the

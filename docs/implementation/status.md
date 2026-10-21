@@ -18,8 +18,10 @@ has been replaced by Vite and the imported source builds with the workspace's
 React 19 and TypeScript 7 toolchain. The shared `kgi-model` domain, lifecycle,
 fault, status, VSPC, and committed graph-update values are implemented against
 the selected rusty-kaspa `v2.1.0` value crates. The session-scoped graph-update
-ingress implements the shared pre-seal gate, nonblocking ordinary offers,
-lossless lifecycle markers, coalescing gap observation, and ingress metrics.
+ingress currently implements the superseded PostSeal gate and marker names,
+along with nonblocking ordinary offers, lossless lifecycle markers, coalescing
+gap observation, and ingress metrics. It must be adapted to the accepted
+AwaitingCatchup gate before publication-runtime implementation continues.
 ApiService orchestration remains behavior-free scaffolding; `kgi-api-core`
 contains the in-memory publication kernel described below. The processing
 crate contains the session-scoped BlockProcessor and VspcProcessor slices
@@ -183,11 +185,13 @@ failure, cancellation, terminal backlog preemption, and exact RPC-generation
 release. Unexpected loss of an active processor or descendant command path is
 reported through the typed ownership-fault path rather than interpreted as
 ordinary shutdown.
-The BlockProcessor-owned lifecycle-marker worker provides the nonblocking
-two-command local FIFO, lossless graph-ingress delivery, accepted-command drain
-after local closure, and receiver-closure termination without retaining RPC or
-database generations. Terminal BlockProcessor shutdown joins it after draining
-accepted markers. The BlockProcessor owner loop implements explicit input
+The current BlockProcessor-owned lifecycle-marker worker provides the
+nonblocking two-command local FIFO, lossless graph-ingress delivery,
+accepted-command drain after local closure, and receiver-closure termination
+without retaining RPC or database generations. The accepted architecture now
+relocates that worker to ProcessingSession and changes its first command to
+Catchup; this implementation remains to be adapted before integration. The
+BlockProcessor owner loop implements explicit input
 priority, notification gating, phase-specific materialization policy, PostSeal
 transition, graph-before-persisted delivery, Catchup lower-bound and
 source-overlap accounting, child fault provenance, and typed storage and node
@@ -228,7 +232,7 @@ and composition forms, gapless history append, cumulative estimates,
 prefix-only pruning, detached entry lifetime, and retained-range selection.
 Publication, database projection reads, encoding, transport, and ApiService
 runtime behavior remain in the separately numbered increments recorded in
-[the implementation sequence](sequence.md#active-increment-6-canonical-graph-model).
+[the implementation sequence](sequence.md#remaining-reviewable-increments).
 Completion validation passed workspace formatting, Cargo check, 337/337
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.

@@ -11,7 +11,7 @@ become durable project constraints.
    scheduling and batching remain implementation choices only where the
    focused architecture does not fix request boundaries or batch semantics.
 4. Detailed Tokio fairness, drain, graph-update gap counter/wakeup primitives,
-   component-status watch primitives, and BlockProcessor marker-worker
+   component-status watch primitives, and ProcessingSession marker-worker
    primitives.
 5. Exact metrics export and labels, tracing, operational endpoints, file-log
    rotation size and retained archive count, service hardening directives, and

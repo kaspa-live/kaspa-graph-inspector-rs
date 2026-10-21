@@ -303,7 +303,7 @@ can observe the same watch value; no separate replacement signal or
 A runtime never clears the slot. ApiService stores `None` only at initial
 construction and when terminal shutdown releases the current publication.
 
-`PublishPostSeal` and `Live` are graph-update-feed markers rather than
+`Catchup` and `Live` are graph-update-feed markers rather than
 out-of-band controls. They have no publication-completion acknowledgement. A
 later session's `reset` call is the only session-supersession mechanism visible
 to ApiService.
@@ -315,7 +315,7 @@ a session-supersession control call.
 An ordinary Resync `reset` preserves both fields of `ApiDbState`. A Rebuild
 `reset` invokes `begin_rebuild`; a repeated Rebuild reset has the same
 idempotent effect. During Rebuild, public
-database-backed request admission remains disabled in `PreSeal`, `Constructing`,
+database-backed request admission remains disabled in `AwaitingCatchup`, `Constructing`,
 `Aligning`, and `Prewarming`.
 
 Clearing `current` prevents the Rebuild runtime from capturing the old API
@@ -705,7 +705,7 @@ barriers.
 ## ApiService shutdown — settled
 
 `shutdown` is a reliable completed-barrier operation. It is terminal,
-idempotent, valid from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`,
+idempotent, valid from `AwaitReset`, `AwaitingCatchup`, `Constructing`, `Aligning`,
 `Prewarming`, and `Active`, and is serialized with `reset` by the runtime
 lifecycle mutex.
 ApiService performs the local barrier in order:

@@ -645,14 +645,18 @@ Shutdown aborts and joins all tasks before acknowledging.
 
 ### Lifecycle-marker worker primitive
 
-Use a Tokio unbounded MPSC channel for the BlockProcessor-owned marker worker.
-Its architecture-owned protocol admits at most the two ordered commands for
-one session, so the channel is intrinsically bounded by the producer protocol
-while keeping command handoff independent of graph-update-channel capacity.
-Dropping the sole command sender closes the input and the worker drains
-accepted commands. The graph-update producer remains the sole owner of
-lossless marker backpressure and receiver-closure classification, and
-BlockProcessor joins the worker during terminal session shutdown.
+Use a Tokio unbounded MPSC channel for the ProcessingSession-owned marker
+worker defined by the
+[processing lifecycle](../architecture/processing-lifecycle.md#graph-lifecycle-marker-worker--settled).
+Its architecture-bounded per-session command cardinality prevents unbounded
+queue growth while keeping local command handoff independent of graph-update-
+channel capacity. Marker delivery behavior remains owned by the
+[graph-update ingress](../architecture/api-ingress.md#in-process-graph-update-feed--settled).
+
+Keep marker-worker receiver closure in a shared atomic flag so a later session
+handoff failure can remain distinct from an internal command-path failure. The
+flag is diagnostic coordination inside the worker primitive; graph-update gate
+state and delivery semantics remain owned by the ingress capability.
 
 ### BlockProcessor owner loop
 
@@ -668,11 +672,6 @@ owner-loop tests. The production implementations delegate directly to
 `ValidatedDbClient` and `ValidatedRpcClient`; the adapters add no boxed future,
 public mock API, or alternate runtime behavior. Preserve child-fault provenance
 as a typed `Component` field while forwarding it through OrphanManager.
-
-Keep marker-worker receiver closure in a shared atomic flag so a later local
-handoff failure can remain distinct from an internal command-path failure. The
-flag is diagnostic coordination inside the worker primitive; graph-update gate
-state and delivery semantics remain owned by the ingress capability.
 
 ## 14 October 2026: VspcProcessor owner loop
 

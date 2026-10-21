@@ -333,27 +333,34 @@ One `PublicationRuntime` projects its processing session through these internal
 states:
 
 ```text
-PreSeal -- PublishPostSeal --> Constructing
+AwaitingCatchup -- Catchup --> Constructing
     -- seed succeeds --> Aligning
     -- block and VSPC cuts crossed --> Prewarming
     -- tier 50 ready and eligible --> Active
 ```
 
-ApiService creates a fresh runtime in `PreSeal` for each accepted `reset`; a
+ApiService creates a fresh runtime in `AwaitingCatchup` for each accepted `reset`; a
 later reset replaces the whole runtime rather than moving the existing runtime
-back to `PreSeal`. The complete replacement topology and control effects are
+back to `AwaitingCatchup`. The complete replacement topology and control effects are
 owned by the
 [reset contract](api-service.md#reset-and-recovery-time-availability--settled).
 
-In `PreSeal`, the runtime waits for the mandatory `PublishPostSeal` marker; the
-producer gate prevents ordinary committed updates from entering the channel.
+In `AwaitingCatchup`, the runtime waits for the mandatory `Catchup` marker. The
+[ingress contract](api-ingress.md#in-process-graph-update-feed--settled)
+prevents ordinary committed updates from entering the channel before that
+marker.
 The marker establishes the reconstruction cut, initializes the target
 publication state to `Synchronizing`, starts an empty staging buffer and a
 fresh database seed, and enters `Constructing`. Every intentionally suppressed
 update committed before this cut is covered by that newer database snapshot.
-`Live` before `PublishPostSeal` violates the settled marker order. The
-producer-side PostSeal precondition belongs to the
-[BlockProcessor marker contract](block-processing.md#graph-lifecycle-marker-delivery--settled).
+An update whose offer is ordered after the atomic Catchup enqueue-and-open
+operation enters the stream behind the marker. The seed and stream may overlap;
+alignment resolves that overlap. Publication construction therefore starts
+only when processing reaches Catchup, avoiding a long-lived seed and alignment
+attempt while historical recovery is still advancing as quickly as possible.
+`Live` before `Catchup` violates the settled marker order. The producer-side
+marker causality belongs to the
+[ProcessingSession marker contract](processing-lifecycle.md#graph-lifecycle-marker-worker--settled).
 
 `Constructing` has exactly one responsibility: obtain a coherent revision-zero
 `Head` view and revision-zero history while staging every subsequently received
@@ -490,9 +497,9 @@ same reconstruction primitive while leaving the current client unchanged. A
 attempt. The [database-binding owner](api-service.md#api-database-generation-binding--settled)
 defines when either accessor returns a client or `None`.
 
-`PublishPostSeal` is not tracked during reconstruction. Entering
+`Catchup` is not tracked during reconstruction. Entering
 `Constructing` already proves that the session consumed its mandatory marker;
-API-local reconstruction in that session remains post-seal and requires no
+API-local reconstruction in that session remains post-Catchup and requires no
 second marker.
 
 The primitive is identical from `Constructing`, `Aligning`, `Prewarming`, and
@@ -512,7 +519,7 @@ API_STAGING_UPDATE_CAPACITY = 4096
 ```
 
 The staging buffer counts `BlockCommitted` and `VspcCommitted` updates. `Live`
-is sticky state rather than a staged entry, and `PublishPostSeal` establishes
+is sticky state rather than a staged entry, and `Catchup` establishes
 the construction cut. The buffer never drops one staged entry in isolation.
 If admitting another update would exceed its capacity, do not insert that
 update and invoke `restart_construction()`, making the current receive frontier

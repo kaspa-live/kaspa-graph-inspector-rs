@@ -12,10 +12,10 @@ control and resource bulkheads belong to the
 The per-session graph-update channel, producer gate, lifecycle-marker delivery,
 and gap reporting belong to [API graph-update ingress](api-ingress.md).
 The [processing lifecycle](processing-lifecycle.md) owns when Supervisor calls
-`reset` and when processor phase commands occur. [Block processing](block-processing.md)
-owns lifecycle-marker production. [Storage](storage.md) owns database
-transactions, query implementation, and database-replacement exclusion. Web
-client behavior belongs to the [Web architecture](web.md).
+`reset`, when processor phase commands occur, and lifecycle-marker production.
+[Storage](storage.md) owns database transactions, query implementation, and
+database-replacement exclusion. Web client behavior belongs to the
+[Web architecture](web.md).
 
 ## Common HTTP conventions — settled
 

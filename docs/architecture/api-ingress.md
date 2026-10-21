@@ -3,11 +3,12 @@
 ## Scope and ownership
 
 This document owns the per-session graph-update channel, its producer and
-receiver capabilities, the pre-seal delivery gate, lifecycle-marker delivery,
-and gap reporting. The producer documents own when committed values and marker
-commands are offered. [API publication](api-publication.md) owns how the private
-publication runtime consumes the ordered stream and reconstructs its derived
-graph projection.
+receiver capabilities, the Catchup delivery gate, lifecycle-marker delivery,
+and gap reporting. The processor owners define when committed values are
+offered; the [processing lifecycle](processing-lifecycle.md#graph-lifecycle-marker-worker--settled)
+owns marker-command timing and worker lifecycle. [API publication](api-publication.md)
+owns how the private publication runtime consumes the ordered stream and
+reconstructs its derived graph projection.
 
 ## In-process graph-update feed — settled
 
@@ -31,7 +32,7 @@ The ordered stream has this semantic shape:
 
 ```rust
 enum GraphUpdate {
-    PublishPostSeal,
+    Catchup,
     BlockCommitted(BlockCommitted),
     VspcCommitted(VspcCommitted),
     Live,
@@ -53,12 +54,12 @@ struct GraphUpdateGate {
 }
 
 enum GraphUpdateGateState {
-    PreSeal,
+    AwaitingCatchup,
     Open,
 }
 
 enum GraphUpdateOfferOutcome {
-    SuppressedPreSeal,
+    SuppressedAwaitingCatchup,
     Enqueued,
     GapReported,
 }
@@ -78,7 +79,7 @@ impl GraphUpdateProducer {
         update: VspcCommitted,
     ) -> Result<GraphUpdateOfferOutcome, GraphUpdateProducerError>;
 
-    fn publish_post_seal(
+    fn publish_catchup(
         &self,
     ) -> Result<(), GraphUpdateProducerError>;
 
@@ -93,7 +94,8 @@ Supervisor supplies through ProcessingSession to both processors.
 `GraphUpdateReceiver` is the corresponding single-consumer session capability
 that Supervisor supplies through `ApiService::reset` to the session's private
 publication runtime. Every producer clone shares one `GraphUpdateGate`,
-initially `PreSeal`; the receiver does not expose that producer-side gate.
+initially `AwaitingCatchup`; the receiver does not expose that producer-side
+gate.
 `GraphUpdateGapReporter` and the consumer-side `GraphUpdateGap` refer to the
 same session-local continuity state. These names fix the semantic capability
 split. The mutex around `GraphUpdateGateState` is settled; concrete channel,
@@ -102,9 +104,9 @@ gap-counter, and wakeup types remain deferred.
 The producer exposes distinct nonblocking operations for `BlockCommitted` and
 `VspcCommitted`. Each operation holds the state mutex through classification
 and `try_send`. A closed receiver returns `ReceiverClosed`. Otherwise, in
-`PreSeal`, the operation discards the API projection update, returns
-`SuppressedPreSeal`, and does not advance the gap. The underlying database
-commit and processing-tier delivery remain valid. In `Open`, successful
+`AwaitingCatchup`, the operation discards the API projection update, returns
+`SuppressedAwaitingCatchup`, and does not advance the gap. The underlying
+database commit and processing-tier delivery remain valid. In `Open`, successful
 delivery returns `Enqueued`; `Full` discards that delivery, advances the
 session's reliable, coalescing gap generation, and returns `GapReported`.
 Every producer operation returns `ReceiverClosed` without advancing the gap
@@ -113,25 +115,37 @@ when the receiver is closed. The
 owns its active-run and expected-teardown dispositions; producer owners define
 only the local work that follows the result.
 
-The marker worker's `publish_post_seal` operation holds the same state mutex,
-requires `PreSeal`, enqueues `GraphUpdate::PublishPostSeal`, changes the state
+The marker worker's `publish_catchup` operation holds the same state mutex,
+requires `AwaitingCatchup`, enqueues `GraphUpdate::Catchup`, changes the state
 to `Open`, and releases the mutex. No ordinary value can enter before the
-marker or race between its enqueue and the state transition. Because pre-seal
-ordinary values are suppressed, this marker is the first value in the fresh
-positive-capacity channel and cannot encounter `Full`; receiver closure leaves
-the gate in `PreSeal` and returns `ReceiverClosed`.
+marker or race between its enqueue and the state transition. Because ordinary
+values are suppressed while awaiting Catchup, this marker is the first value
+in the fresh positive-capacity channel and cannot encounter `Full`; receiver
+closure leaves the gate in `AwaitingCatchup` and returns `ReceiverClosed`.
+
+This atomic enqueue-and-open operation is the complete database/stream
+boundary; marker delivery needs no completion acknowledgement. An ordinary
+offer ordered before it is suppressed only after its database commit has
+completed. Under the
+[publication lifecycle](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled),
+the seed starts only after consuming the later Catchup marker, so that commit
+is covered by the seed. An ordinary offer
+ordered after it enters the stream behind the marker. A commit covered by both
+the seed and the stream is handled by publication alignment. The
+[processing lifecycle](processing-lifecycle.md#graph-lifecycle-marker-worker--settled)
+owns command handoff and continuation without waiting for the marker to reach
+PublicationRuntime.
 
 The marker worker's `publish_live` operation requires `Open`, releases the
 state mutex, and then uses lossless delivery, awaiting channel capacity instead
 of reporting an ordinary-update gap. Its command FIFO preserves
-`PublishPostSeal` before `Live`; unrelated ordinary graph updates may
-interleave before `Live`. The runtime's reaction to a reported gap belongs to
-the [publication reconstruction contract](api-publication.md#universal-api-reconstruction--settled).
+`Catchup` before `Live`; unrelated ordinary graph updates may interleave before
+`Live`. The runtime's reaction to a reported gap belongs to the
+[publication reconstruction contract](api-publication.md#universal-api-reconstruction--settled).
 
-The [BlockProcessor marker contract](block-processing.md#graph-lifecycle-marker-delivery--settled)
-owns its worker and marker-command enqueue points. The
-[processing lifecycle](processing-lifecycle.md#live-admission) owns the global
-causality before the Live command. The publication runtime consumes the
+The [processing lifecycle](processing-lifecycle.md#graph-lifecycle-marker-worker--settled)
+owns the worker, reliable command handoffs, and their recovery-phase causality.
+The publication runtime consumes the
 resulting channel order without reconstructing those producer decisions. The
 capacity provides about 51 seconds at an expected 20 updates per second and
 about 10 seconds at 100 updates per second. Exact channel and wakeup primitives remain deferred in
