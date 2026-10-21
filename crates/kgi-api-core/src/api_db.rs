@@ -94,6 +94,34 @@ impl<G: ApiDbGeneration> ApiDbState<G> {
         });
         result
     }
+
+    /// Returns the current valid generation when public database reads are enabled.
+    pub(crate) fn public_read_client(&self) -> Option<Arc<G>> {
+        match &*self.tx.borrow() {
+            ApiDbSnapshot::Running { current: Some(current), public_reads_enabled: true } if current.is_valid() => {
+                Some(current.clone())
+            }
+            ApiDbSnapshot::Running { .. } | ApiDbSnapshot::Stopped => None,
+        }
+    }
+
+    /// Waits for and returns the next valid current generation, or `None` after stop.
+    pub(crate) async fn current(&self) -> Option<Arc<G>> {
+        let mut snapshots = self.tx.subscribe();
+        loop {
+            {
+                let snapshot = snapshots.borrow_and_update();
+                match &*snapshot {
+                    ApiDbSnapshot::Running { current: Some(current), .. } if current.is_valid() => {
+                        return Some(current.clone());
+                    }
+                    ApiDbSnapshot::Running { .. } => {}
+                    ApiDbSnapshot::Stopped => return None,
+                }
+            }
+            snapshots.changed().await.expect("ApiDbState retains its sender while current() is waiting");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -222,5 +250,72 @@ mod tests {
 
         assert!(current(&state).is_some_and(|current| Arc::ptr_eq(&current, &generation)));
         assert!(!snapshots.has_changed().expect("binding remains open"));
+    }
+
+    #[test]
+    fn public_read_admission_is_immediate_and_requires_an_enabled_valid_current_generation() {
+        let state = ApiDbState::<TestGeneration>::new();
+        assert!(state.public_read_client().is_none());
+
+        let generation = TestGeneration::valid();
+        state.update(ApiDbGenerationEvent::Published(generation.clone())).expect("publication succeeds");
+        assert!(state.public_read_client().is_some_and(|current| Arc::ptr_eq(&current, &generation)));
+
+        generation.retire();
+        assert!(state.public_read_client().is_none());
+
+        let replacement = TestGeneration::valid();
+        state.update(ApiDbGenerationEvent::Published(replacement.clone())).expect("replacement succeeds");
+        state.tx.send_modify(|snapshot| {
+            let ApiDbSnapshot::Running { public_reads_enabled, .. } = snapshot else {
+                panic!("test binding remains running");
+            };
+            *public_reads_enabled = false;
+        });
+        assert!(state.public_read_client().is_none());
+    }
+
+    #[tokio::test]
+    async fn construction_waits_through_absence_and_wakes_for_a_valid_publication() {
+        let state = Arc::new(ApiDbState::<TestGeneration>::new());
+        let waiter = {
+            let state = state.clone();
+            tokio::spawn(async move { state.current().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        let generation = TestGeneration::valid();
+        state.update(ApiDbGenerationEvent::Published(generation.clone())).expect("publication succeeds");
+
+        let observed = waiter.await.expect("waiter task succeeds").expect("publication satisfies the waiter");
+        assert!(Arc::ptr_eq(&observed, &generation));
+    }
+
+    #[tokio::test]
+    async fn construction_ignores_the_public_gate_and_waits_past_an_invalid_current_generation() {
+        let state = Arc::new(ApiDbState::<TestGeneration>::new());
+        let invalid = TestGeneration::valid();
+        state.update(ApiDbGenerationEvent::Published(invalid.clone())).expect("publication succeeds");
+        invalid.retire();
+        state.tx.send_modify(|snapshot| {
+            let ApiDbSnapshot::Running { public_reads_enabled, .. } = snapshot else {
+                panic!("test binding remains running");
+            };
+            *public_reads_enabled = false;
+        });
+
+        let waiter = {
+            let state = state.clone();
+            tokio::spawn(async move { state.current().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        let replacement = TestGeneration::valid();
+        state.update(ApiDbGenerationEvent::Published(replacement.clone())).expect("replacement succeeds");
+
+        let observed = waiter.await.expect("waiter task succeeds").expect("replacement satisfies the waiter");
+        assert!(Arc::ptr_eq(&observed, &replacement));
     }
 }
