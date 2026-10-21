@@ -1003,3 +1003,15 @@ its boolean result to control notification. A captured typed result
 distinguishes rejection from an accepted no-op without adding another state
 lock. The event semantics are owned by
 [API Service](../architecture/api-service.md#api-database-generation-binding--settled).
+
+### Snapshot observation and waiting
+
+Use `watch::Sender::borrow` for the immediate accessor so it allocates no
+receiver and retains no binding lock after cloning the selected generation.
+The waiting accessor subscribes before its first inspection, then alternates
+`borrow_and_update` with `changed`; this closes the inspection-to-suspension
+race without polling or exposing a receiver. Keep Rebuild, admission-gate, and
+terminal mutations on `send_if_modified` as well, leaving the watch value as
+the module's only synchronization domain. The accessor and transition
+semantics remain owned by
+[API Service](../architecture/api-service.md#api-database-generation-binding--settled).
