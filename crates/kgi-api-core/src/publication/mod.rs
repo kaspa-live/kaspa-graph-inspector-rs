@@ -2,6 +2,7 @@
 
 mod error;
 mod estimate;
+pub(crate) mod runtime;
 
 use std::{sync::Arc, time::Instant};
 
