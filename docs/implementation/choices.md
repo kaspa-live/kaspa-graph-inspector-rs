@@ -978,3 +978,18 @@ acquires only registry state. Publication replacement will acquire two registry
 states in stable address order before the shared mailbox; no path acquires a
 registry while retaining a mailbox guard. Readiness notification and connection
 cancellation occur after releasing the applicable state guards.
+
+## 21 October 2026: API database binding foundation
+
+### Module placement and deterministic generation seam
+
+Place the ApiService-owned latest API database-generation value in the private
+`kgi_api_core::api_db` module, with no crate-root re-export. Use the settled
+Tokio watch sender as the sole synchronized snapshot owner.
+
+Keep the production type parameter defaulted to
+`kgi_storage::generation::ValidatedApiDbClient`, while expressing the one
+required observation through a private `ApiDbGeneration` trait. This permits
+deterministic unit fixtures for validity and exact `Arc` identity without
+adding a public Storage test constructor, opening a PostgreSQL fixture, or
+introducing a trait object into the production binding.
