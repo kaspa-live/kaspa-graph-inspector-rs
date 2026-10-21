@@ -87,8 +87,8 @@ do not enlarge the PR silently. Any future regrouping requires updating this
 sequence first.
 
 The former broad Step 6 is now increments 6–17, former Step 7 is increments
-18–22, and former Step 8 is increments 23–27. Increments 6–11 are complete;
-the active work is increment 12, without an additional nesting level.
+18–22, and former Step 8 is increments 23–27. Increments 6–12 are complete;
+the active work is increment 13, without an additional nesting level.
 
 | Increment / PR | Isolated production scope | Completion evidence |
 |---|---|---|
@@ -115,49 +115,56 @@ the active work is increment 12, without an additional nesting level.
 | 26. Deployment and release artifacts | Complete the conventional and Docker layouts, runtime log directories, systemd and Compose examples, static-asset cache behavior, and atomic `xtask` bundle/container construction against the composed binary and Web build. | Reproducible bundle and image checks, matching binary/assets and provenance, missing-root failure, unprivileged/read-only deployment, writable logs, direct signal delivery, and atomic failure cleanup. |
 | 27. Full-stack acceptance | Add only the remaining cross-component fixtures and acceptance coverage needed to prove the focused verification contract across node RPC, PostgreSQL, recovery, API/Web, packaging, logging, and resource isolation; update implementation status with the final evidence. | Full Rust, PostgreSQL, Vitest, deterministic and complete-stack Playwright, parity, packaging, shutdown, and load/isolation suites pass from a clean checkout. |
 
-### Active increment 12: API database binding
+### Active increment 13: publication runtime
 
-Increment 12 is exactly one reviewable PR. It implements only the
-ApiService-owned latest-value binding between ordered API database-generation
-events and future construction or public-read consumers. The focused
-[ApiService database-binding contract](../architecture/api-service.md#api-database-generation-binding--settled)
-owns this state; Storage retains generation validity, retirement,
-reacquisition, and replacement exclusion.
+Increment 13 is exactly one reviewable PR. It implements only the private,
+session-bound `PublicationRuntime` owned by the focused
+[publication runtime contract](../architecture/api-publication.md#publication-runtime--settled).
+It consumes the graph-update ingress and the API database binding completed by
+earlier increments, constructs and advances publication candidates, and asks
+the future ApiService integration boundary to install a completed publication.
 
-Execute increment 12 as these ordered points:
+Execute increment 13 as these ordered points:
 
-1. Add a private `api_db` module in `kgi-api-core` containing the concrete
-   `ApiDbGenerationEvent`, complete `ApiDbSnapshot`, and watch-backed
-   `ApiDbState`. Initialize it with no current generation and public reads
-   enabled. Keep the production state bound to `ValidatedApiDbClient`; use only
-   a private lightweight generation abstraction for deterministic unit tests.
-2. Implement synchronous ordered generation updates and their focused tests
-   according to the event and notification contract owned by
-   [API Service](../architecture/api-service.md#api-database-generation-binding--settled).
-3. Implement the two read paths. `public_read_client()` performs one immediate
-   snapshot read and admits only an enabled, present, still-valid generation.
-   `current().await` ignores the public-read gate, waits through absent or
-   invalid generations without polling or timeout, wakes on replacement, and
-   returns `None` only after stop.
-4. Implement the private gate transitions needed by later ApiService
-   integration: Rebuild atomically unbinds the current generation and disables
-   public reads without invalidating it; publication installation changes only
-   the public-read flag; terminal stop atomically drops the bound generation,
-   wakes construction waiters, and is idempotent.
-5. Add deterministic lifecycle and race coverage for initial absence,
-   publication and exact retirement, repeated and stale events, invalid
-   handles, immediate public admission, construction waiting and wakeup,
-   invalid-current waiting, Rebuild disable/reopen, generation turnover,
-   stop/update linearization in both outcomes, waiter
-   release on stop, and reference release.
-6. Record the completed implementation choice and status, confirm that the
-   binding changes no graph publication or Storage lifecycle state, and run the
-   full Rust validation suite.
+1. Add the private publication-runtime module, completed shutdown barrier,
+   cancellation ownership, bounded staging state and measurements, initial
+   `PreSeal` handling, and quiescent receiver-closure behavior. Keep its
+   dependency and test seams private to `kgi-api-core`.
+2. Implement database construction after the first `PublishPostSeal`: wait
+   through `ApiDbState::current()`, load `HeadPublication` through one exact
+   `ValidatedApiDbClient`, create the revision-zero Head candidate and history,
+   stage concurrent ordinary updates, and retain `Live` as sticky target state.
+3. Implement dual-cut alignment, including independent block-ID and VSPC-source
+   cuts, both crossing orders, a no-effect block crossing, continued application
+   after one source crosses, indefinite idle-source waiting, and ordered replay
+   through the captured prewarming frontier.
+4. Implement mandatory tier-50 prewarming by reusing the publication cache,
+   tracked cache jobs, graph codec, and encoding scheduler. Retry failed or
+   hard-aged captures, continue applying ordinary updates while encoding, and
+   request installation through a narrow private capability that returns the
+   architecture-owned `Installed` or `Superseded` outcome. Leave the concrete
+   generation fence, current-publication slot, and Rebuild gate reopening to
+   increment 14.
+5. Implement the universal reconstruction path for continuity gaps, staging
+   overflow, database read failures, alignment failures, and publication
+   projection failures. Drain through the first observed empty frontier,
+   preserve sticky `Live`, record the newest gap generation, and reconstruct
+   without requesting processing recovery.
+6. Complete terminal lifecycle behavior and deterministic verification:
+   shutdown from every runtime state, Active-to-Stale ordering, repeated
+   shutdown observation, abandoned seed and prewarming work, receiver closure,
+   installation supersession, unexpected worker failure propagation, staging
+   and reconstruction measurements, and proof that no runtime-owned task
+   survives completion.
+7. Record the completed implementation choices and status, confirm that the
+   runtime adds no ApiService control or public request path, and run the full
+   Rust validation suite.
 
-This increment adds no `PublicationRuntime`, ApiService runtime slot,
-publication installation, Supervisor event forwarding, HTTP request handler,
-database query, Storage replacement control, or shutdown orchestration. Those
-consumers integrate the binding in increments 13–17 and 20.
+This increment adds no ApiService runtime slot, reset serialization, concrete
+publication-generation fence, current-publication watch, database-read gate
+reopening, Supervisor event forwarding, logical public request operation, or
+HTTP/SSE transport. Increment 14 integrates the runtime with those ApiService
+control responsibilities.
 
 ## Cross-increment ordering
 
