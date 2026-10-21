@@ -993,3 +993,13 @@ required observation through a private `ApiDbGeneration` trait. This permits
 deterministic unit fixtures for validity and exact `Arc` identity without
 adding a public Storage test constructor, opening a PostgreSQL fixture, or
 introducing a trait object into the production binding.
+
+### Update linearization
+
+Apply each generation event through `watch::Sender::send_if_modified` rather
+than adding an outer mutex beside the settled watch value. The closure performs
+the event classification while holding the watch value's write guard and uses
+its boolean result to control notification. A captured typed result
+distinguishes rejection from an accepted no-op without adding another state
+lock. The event semantics are owned by
+[API Service](../architecture/api-service.md#api-database-generation-binding--settled).

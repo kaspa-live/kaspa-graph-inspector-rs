@@ -131,11 +131,9 @@ Execute increment 12 as these ordered points:
    `ApiDbState`. Initialize it with no current generation and public reads
    enabled. Keep the production state bound to `ValidatedApiDbClient`; use only
    a private lightweight generation abstraction for deterministic unit tests.
-2. Implement synchronous ordered generation updates. Accept a valid published
-   exact generation, retire only the exact currently bound `Arc`, make stale
-   and repeated events idempotent, reject a distinct invalid publication, and
-   reject every update after terminal stop. Each accepted event publishes one
-   complete latest-value snapshot.
+2. Implement synchronous ordered generation updates and their focused tests
+   according to the event and notification contract owned by
+   [API Service](../architecture/api-service.md#api-database-generation-binding--settled).
 3. Implement the two read paths. `public_read_client()` performs one immediate
    snapshot read and admits only an enabled, present, still-valid generation.
    `current().await` ignores the public-read gate, waits through absent or

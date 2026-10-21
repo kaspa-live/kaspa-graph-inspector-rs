@@ -13,7 +13,7 @@ pub(crate) trait ApiDbGeneration: Send + Sync + 'static {
 
 impl ApiDbGeneration for ValidatedApiDbClient {
     fn is_valid(&self) -> bool {
-        self.is_valid()
+        ValidatedApiDbClient::is_valid(self)
     }
 }
 
@@ -40,6 +40,17 @@ pub(crate) enum ApiDbSnapshot<G = ValidatedApiDbClient> {
     Stopped,
 }
 
+/// Rejection of one API database-generation update.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum ApiDbUpdateError {
+    /// The supplied publication is already terminally invalid.
+    #[error("cannot publish an invalid API database generation")]
+    InvalidGeneration,
+    /// The binding has crossed its terminal update cutoff.
+    #[error("API database binding is stopped")]
+    Stopped,
+}
+
 /// Watch-backed latest-value API database binding.
 pub(crate) struct ApiDbState<G = ValidatedApiDbClient> {
     tx: watch::Sender<ApiDbSnapshot<G>>,
@@ -51,17 +62,77 @@ impl<G: ApiDbGeneration> ApiDbState<G> {
         let (tx, _) = watch::channel(ApiDbSnapshot::Running { current: None, public_reads_enabled: true });
         Self { tx }
     }
+
+    /// Applies one ordered exact-generation event and publishes its complete snapshot.
+    pub(crate) fn update(&self, event: ApiDbGenerationEvent<G>) -> Result<(), ApiDbUpdateError> {
+        let mut result = Ok(());
+        self.tx.send_if_modified(|snapshot| match snapshot {
+            ApiDbSnapshot::Stopped => {
+                result = Err(ApiDbUpdateError::Stopped);
+                false
+            }
+            ApiDbSnapshot::Running { current, .. } => match &event {
+                ApiDbGenerationEvent::Retired(retired) => {
+                    let exact = current.as_ref().is_some_and(|bound| Arc::ptr_eq(bound, retired));
+                    if exact {
+                        *current = None;
+                    }
+                    exact
+                }
+                ApiDbGenerationEvent::Published(published) => {
+                    if current.as_ref().is_some_and(|bound| Arc::ptr_eq(bound, published)) {
+                        return false;
+                    }
+                    if !published.is_valid() {
+                        result = Err(ApiDbUpdateError::InvalidGeneration);
+                        return false;
+                    }
+                    *current = Some(published.clone());
+                    true
+                }
+            },
+        });
+        result
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiDbGeneration, ApiDbSnapshot, ApiDbState};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
-    struct TestGeneration;
+    use super::{ApiDbGeneration, ApiDbGenerationEvent, ApiDbSnapshot, ApiDbState, ApiDbUpdateError};
+
+    struct TestGeneration {
+        valid: AtomicBool,
+    }
+
+    impl TestGeneration {
+        fn valid() -> Arc<Self> {
+            Arc::new(Self { valid: AtomicBool::new(true) })
+        }
+
+        fn invalid() -> Arc<Self> {
+            Arc::new(Self { valid: AtomicBool::new(false) })
+        }
+
+        fn retire(&self) {
+            self.valid.store(false, Ordering::Release);
+        }
+    }
 
     impl ApiDbGeneration for TestGeneration {
         fn is_valid(&self) -> bool {
-            true
+            self.valid.load(Ordering::Acquire)
+        }
+    }
+
+    fn current(state: &ApiDbState<TestGeneration>) -> Option<Arc<TestGeneration>> {
+        match &*state.tx.borrow() {
+            ApiDbSnapshot::Running { current, .. } => current.clone(),
+            ApiDbSnapshot::Stopped => None,
         }
     }
 
@@ -71,5 +142,85 @@ mod tests {
         let snapshot = state.tx.borrow();
 
         assert!(matches!(&*snapshot, ApiDbSnapshot::Running { current: None, public_reads_enabled: true }));
+    }
+
+    #[test]
+    fn publication_and_retirement_follow_exact_arc_identity() {
+        let state = ApiDbState::<TestGeneration>::new();
+        let first = TestGeneration::valid();
+        let replacement = TestGeneration::valid();
+
+        state.update(ApiDbGenerationEvent::Published(first.clone())).expect("first generation is accepted");
+        assert!(current(&state).is_some_and(|current| Arc::ptr_eq(&current, &first)));
+
+        state.update(ApiDbGenerationEvent::Published(replacement.clone())).expect("replacement generation is accepted");
+        state.update(ApiDbGenerationEvent::Retired(first)).expect("stale retirement is idempotent");
+        assert!(current(&state).is_some_and(|current| Arc::ptr_eq(&current, &replacement)));
+
+        state.update(ApiDbGenerationEvent::Retired(replacement)).expect("exact retirement is accepted");
+        assert!(current(&state).is_none());
+    }
+
+    #[test]
+    fn only_state_changing_events_publish_a_complete_snapshot() {
+        let state = ApiDbState::<TestGeneration>::new();
+        let generation = TestGeneration::valid();
+        let mut snapshots = state.tx.subscribe();
+
+        state.update(ApiDbGenerationEvent::Published(generation.clone())).expect("publication succeeds");
+        assert!(snapshots.has_changed().expect("binding remains open"));
+        snapshots.borrow_and_update();
+
+        state.update(ApiDbGenerationEvent::Published(generation.clone())).expect("repeated publication is idempotent");
+        assert!(!snapshots.has_changed().expect("binding remains open"));
+
+        let stale = TestGeneration::valid();
+        state.update(ApiDbGenerationEvent::Retired(stale)).expect("stale retirement is idempotent");
+        assert!(!snapshots.has_changed().expect("binding remains open"));
+        assert!(current(&state).is_some_and(|current| Arc::ptr_eq(&current, &generation)));
+
+        state.update(ApiDbGenerationEvent::Retired(generation)).expect("exact retirement succeeds");
+        assert!(snapshots.has_changed().expect("binding remains open"));
+    }
+
+    #[test]
+    fn a_distinct_invalid_publication_is_rejected_without_changing_or_publishing_state() {
+        let state = ApiDbState::<TestGeneration>::new();
+        let current_generation = TestGeneration::valid();
+        state.update(ApiDbGenerationEvent::Published(current_generation.clone())).expect("valid generation is accepted");
+        let snapshots = state.tx.subscribe();
+        let invalid = TestGeneration::invalid();
+
+        assert_eq!(state.update(ApiDbGenerationEvent::Published(invalid)), Err(ApiDbUpdateError::InvalidGeneration));
+
+        assert!(!snapshots.has_changed().expect("binding remains open"));
+        assert!(current(&state).is_some_and(|current| Arc::ptr_eq(&current, &current_generation)));
+    }
+
+    #[test]
+    fn stopped_binding_rejects_every_later_generation_event() {
+        let state = ApiDbState::<TestGeneration>::new();
+        state.tx.send_replace(ApiDbSnapshot::Stopped);
+        let snapshots = state.tx.subscribe();
+
+        assert_eq!(state.update(ApiDbGenerationEvent::Published(TestGeneration::valid())), Err(ApiDbUpdateError::Stopped));
+        assert_eq!(state.update(ApiDbGenerationEvent::Retired(TestGeneration::valid())), Err(ApiDbUpdateError::Stopped));
+        assert!(!snapshots.has_changed().expect("binding remains observable"));
+    }
+
+    #[test]
+    fn repeating_the_bound_publication_remains_idempotent_after_external_invalidation() {
+        let state = ApiDbState::<TestGeneration>::new();
+        let generation = TestGeneration::valid();
+        state.update(ApiDbGenerationEvent::Published(generation.clone())).expect("publication succeeds");
+        generation.retire();
+        let snapshots = state.tx.subscribe();
+
+        state
+            .update(ApiDbGenerationEvent::Published(generation.clone()))
+            .expect("same-Arc delivery is idempotent rather than a republication");
+
+        assert!(current(&state).is_some_and(|current| Arc::ptr_eq(&current, &generation)));
+        assert!(!snapshots.has_changed().expect("binding remains open"));
     }
 }
