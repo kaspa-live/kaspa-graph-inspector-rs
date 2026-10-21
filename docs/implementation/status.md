@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 20 October 2026.
+Updated 21 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -328,5 +328,24 @@ identifier collisions, atomic admission, mailbox ordering and closure,
 Head/rearm and registration/lifecycle linearizations in both orders,
 replacement, stale weak registrations, and maximum-revision saturation.
 Completion validation passed workspace formatting, Cargo check, 470/470
+Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
+with warnings denied, and `git diff --check`.
+
+Implementation increment 12 is implemented: the private `kgi-api-core`
+`api_db` module contains the watch-backed API database binding, its ordered
+generation-event and complete-snapshot values, synchronous update and gate
+entry points, immediate and waiting accessors, and terminal cutoff. Production
+specialization remains `ValidatedApiDbClient`; a private generic validity seam
+supports deterministic tests without exposing a Storage test constructor or a
+trait object. The module has no crate-root re-export and imports neither graph
+publication values nor StorageService lifecycle authority. It observes only
+the validated generation's terminal validity, so this increment changes no
+graph publication or Storage lifecycle state. Focused tests cover initial
+absence, exact generation identity and turnover, stale and repeated events,
+invalid handles, immediate admission, construction waiting and wakeup,
+Rebuild gate transitions, both sides of the stop cutoff, terminal waiter
+release, and generation-reference release. Seed construction, public request
+handlers, and ApiService integration remain in later increments.
+Completion validation passed workspace formatting, Cargo check, 486/486
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.

@@ -978,3 +978,40 @@ acquires only registry state. Publication replacement will acquire two registry
 states in stable address order before the shared mailbox; no path acquires a
 registry while retaining a mailbox guard. Readiness notification and connection
 cancellation occur after releasing the applicable state guards.
+
+## 21 October 2026: API database binding foundation
+
+### Module placement and deterministic generation seam
+
+Place the ApiService-owned latest API database-generation value in the private
+`kgi_api_core::api_db` module, with no crate-root re-export. Use the settled
+Tokio watch sender as the sole synchronized snapshot owner.
+
+Keep the production type parameter defaulted to
+`kgi_storage::generation::ValidatedApiDbClient`, while expressing the one
+required observation through a private `ApiDbGeneration` trait. This permits
+deterministic unit fixtures for validity and exact `Arc` identity without
+adding a public Storage test constructor, opening a PostgreSQL fixture, or
+introducing a trait object into the production binding.
+
+### Update linearization
+
+Apply each generation event through `watch::Sender::send_if_modified` rather
+than adding an outer mutex beside the settled watch value. The closure performs
+the event classification while holding the watch value's write guard and uses
+its boolean result to control notification. A captured typed result
+distinguishes rejection from an accepted no-op without adding another state
+lock. The event semantics are owned by
+[API Service](../architecture/api-service.md#api-database-generation-binding--settled).
+
+### Snapshot observation and waiting
+
+Use `watch::Sender::borrow` for the immediate accessor so it allocates no
+receiver and retains no binding lock after cloning the selected generation.
+The waiting accessor subscribes before its first inspection, then alternates
+`borrow_and_update` with `changed`; this closes the inspection-to-suspension
+race without polling or exposing a receiver. Keep Rebuild, admission-gate, and
+terminal mutations on `send_if_modified` as well, leaving the watch value as
+the module's only synchronization domain. The accessor and transition
+semantics remain owned by
+[API Service](../architecture/api-service.md#api-database-generation-binding--settled).

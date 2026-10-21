@@ -89,9 +89,10 @@ generation-loss event.
 `Published(client)` sets `current = Some(client)` only for the valid published
 handle. `Retired(lost)` clears `current` only when it still holds that exact
 `Arc`; a late retirement for an older generation cannot clear a newer binding.
-Repeating either event for the same `Arc` is idempotent. Each accepted event
-publishes the resulting complete snapshot. The reliable Supervisor call
-returns after this local state transition has completed.
+Repeating either event for the same `Arc` is idempotent and does not publish a
+new watch revision. A state-changing accepted event publishes the resulting
+complete snapshot. The reliable Supervisor call returns after this local state
+transition has completed.
 
 `public_read_client()` is an immediate snapshot read. It returns a clone only
 when the state is `Running`, public reads are enabled, a current client exists,

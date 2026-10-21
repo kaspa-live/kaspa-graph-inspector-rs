@@ -2,6 +2,7 @@
 
 //! ApiService, graph publication, and HTTP/SSE runtime.
 
+pub(crate) mod api_db;
 pub(crate) mod cache;
 pub(crate) mod client;
 pub(crate) mod codec;

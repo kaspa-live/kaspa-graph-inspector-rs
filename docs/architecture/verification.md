@@ -1842,6 +1842,9 @@ returns a client only while the gate is open and the current exact client is
 valid. Verify `current().await` ignores that gate, waits through an absent or
 invalid current client, wakes on a valid published replacement, and returns
 `None` only after ApiDbState becomes `Stopped`.
+Exercise repeated publication and stale or repeated retirement against the
+[API database generation binding](api-service.md#api-database-generation-binding--settled)
+contract, including observation through the watch receiver.
 
 From an Active publication using `G1`, make a public database operation report
 `GenerationLost`. StorageService must atomically retire `G1`, emit exactly one
