@@ -18,10 +18,9 @@ has been replaced by Vite and the imported source builds with the workspace's
 React 19 and TypeScript 7 toolchain. The shared `kgi-model` domain, lifecycle,
 fault, status, VSPC, and committed graph-update values are implemented against
 the selected rusty-kaspa `v2.1.0` value crates. The session-scoped graph-update
-ingress currently implements the superseded PostSeal gate and marker names,
+ingress implements the accepted AwaitingCatchup gate and Catchup marker,
 along with nonblocking ordinary offers, lossless lifecycle markers, coalescing
-gap observation, and ingress metrics. It must be adapted to the accepted
-AwaitingCatchup gate before publication-runtime implementation continues.
+gap observation, and ingress metrics.
 ApiService orchestration remains behavior-free scaffolding; `kgi-api-core`
 contains the in-memory publication kernel described below. The processing
 crate contains the session-scoped BlockProcessor and VspcProcessor slices
@@ -185,21 +184,18 @@ failure, cancellation, terminal backlog preemption, and exact RPC-generation
 release. Unexpected loss of an active processor or descendant command path is
 reported through the typed ownership-fault path rather than interpreted as
 ordinary shutdown.
-The current BlockProcessor-owned lifecycle-marker worker provides the
-nonblocking two-command local FIFO, lossless graph-ingress delivery,
-accepted-command drain after local closure, and receiver-closure termination
-without retaining RPC or database generations. The accepted architecture now
-relocates that worker to ProcessingSession and changes its first command to
-Catchup; this implementation remains to be adapted before integration. The
-BlockProcessor owner loop implements explicit input
+The superseded BlockProcessor-owned lifecycle-marker worker and its API marker
+effects have been removed. The ProcessingSession-owned worker remains scheduled
+for increment 18. The BlockProcessor owner loop implements explicit input
 priority, notification gating, phase-specific materialization policy, PostSeal
 transition, graph-before-persisted delivery, Catchup lower-bound and
 source-overlap accounting, child fault provenance, and typed storage and node
 fault normalization. Focused tests cover inert construction and initialization,
-single launch, final startup-handoff failure, Genesis and non-Genesis marker
-paths, strict sealing, closed-gate discard, late notification filtering, exact
-overlap, post-commit delivery loss, API receiver closure, terminal input
-preemption, complete descendant joining, and session-generation release.
+single launch, final startup-milestone failure, Genesis and non-Genesis sealing
+without API marker publication, closed-gate discard, late notification
+filtering, exact overlap, post-commit delivery loss, API receiver closure,
+terminal input preemption, complete descendant joining, and session-generation
+release.
 The VspcProcessor owner loop now retains its exact session RPC and processing
 database generations, anchor-derived sink and materialization history,
 multi-index pending state, synthetic FIFO, ordered resolved notifications,

@@ -1268,8 +1268,8 @@ mod tests {
         let rpc = MockRpc::new();
         let (persisted_tx, persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (graph_tx, mut graph_rx) = graph_update_channel();
-        graph_tx.publish_post_seal().expect("open graph producer gate");
-        assert_eq!(graph_rx.try_recv_update(), Ok(GraphUpdate::PublishPostSeal));
+        graph_tx.publish_catchup().expect("open graph producer gate");
+        assert_eq!(graph_rx.try_recv_update(), Ok(GraphUpdate::Catchup));
         let (mut processor, events) = VspcProcessor::new(RecoveryMode::Resync, rpc.clone(), db.clone(), graph_tx, persisted_rx);
         processor.initialize(anchor).expect("VspcProcessor initialization");
         processor.start().expect("VspcProcessor start");

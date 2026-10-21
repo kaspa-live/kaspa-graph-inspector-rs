@@ -26,14 +26,14 @@ impl GraphUpdateGate {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GraphUpdateGateState {
-    PreSeal,
+    AwaitingCatchup,
     Open,
 }
 
 /// Result of offering an ordinary committed graph update.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GraphUpdateOfferOutcome {
-    SuppressedPreSeal,
+    SuppressedAwaitingCatchup,
     Enqueued,
     GapReported,
 }
@@ -175,8 +175,8 @@ impl GraphUpdateProducer {
             return Err(GraphUpdateProducerError::ReceiverClosed);
         }
 
-        if *state == GraphUpdateGateState::PreSeal {
-            return Ok(GraphUpdateOfferOutcome::SuppressedPreSeal);
+        if *state == GraphUpdateGateState::AwaitingCatchup {
+            return Ok(GraphUpdateOfferOutcome::SuppressedAwaitingCatchup);
         }
 
         match self.try_send(update) {
@@ -189,7 +189,7 @@ impl GraphUpdateProducer {
         }
     }
 
-    /// Publishes the first session marker and opens the shared producer gate.
+    /// Publishes the session Catchup marker and opens the shared producer gate.
     ///
     /// # Errors
     ///
@@ -198,20 +198,20 @@ impl GraphUpdateProducer {
     ///
     /// # Panics
     ///
-    /// Panics when the shared producer gate is not in its initial pre-seal
+    /// Panics when the shared producer gate is not awaiting Catchup
     /// state.
-    pub fn publish_post_seal(&self) -> Result<(), GraphUpdateProducerError> {
+    pub fn publish_catchup(&self) -> Result<(), GraphUpdateProducerError> {
         let mut state = self.gate.state.lock().expect("graph-update gate mutex poisoned");
-        assert_eq!(*state, GraphUpdateGateState::PreSeal, "PublishPostSeal requires the PreSeal graph-update gate");
+        assert_eq!(*state, GraphUpdateGateState::AwaitingCatchup, "Catchup requires the AwaitingCatchup graph-update gate");
 
-        match self.try_send(GraphUpdate::PublishPostSeal) {
+        match self.try_send(GraphUpdate::Catchup) {
             Ok(()) => {
                 *state = GraphUpdateGateState::Open;
                 Ok(())
             }
             Err(GraphUpdateTrySendError::Closed) => Err(GraphUpdateProducerError::ReceiverClosed),
             Err(GraphUpdateTrySendError::Full) => {
-                unreachable!("PublishPostSeal must be the first value in a positive-capacity channel")
+                unreachable!("Catchup must be the first value in a positive-capacity channel")
             }
         }
     }
@@ -316,7 +316,7 @@ impl GraphUpdateReceiver {
     ///
     /// An already reported gap takes priority. Call [`Self::recv_update`]
     /// when channel order must be observed independently, including while
-    /// awaiting the first `PublishPostSeal` marker.
+    /// awaiting the first `Catchup` marker.
     pub async fn next_event(&mut self) -> Option<GraphUpdateReceiveEvent> {
         loop {
             if let Some(generation) = self.gap.take_pending() {
@@ -386,7 +386,7 @@ pub fn graph_update_channel() -> (GraphUpdateProducer, GraphUpdateReceiver) {
     let (gap_tx, gap_rx) = watch::channel(0);
     let channel_state = GraphUpdateChannelState::new();
     let gate = Arc::new(GraphUpdateGate::new(
-        Mutex::new(GraphUpdateGateState::PreSeal),
+        Mutex::new(GraphUpdateGateState::AwaitingCatchup),
         GraphUpdateGapReporter::new(gap_tx, channel_state.clone()),
     ));
 
@@ -422,29 +422,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_seal_offers_are_suppressed_without_a_gap() {
+    async fn pre_catchup_offers_are_suppressed_without_a_gap() {
         let (producer, mut receiver) = graph_update_channel();
 
-        assert_eq!(producer.offer_vspc_committed(vspc_update(1)), Ok(GraphUpdateOfferOutcome::SuppressedPreSeal));
+        assert_eq!(producer.offer_vspc_committed(vspc_update(1)), Ok(GraphUpdateOfferOutcome::SuppressedAwaitingCatchup));
         assert_eq!(receiver.gap_generation(), 0);
         assert_eq!(receiver.try_recv_update(), Err(mpsc::error::TryRecvError::Empty));
         assert_eq!(producer.metrics().current_occupancy, 0);
     }
 
     #[tokio::test]
-    async fn post_seal_is_first_and_opens_every_producer_clone() {
+    async fn catchup_is_first_and_opens_every_producer_clone() {
         let (producer, mut receiver) = graph_update_channel();
         let clone = producer.clone();
 
-        producer.publish_post_seal().expect("receiver is open");
+        producer.publish_catchup().expect("receiver is open");
         assert_eq!(clone.offer_vspc_committed(vspc_update(2)), Ok(GraphUpdateOfferOutcome::Enqueued));
 
-        assert_eq!(receiver.recv_update().await, Some(GraphUpdate::PublishPostSeal));
+        assert_eq!(receiver.recv_update().await, Some(GraphUpdate::Catchup));
         assert_eq!(receiver.recv_update().await, Some(GraphUpdate::VspcCommitted(vspc_update(2))));
     }
 
     #[tokio::test]
-    async fn racing_post_seal_and_ordinary_offer_preserve_the_gate_boundary() {
+    async fn racing_catchup_and_ordinary_offer_preserve_the_gate_boundary() {
         let (producer, mut receiver) = graph_update_channel();
         let _keepalive = producer.clone();
         let ordinary_producer = producer.clone();
@@ -453,7 +453,7 @@ mod tests {
         let marker_start = start.clone();
         let marker = tokio::spawn(async move {
             marker_start.wait().await;
-            producer.publish_post_seal()
+            producer.publish_catchup()
         });
         let ordinary_start = start.clone();
         let ordinary = tokio::spawn(async move {
@@ -464,9 +464,9 @@ mod tests {
 
         assert_eq!(marker.await.expect("marker task joins"), Ok(()));
         let ordinary_outcome = ordinary.await.expect("ordinary task joins").expect("receiver is open");
-        assert_eq!(receiver.try_recv_update(), Ok(GraphUpdate::PublishPostSeal));
+        assert_eq!(receiver.try_recv_update(), Ok(GraphUpdate::Catchup));
         match ordinary_outcome {
-            GraphUpdateOfferOutcome::SuppressedPreSeal => {
+            GraphUpdateOfferOutcome::SuppressedAwaitingCatchup => {
                 assert_eq!(receiver.try_recv_update(), Err(mpsc::error::TryRecvError::Empty));
             }
             GraphUpdateOfferOutcome::Enqueued => {
@@ -479,7 +479,7 @@ mod tests {
     #[tokio::test]
     async fn a_final_full_offer_reports_a_coalescing_gap() {
         let (producer, mut receiver) = graph_update_channel();
-        producer.publish_post_seal().expect("receiver is open");
+        producer.publish_catchup().expect("receiver is open");
 
         for byte in 0..(GRAPH_UPDATE_CHANNEL_CAPACITY - 1) {
             assert_eq!(producer.offer_vspc_committed(vspc_update(byte as u8)), Ok(GraphUpdateOfferOutcome::Enqueued));
@@ -502,7 +502,7 @@ mod tests {
     #[tokio::test]
     async fn live_waits_for_capacity_and_preserves_channel_order() {
         let (producer, mut receiver) = graph_update_channel();
-        producer.publish_post_seal().expect("receiver is open");
+        producer.publish_catchup().expect("receiver is open");
         for byte in 0..(GRAPH_UPDATE_CHANNEL_CAPACITY - 1) {
             assert_eq!(producer.offer_vspc_committed(vspc_update(byte as u8)), Ok(GraphUpdateOfferOutcome::Enqueued));
         }
@@ -512,7 +512,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!live.is_finished());
 
-        assert_eq!(receiver.recv_update().await, Some(GraphUpdate::PublishPostSeal));
+        assert_eq!(receiver.recv_update().await, Some(GraphUpdate::Catchup));
         assert_eq!(live.await.expect("task joins"), Ok(()));
 
         for _ in 0..(GRAPH_UPDATE_CHANNEL_CAPACITY - 1) {
@@ -524,7 +524,7 @@ mod tests {
     #[tokio::test]
     async fn live_reports_receiver_closed_when_receiver_drops_after_reservation() {
         let (producer, receiver) = graph_update_channel();
-        producer.publish_post_seal().expect("receiver is open");
+        producer.publish_catchup().expect("receiver is open");
 
         let reserved = Arc::new(tokio::sync::Barrier::new(2));
         let continue_send = Arc::new(tokio::sync::Barrier::new(2));
@@ -553,7 +553,7 @@ mod tests {
     #[tokio::test]
     async fn receiver_closure_is_not_reported_as_a_gap() {
         let (producer, receiver) = graph_update_channel();
-        producer.publish_post_seal().expect("receiver is open");
+        producer.publish_catchup().expect("receiver is open");
         drop(receiver);
 
         assert_eq!(producer.offer_block_committed(block_update()), Err(GraphUpdateProducerError::ReceiverClosed));
@@ -569,12 +569,12 @@ mod tests {
     #[tokio::test]
     async fn closing_a_receiver_rejects_new_offers_and_drains_queued_updates() {
         let (producer, mut receiver) = graph_update_channel();
-        producer.publish_post_seal().expect("receiver is open");
+        producer.publish_catchup().expect("receiver is open");
         assert_eq!(producer.offer_vspc_committed(vspc_update(8)), Ok(GraphUpdateOfferOutcome::Enqueued));
 
         receiver.close();
         assert_eq!(producer.offer_vspc_committed(vspc_update(9)), Err(GraphUpdateProducerError::ReceiverClosed));
-        assert_eq!(receiver.recv_update().await, Some(GraphUpdate::PublishPostSeal));
+        assert_eq!(receiver.recv_update().await, Some(GraphUpdate::Catchup));
         assert_eq!(receiver.recv_update().await, Some(GraphUpdate::VspcCommitted(vspc_update(8))));
         assert_eq!(receiver.recv_update().await, None);
 
@@ -585,12 +585,12 @@ mod tests {
     }
 
     #[test]
-    fn closed_receiver_leaves_a_failed_post_seal_gate_closed() {
+    fn closed_receiver_leaves_a_failed_catchup_gate_closed() {
         let (producer, receiver) = graph_update_channel();
         drop(receiver);
 
-        assert_eq!(producer.publish_post_seal(), Err(GraphUpdateProducerError::ReceiverClosed));
-        assert_eq!(*producer.gate.state.lock().expect("gate mutex is healthy"), GraphUpdateGateState::PreSeal);
+        assert_eq!(producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
+        assert_eq!(*producer.gate.state.lock().expect("gate mutex is healthy"), GraphUpdateGateState::AwaitingCatchup);
         assert_eq!(producer.metrics().receiver_closure_count, 1);
     }
 
@@ -617,10 +617,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "PublishPostSeal requires the PreSeal graph-update gate")]
-    async fn duplicate_post_seal_marker_is_an_invariant_failure() {
+    #[should_panic(expected = "Catchup requires the AwaitingCatchup graph-update gate")]
+    async fn duplicate_catchup_marker_is_an_invariant_failure() {
         let (producer, _receiver) = graph_update_channel();
-        producer.publish_post_seal().expect("receiver is open");
-        producer.publish_post_seal().expect("invariant panic occurs first");
+        producer.publish_catchup().expect("receiver is open");
+        producer.publish_catchup().expect("invariant panic occurs first");
     }
 }

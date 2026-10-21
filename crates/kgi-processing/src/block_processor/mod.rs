@@ -12,7 +12,6 @@ use kgi_storage::{
 
 mod dependency;
 mod error;
-mod marker;
 mod orphan;
 mod processor;
 

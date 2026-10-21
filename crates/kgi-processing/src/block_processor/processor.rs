@@ -26,7 +26,6 @@ use super::{
     BlockDatabase, BlockProcessorInitialization, BlockResolutionEvent, BlockRpc,
     dependency::{DependencyResolverMetrics, DependencyResolverMetricsSnapshot},
     error::{ChildControlError, ChildFault, ChildFaultKind},
-    marker::{LifecycleMarkerWorker, MarkerHandoffError},
     orphan::OrphanManager,
 };
 use crate::{
@@ -165,8 +164,7 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessor<D, R> {
             overlap: overlap.clone(),
             rpc,
             db,
-            graph_updates: graph_updates.clone(),
-            marker: Some(LifecycleMarkerWorker::new(graph_updates)),
+            graph_updates,
             run: BlockProcessorRun::Inert { mode },
             faulted: false,
         };
@@ -334,7 +332,6 @@ struct BlockProcessorWorker<D: BlockDatabase, R: BlockRpc> {
     rpc: Arc<R>,
     db: Arc<D>,
     graph_updates: GraphUpdateProducer,
-    marker: Option<LifecycleMarkerWorker>,
     run: BlockProcessorRun,
     faulted: bool,
 }
@@ -378,23 +375,10 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessorWorker<D, R> {
     }
 
     fn startup(&mut self) -> Result<(), ComponentFault> {
-        let BlockProcessorRun::Active { stage, emit_boundary_sealed_on_start, .. } = self.run else {
+        let BlockProcessorRun::Active { emit_boundary_sealed_on_start, .. } = self.run else {
             return Err(invalid_lifecycle("BlockProcessor start requires initialization"));
         };
         self.orphan.as_mut().expect("initialized BlockProcessor owns OrphanManager").start();
-        let marker = self.marker.as_mut().expect("initialized BlockProcessor owns lifecycle-marker worker");
-        marker.start();
-
-        if !matches!(stage, RunStage::Synchronizing(SealPhase::PreSeal { .. }))
-            && matches!(marker.publish_post_seal(), Err(MarkerHandoffError::CommandPathClosed))
-        {
-            self.faulted = true;
-            return Err(ownership_fault(
-                Component::BlockProcessor,
-                OwnershipFault::InternalControlPathLost,
-                "lifecycle-marker PostSeal handoff failed",
-            ));
-        }
         if emit_boundary_sealed_on_start && self.events.send(BlockProcessorEvent::PpBoundarySealed).is_err() {
             self.faulted = true;
             return Err(ownership_fault(
@@ -506,22 +490,10 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessorWorker<D, R> {
                 if !matches!(self.run, BlockProcessorRun::Active { stage: RunStage::Catchup { .. }, .. }) {
                     self.enter_fault(invalid_lifecycle("Live requires active Catchup")).await;
                 } else {
-                    match self.marker.as_ref().expect("active BlockProcessor owns marker worker").publish_live() {
-                        Ok(()) | Err(MarkerHandoffError::ReceiverClosed) => {
-                            let BlockProcessorRun::Active { stage, .. } = &mut self.run else {
-                                unreachable!("validated active BlockProcessor run remains active");
-                            };
-                            *stage = RunStage::Live;
-                        }
-                        Err(MarkerHandoffError::CommandPathClosed) => {
-                            self.enter_fault(ownership_fault(
-                                Component::BlockProcessor,
-                                OwnershipFault::InternalControlPathLost,
-                                "lifecycle-marker Live handoff failed",
-                            ))
-                            .await;
-                        }
-                    }
+                    let BlockProcessorRun::Active { stage, .. } = &mut self.run else {
+                        unreachable!("validated active BlockProcessor run remains active");
+                    };
+                    *stage = RunStage::Live;
                 }
                 false
             }
@@ -536,16 +508,10 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessorWorker<D, R> {
     async fn shutdown_worker(&mut self) -> Result<(), ComponentFault> {
         self.drain_session_data();
         self.overlap.reset();
-        let mut first_fault = None;
         if let Err(error) = self.shutdown_orphan().await {
-            first_fault = Some(child_control_fault(Component::OrphanManager, error, "OrphanManager Shutdown barrier"));
+            return Err(child_control_fault(Component::OrphanManager, error, "OrphanManager Shutdown barrier"));
         }
-        if let Some(marker) = self.marker.take()
-            && let Err(error) = marker.shutdown().await
-        {
-            first_fault.get_or_insert_with(|| child_control_fault(Component::BlockProcessor, error, "lifecycle-marker worker join"));
-        }
-        first_fault.map_or(Ok(()), Err)
+        Ok(())
     }
 
     async fn shutdown_orphan(&mut self) -> Result<(), ChildControlError> {
@@ -665,27 +631,20 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessorWorker<D, R> {
             Ok(MaterializeBlockOutcome::Inserted { committed }) => {
                 let offer = self.graph_updates.offer_block_committed(committed.clone());
                 if matches!(stage.seal_phase(), SealPhase::PreSeal { .. })
-                    && !matches!(offer, Ok(GraphUpdateOfferOutcome::SuppressedPreSeal) | Err(GraphUpdateProducerError::ReceiverClosed))
+                    && !matches!(
+                        offer,
+                        Ok(GraphUpdateOfferOutcome::SuppressedAwaitingCatchup) | Err(GraphUpdateProducerError::ReceiverClosed)
+                    )
                 {
                     return Err(ownership_fault(
                         Component::BlockProcessor,
                         OwnershipFault::InvalidLifecycleControl,
-                        "PreSeal graph update was not suppressed",
+                        "Pre-Catchup graph update was not suppressed",
                     ));
                 }
 
                 let delivery_fault = self.deliver_persisted(&block, committed.id).err();
                 if sealing {
-                    if matches!(
-                        self.marker.as_ref().expect("active BlockProcessor owns marker worker").publish_post_seal(),
-                        Err(MarkerHandoffError::CommandPathClosed)
-                    ) {
-                        return Err(ownership_fault(
-                            Component::BlockProcessor,
-                            OwnershipFault::InternalControlPathLost,
-                            "lifecycle-marker PostSeal handoff failed",
-                        ));
-                    }
                     let BlockProcessorRun::Active { stage, .. } = &mut self.run else {
                         unreachable!("sealing run remains active");
                     };
@@ -1145,7 +1104,7 @@ mod tests {
         assert!(events.try_recv().is_err());
 
         processor.start().expect("BlockProcessor start");
-        assert_eq!(graph_rx.recv_update().await, Some(GraphUpdate::PublishPostSeal));
+        assert!(graph_rx.try_recv_update().is_err());
         processor.shutdown().await.expect("shutdown");
     }
 
@@ -1179,7 +1138,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_startup_handoff_failure_remains_joinable() {
+    async fn final_startup_milestone_failure_remains_joinable() {
         let genesis = hash(1);
         let db = MockDb::new(genesis);
         let rpc = MockRpc::new(db.network_id, db.genesis_hash);
@@ -1200,20 +1159,20 @@ mod tests {
                 ..
             }))
         ));
-        processor.shutdown().await.expect("shutdown after failed final handoff");
+        processor.shutdown().await.expect("shutdown after failed final milestone");
         assert!(weak_db.upgrade().is_none());
         assert!(weak_rpc.upgrade().is_none());
     }
 
     #[tokio::test]
-    async fn genesis_rebuild_publishes_post_seal_and_milestone_during_start() {
+    async fn genesis_rebuild_emits_milestone_without_api_marker() {
         let genesis = hash(1);
         let (graph, mut graph_rx) = graph_update_channel();
         let ProcessorFixture { processor, mut events, mut persisted, .. } =
             fixture(genesis, RecoveryMode::Rebuild, anchor(genesis, 0), 0, graph);
 
         assert_eq!(events.recv().await, Some(BlockProcessorEvent::PpBoundarySealed));
-        assert_eq!(graph_rx.recv_update().await, Some(GraphUpdate::PublishPostSeal));
+        assert!(graph_rx.try_recv_update().is_err());
         assert!(persisted.try_recv().is_err(), "Genesis never enters ordinary persisted-block delivery");
 
         processor.shutdown().await.expect("shutdown");
@@ -1240,7 +1199,7 @@ mod tests {
         processor.submit_synthetic(sealing.clone()).await.expect("sealing block");
         assert_eq!(persisted.recv().await.map(|block| block.point.hash()), Some(sealing.hash));
         assert_eq!(events.recv().await, Some(BlockProcessorEvent::PpBoundarySealed));
-        assert_eq!(graph_rx.recv_update().await, Some(GraphUpdate::PublishPostSeal));
+        assert!(graph_rx.try_recv_update().is_err());
         assert_eq!(
             db.state.lock().expect("mock DB mutex").policies,
             [ReferencePolicy::AllowBoundaryIdentities, ReferencePolicy::RequireMaterialized]
@@ -1254,7 +1213,7 @@ mod tests {
         let genesis = hash(1);
         let shared = block(hash(20), 20);
         let late = block(hash(5), 5);
-        let (graph, mut graph_rx) = graph_update_channel();
+        let (graph, _graph_rx) = graph_update_channel();
         let ProcessorFixture { processor, mut events, mut persisted, db, .. } =
             fixture(genesis, RecoveryMode::Resync, anchor(genesis, 20), 10, graph);
         db.push_presence(Ok(BlockPresence::Materialized { id: id(5), coordinate: BlockCoordinate::new(1, 0).expect("coordinate") }));
@@ -1264,7 +1223,6 @@ mod tests {
                 coordinate: BlockCoordinate::new(1, 0).expect("coordinate"),
             }));
         }
-        assert_eq!(graph_rx.recv_update().await, Some(GraphUpdate::PublishPostSeal));
         processor.catchup(id(10)).expect("Catchup command");
         tokio::task::yield_now().await;
 
@@ -1292,11 +1250,10 @@ mod tests {
     #[tokio::test]
     async fn closed_notification_gate_discards_without_database_admission() {
         let genesis = hash(1);
-        let (graph, mut graph_rx) = graph_update_channel();
+        let (graph, _graph_rx) = graph_update_channel();
         let ProcessorFixture { processor, events: _events, persisted: _persisted, db, .. } =
             fixture(genesis, RecoveryMode::Resync, anchor(genesis, 20), 10, graph);
         let notification = processor.block_notification_sender();
-        assert_eq!(graph_rx.recv_update().await, Some(GraphUpdate::PublishPostSeal));
         notification.send(block(hash(9), 9)).await.expect("pre-Catchup notification");
         for _ in 0..5 {
             tokio::task::yield_now().await;
@@ -1310,7 +1267,7 @@ mod tests {
     async fn identity_only_reference_takes_rebuild_precedence_during_catchup() {
         let genesis = hash(1);
         let incoming = block(hash(4), 4);
-        let (graph, mut graph_rx) = graph_update_channel();
+        let (graph, _graph_rx) = graph_update_channel();
         let ProcessorFixture { processor, mut events, mut persisted, db, .. } =
             fixture(genesis, RecoveryMode::Resync, anchor(genesis, 20), 10, graph);
         db.push_presence(Ok(BlockPresence::Absent));
@@ -1318,7 +1275,6 @@ mod tests {
             missing: Arc::from([hash(7)]),
             identity_only: Arc::from([hash(8)]),
         }));
-        assert_eq!(graph_rx.recv_update().await, Some(GraphUpdate::PublishPostSeal));
         processor.catchup(id(1)).expect("Catchup command");
         processor.submit_synthetic(incoming).await.expect("synthetic block");
 
@@ -1362,7 +1318,7 @@ mod tests {
     async fn strict_pre_catchup_omission_requires_resync_without_orphan_admission() {
         let genesis = hash(1);
         let incoming = block(hash(4), 4);
-        let (graph, mut graph_rx) = graph_update_channel();
+        let (graph, _graph_rx) = graph_update_channel();
         let ProcessorFixture { processor, mut events, mut persisted, db, .. } =
             fixture(genesis, RecoveryMode::Resync, anchor(genesis, 20), 10, graph);
         db.push_presence(Ok(BlockPresence::Absent));
@@ -1370,8 +1326,6 @@ mod tests {
             missing: Arc::from([hash(7)]),
             identity_only: Arc::from([]),
         }));
-        assert_eq!(graph_rx.recv_update().await, Some(GraphUpdate::PublishPostSeal));
-
         processor.submit_synthetic(incoming).await.expect("synthetic block");
 
         assert!(matches!(
@@ -1392,12 +1346,13 @@ mod tests {
         let genesis = hash(1);
         let incoming = block(hash(4), 4);
         let (graph, mut graph_rx) = graph_update_channel();
+        graph.publish_catchup().expect("open API graph-update gate");
+        assert_eq!(graph_rx.try_recv_update(), Ok(GraphUpdate::Catchup));
         let filler = graph.clone();
         let ProcessorFixture { processor, mut events, mut persisted, db, .. } =
             fixture(genesis, RecoveryMode::Resync, anchor(genesis, 20), 10, graph);
         db.push_presence(Ok(BlockPresence::Absent));
         db.push_materialization(Ok(MaterializeBlockOutcome::Inserted { committed: committed(&incoming, id(4)) }));
-        assert_eq!(graph_rx.recv_update().await, Some(GraphUpdate::PublishPostSeal));
         let filler_update = committed(&block(hash(99), 99), id(99));
         for _ in 0..GRAPH_UPDATE_CHANNEL_CAPACITY {
             assert_eq!(filler.offer_block_committed(filler_update.clone()), Ok(GraphUpdateOfferOutcome::Enqueued));
@@ -1412,7 +1367,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_command_delivers_marker_without_clearing_overlap() {
+    async fn live_command_changes_only_processor_stage_without_clearing_overlap() {
         let genesis = hash(1);
         let shared = block(hash(20), 20);
         let (graph, mut graph_rx) = graph_update_channel();
@@ -1424,7 +1379,6 @@ mod tests {
                 coordinate: BlockCoordinate::new(1, 0).expect("coordinate"),
             }));
         }
-        assert_eq!(graph_rx.recv_update().await, Some(GraphUpdate::PublishPostSeal));
         processor.catchup(id(1)).expect("Catchup command");
         processor.submit_synthetic(shared.clone()).await.expect("synthetic block");
         processor.block_notification_sender().send(shared).await.expect("notification block");
@@ -1434,14 +1388,15 @@ mod tests {
 
         processor.live().expect("Live command");
 
-        assert_eq!(graph_rx.recv_update().await, Some(GraphUpdate::Live));
+        tokio::task::yield_now().await;
+        assert!(graph_rx.try_recv_update().is_err());
         assert!(processor.overlap().observed());
         assert!(events.try_recv().is_err());
         processor.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]
-    async fn ambiguous_sealing_commit_publishes_no_marker_or_milestone() {
+    async fn ambiguous_sealing_commit_produces_no_api_marker_or_milestone() {
         let genesis = hash(1);
         let pruning_point = hash(3);
         let sealing = block(hash(5), 10);
@@ -1464,7 +1419,7 @@ mod tests {
             }))
         ));
         assert!(events.try_recv().is_err(), "no PP-boundary milestone follows ambiguity");
-        assert!(graph_rx.try_recv_update().is_err(), "no PostSeal marker follows ambiguity");
+        assert!(graph_rx.try_recv_update().is_err(), "no API marker follows ambiguity");
         assert!(persisted.try_recv().is_err());
         processor.shutdown().await.expect("shutdown");
     }
@@ -1473,12 +1428,11 @@ mod tests {
     async fn queued_shutdown_preempts_remaining_block_inputs() {
         let genesis = hash(1);
         let first = block(hash(4), 4);
-        let (graph, mut graph_rx) = graph_update_channel();
+        let (graph, _graph_rx) = graph_update_channel();
         let ProcessorFixture { processor, events: _events, mut persisted, db, .. } =
             fixture(genesis, RecoveryMode::Resync, anchor(genesis, 20), 10, graph);
         db.push_presence(Ok(BlockPresence::Materialized { id: id(4), coordinate: BlockCoordinate::new(1, 0).expect("coordinate") }));
         let (mut started, releases) = db.gate_next_presence();
-        assert_eq!(graph_rx.recv_update().await, Some(GraphUpdate::PublishPostSeal));
         processor.submit_synthetic(first.clone()).await.expect("first input");
         started.recv().await.expect("first database operation started");
         for value in 5..25 {
@@ -1565,12 +1519,13 @@ mod tests {
             .await
             .expect("fill persisted channel");
         let (graph, mut graph_rx) = graph_update_channel();
+        graph.publish_catchup().expect("open API graph-update gate");
+        assert_eq!(graph_rx.try_recv_update(), Ok(GraphUpdate::Catchup));
         let (mut processor, mut events) = BlockProcessor::new(RecoveryMode::Resync, rpc, db, graph, persisted_tx);
         processor
             .initialize(BlockProcessorInitialization { anchor: anchor(genesis, 4), boundary_seal_blue_score: 0 })
             .expect("BlockProcessor initialization");
         processor.start().expect("BlockProcessor start");
-        assert_eq!(graph_rx.recv_update().await, Some(GraphUpdate::PublishPostSeal));
 
         processor.submit_synthetic(inserted.clone()).await.expect("inserted block");
 
