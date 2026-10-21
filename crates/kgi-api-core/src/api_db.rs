@@ -122,6 +122,44 @@ impl<G: ApiDbGeneration> ApiDbState<G> {
             snapshots.changed().await.expect("ApiDbState retains its sender while current() is waiting");
         }
     }
+
+    /// Unbinds the current generation and closes public reads for a Rebuild.
+    pub(crate) fn begin_rebuild(&self) {
+        self.tx.send_if_modified(|snapshot| {
+            let ApiDbSnapshot::Running { current, public_reads_enabled } = snapshot else {
+                return false;
+            };
+            let changed = current.is_some() || *public_reads_enabled;
+            *current = None;
+            *public_reads_enabled = false;
+            changed
+        });
+    }
+
+    /// Changes public-read admission without changing the bound generation.
+    pub(crate) fn set_public_reads_enabled(&self, enabled: bool) {
+        self.tx.send_if_modified(|snapshot| {
+            let ApiDbSnapshot::Running { public_reads_enabled, .. } = snapshot else {
+                return false;
+            };
+            if *public_reads_enabled == enabled {
+                return false;
+            }
+            *public_reads_enabled = enabled;
+            true
+        });
+    }
+
+    /// Stops the binding, releases its generation, and wakes construction waiters.
+    pub(crate) fn stop(&self) {
+        self.tx.send_if_modified(|snapshot| {
+            if matches!(snapshot, ApiDbSnapshot::Stopped) {
+                return false;
+            }
+            *snapshot = ApiDbSnapshot::Stopped;
+            true
+        });
+    }
 }
 
 #[cfg(test)]
@@ -228,7 +266,7 @@ mod tests {
     #[test]
     fn stopped_binding_rejects_every_later_generation_event() {
         let state = ApiDbState::<TestGeneration>::new();
-        state.tx.send_replace(ApiDbSnapshot::Stopped);
+        state.stop();
         let snapshots = state.tx.subscribe();
 
         assert_eq!(state.update(ApiDbGenerationEvent::Published(TestGeneration::valid())), Err(ApiDbUpdateError::Stopped));
@@ -266,12 +304,7 @@ mod tests {
 
         let replacement = TestGeneration::valid();
         state.update(ApiDbGenerationEvent::Published(replacement.clone())).expect("replacement succeeds");
-        state.tx.send_modify(|snapshot| {
-            let ApiDbSnapshot::Running { public_reads_enabled, .. } = snapshot else {
-                panic!("test binding remains running");
-            };
-            *public_reads_enabled = false;
-        });
+        state.set_public_reads_enabled(false);
         assert!(state.public_read_client().is_none());
     }
 
@@ -298,12 +331,7 @@ mod tests {
         let invalid = TestGeneration::valid();
         state.update(ApiDbGenerationEvent::Published(invalid.clone())).expect("publication succeeds");
         invalid.retire();
-        state.tx.send_modify(|snapshot| {
-            let ApiDbSnapshot::Running { public_reads_enabled, .. } = snapshot else {
-                panic!("test binding remains running");
-            };
-            *public_reads_enabled = false;
-        });
+        state.set_public_reads_enabled(false);
 
         let waiter = {
             let state = state.clone();
@@ -317,5 +345,83 @@ mod tests {
 
         let observed = waiter.await.expect("waiter task succeeds").expect("replacement satisfies the waiter");
         assert!(Arc::ptr_eq(&observed, &replacement));
+    }
+
+    #[test]
+    fn rebuild_unbinds_without_invalidating_and_only_a_later_publication_rebinds() {
+        let state = ApiDbState::<TestGeneration>::new();
+        let previous = TestGeneration::valid();
+        state.update(ApiDbGenerationEvent::Published(previous.clone())).expect("publication succeeds");
+        let mut snapshots = state.tx.subscribe();
+
+        state.begin_rebuild();
+
+        assert!(previous.is_valid());
+        assert!(matches!(&*snapshots.borrow_and_update(), ApiDbSnapshot::Running { current: None, public_reads_enabled: false }));
+
+        state.update(ApiDbGenerationEvent::Retired(previous)).expect("late retirement is harmless");
+        assert!(!snapshots.has_changed().expect("binding remains open"));
+
+        let replacement = TestGeneration::valid();
+        state.update(ApiDbGenerationEvent::Published(replacement.clone())).expect("replacement succeeds");
+        assert!(matches!(
+            &*snapshots.borrow_and_update(),
+            ApiDbSnapshot::Running { current: Some(current), public_reads_enabled: false }
+                if Arc::ptr_eq(current, &replacement)
+        ));
+        assert!(state.public_read_client().is_none());
+    }
+
+    #[test]
+    fn public_read_gate_changes_without_rebinding_the_generation() {
+        let state = ApiDbState::<TestGeneration>::new();
+        let generation = TestGeneration::valid();
+        state.update(ApiDbGenerationEvent::Published(generation.clone())).expect("publication succeeds");
+        let mut snapshots = state.tx.subscribe();
+
+        state.set_public_reads_enabled(false);
+        assert!(matches!(
+            &*snapshots.borrow_and_update(),
+            ApiDbSnapshot::Running { current: Some(current), public_reads_enabled: false }
+                if Arc::ptr_eq(current, &generation)
+        ));
+
+        state.set_public_reads_enabled(false);
+        assert!(!snapshots.has_changed().expect("binding remains open"));
+
+        state.set_public_reads_enabled(true);
+        assert!(state.public_read_client().is_some_and(|current| Arc::ptr_eq(&current, &generation)));
+    }
+
+    #[tokio::test]
+    async fn stop_releases_waiters_and_rejects_later_updates() {
+        let state = Arc::new(ApiDbState::<TestGeneration>::new());
+        let waiter = {
+            let state = state.clone();
+            tokio::spawn(async move { state.current().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        state.stop();
+
+        assert!(waiter.await.expect("waiter task succeeds").is_none());
+        assert_eq!(state.update(ApiDbGenerationEvent::Published(TestGeneration::valid())), Err(ApiDbUpdateError::Stopped));
+        assert!(state.public_read_client().is_none());
+    }
+
+    #[test]
+    fn stop_and_gate_mutations_are_idempotent_after_the_terminal_cutoff() {
+        let state = ApiDbState::<TestGeneration>::new();
+        state.update(ApiDbGenerationEvent::Published(TestGeneration::valid())).expect("publication succeeds");
+        state.stop();
+        let snapshots = state.tx.subscribe();
+
+        state.stop();
+        state.begin_rebuild();
+        state.set_public_reads_enabled(true);
+
+        assert!(!snapshots.has_changed().expect("binding remains observable"));
+        assert!(matches!(&*snapshots.borrow(), ApiDbSnapshot::Stopped));
     }
 }
