@@ -424,4 +424,69 @@ mod tests {
         assert!(!snapshots.has_changed().expect("binding remains observable"));
         assert!(matches!(&*snapshots.borrow(), ApiDbSnapshot::Stopped));
     }
+
+    #[tokio::test]
+    async fn generation_turnover_wakes_construction_with_the_exact_replacement() {
+        let state = Arc::new(ApiDbState::<TestGeneration>::new());
+        let first = TestGeneration::valid();
+        state.update(ApiDbGenerationEvent::Published(first.clone())).expect("first publication succeeds");
+        first.retire();
+        state.update(ApiDbGenerationEvent::Retired(first.clone())).expect("exact retirement succeeds");
+
+        let waiter = {
+            let state = state.clone();
+            tokio::spawn(async move { state.current().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        let replacement = TestGeneration::valid();
+        state.update(ApiDbGenerationEvent::Published(replacement.clone())).expect("replacement publication succeeds");
+        state.update(ApiDbGenerationEvent::Retired(first)).expect("late retirement remains harmless");
+
+        let observed = waiter.await.expect("waiter task succeeds").expect("replacement satisfies the waiter");
+        assert!(Arc::ptr_eq(&observed, &replacement));
+        assert!(state.public_read_client().is_some_and(|current| Arc::ptr_eq(&current, &replacement)));
+    }
+
+    #[test]
+    fn generation_updates_linearize_on_both_sides_of_stop() {
+        let update_first = ApiDbState::<TestGeneration>::new();
+        let accepted = TestGeneration::valid();
+        update_first.update(ApiDbGenerationEvent::Published(accepted)).expect("update before stop succeeds");
+        update_first.stop();
+        assert!(matches!(&*update_first.tx.borrow(), ApiDbSnapshot::Stopped));
+
+        let stop_first = ApiDbState::<TestGeneration>::new();
+        stop_first.stop();
+        assert_eq!(stop_first.update(ApiDbGenerationEvent::Published(TestGeneration::valid())), Err(ApiDbUpdateError::Stopped));
+        assert!(matches!(&*stop_first.tx.borrow(), ApiDbSnapshot::Stopped));
+    }
+
+    #[test]
+    fn replacement_rebuild_and_stop_release_bound_generation_references() {
+        let state = ApiDbState::<TestGeneration>::new();
+
+        let first = TestGeneration::valid();
+        let first_weak = Arc::downgrade(&first);
+        state.update(ApiDbGenerationEvent::Published(first.clone())).expect("first publication succeeds");
+        drop(first);
+
+        let replacement = TestGeneration::valid();
+        let replacement_weak = Arc::downgrade(&replacement);
+        state.update(ApiDbGenerationEvent::Published(replacement.clone())).expect("replacement publication succeeds");
+        assert!(first_weak.upgrade().is_none());
+        drop(replacement);
+
+        state.begin_rebuild();
+        assert!(replacement_weak.upgrade().is_none());
+
+        let terminal = TestGeneration::valid();
+        let terminal_weak = Arc::downgrade(&terminal);
+        state.update(ApiDbGenerationEvent::Published(terminal.clone())).expect("terminal publication succeeds");
+        drop(terminal);
+
+        state.stop();
+        assert!(terminal_weak.upgrade().is_none());
+    }
 }
