@@ -87,8 +87,8 @@ do not enlarge the PR silently. Any future regrouping requires updating this
 sequence first.
 
 The former broad Step 6 is now increments 6–17, former Step 7 is increments
-18–22, and former Step 8 is increments 23–27. Increments 6–10 are complete;
-the active work is increment 11, without an additional nesting level.
+18–22, and former Step 8 is increments 23–27. Increments 6–11 are complete;
+the active work is increment 12, without an additional nesting level.
 
 | Increment / PR | Isolated production scope | Completion evidence |
 |---|---|---|
@@ -115,58 +115,51 @@ the active work is increment 11, without an additional nesting level.
 | 26. Deployment and release artifacts | Complete the conventional and Docker layouts, runtime log directories, systemd and Compose examples, static-asset cache behavior, and atomic `xtask` bundle/container construction against the composed binary and Web build. | Reproducible bundle and image checks, matching binary/assets and provenance, missing-root failure, unprivileged/read-only deployment, writable logs, direct signal delivery, and atomic failure cleanup. |
 | 27. Full-stack acceptance | Add only the remaining cross-component fixtures and acceptance coverage needed to prove the focused verification contract across node RPC, PostgreSQL, recovery, API/Web, packaging, logging, and resource isolation; update implementation status with the final evidence. | Full Rust, PostgreSQL, Vitest, deterministic and complete-stack Playwright, parity, packaging, shutdown, and load/isolation suites pass from a clean checkout. |
 
-### Active increment 11: SSE client registry and mailboxes
+### Active increment 12: API database binding
 
-Increment 11 is exactly one reviewable PR. It implements the publication-local
-SSE client coordination state owned by the [ApiService task
-contract](../architecture/api-service.md#sse-client-registry-and-mailbox)
-and the logical observation rules owned by the [API protocol
-contract](../architecture/api-protocol.md#publication-wire-observation). It
-builds on `GraphPublication` without adding Axum transport or the logical delta
-operation that consumes completion-time rearming.
+Increment 12 is exactly one reviewable PR. It implements only the
+ApiService-owned latest-value binding between ordered API database-generation
+events and future construction or public-read consumers. The focused
+[ApiService database-binding contract](../architecture/api-service.md#api-database-generation-binding--settled)
+owns this state; Storage retains generation validity, retirement,
+reacquisition, and replacement exclusion.
 
-Execute increment 11 as these ordered points:
+Execute increment 12 as these ordered points:
 
-1. Add the private SSE client coordination foundation in `kgi-api-core`: the
-   settled capacity constants, canonical opaque registration identifiers with a
-   deterministic test seam, mailbox items, registration state, and internal
-   scheduling results. Keep transport parsing and SSE framing outside this
-   layer.
-2. Implement the bounded `SseMailbox`. Provide synchronous atomic admission of
-   required message batches, ordinary graph-wakeup insertion and coalescing,
-   wakeup repositioning behind required messages, targeted wakeup removal,
-   closure, draining, and one `Notify`-driven asynchronous receive path. Hold
-   no mailbox lock across an await.
-3. Implement `SseClientRegistry` with coherent initial publication state and
-   Head revision, the settled client bound, collision-checked registration,
-   weak mailbox ownership, stale weak-reference removal, lifecycle-message
-   publication, Head advancement, and connection cancellation after registry
-   and mailbox locks have been released.
-4. Implement atomic delta completion and registration replacement. Rearming
-   removes a still-queued ordinary wakeup, installs the new boundary, and
-   immediately schedules a wakeup when Head already satisfies it; the final
-   Stale action validates without arming. Replacement removes the old
-   registration and its queued ordinary wakeup, then installs a fresh
-   registration and its complete ordered required batch in the same mailbox
-   without partial state.
-5. Attach the registry to `GraphPublication`. Initialize it from the same
-   publication state and revision, advance it after a successful image/history
-   mutation and before releasing mutation authority, and publish lifecycle
-   state after releasing the publication-core write lock but before releasing
-   mutation authority.
-6. Complete lifecycle and race verification: capacity boundaries, identifier
-   collision, atomic required batches, wakeup coalescing and ordering, full
-   mailbox removal, close/drain notification, stale weak registrations,
-   Head/rearm races in both orders, replacement ordering, registration versus
-   lifecycle linearization, and maximum-revision saturation. Confirm that the
-   registry creates neither per-client tasks nor timers, update implementation
-   status, and run the full Rust validation suite.
+1. Add a private `api_db` module in `kgi-api-core` containing the concrete
+   `ApiDbGenerationEvent`, complete `ApiDbSnapshot`, and watch-backed
+   `ApiDbState`. Initialize it with no current generation and public reads
+   enabled. Keep the production state bound to `ValidatedApiDbClient`; use only
+   a private lightweight generation abstraction for deterministic unit tests.
+2. Implement synchronous ordered generation updates. Accept a valid published
+   exact generation, retire only the exact currently bound `Arc`, make stale
+   and repeated events idempotent, reject a distinct invalid publication, and
+   reject every update after terminal stop. Each accepted event publishes one
+   complete latest-value snapshot.
+3. Implement the two read paths. `public_read_client()` performs one immediate
+   snapshot read and admits only an enabled, present, still-valid generation.
+   `current().await` ignores the public-read gate, waits through absent or
+   invalid generations without polling or timeout, wakes on replacement, and
+   returns `None` only after stop.
+4. Implement the private gate transitions needed by later ApiService
+   integration: Rebuild atomically unbinds the current generation and disables
+   public reads without invalidating it; publication installation changes only
+   the public-read flag; terminal stop atomically drops the bound generation,
+   wakes construction waiters, and is idempotent.
+5. Add deterministic lifecycle and race coverage for initial absence,
+   publication and exact retirement, repeated and stale events, invalid
+   handles, immediate public admission, construction waiting and wakeup,
+   invalid-current waiting, Rebuild disable/reopen, generation turnover,
+   stop/update linearization in both outcomes, waiter
+   release on stop, and reference release.
+6. Record the completed implementation choice and status, confirm that the
+   binding changes no graph publication or Storage lifecycle state, and run the
+   full Rust validation suite.
 
-This increment adds no API database binding, publication construction runtime,
-logical Head or delta outcome selection, historical database read, Axum router,
-request parser, SSE connection task or framing, HTTP header mapping, or response
-delivery behavior. The registry and mailbox remain private to `kgi-api-core`;
-increments 15 and 17 consume them through logical operations and transport.
+This increment adds no `PublicationRuntime`, ApiService runtime slot,
+publication installation, Supervisor event forwarding, HTTP request handler,
+database query, Storage replacement control, or shutdown orchestration. Those
+consumers integrate the binding in increments 13–17 and 20.
 
 ## Cross-increment ordering
 
