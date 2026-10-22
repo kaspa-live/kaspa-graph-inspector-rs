@@ -1,10 +1,16 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    fmt::Display,
+    sync::{Arc, Mutex},
+};
 
 use kgi_api_ingress::channel::GraphUpdateReceiver;
 use kgi_api_model::protocol::SystemStatus;
 use kgi_model::lifecycle::{NodeServiceStatus, ProcessingStatus, RecoveryMode, StorageServiceStatus, SupervisorStatus};
 use kgi_storage::generation::ValidatedApiDbClient;
-use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
+use tokio::{
+    sync::{Mutex as AsyncMutex, mpsc, watch},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -39,9 +45,91 @@ pub enum ApiDbGenerationMessage {
 
 enum ApiRuntimeSlot {
     AwaitReset,
-    Running(PublicationRuntime),
+    Running(OwnedPublicationRuntime),
     #[allow(dead_code, reason = "terminal shutdown enters this state in increment-14 point 6")]
     Stopped,
+}
+
+struct OwnedPublicationRuntime {
+    runtime: PublicationRuntime,
+    completion_observer: AsyncMutex<Option<JoinHandle<()>>>,
+    events: mpsc::UnboundedSender<ApiServiceEvent>,
+}
+
+impl OwnedPublicationRuntime {
+    fn new(
+        graph_updates: GraphUpdateReceiver,
+        api_db: Arc<ApiDbState>,
+        installer: RuntimePublicationInstaller,
+        events: mpsc::UnboundedSender<ApiServiceEvent>,
+    ) -> Self {
+        let runtime = PublicationRuntime::new(graph_updates, api_db, installer);
+        let completion = runtime.completion();
+        let observer_events = events.clone();
+        let completion_observer = tokio::spawn(async move {
+            if let Err(error) = completion.await {
+                let _ = observer_events.send(ApiServiceEvent::Failed(Self::failure(error)));
+            }
+        });
+        Self { runtime, completion_observer: AsyncMutex::new(Some(completion_observer)), events }
+    }
+
+    async fn shutdown(&self) -> Result<(), ApiServiceError> {
+        let result = self.runtime.shutdown().await.map_err(Self::failure);
+        let observer = self.completion_observer.lock().await.take();
+        if let Some(observer) = observer
+            && let Err(error) = observer.await
+            && result.is_ok()
+        {
+            let failure = Self::failure(error);
+            let _ = self.events.send(ApiServiceEvent::Failed(failure.clone()));
+            return Err(failure);
+        }
+        result
+    }
+
+    fn failure(error: impl Display) -> ApiServiceError {
+        ApiServiceError::PublicationRuntimeFailed { diagnostic: error.to_string().into() }
+    }
+}
+
+struct OwnedEncodingScheduler {
+    scheduler: EncodingScheduler,
+    completion_observer: AsyncMutex<Option<JoinHandle<()>>>,
+    events: mpsc::UnboundedSender<ApiServiceEvent>,
+}
+
+impl OwnedEncodingScheduler {
+    fn new(events: mpsc::UnboundedSender<ApiServiceEvent>) -> Self {
+        let scheduler = EncodingScheduler::production();
+        let completion = scheduler.completion();
+        let observer_events = events.clone();
+        let completion_observer = tokio::spawn(async move {
+            if let Err(error) = completion.await {
+                let _ = observer_events.send(ApiServiceEvent::Failed(Self::failure(error)));
+            }
+        });
+        Self { scheduler, completion_observer: AsyncMutex::new(Some(completion_observer)), events }
+    }
+
+    #[allow(dead_code, reason = "terminal shutdown consumes this barrier in increment-14 point 6")]
+    async fn shutdown(&self) -> Result<(), ApiServiceError> {
+        let result = self.scheduler.shutdown().await.map_err(Self::failure);
+        let observer = self.completion_observer.lock().await.take();
+        if let Some(observer) = observer
+            && let Err(error) = observer.await
+            && result.is_ok()
+        {
+            let failure = Self::failure(error);
+            let _ = self.events.send(ApiServiceEvent::Failed(failure.clone()));
+            return Err(failure);
+        }
+        result
+    }
+
+    fn failure(error: impl Display) -> ApiServiceError {
+        ApiServiceError::EncodingSchedulerFailed { diagnostic: error.to_string().into() }
+    }
 }
 
 struct PublicationInstallState {
@@ -116,12 +204,16 @@ pub struct ApiService {
     current_publication: watch::Sender<Option<Arc<GraphPublication>>>,
     cancellation: ApiCancellation,
     cache_jobs: CacheJobTracker,
-    encoding: EncodingScheduler,
+    encoding: OwnedEncodingScheduler,
     status: ApiStatusInputs,
 }
 
 impl ApiService {
     /// Constructs ApiService in `AwaitReset` with its reliable event path installed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a Tokio runtime.
     #[must_use]
     pub fn new(
         supervisor_status: watch::Receiver<SupervisorStatus>,
@@ -134,6 +226,7 @@ impl ApiService {
         let api_db = Arc::new(ApiDbState::new());
         let publication_install = Arc::new(Mutex::new(PublicationInstallState { runtime_generation: 0 }));
         let (current_publication, _) = watch::channel(None);
+        let encoding = OwnedEncodingScheduler::new(events.clone());
         let service = Arc::new(Self {
             events,
             runtime: AsyncMutex::new(ApiRuntimeSlot::AwaitReset),
@@ -146,7 +239,7 @@ impl ApiService {
                 cache_jobs: cache_jobs_cancellation.clone(),
             },
             cache_jobs: CacheJobTracker::with_cancellation(cache_jobs_cancellation),
-            encoding: EncodingScheduler::production(),
+            encoding,
             status: ApiStatusInputs {
                 kgi_version: env!("CARGO_PKG_VERSION"),
                 supervisor: supervisor_status,
@@ -189,14 +282,11 @@ impl ApiService {
             runtime_generation,
             recovery_mode,
         };
-        let successor = PublicationRuntime::new(graph_updates, self.api_db.clone(), installer);
+        let successor = OwnedPublicationRuntime::new(graph_updates, self.api_db.clone(), installer, self.events.clone());
         let predecessor = std::mem::replace(&mut *runtime, ApiRuntimeSlot::Running(successor));
 
         if let ApiRuntimeSlot::Running(predecessor) = predecessor {
-            predecessor
-                .shutdown()
-                .await
-                .map_err(|error| ApiServiceError::PublicationRuntimeFailed { diagnostic: error.to_string().into() })?;
+            predecessor.shutdown().await?;
         }
         Ok(())
     }
@@ -304,16 +394,20 @@ mod tests {
         assert_eq!(service.status.node.borrow().state, NodeServiceStatusState::Connecting);
         assert_eq!(service.status.storage.borrow().state, StorageServiceStatusState::Connecting);
         assert_eq!(service.status.processing.borrow().state, ProcessingState::Idle);
+
+        service.encoding.shutdown().await.expect("encoding scheduler shuts down");
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
     }
 
-    #[test]
-    fn cancellation_domains_are_independent_roots() {
+    #[tokio::test]
+    async fn cancellation_domains_are_independent_roots() {
         let (service, _events) = service();
 
         service.cancellation.sse.cancel();
         assert!(service.cancellation.sse.is_cancelled());
         assert!(!service.cancellation.http.is_cancelled());
         assert!(!service.cancellation.cache_jobs.is_cancelled());
+        service.encoding.shutdown().await.expect("encoding scheduler shuts down");
     }
 
     #[test]
@@ -449,9 +543,12 @@ mod tests {
         assert_eq!(predecessor_producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
         successor_producer.publish_catchup().expect("successor receiver is active when reset returns");
 
-        let runtime = service.runtime.lock().await;
-        let ApiRuntimeSlot::Running(runtime) = &*runtime else { panic!("successor remains installed") };
-        runtime.shutdown().await.expect("successor shuts down");
+        {
+            let slot = service.runtime.lock().await;
+            let ApiRuntimeSlot::Running(runtime) = &*slot else { panic!("successor remains installed") };
+            runtime.shutdown().await.expect("successor shuts down");
+        }
+        service.encoding.shutdown().await.expect("encoding scheduler shuts down");
     }
 
     #[tokio::test]
@@ -463,5 +560,6 @@ mod tests {
         assert_eq!(service.reset(receiver, RecoveryMode::Resync).await, Err(crate::error::ApiServiceError::ControlUnavailable));
         assert_eq!(producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
         assert_eq!(service.publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).runtime_generation, 0);
+        service.encoding.shutdown().await.expect("encoding scheduler shuts down");
     }
 }

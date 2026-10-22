@@ -88,6 +88,12 @@ impl PublicationRuntime {
         self.completion.wait().await
     }
 
+    /// Returns an owned future that observes completion without requesting shutdown.
+    pub(crate) fn completion(&self) -> impl Future<Output = Result<(), PublicationRuntimeError>> + Send + 'static {
+        let completion = self.completion.clone();
+        async move { completion.wait().await }
+    }
+
     /// Returns this runtime's current operational measurements.
     #[must_use]
     pub(crate) fn metrics(&self) -> PublicationRuntimeMetricsSnapshot {
