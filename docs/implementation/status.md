@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 21 October 2026.
+Updated 22 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -305,8 +305,8 @@ through refresh and failed replacement. Focused tests cover encoding limits
 and failures, scheduler priority and saturation, request cancellation and
 terminal draining, delta and Head single-flight, no-waiter and dropped-cache
 completion, shared body allocations, structural pruning, exact Head selection,
-soft refresh, hard-age retry, and prewarming cancellation during cache-job
-shutdown. Logical request operations, client wakeup state, publication
+soft refresh, hard-age retry, and unobserved Head-tier cancellation during
+cache-job shutdown. Logical request operations, client wakeup state, publication
 construction, HTTP routing, and response delivery remain in the later
 increments recorded in
 [the implementation sequence](sequence.md#remaining-reviewable-increments).

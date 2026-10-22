@@ -169,7 +169,7 @@ Supervisor-facing command handle or command mailbox. Successful
 `update_api_db_generation` returns after the local idempotent binding
 transition is complete. Successful `reset` means the new runtime is installed
 and its predecessor, if any, completed shutdown. It does not wait for graph
-construction, alignment, prewarming, publication installation, or processing
+construction, alignment, publication installation, or processing
 progress.
 Successful `shutdown` means ApiService completed the shutdown barrier. An
 unavailable component returns `ApiServiceError` under the
@@ -316,7 +316,7 @@ An ordinary Resync `reset` preserves both fields of `ApiDbState`. A Rebuild
 `reset` invokes `begin_rebuild`; a repeated Rebuild reset has the same
 idempotent effect. During Rebuild, public
 database-backed request admission remains disabled in `AwaitingCatchup`, `Constructing`,
-`Aligning`, and `Prewarming`.
+and `Aligning`.
 
 Clearing `current` prevents the Rebuild runtime from capturing the old API
 generation. The next forwarded `Published` event from the storage-owned
@@ -349,8 +349,8 @@ reports database-backed read unavailability to the public API. ApiService
 neither coordinates replacement nor waits for the remaining delivery of
 detached responses.
 
-After Rebuild, public database-backed reads reopen only when `Aligning` and
-`Prewarming` complete and the replacement publication becomes `Active`; that
+After Rebuild, public database-backed reads reopen only when `Aligning`
+completes and the replacement publication becomes `Active`; that
 current-generation installation sets `public_reads_enabled = true` under the
 publication-install boundary. A superseded runtime cannot reopen the gate. If
 `current` is absent then, the graph
@@ -427,8 +427,10 @@ operation and spawns one tracked orchestration task with a child of
 
 A source-keyed delta job captures its immutable history-entry Arcs and fixed
 target. A Head snapshot tier job captures one immutable Frozen extraction.
-The mandatory tier-50 Prewarming job and later demand-triggered tier jobs use
-the same tracked scheduler and final response construction path. Every job
+Head-tier job creation follows the request-driven policy owned by the
+[protocol cache contract](api-protocol.md#publication-scoped-head-response-cache--settled).
+Every such job uses the same tracked scheduler and final response construction
+path. Every job
 holds only detached immutable inputs during JSON serialization and gzip and no
 publication-core or cache-state guard.
 
@@ -516,10 +518,9 @@ reuse, exact running-job identity, weak publication-local insertion,
 destination heat, and structural pruning form one cache protocol; a
 general-purpose cache would not replace that synchronization.
 
-The unpublished publication runtime consumes the result of its mandatory
-Prewarming job under the
-[publication lifecycle](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled);
-that job has no public request waiters.
+Publication installation starts no cache job and has no cache-readiness
+condition. The [publication lifecycle](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled)
+owns that boundary.
 The publication owner defines job preservation and release of the old cache
 and client registry across publication replacement.
 
@@ -706,7 +707,7 @@ barriers.
 
 `shutdown` is a reliable completed-barrier operation. It is terminal,
 idempotent, valid from `AwaitReset`, `AwaitingCatchup`, `Constructing`, `Aligning`,
-`Prewarming`, and `Active`, and is serialized with `reset` by the runtime
+and `Active`, and is serialized with `reset` by the runtime
 lifecycle mutex.
 ApiService performs the local barrier in order:
 
@@ -937,7 +938,7 @@ V2 exposes these operational measurements:
 - encoded-response cache hits, misses, pruned entries, and coalesced identical
   requests, including raw requested Head depth, selected Head tier, tier age,
   larger-tier fallback, tier-job joins, construction and refresh duration,
-  construction failure, and hard-age prewarming retries;
+  construction failure, and hard-age tier retries;
 - destination concentration, request-source counts, cached segment length,
   per-client revision wakeups, requests per catch-up, and size-limited
   short-prefix frequency;

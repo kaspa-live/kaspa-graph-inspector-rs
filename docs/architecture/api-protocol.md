@@ -166,7 +166,6 @@ MAX_CACHE_LEVEL_DISTANCE = 500
 MAX_CACHE_LEVEL_DISTANCE + MAX_WINDOW_DEPTH < MAX_CACHE_DEPTH
 
 CACHED_HEAD_WINDOW_DEPTH_STEP = 50
-PREWARMED_HEAD_WINDOW_DEPTH = 50
 CACHED_WINDOW_REFRESH_LEVEL_DISTANCE = 40
 CACHED_WINDOW_MAX_LEVEL_DISTANCE = 100
 ```
@@ -192,9 +191,10 @@ selected_depth =
 ```
 
 The initial values therefore produce depths `50`, `100`, `150`, `200`, and
-`250`. `PREWARMED_HEAD_WINDOW_DEPTH` must be one derived tier. The refresh and
-maximum distances measure the cached snapshot's `high_level` behind its
-publication's current Head and satisfy:
+`250`. Every tier, including tier 50, is constructed only in response to a
+public request; publication installation performs no preemptive tier build.
+The refresh and maximum distances measure the cached snapshot's `high_level`
+behind its publication's current Head and satisfy:
 
 ```text
 CACHED_WINDOW_REFRESH_LEVEL_DISTANCE
@@ -1760,9 +1760,9 @@ waiting responses; later Head advancement does not revoke the entry, terminal
 completion, or an in-flight response. A later request performs a new
 current-Head eligibility check.
 
-The `50` tier is constructed preemptively only while opening a new
-publication. No tier, including `50`, is refreshed merely because Head
-advances. Every later construction or refresh is triggered by request demand.
+Every tier follows the request-driven construction rule above. No tier,
+including `50`, is constructed or refreshed merely because a publication is
+installed or Head advances.
 A refresh retains the previous completed entry until the replacement succeeds
 and atomically replaces only that tier. Failure preserves any previous
 completed entry. Waiter completion, job removal, and retry availability belong

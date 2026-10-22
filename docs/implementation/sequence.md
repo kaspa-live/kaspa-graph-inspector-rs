@@ -99,7 +99,7 @@ the active work is increment 13, without an additional nesting level.
 | 10. Encoding scheduler and response cache | Implement the bounded blocking encoding scheduler, JSON size enforcement and gzip execution, publication-local single-flight cache slots, Head tiers, source-keyed delta entries, heat bookkeeping, weak insertion, and tracked cache-job completion. | Deterministic queue, priority, cancellation, hard-age retry, tier selection, single-flight, weak-cache, shared-body, size-limit, gzip-failure, and scheduler-shutdown tests. |
 | 11. SSE client registry and mailboxes | Implement the publication-local client registry and bounded ordered mailbox independently of Axum transport. Cover registration, lifecycle messages, graph-wakeup scheduling and coalescing, completion-time rearming, replacement, disconnect, and slow-client removal. | Race tests for atomic required batches, state-before-wakeup ordering, Head/rearm linearization, stale registrations, replacement sequences, queue bounds, and closure. |
 | 12. API database binding | Implement `ApiDbState`, ordered exact-generation updates, public-read admission, construction-side waiting, Rebuild gating, and terminal stop behavior. Do not add seed construction or public request handlers. | Tests for stale and repeated events, invalid handles, waiting and wakeup, Rebuild disable/reopen authority, generation turnover, and stop/update races. |
-| 13. Publication runtime | First adapt the existing graph-update ingress and processing producer to the Catchup-triggered publication contract, then implement the session-bound `PublicationRuntime`: AwaitingCatchup handling, Catchup-triggered database seeding, staging, dual-cut alignment, prewarming, activation requests, gap reconstruction, projection-failure reconstruction, quiescent receiver closure, and its completed shutdown barrier. | Focused ingress and processor tests for the Catchup gate and marker-ownership refactor, followed by deterministic runtime state-machine tests for every construction state, both alignment cuts, idle-source waits, overflow and gap cuts, sticky Live, supersession, prewarm retry, database failure classes, worker failure, and cancellation with no surviving task. |
+| 13. Publication runtime | First adapt the existing graph-update ingress and processing producer to the Catchup-triggered publication contract, then implement the session-bound `PublicationRuntime`: AwaitingCatchup handling, Catchup-triggered database seeding, staging, dual-cut alignment, immediate installation, gap reconstruction, projection-failure reconstruction, quiescent receiver closure, and its completed shutdown barrier. | Focused ingress and processor tests for the Catchup gate and marker-ownership refactor, followed by deterministic runtime state-machine tests for every construction state, both alignment cuts, idle-source waits, overflow and gap cuts, sticky Live, installation supersession, database failure classes, worker failure, and cancellation with no surviving task. |
 | 14. ApiService lifecycle and publication installation | Implement ApiService's event path, runtime generation fence, reset/current-publication slots, publication installation, cancellation roots, status aggregation, and terminal service barrier. This PR integrates increments 8–13 but adds no Axum router. | Control-level tests for Resync/Rebuild reset, predecessor overlap and join, superseded installation, publication replacement, database-read reopening, unexpected worker failure, shutdown from every runtime state, task/resource release, and idempotence. |
 | 15. In-memory Head operations | Implement the logical Head snapshot, canonical delta, and retained Head-level lookup operations over one captured publication, including cache selection, history budgeting, continuation and registration completion. Keep transport parsing and Axum response delivery out of this PR. | Operation tests for tiers and ETags, every delta outcome and distance/budget boundary, cache bridges and heat, Stale catch-up, all-or-nothing levels, publication mismatch, and request-local failures. |
 | 16. Anchored windows, status, and API admission | Implement Head-first anchored-window resolution with database fallback, detached historical projections, status composition, the independent Head/historical/status admission lanes, database-read permits and timeouts, and request-owned resource accounting. | Tests for all anchors and misses, immutable-source selection, DB/gate races, detached-resource lifetime, status independence, lane saturation, query timeout, and no partial graph. |
@@ -148,14 +148,17 @@ Execute increment 13 as these ordered points:
 4. Implement dual-cut alignment, including independent block-ID and VSPC-source
    cuts, both crossing orders, a no-effect block crossing, continued application
    after one source crosses, indefinite idle-source waiting, and ordered replay
-   through the captured prewarming frontier.
-5. Implement mandatory tier-50 prewarming by reusing the publication cache,
-   tracked cache jobs, graph codec, and encoding scheduler. Retry failed or
-   hard-aged captures, continue applying ordinary updates while encoding, and
-   request installation through a narrow private capability that returns the
-   architecture-owned `Installed` or `Superseded` outcome. Leave the concrete
-   generation fence, current-publication slot, and Rebuild gate reopening to
-   increment 14.
+   through the captured alignment frontier.
+5. Implement immediate post-alignment installation through a narrow private
+   capability that returns the architecture-owned `Installed` or `Superseded`
+   outcome. Recheck the graph-gap generation immediately before constructing
+   and submitting the complete publication Arc; introduce no await, graph
+   receive, `Prewarming` or `Installing` state, or cache job at this boundary.
+   Remove the obsolete `PREWARMED_HEAD_WINDOW_DEPTH` constant and
+   prewarming-specific cache terminology while preserving the existing
+   request-driven tier and hard-age behavior.
+   Leave the concrete generation fence, current-publication slot, Rebuild gate
+   reopening, and demand-triggered Head operation to later increments.
 6. Implement the universal reconstruction path for continuity gaps, staging
    overflow, database read failures, alignment failures, and publication
    projection failures. Drain through the first observed empty frontier,
@@ -163,7 +166,7 @@ Execute increment 13 as these ordered points:
    without requesting processing recovery.
 7. Complete terminal lifecycle behavior and deterministic verification:
    shutdown from every runtime state, Active-to-Stale ordering, repeated
-   shutdown observation, abandoned seed and prewarming work, receiver closure,
+   shutdown observation, abandoned seed and candidate work, receiver closure,
    installation supersession, unexpected worker failure propagation, staging
    and reconstruction measurements, and proof that no runtime-owned task
    survives completion.
