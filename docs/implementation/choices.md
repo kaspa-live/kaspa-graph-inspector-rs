@@ -995,12 +995,12 @@ introducing a trait object into the production binding.
 
 ### Update linearization
 
-Apply each generation event through `watch::Sender::send_if_modified` rather
+Apply each generation message through `watch::Sender::send_if_modified` rather
 than adding an outer mutex beside the settled watch value. The closure performs
-the event classification while holding the watch value's write guard and uses
+the message classification while holding the watch value's write guard and uses
 its boolean result to control notification. A captured typed result
 distinguishes rejection from an accepted no-op without adding another state
-lock. The event semantics are owned by
+lock. The message semantics are owned by
 [API Service](../architecture/api-service.md#api-database-generation-binding--settled).
 
 ### Snapshot observation and waiting

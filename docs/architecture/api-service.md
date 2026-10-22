@@ -44,7 +44,7 @@ ApiService owns one shared database state and gives a clone to each private
 `tokio::sync::watch` is the settled primitive:
 
 ```rust
-enum ApiDbGenerationEvent {
+enum ApiDbGenerationMessage {
     Retired(Arc<ValidatedApiDbClient>),
     Published(Arc<ValidatedApiDbClient>),
 }
@@ -77,20 +77,20 @@ publication-install boundary. It updates a `Running` snapshot without changing
 `begin_rebuild` is a private synchronous mutation under that same boundary. It
 atomically sets `current = None` and `public_reads_enabled = false` without
 retiring or invalidating the previously bound storage-owned client. A later
-exact-client `Retired` event is therefore harmless, and only a subsequent
-`Published` event can bind the Rebuild runtime to an API generation.
+exact-client `Retired` message is therefore harmless, and only a subsequent
+`Published` message can bind the Rebuild runtime to an API generation.
 StorageService owns generation retirement and autonomous replacement under the
 [storage lifecycle](storage.md#storageservice-lifecycle--settled). Supervisor
-maps StorageService's ordered API-generation variants to
-`ApiDbGenerationEvent` and forwards them through the control method below.
+delivers `ApiDbGenerationMessage` values through the control method below under
+the [processing lifecycle](processing-lifecycle.md#api-session-replacement-and-publication).
 ApiService never calls StorageService, requests reacquisition, or emits a
 generation-loss event.
 
 `Published(client)` sets `current = Some(client)` only for the valid published
 handle. `Retired(lost)` clears `current` only when it still holds that exact
 `Arc`; a late retirement for an older generation cannot clear a newer binding.
-Repeating either event for the same `Arc` is idempotent and does not publish a
-new watch revision. A state-changing accepted event publishes the resulting
+Repeating either message for the same `Arc` is idempotent and does not publish a
+new watch revision. A state-changing accepted message publishes the resulting
 complete snapshot. The reliable Supervisor call returns after this local state
 transition has completed.
 
@@ -120,7 +120,7 @@ The public request fails under the public API mapping. Construction invokes
 the publication-owned
 [`restart_construction()`](api-publication.md#universal-api-reconstruction--settled),
 whose next seed awaits a valid current client. Neither path clears ApiDbState;
-the ordered forwarded `Retired` event performs exact-Arc housekeeping and
+the ordered forwarded `Retired` message performs exact-Arc housekeeping and
 wakes watchers. Outside a deliberate Rebuild replacement failure,
 StorageService has already started autonomous reacquisition. The storage-owned
 replacement contract defines when a later Rebuild attempt creates the next
@@ -133,9 +133,9 @@ For a public operation, `QueryFailed` and `InconsistentProjection` leave
 `ApiDbState` unchanged. Normal anchor-unavailability and invalid-request
 outcomes likewise do not enter generation-loss handling. `GenerationLost`
 also changes no snapshot directly: invalidity makes the exact client
-immediately unusable, and the ordered generation event owns its removal.
+immediately unusable, and the ordered generation message owns its removal.
 
-Generation events by themselves change no graph publication ID, state, view
+Generation messages by themselves change no graph publication ID, state, view
 revision, history, or SSE cursor and do not invoke processing Resync or Rebuild.
 An Active graph publication therefore remains usable while database-backed
 reads are temporarily unavailable.
@@ -150,7 +150,7 @@ Supervisor owns `Arc<ApiService>` and uses this public control surface:
 impl ApiService {
     async fn update_api_db_generation(
         &self,
-        event: ApiDbGenerationEvent,
+        message: ApiDbGenerationMessage,
     ) -> Result<(), ApiServiceError>;
 
     async fn reset(
@@ -319,14 +319,14 @@ database-backed request admission remains disabled in `AwaitingCatchup`, `Constr
 and `Aligning`.
 
 Clearing `current` prevents the Rebuild runtime from capturing the old API
-generation. The next forwarded `Published` event from the storage-owned
+generation. The next forwarded `Published` message from the storage-owned
 [replacement lifecycle](storage.md#api-read-exclusion-during-database-replacement--settled)
 makes its generation immediately available through `current().await`. A first
 construction read may then remain pending inside storage under that contract.
 The ApiService-owned public-read gate remains disabled throughout.
 
-On ordinary initialized startup, StorageService's initial `Published` event
-provides the first usable generation and the normal Resync reset preserves it.
+On ordinary initialized startup, the initial `Published` message provides the
+first usable generation and the normal Resync reset preserves it.
 A coherent network-bound Empty database may likewise supply that generation;
 its valid anchored requests produce ordinary typed anchor-unavailability
 outcomes. If the initial Resync then leads to a distinct Rebuild run under the
@@ -338,7 +338,7 @@ ApiService never rebinds an in-flight public request or seed attempt to a newly
 published API DB generation. Each operation finishes against its captured
 client or reports its actual failure. If `reset` processing lags behind storage
 replacement, exact-`Arc` retirement and publication updates still prevent a
-late old-generation event from clearing the replacement.
+late old-generation message from clearing the replacement.
 
 StorageService, rather than `reset`, owns database-replacement exclusion. Its
 [replacement gate](storage.md#api-read-exclusion-during-database-replacement--settled)
