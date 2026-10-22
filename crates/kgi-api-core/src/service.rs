@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use kgi_api_ingress::channel::GraphUpdateReceiver;
 use kgi_api_model::protocol::SystemStatus;
 use kgi_model::lifecycle::{NodeServiceStatus, ProcessingStatus, RecoveryMode, StorageServiceStatus, SupervisorStatus};
 use kgi_storage::generation::ValidatedApiDbClient;
@@ -36,20 +37,18 @@ pub enum ApiDbGenerationMessage {
     Published(Arc<ValidatedApiDbClient>),
 }
 
-#[allow(dead_code, reason = "the runtime slot is advanced by the next increment-14 control point")]
 enum ApiRuntimeSlot {
     AwaitReset,
     Running(PublicationRuntime),
+    #[allow(dead_code, reason = "terminal shutdown enters this state in increment-14 point 6")]
     Stopped,
 }
 
-#[allow(dead_code, reason = "the installation boundary is implemented in increment-14 point 2")]
 struct PublicationInstallState {
     runtime_generation: u64,
 }
 
 impl PublicationInstallState {
-    #[allow(dead_code, reason = "ApiService reset advances this generation in increment-14 point 4")]
     fn advance_runtime_generation(&mut self) -> u64 {
         let generation = self.runtime_generation.checked_add(1).expect("publication runtime generation fits u64");
         self.runtime_generation = generation;
@@ -57,7 +56,6 @@ impl PublicationInstallState {
     }
 }
 
-#[allow(dead_code, reason = "ApiService reset constructs this capability in increment-14 point 4")]
 struct RuntimePublicationInstaller<G = ValidatedApiDbClient> {
     publication_install: Arc<Mutex<PublicationInstallState>>,
     current_publication: watch::Sender<Option<Arc<GraphPublication>>>,
@@ -169,6 +167,40 @@ impl ApiService {
         self.api_db.update(update).map_err(|_| ApiServiceError::ControlUnavailable)
     }
 
+    /// Replaces the session-bound publication runtime and joins its predecessor.
+    pub async fn reset(&self, graph_updates: GraphUpdateReceiver, recovery_mode: RecoveryMode) -> Result<(), ApiServiceError> {
+        let mut runtime = self.runtime.lock().await;
+        if matches!(*runtime, ApiRuntimeSlot::Stopped) {
+            return Err(ApiServiceError::ControlUnavailable);
+        }
+
+        let runtime_generation = {
+            let mut installation = self.publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let generation = installation.advance_runtime_generation();
+            if recovery_mode == RecoveryMode::Rebuild {
+                self.api_db.begin_rebuild();
+            }
+            generation
+        };
+        let installer = RuntimePublicationInstaller {
+            publication_install: self.publication_install.clone(),
+            current_publication: self.current_publication.clone(),
+            api_db: self.api_db.clone(),
+            runtime_generation,
+            recovery_mode,
+        };
+        let successor = PublicationRuntime::new(graph_updates, self.api_db.clone(), installer);
+        let predecessor = std::mem::replace(&mut *runtime, ApiRuntimeSlot::Running(successor));
+
+        if let ApiRuntimeSlot::Running(predecessor) = predecessor {
+            predecessor
+                .shutdown()
+                .await
+                .map_err(|error| ApiServiceError::PublicationRuntimeFailed { diagnostic: error.to_string().into() })?;
+        }
+        Ok(())
+    }
+
     /// Captures the latest independent component observations without waiting for a common revision.
     #[allow(dead_code, reason = "the public status operation is implemented in increment 16")]
     pub(crate) fn system_status(&self) -> SystemStatus {
@@ -193,6 +225,7 @@ mod tests {
         time::Instant,
     };
 
+    use kgi_api_ingress::channel::{GraphUpdateProducerError, graph_update_channel};
     use kgi_api_model::{
         graph::{GraphView, Level, LevelExtent, TrackingPolicy},
         history::GraphHistory,
@@ -398,5 +431,37 @@ mod tests {
         assert_eq!(status.node.last_validated, None);
         assert_eq!(status.storage.state, StorageServiceStatusState::Ready);
         assert_eq!(status.processing.state, ProcessingState::Reconciling { mode: RecoveryMode::Resync });
+    }
+
+    #[tokio::test]
+    async fn reset_starts_the_successor_and_joins_the_predecessor_receiver() {
+        let (service, _) = service();
+        let (predecessor_producer, predecessor_receiver) = graph_update_channel();
+
+        service.reset(predecessor_receiver, RecoveryMode::Resync).await.expect("first reset succeeds");
+        assert_eq!(service.publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).runtime_generation, 1);
+        assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Running(_)));
+
+        let (successor_producer, successor_receiver) = graph_update_channel();
+        service.reset(successor_receiver, RecoveryMode::Rebuild).await.expect("replacement reset succeeds");
+
+        assert_eq!(service.publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).runtime_generation, 2);
+        assert_eq!(predecessor_producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
+        successor_producer.publish_catchup().expect("successor receiver is active when reset returns");
+
+        let runtime = service.runtime.lock().await;
+        let ApiRuntimeSlot::Running(runtime) = &*runtime else { panic!("successor remains installed") };
+        runtime.shutdown().await.expect("successor shuts down");
+    }
+
+    #[tokio::test]
+    async fn reset_after_stop_is_rejected_and_releases_the_supplied_receiver() {
+        let (service, _) = service();
+        *service.runtime.lock().await = ApiRuntimeSlot::Stopped;
+        let (producer, receiver) = graph_update_channel();
+
+        assert_eq!(service.reset(receiver, RecoveryMode::Resync).await, Err(crate::error::ApiServiceError::ControlUnavailable));
+        assert_eq!(producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
+        assert_eq!(service.publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).runtime_generation, 0);
     }
 }
