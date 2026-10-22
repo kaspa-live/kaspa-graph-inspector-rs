@@ -147,7 +147,7 @@ Execute increment 14 as these ordered points:
    before starting the successor; install the successor runtime before awaiting
    its predecessor's completed shutdown barrier. Verify first reset, both
    recovery modes, bounded predecessor overlap, superseded installation,
-   receiver release, generation-overflow failure, and reset serialization.
+   receiver release, and reset serialization.
 5. Add owned completion observation for permanent work. Adapt
    `PublicationRuntime` completion narrowly enough for ApiService to observe an
    unexpected return or panic without detached tasks, emit `ApiServiceEvent::Failed`

@@ -245,9 +245,11 @@ ApiService accepts exactly one `reset` call for each processing attempt. Under
 the runtime lifecycle mutex it briefly enters the publication-install
 synchronization boundary, advances `runtime_generation` with checked
 arithmetic, and applies the recovery-mode-specific ApiDbState effect below.
-Failure to advance leaves the topology and database-read gate unchanged and
-fails `reset`. The new generation becomes authoritative before the successor
-runtime starts, so this transition immediately revokes every predecessor's
+Exhausting the `u64` generation space is physically unreachable within one
+process lifetime and is an internal invariant violation: checked advancement
+must panic rather than add a typed `ApiServiceError` or recoverable `reset`
+outcome. The new generation becomes authoritative before the successor runtime
+starts, so this transition immediately revokes every predecessor's
 publication-installation and database-read-gate authority.
 
 ApiService then starts a new runtime with the fresh receiver, the captured
