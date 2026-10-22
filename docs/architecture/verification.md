@@ -467,16 +467,15 @@ and [rebuild transaction](storage.md#rebuild-transaction--settled) with:
 Verify the [block materialization transaction](storage.md#block-materialization-transaction--settled)
 and [PP seal behavior](block-processing.md#pp-boundary-phase-behavior--settled)
 with an ordering fixture for a non-Genesis PP: the threshold block commits
-before BlockProcessor enters PostSeal, enqueues `PublishPostSeal` to its
-lifecycle-marker worker, or emits `PpBoundarySealed`. The sealing block's graph
-offer returns `SuppressedPreSeal` before the marker-command enqueue, which
-precedes the milestone. For Genesis, verify that the rebuild transaction
-establishes an intrinsically sealed boundary, Rebuild construction creates
-BlockProcessor in PostSeal, enqueues `PublishPostSeal` to the worker, and then
-emits the same exact-once milestone without ordinary Genesis materialization. Inject crash and
+before BlockProcessor enters PostSeal or emits `PpBoundarySealed`. The sealing
+block's graph offer returns `SuppressedAwaitingCatchup` before the milestone.
+For Genesis, verify that the rebuild transaction establishes an intrinsically
+sealed boundary, Rebuild construction creates BlockProcessor in PostSeal, and
+then emits the same exact-once milestone without ordinary Genesis
+materialization. Neither seal path emits an API marker. Inject crash and
 ambiguous-commit outcomes around both paths; an unproven non-Genesis seal emits
-no marker or milestone, while restart after a committed Genesis rebuild derives
-PostSeal from storage and proceeds through ordinary Resync.
+no milestone, while restart after a committed Genesis rebuild derives PostSeal
+from storage and proceeds through ordinary Resync.
 
 Verify the rebuild pruning point establishes the Materialized base case and
 every successful insertion preserves the invariant from Materialized
@@ -841,8 +840,8 @@ Verify [block admission](block-processing.md#admission-and-materialization),
 [OrphanManager](block-processing.md#orphanmanager--settled), and
 [DependencyResolver](block-processing.md#dependencyresolver--settled) with:
 
-1. `ProcessingSession::new` constructs an inert BlockProcessor, OrphanManager,
-   marker worker, and private DependencyResolver bound to the exact session RPC
+1. `ProcessingSession::new` constructs an inert session marker worker,
+   BlockProcessor, OrphanManager, and private DependencyResolver bound to the exact session RPC
    generation before any component task or data sender exists. Successful
    preparation initializes the complete tree before its tasks launch. Shut that
    tree down with handlers and resolver
@@ -946,19 +945,27 @@ with:
 Verify the [graph-update feed](api-ingress.md#in-process-graph-update-feed--settled)
 and [graph model](api-graph.md#graph-values-views-revisions-and-history--settled)
 for causal order, one fresh ingress per processing session, no cross-session
-message tagging, the mutex-protected `PreSeal -> Open` producer gate,
+message tagging, the mutex-protected `AwaitingCatchup -> Open` producer gate,
 nonblocking ordinary delivery, a reliable coalescing gap generation even when
 the final open-gate ordinary update is lost, and lossless causal
-`PublishPostSeal` and `Live` markers. Verify all producer clones share the gate;
-pre-seal block and VSPC offers return `SuppressedPreSeal` without entering the
-channel or advancing the gap; `PublishPostSeal` is the first channel value and
+`Catchup` and `Live` markers. Verify all producer clones share the gate;
+pre-Catchup block and VSPC offers return `SuppressedAwaitingCatchup` without
+entering the channel or advancing the gap; `Catchup` is the first channel value and
 opens the gate without a racing ordinary offer; and later `Full` outcomes
-advance the gap. Verify BlockProcessor's dedicated marker worker absorbs Live
-marker backpressure without blocking its main loop, preserves PostSeal before
-Live, and permits unrelated open-gate graph updates to interleave before Live.
-Initial Resync task startup enqueues `PublishPostSeal`; a Rebuild seal enqueues it
-before the upward milestone; and handling BlockProcessor's Live command enqueues `Live`
-without using `EnteredLive` as an API trigger. After the gate opens, a causal
+advance the gap. Verify ProcessingSession's dedicated marker worker absorbs
+Live marker backpressure without blocking either processor or the session
+coordinator, preserves Catchup before Live, and permits unrelated open-gate
+graph updates to interleave before Live. Resync and Rebuild startup and
+PP-boundary sealing enqueue no API marker. Every accepted Catchup trigger first
+hands Catchup to the worker without awaiting graph-channel delivery, then sends
+both processor commands and activates subscriptions before dispatching its held
+page. Verify every commit offered before the atomic marker/open boundary is
+covered by the later seed, every offer after it enters the stream, and overlap
+is accepted. Delay marker-worker execution after Catchup handoff until both
+processors reach Live; verify their completed offers remain seed-covered, then
+release the worker and observe ordered Catchup and Live delivery without a
+Catchup completion acknowledgement. Global Live admission hands Live to the worker before emitting
+`EnteredLive`; that milestone does not acknowledge API delivery. After the gate opens, a causal
 graph offer must complete before its dependent processing delivery; on `Full`,
 the gap generation must advance first. Cover complete view levels, external
 parent-edge endpoints and level sizes, actual parent presence independent of
@@ -1267,15 +1274,14 @@ Verify deltas and client behavior across
 replay and expiry, response-local hash dictionaries,
 terminal Stale state, replacement publication identity, SSE slow clients,
 fixed-view freeze, DAA focus, and Live arriving during construction,
-alignment, or Prewarming. The latter must install the completed image directly
-as Live.
+or alignment. The completed image must install directly as Live.
 
 Verify the settled
 [publication-state contract](api-publication.md#publication-state-and-revision--settled):
 initial Synchronizing, direct initial Live, visible `Synchronizing -> Live`,
 and terminal Stale transitions leave graph view and history revisions and
 timestamps unchanged. Cover the runtime-replacement `reset` barrier without waiting for
-construction, `Prewarming`, or installation, cancellation of unpublished work,
+construction or installation, cancellation of unpublished work,
 no additional effect for an already Stale publication, canonical delta catch-up
 through the Stale publication's final Head, request-specific state-header
 changes with unchanged Head snapshot bytes and ETag, and immutable delta bytes
@@ -1293,7 +1299,7 @@ command enum. In particular, verify the
 Supervisor can call `reset` and await the `shutdown` barrier while
 `kgi-processing` remains independent of `kgi-api-core`; `reset` returns after
 the new runtime is installed and its predecessor has shut down, without waiting
-for graph construction, `Prewarming`, or publication installation. Verify
+for graph construction or publication installation. Verify
 status observations are latest-value and lossy, remain available through the separate memory-only
 lane, and never influence lifecycle decisions. Node status begins without a
 validated observation, replaces it before each Ready publication, and
@@ -1544,8 +1550,9 @@ body that transfers efficiently does not permit an over-limit uncompressed
 representation.
 
 For tiered Head snapshot reuse, derive exactly `50`, `100`, `150`, `200`, and
-`250` from the initial limits. Require tier `50` to finish before publication
-installation and require every later build or refresh to be request-driven.
+`250` from the initial limits. Install a publication with no encoded tier and
+require the first applicable request, including for tier `50`, to start the
+single-flight job. Every build or refresh is request-driven.
 Exercise selection in this order: eligible selected entry; smallest eligible
 completed larger entry plus selected-tier construction; selected-tier job;
 smallest covering larger job without concurrent selected-tier construction;
@@ -1569,7 +1576,7 @@ terminal result: the same job remains pending, every concurrent waiter stays
 joined, and a newer capture eventually supplies their one shared eligible
 result. Advancing Head after an eligible candidate's admission must not revoke
 that installed entry or its already waiting responses. Repeat the hard-age
-case for mandatory prewarming.
+case for the publication's first tier-50 request.
 
 For canonical Head deltas, verify one
 publication-owned job per source revision: concurrent requests join it after
@@ -1770,25 +1777,29 @@ edges. Exercise the separate capped API pool and prove its saturation or
 generation loss cannot consume or retire a processing-pool connection.
 
 Lifecycle cases cover ApiService `AwaitReset`, construction of a fresh private
-runtime in `PreSeal`, waiting for the first-channel PostSeal marker while
-producer-side suppression remains active,
-`Constructing -> Aligning -> Prewarming -> Active`, and the prohibition on
-direct construction-to-installation. Alignment covers block IDs at and below
+runtime in `AwaitingCatchup`, waiting for the first-channel Catchup marker while
+producer-side suppression remains active through processing PreSeal and
+PostSeal,
+`Constructing -> Aligning -> Active`, and the prohibition on installation
+before alignment completes. Alignment covers block IDs at and below
 the snapshot cut, a first greater ID with no retained effect, a first greater ID
 that returns a delta, and the matching VSPC source. Exercise both crossing
 orders. After one cut crosses, later updates from that source apply while the
 other source continues its snapshot-relative filtering. Empty staging and
 either single-cut state remain Aligning and publish no candidate, including an
 indefinitely idle second source. Only after both cuts cross, apply all later
-interleaved updates through a captured prewarming frontier, assign the
-publication identity, and continue applying newer arrivals normally while the
-tier-50 capture is serialized and compressed. Cache work must create no graph
-revision and must not accumulate a hidden update backlog. Install only after
-the tier is complete and less than 100 levels behind the then-current Head.
-Cover a tier that becomes hard-ineligible during construction and is rebuilt
-from a newer capture, mandatory tier failure and retry without installation,
-and installation with the current publication revision ahead of the cached
-snapshot cursor. The first client catches up from that cursor through retained
+interleaved updates through a captured alignment frontier, require the recorded
+gap generation still to be current, assign the publication identity, and
+synchronously request installation without an intervening await or graph
+receive. `Installed` enters Active; `Superseded` enters Quiescent. Updates queued
+after the frontier apply through the Active path. Advance the gap generation
+before the final fence and verify the candidate is abandoned for reconstruction
+without an installation attempt. Verify the newly installed
+publication initially has no encoded Head tier, its first applicable request
+starts one shared tier job, and concurrent requests join it. Tier capture,
+size, serialization, or compression failure must remain request-local and
+must not change publication state or current-publication installation. The
+first successful client catches up from the cached cursor through retained
 ordinary deltas. Cover first publication revisions zero and above zero, plus
 jointly atomic view and history visibility at every publication revision.
 
@@ -1803,17 +1814,15 @@ request observes the replacement. Runtime shutdown never clears the slot,
 while terminal ApiService shutdown replaces it with `None` after the runtime
 barrier and before releasing publication resources.
 
-Pre-seal suppression produces no gap. Verify the database seed started after
-the marker covers every intentionally suppressed commit, including block and
-VSPC commits racing with the marker transition; an offer ordered after the
-transition enters the channel instead. No pre-seal seed or second marker is
-required.
+Pre-Catchup suppression produces no gap. Verify no database seed starts before
+Catchup. The seed started after the marker covers every intentionally
+suppressed commit, including block and VSPC commits racing with the marker
+transition; an offer ordered after the transition enters the channel instead.
+No second marker is required.
 
 Exercise the runtime's universal intra-session reconstruction primitive from
-`Constructing`, `Aligning`, `Prewarming`, and `Active`. The first two cancel any
-seed attempt and abandon their candidate; `Prewarming` abandons its unpublished
-publication and detaches its mandatory tier waiter while the tracked job may
-finish without inserting; `Active` first becomes terminally Stale. In every
+`Constructing`, `Aligning`, and `Active`. The first two cancel any seed attempt
+and abandon their candidate; `Active` first becomes terminally Stale. In every
 case,
 drain through the first observed channel Empty, discard graph mutations,
 preserve sticky Live, capture the newest gap generation, and start a newer
@@ -1821,7 +1830,7 @@ seed. Updates after the empty frontier must be staged, while a later
 gap-generation change restarts reconstruction again.
 Cover staging overflow, query/generation/projection failure, alignment or
 application failure, and a gap during each state. None may request processing
-recovery. `PublishPostSeal` is not repeated during same-session reconstruction.
+recovery. `Catchup` is not repeated during same-session reconstruction.
 Changing the API database generation alone must not replace an otherwise
 advancing Active publication.
 
@@ -1888,9 +1897,9 @@ forwards both events in order while Rebuild is running. `Published(G2)` makes
 `G2` available to construction while public reads remain disabled, but its seed
 read opens no transaction before definite commit opens the replacement gate.
 The commit emits no second publication event. Replacement graph-publication
-installation after `Prewarming` enables public reads. If the current
+installation after alignment enables public reads. If the current
 generation is lost after the seed has detached but before installation,
-alignment and `Prewarming` may finish, installation still enables the gate, and
+alignment may finish, installation still enables the gate, and
 database-backed requests remain `503` until a later `Published(G3)`. Repeated
 retirement/publication delivery is idempotent, and
 neither generation turnover nor an absent current client invalidates an
@@ -1898,8 +1907,8 @@ otherwise advancing Active graph publication.
 
 Verify [Reset and recovery-time availability](api-service.md#reset-and-recovery-time-availability--settled)
 with ordinary Resync and Rebuild integration scenarios. Verify the fresh
-`GraphUpdateReceiver` and exact recovery mode. From `PreSeal`, `Constructing`,
-`Aligning`, `Prewarming`, and `Active`, start the fresh runtime before
+`GraphUpdateReceiver` and exact recovery mode. From `AwaitingCatchup`, `Constructing`,
+`Aligning`, and `Active`, start the fresh runtime before
 exchanging it into the private lifecycle slot, then await the old runtime's
 uniform shutdown before `reset` returns. Verify the new receiver can drain during the bounded runtime
 overlap and that reset completion waits for neither construction nor
@@ -1932,12 +1941,12 @@ continues. Hold it through that timeout and require
 current generation must not make the drain vacuous.
 Verify a detached old projection may complete delivery while
 an undetached request returns 503, public reads reopen only after the
-replacement completes `Prewarming` and becomes `Active`, and
+replacement completes alignment and becomes `Active`, and
 `PpBoundarySealed` has no API generation role.
 Cover the replacement `Published` event arriving while the Rebuild transaction
-is still running, construction waiting at the storage gate, and
-`PublishPostSeal` arriving before that event with construction remaining
-pending. A final definite replacement failure retires the gated generation
+is still running, the runtime remaining `AwaitingCatchup` after that event, and
+Catchup arriving before that event with construction waiting for the API
+generation and replacement gate. A final definite replacement failure retires the gated generation
 without making it readable; an ambiguous outcome retires both API and
 processing generations. Cover fresh-pool validation failure as
 `RebuildSetupFailed(ApiGenerationPreparation)` without publishing an
@@ -1963,7 +1972,7 @@ receiver. The runtime then becomes quiescent, does not reconstruct or change
 publication state, and remains owned until its later `shutdown()`. A marker
 worker with an accepted delivery retains no RPC or DB client. During session
 replacement, run ProcessingSession shutdown and ApiService reset concurrently;
-receiver replacement releases a blocked marker, BlockProcessor joins the
+receiver replacement releases a blocked marker, ProcessingSession joins the
 worker, and the session barrier completes before its successor starts.
 
 Exercise the
@@ -2003,8 +2012,8 @@ history boundary must become ineligible for selection immediately even though
 its stored counter may remain until level pruning.
 
 Verify all cache orchestration tasks are registered in the ApiService task
-tracker. Include tier-keyed Head snapshot jobs and mandatory `Prewarming` work
-in the same tracked cache and encoding infrastructure. For encoding, reserve
+tracker. Include every demand-triggered tier-keyed Head snapshot job in the
+same tracked cache and encoding infrastructure. For encoding, reserve
 bounded historical capacity before database work,
 release every database resource before submitting the detached projection,
 and enforce the settled total and historical concurrency limits. Verify the
@@ -2021,8 +2030,8 @@ blocking serialization or compression finish while discarding its output, and
 joins the scheduler without a publication lock or database resource held.
 
 Verify the [ApiService shutdown barrier](api-service.md#apiservice-shutdown--settled)
-from `AwaitReset`, `PreSeal`, `Constructing`, `Aligning`, `Prewarming`, and
-`Active`, including races with `reset`, marker delivery, gap reconstruction,
+from `AwaitReset`, `AwaitingCatchup`, `Constructing`, `Aligning`, and `Active`,
+including races with `reset`, marker delivery, gap reconstruction,
 database projection,
 serialization, detached response delivery, SSE wakeups, and API-generation
 publication on either side of Supervisor's terminal-shutdown cutoff. An update

@@ -47,7 +47,7 @@ pub struct VspcCommitted {
 /// Ordered per-session graph publication input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GraphUpdate {
-    PublishPostSeal,
+    Catchup,
     BlockCommitted(BlockCommitted),
     VspcCommitted(VspcCommitted),
     Live,

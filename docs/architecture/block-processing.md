@@ -2,8 +2,8 @@
 
 ## Scope and ownership
 
-This document owns BlockProcessor, its graph lifecycle-marker delivery worker,
-OrphanManager, DependencyResolver, block admission, PP-boundary phase behavior,
+This document owns BlockProcessor, OrphanManager, DependencyResolver, block
+admission, PP-boundary phase behavior,
 and committed block delivery. The
 [storage contract](storage.md) owns persistent representation and transactions.
 The [processing lifecycle](processing-lifecycle.md) owns recovery phase
@@ -21,8 +21,8 @@ supplied value.
 Genesis has no discarded DAG past, so a Genesis PP is intrinsically sealed at
 blue score zero. After the atomic Genesis rebuild transaction, Rebuild
 initialization starts BlockProcessor directly in
-`PostSeal`, enqueues `PublishPostSeal` to its lifecycle-marker worker, and then
-emits the existing exact-once `PpBoundarySealed` milestone. Genesis never enters
+`PostSeal` and emits the existing exact-once `PpBoundarySealed` milestone.
+Genesis never enters
 the ordinary BlockProcessor or `PersistedBlock` path.
 
 For every non-Genesis PP, Rebuild initialization starts in
@@ -38,9 +38,8 @@ definite successful commit changes BlockProcessor's local phase to `PostSeal`
 and authorizes the exact-once `PpBoundarySealed` milestone upward to
 ProcessingSession. For an inserted sealing block, BlockProcessor emits that
 milestone only after offering the block's graph update obtains the intentional
-`SuppressedPreSeal` outcome and its marker worker accepts the
-`PublishPostSeal` command. An ambiguous or failed transaction enqueues no
-marker command and emits no milestone.
+`SuppressedAwaitingCatchup` outcome. An ambiguous or failed transaction emits
+no milestone.
 `PpBoundarySealed` is never a command sent back to BlockProcessor.
 
 The [processing lifecycle](processing-lifecycle.md) owns propagation of the
@@ -80,8 +79,8 @@ continually ready inputs.
 The [session construction](processing-lifecycle.md#processor-construction)
 supplies one inert BlockProcessor with direct inputs for the immutable recovery
 mode, exact RPC and DB generations, graph-update producer, and private
-session-channel endpoints. BlockProcessor owns the inert marker worker and
-OrphanManager values; OrphanManager owns its inert DependencyResolver, which
+session-channel endpoints. BlockProcessor owns the inert OrphanManager value;
+OrphanManager owns its inert DependencyResolver, which
 receives the exact RPC generation. None of these BlockProcessor-owned values
 starts a task or producer during construction. Conceptual commands after task
 startup are:
@@ -97,14 +96,12 @@ notification gate, overlap state, empty orphan state, committed anchor, seal
 threshold, and mode-specific initial phase, then starts the complete
 BlockProcessor tree under the
 [cross-processor construction contract](processing-lifecycle.md#processor-construction).
-Initial task execution performs the local milestone and marker behavior owned
+Initial task execution performs the local milestone behavior owned
 by the [PP-boundary contract](#pp-boundary-phase-behavior--settled). Resync
-startup immediately enqueues `PublishPostSeal`; Rebuild startup follows the
-marker-command enqueue points owned above. Processing cannot reach Catchup
-until every startup marker command has been accepted by the marker
-worker. That acceptance precedes the processing-lifecycle-owned successful
-[`start` outcome](processing-lifecycle.md#processingsession--settled). Startup
-does not wait for marker delivery through the graph-update channel.
+startup begins in PostSeal; Rebuild reaches PostSeal through the initialization
+or sealing paths owned above. BlockProcessor does not produce API lifecycle
+markers. The [processing lifecycle](processing-lifecycle.md#resync-blockvspc-pump--settled)
+owns how its milestone constrains Catchup.
 
 Construction and initialization themselves create no BlockProcessor-specific
 lifecycle result. A preparation failure leaves the entire inert tree owned by
@@ -114,36 +111,6 @@ processing-lifecycle-owned startup or post-start fault path according to
 whether the startup barrier has completed. Shutdown is the sole terminal
 descendant barrier. No separate Genesis flag or mutable recovery-mode field
 exists.
-
-### Graph lifecycle-marker delivery — settled
-
-Each BlockProcessor owns one small marker worker value for that session's
-`GraphUpdateProducer`; its task starts with the rest of the BlockProcessor tree.
-BlockProcessor sends it only two commands,
-each at most once and in this order:
-
-```text
-PublishPostSeal
-Live
-```
-
-The local command handoff cannot apply graph-update-channel backpressure to
-BlockProcessor. The worker invokes the
-[API feed's lossless marker operation](api-ingress.md#in-process-graph-update-feed--settled)
-serially in its command FIFO. The API feed contract owns channel delivery,
-interleaving, and gap semantics.
-
-Handling BlockProcessor's existing `Live` command enqueues `Live` to its
-lifecycle-marker worker; `EnteredLive` does not trigger API delivery. After
-that command, no later marker exists for the session.
-
-Shutdown closes the local marker-command input. The worker drains accepted
-commands and exits after delivery, or exits when ApiService replacement or
-shutdown drops that session feed's receiver. The worker owns only its clone of
-the session-scoped `GraphUpdateProducer` and no validated RPC or DB client.
-BlockProcessor joins it as part of terminal shutdown; the processing lifecycle
-owns the cross-component ordering that ensures a closed receiver can release a
-blocked lossless delivery. If no marker is pending, it exits immediately.
 
 The local notification gate starts closed and opens on Catchup. Continue
 polling its receiver while closed and discard received notifications
@@ -255,7 +222,7 @@ be Genesis.
 After `materialize_block` returns `Inserted`, BlockProcessor offers its
 returned [`BlockCommitted`](storage.md#block-materialization-transaction--settled)
 value to the run's graph-update producer before delivering `PersistedBlock` to
-VspcProcessor and OrphanManager. `SuppressedPreSeal` intentionally omits only
+VspcProcessor and OrphanManager. `SuppressedAwaitingCatchup` intentionally omits only
 the API projection update; processing delivery continues. Once the producer
 gate is open, completing the offer before `PersistedBlock` preserves
 graph-update causal order. BlockProcessor preserves the storage materialization

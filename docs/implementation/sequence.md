@@ -37,7 +37,7 @@ Execute it as these small, ordered changes:
 3. Implement `kgi-api-ingress` as the complete bounded session capability:
    channel construction, cloneable producer, single receiver, shared gate,
    coalescing gap observation, ordinary nonblocking offers, and lossless
-   lifecycle-marker delivery. Exercise concurrent gate ordering, PreSeal
+   lifecycle-marker delivery. Exercise concurrent gate ordering, `AwaitingCatchup`
    suppression, full-channel gaps, closure, marker ordering, and wakeup
    coalescing with deterministic tests.
 4. Run formatting, workspace unit and integration tests through Nextest,
@@ -73,7 +73,7 @@ they do not define future PR boundaries.
 | 2. Build validated capabilities | Implement `NodeService`, one-connection `ValidatedRpcClient`, the ordered `NodeServiceEvent` stream, RPC validation/normalization, and all-or-nothing notification routing. Implement `StorageService`, schema/network validation, processing and API validated DB generations, the ordered `StorageServiceEvent` stream, migrations, and transaction/cache publication rules. These can advance independently once milestone 1 interfaces are stable. | Connection-generation, ordered publication/retirement, stale-event suppression, network/schema rejection, IBD, subscription failure, GetBlocks normalization, and ambiguous DB commit tests. |
 | 3. Implement persistence invariants | Add identity/materiality lookup, ordered hash interning, transactional block materialization and coordinate allocation, PP rebuild transaction, committed VSPC sink derivation, atomic VSPC coloring and final level DAA scores. Keep ordinary orphans in memory and boundary identities permanent. | PostgreSQL tests for PP `(1,0)`, anticone levels, strict versus PreSeal references, dedup, no boundary promotion, VSPC reorgs, and crash/ambiguous seal outcomes. |
 | 4. Establish database replacement safety | Implement the autonomously reconnecting read-only API pool, the API variants of StorageService's ordered generation stream, shared/exclusive replacement gate, generation retirement, and bounded database-phase cancellation/drain. Prove an old detached projection or clean 503 outcome for Rebuild races, including the chosen PostgreSQL clear strategy. Keep public Rebuild historical reads closed until an aligned replacement becomes Active; leave them available for Resync. | PostgreSQL race tests for concurrent API database phases, rebuild, independent API-pool reconnection, ordered generation events, and any `TRUNCATE` behavior; bounded gate completion. This milestone must pass before enabling a runnable rebuild. |
-| 5. Build processor workers | Implement OrphanManager, DependencyResolver, and BlockProcessor's lifecycle-marker worker, then BlockProcessor's priority/gates/materialization path. Implement VspcProcessor's pending indexes, source/destination continuity, phase-specific pruning and overlap. Give every processing session a fresh ordered graph-update ingress with its settled producer gate; preserve block-before-`PersistedBlock` order and report nonblocking delivery gaps. | Worker tests for topology, cancellation races, priorities, pre-seal suppression, full versus closed channels, gap signaling, causal processor milestones, lossless BlockProcessor-delivered lifecycle markers, PreSeal seal transition, VSPC sequencing, and duplicate detection. |
+| 5. Build processor workers | Implement OrphanManager and DependencyResolver, then BlockProcessor's priority, gates, and materialization path. Implement VspcProcessor's pending indexes, source/destination continuity, phase-specific pruning and overlap. Give every processing session a fresh ordered graph-update ingress with its settled producer gate; preserve block-before-`PersistedBlock` order and report nonblocking delivery gaps. | Worker tests for topology, cancellation races, priorities, pre-Catchup suppression, full versus closed channels, gap signaling, causal processor milestones, absence of an API marker at PP sealing, PreSeal seal transition, VSPC sequencing, and duplicate detection. |
 
 ## Remaining reviewable increments
 
@@ -87,8 +87,8 @@ do not enlarge the PR silently. Any future regrouping requires updating this
 sequence first.
 
 The former broad Step 6 is now increments 6–17, former Step 7 is increments
-18–22, and former Step 8 is increments 23–27. Increments 6–11 are complete;
-the active work is increment 12, without an additional nesting level.
+18–22, and former Step 8 is increments 23–27. Increments 6–12 are complete;
+the active work is increment 13, without an additional nesting level.
 
 | Increment / PR | Isolated production scope | Completion evidence |
 |---|---|---|
@@ -99,13 +99,13 @@ the active work is increment 12, without an additional nesting level.
 | 10. Encoding scheduler and response cache | Implement the bounded blocking encoding scheduler, JSON size enforcement and gzip execution, publication-local single-flight cache slots, Head tiers, source-keyed delta entries, heat bookkeeping, weak insertion, and tracked cache-job completion. | Deterministic queue, priority, cancellation, hard-age retry, tier selection, single-flight, weak-cache, shared-body, size-limit, gzip-failure, and scheduler-shutdown tests. |
 | 11. SSE client registry and mailboxes | Implement the publication-local client registry and bounded ordered mailbox independently of Axum transport. Cover registration, lifecycle messages, graph-wakeup scheduling and coalescing, completion-time rearming, replacement, disconnect, and slow-client removal. | Race tests for atomic required batches, state-before-wakeup ordering, Head/rearm linearization, stale registrations, replacement sequences, queue bounds, and closure. |
 | 12. API database binding | Implement `ApiDbState`, ordered exact-generation updates, public-read admission, construction-side waiting, Rebuild gating, and terminal stop behavior. Do not add seed construction or public request handlers. | Tests for stale and repeated events, invalid handles, waiting and wakeup, Rebuild disable/reopen authority, generation turnover, and stop/update races. |
-| 13. Publication runtime | Implement the session-bound `PublicationRuntime`: PreSeal handling, database seeding, staging, dual-cut alignment, prewarming, activation requests, gap reconstruction, projection-failure reconstruction, quiescent receiver closure, and its completed shutdown barrier. | Deterministic state-machine tests for every construction state, both alignment cuts, idle-source waits, overflow and gap cuts, sticky Live, supersession, prewarm retry, database failure classes, worker failure, and cancellation with no surviving task. |
+| 13. Publication runtime | First adapt the existing graph-update ingress and processing producer to the Catchup-triggered publication contract, then implement the session-bound `PublicationRuntime`: AwaitingCatchup handling, Catchup-triggered database seeding, staging, dual-cut alignment, immediate installation, gap reconstruction, projection-failure reconstruction, quiescent receiver closure, and its completed shutdown barrier. | Focused ingress and processor tests for the Catchup gate and marker-ownership refactor, followed by deterministic runtime state-machine tests for every construction state, both alignment cuts, idle-source waits, overflow and gap cuts, sticky Live, installation supersession, database failure classes, worker failure, and cancellation with no surviving task. |
 | 14. ApiService lifecycle and publication installation | Implement ApiService's event path, runtime generation fence, reset/current-publication slots, publication installation, cancellation roots, status aggregation, and terminal service barrier. This PR integrates increments 8–13 but adds no Axum router. | Control-level tests for Resync/Rebuild reset, predecessor overlap and join, superseded installation, publication replacement, database-read reopening, unexpected worker failure, shutdown from every runtime state, task/resource release, and idempotence. |
 | 15. In-memory Head operations | Implement the logical Head snapshot, canonical delta, and retained Head-level lookup operations over one captured publication, including cache selection, history budgeting, continuation and registration completion. Keep transport parsing and Axum response delivery out of this PR. | Operation tests for tiers and ETags, every delta outcome and distance/budget boundary, cache bridges and heat, Stale catch-up, all-or-nothing levels, publication mismatch, and request-local failures. |
 | 16. Anchored windows, status, and API admission | Implement Head-first anchored-window resolution with database fallback, detached historical projections, status composition, the independent Head/historical/status admission lanes, database-read permits and timeouts, and request-owned resource accounting. | Tests for all anchors and misses, immutable-source selection, DB/gate races, detached-resource lifetime, status independence, lane saturation, query timeout, and no partial graph. |
 | 17. HTTP and SSE transport | Implement the `kgi-api-core` Axum router, strict request parsing, HTTP outcome/header mapping, gzip requirements, body delivery guards/timeouts, SSE connection tasks, API fallback, and method handling over the completed logical operations. | Router-level tests for every route and method, malformed input precedence, exact headers/errors/cache policy, conditional requests, SSE framing/replacement/slow clients, committed-response failure, middleware isolation, and router shutdown. |
-| 18. ProcessingSession construction and preparation | Implement the non-reusable session owner, inert actor-tree construction, Resync and Rebuild preparation, processor initialization/launch, startup outcomes and cancellation, initial marker handoff, and consuming actor-tree shutdown. Do not yet add the synchronization pump or Supervisor. | Session tests for both preparation modes and all typed outcomes, threshold construction, exact generation retention/release, startup cancellation races, partial-launch cleanup, marker acceptance, and complete descendant joining. |
-| 19. ProcessingSession synchronization and Live transition | Add the common GetBlocks/VSPC pump, rolling Catchup trigger and fallbacks, notification activation, synthetic dispatch, Catchup accounting, overlap admission, producer shutdown, ordered processor Live commands, and `EnteredLive`. | Deterministic pump tests for page/cursor order, held-page behavior, marker refresh, all fallbacks, malformed and cancelled RPC outcomes, cross-page deduplication, overlap at complete page boundaries, and abandonment of synthetic work at Live. |
+| 18. ProcessingSession construction and preparation | Implement the non-reusable session owner, inert actor-tree and lifecycle-marker-worker construction, Resync and Rebuild preparation, processor initialization/launch, startup outcomes and cancellation, and consuming actor-tree shutdown. Recover the removed marker-worker primitive from pre-refactor commit `1a7fd26`, then adapt its ownership and first marker to the settled ProcessingSession contract. Do not yet add the synchronization pump or Supervisor. | Session tests for both preparation modes and all typed outcomes, threshold construction, exact generation retention/release, startup cancellation races, partial-launch cleanup, no marker before Catchup, and complete descendant joining. |
+| 19. ProcessingSession synchronization and Live transition | Add the common GetBlocks/VSPC pump, rolling Catchup trigger and fallbacks, Catchup marker handoff, notification activation, synthetic dispatch, Catchup accounting, overlap admission, producer shutdown, ordered processor and marker-worker Live commands, and `EnteredLive`. | Deterministic pump tests for page/cursor order, held-page behavior, marker refresh, all fallbacks, Catchup marker/open ordering without delivery acknowledgement, malformed and cancelled RPC outcomes, cross-page deduplication, overlap at complete page boundaries, asynchronous Live delivery, and abandonment of synthetic work at Live. |
 | 20. Supervisor recovery orchestration | Implement service-event resource binding, exact-generation retirement coalescence, fault/recovery policy and backoff, session slot transitions, API DB event forwarding, per-attempt ingress/reset, milestone handling, retry/Fatal behavior, and status publication. | End-to-end orchestration tests for startup, Resync-to-Rebuild replacement, stronger intent, malformed-input budget, persistence and ownership faults, stale service events, API forwarding, same-generation reuse, and no cross-session state. |
 | 21. Logging and administrative command | Initialize the retained rusty-kaspa-derived console/file logging after validated configuration and implement the complete one-shot database reinitialization dispatch and exit behavior. Preserve secret redaction and validation-before-effects; leave ordinary service dispatch to increment 22 rather than adding a placeholder composition path. | Command-level tests for help/version, logging modes and failure, administrative success and failure exits, redaction, startup ordering, and absence of every long-lived component in the one-shot command. |
 | 22. Service and HTTP composition with global shutdown | Implement ordinary service dispatch; compose the long-lived service `Arc`s, Supervisor, listener, API router, runtime Web configuration and static files; install the Supervisor-owned signal adapter; run Axum; and implement the complete concurrent global shutdown order. | Integration and subprocess tests for startup ordering, API/static fallback isolation, runtime configuration and assets, service rejection, Axum failure, first/second/third signals, session/API/server concurrency, event draining, and final NodeService-then-StorageService shutdown. |
@@ -115,49 +115,70 @@ the active work is increment 12, without an additional nesting level.
 | 26. Deployment and release artifacts | Complete the conventional and Docker layouts, runtime log directories, systemd and Compose examples, static-asset cache behavior, and atomic `xtask` bundle/container construction against the composed binary and Web build. | Reproducible bundle and image checks, matching binary/assets and provenance, missing-root failure, unprivileged/read-only deployment, writable logs, direct signal delivery, and atomic failure cleanup. |
 | 27. Full-stack acceptance | Add only the remaining cross-component fixtures and acceptance coverage needed to prove the focused verification contract across node RPC, PostgreSQL, recovery, API/Web, packaging, logging, and resource isolation; update implementation status with the final evidence. | Full Rust, PostgreSQL, Vitest, deterministic and complete-stack Playwright, parity, packaging, shutdown, and load/isolation suites pass from a clean checkout. |
 
-### Active increment 12: API database binding
+### Active increment 13: publication runtime
 
-Increment 12 is exactly one reviewable PR. It implements only the
-ApiService-owned latest-value binding between ordered API database-generation
-events and future construction or public-read consumers. The focused
-[ApiService database-binding contract](../architecture/api-service.md#api-database-generation-binding--settled)
-owns this state; Storage retains generation validity, retirement,
-reacquisition, and replacement exclusion.
+Increment 13 is exactly one reviewable PR. It begins with the narrow prerequisite
+refactor that adapts the already implemented graph-update ingress and processing
+producer to the Catchup-triggered publication contract. It then implements the
+private, session-bound `PublicationRuntime` owned by the focused
+[publication runtime contract](../architecture/api-publication.md#publication-runtime--settled).
+The runtime consumes the adapted graph-update ingress and the API database binding
+completed by earlier increments, constructs and advances publication candidates,
+and asks the future ApiService integration boundary to install a completed
+publication.
 
-Execute increment 12 as these ordered points:
+Execute increment 13 as these ordered points:
 
-1. Add a private `api_db` module in `kgi-api-core` containing the concrete
-   `ApiDbGenerationEvent`, complete `ApiDbSnapshot`, and watch-backed
-   `ApiDbState`. Initialize it with no current generation and public reads
-   enabled. Keep the production state bound to `ValidatedApiDbClient`; use only
-   a private lightweight generation abstraction for deterministic unit tests.
-2. Implement synchronous ordered generation updates and their focused tests
-   according to the event and notification contract owned by
-   [API Service](../architecture/api-service.md#api-database-generation-binding--settled).
-3. Implement the two read paths. `public_read_client()` performs one immediate
-   snapshot read and admits only an enabled, present, still-valid generation.
-   `current().await` ignores the public-read gate, waits through absent or
-   invalid generations without polling or timeout, wakes on replacement, and
-   returns `None` only after stop.
-4. Implement the private gate transitions needed by later ApiService
-   integration: Rebuild atomically unbinds the current generation and disables
-   public reads without invalidating it; publication installation changes only
-   the public-read flag; terminal stop atomically drops the bound generation,
-   wakes construction waiters, and is idempotent.
-5. Add deterministic lifecycle and race coverage for initial absence,
-   publication and exact retirement, repeated and stale events, invalid
-   handles, immediate public admission, construction waiting and wakeup,
-   invalid-current waiting, Rebuild disable/reopen, generation turnover,
-   stop/update linearization in both outcomes, waiter
-   release on stop, and reference release.
-6. Record the completed implementation choice and status, confirm that the
-   binding changes no graph publication or Storage lifecycle state, and run the
-   full Rust validation suite.
+1. Adapt the shared graph-update value and ingress to the `Catchup` marker and
+   `AwaitingCatchup` gate. Update the ingress ordering and concurrency tests,
+   remove BlockProcessor's superseded marker ownership and PP-seal API-marker
+   effects, and preserve BlockProcessor's processing-specific `PreSeal`,
+   `PostSeal`, and `PpBoundarySealed` behavior. Remove the current
+   BlockProcessor marker worker; its settled primitive will be recreated under
+   ProcessingSession ownership in increment 18. Add no `PublicationRuntime`
+   implementation in this point.
+2. Add the private publication-runtime module, completed shutdown barrier,
+   cancellation ownership, bounded staging state and measurements, initial
+   `AwaitingCatchup` handling, and quiescent receiver-closure behavior. Keep
+   runtime dependency and test seams private to `kgi-api-core`.
+3. Implement database construction after the first `Catchup`: wait
+   through `ApiDbState::current()`, load `HeadPublication` through one exact
+   `ValidatedApiDbClient`, create the revision-zero Head candidate and history,
+   stage concurrent ordinary updates, and retain `Live` as sticky target state.
+4. Implement dual-cut alignment, including independent block-ID and VSPC-source
+   cuts, both crossing orders, a no-effect block crossing, continued application
+   after one source crosses, indefinite idle-source waiting, and ordered replay
+   through the captured alignment frontier.
+5. Implement immediate post-alignment installation through a narrow private
+   capability that returns the architecture-owned `Installed` or `Superseded`
+   outcome. Recheck the graph-gap generation immediately before constructing
+   and submitting the complete publication Arc; introduce no await, graph
+   receive, `Prewarming` or `Installing` state, or cache job at this boundary.
+   Remove the obsolete `PREWARMED_HEAD_WINDOW_DEPTH` constant and
+   prewarming-specific cache terminology while preserving the existing
+   request-driven tier and hard-age behavior.
+   Leave the concrete generation fence, current-publication slot, Rebuild gate
+   reopening, and demand-triggered Head operation to later increments.
+6. Implement the universal reconstruction path for continuity gaps, staging
+   overflow, database read failures, alignment failures, and publication
+   projection failures. Drain through the first observed empty frontier,
+   preserve sticky `Live`, record the newest gap generation, and reconstruct
+   without requesting processing recovery.
+7. Complete terminal lifecycle behavior and deterministic verification:
+   shutdown from every runtime state, Active-to-Stale ordering, repeated
+   shutdown observation, abandoned seed and candidate work, receiver closure,
+   installation supersession, unexpected worker failure propagation, staging
+   and reconstruction measurements, and proof that no runtime-owned task
+   survives completion.
+8. Record the completed implementation choices and status, confirm that the
+   runtime adds no ApiService control or public request path, and run the full
+   Rust validation suite.
 
-This increment adds no `PublicationRuntime`, ApiService runtime slot,
-publication installation, Supervisor event forwarding, HTTP request handler,
-database query, Storage replacement control, or shutdown orchestration. Those
-consumers integrate the binding in increments 13–17 and 20.
+This increment adds no ApiService runtime slot, reset serialization, concrete
+publication-generation fence, current-publication watch, database-read gate
+reopening, Supervisor event forwarding, logical public request operation, or
+HTTP/SSE transport. Increment 14 integrates the runtime with those ApiService
+control responsibilities.
 
 ## Cross-increment ordering
 

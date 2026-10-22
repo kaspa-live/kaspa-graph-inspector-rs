@@ -1104,7 +1104,7 @@ fn node_operation_fault(error: NodeError, is_live: bool, hash: BlockHash) -> Com
 mod tests {
     use std::{collections::VecDeque, sync::Weak};
 
-    use kgi_api_ingress::channel::{GraphUpdateReceiveEvent, graph_update_channel};
+    use kgi_api_ingress::channel::{GraphUpdateObservation, graph_update_channel};
     use kgi_model::{
         block::{BlueWork, ConsensusOrder},
         graph_update::GraphUpdate,
@@ -1268,8 +1268,8 @@ mod tests {
         let rpc = MockRpc::new();
         let (persisted_tx, persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (graph_tx, mut graph_rx) = graph_update_channel();
-        graph_tx.publish_post_seal().expect("open graph producer gate");
-        assert_eq!(graph_rx.try_recv_update(), Ok(GraphUpdate::PublishPostSeal));
+        graph_tx.publish_catchup().expect("open graph producer gate");
+        assert_eq!(graph_rx.try_recv_update(), Ok(GraphUpdate::Catchup));
         let (mut processor, events) = VspcProcessor::new(RecoveryMode::Resync, rpc.clone(), db.clone(), graph_tx, persisted_rx);
         processor.initialize(anchor).expect("VspcProcessor initialization");
         processor.start().expect("VspcProcessor start");
@@ -1392,8 +1392,8 @@ mod tests {
 
         persisted.send(persisted_block(2, 1)).await.expect("persisted destination");
         assert!(matches!(
-            graph.next_event().await,
-            Some(GraphUpdateReceiveEvent::Update(GraphUpdate::VspcCommitted(VspcCommitted { source, destination, .. })))
+            graph.next_observation().await,
+            Some(GraphUpdateObservation::Update(GraphUpdate::VspcCommitted(VspcCommitted { source, destination, .. })))
                 if source == hash(1) && destination == hash(2)
         ));
         let applied = db.state.lock().expect("mock DB mutex").applied.clone();
@@ -1436,8 +1436,8 @@ mod tests {
         apply_releases.add_permits(1);
 
         assert!(matches!(
-            graph.next_event().await,
-            Some(GraphUpdateReceiveEvent::Update(GraphUpdate::VspcCommitted(VspcCommitted { destination, .. })))
+            graph.next_observation().await,
+            Some(GraphUpdateObservation::Update(GraphUpdate::VspcCommitted(VspcCommitted { destination, .. })))
                 if destination == hash(2)
         ));
         for _ in 0..20 {
@@ -1469,8 +1469,8 @@ mod tests {
 
         processor.live().expect("Live");
         assert!(matches!(
-            graph.next_event().await,
-            Some(GraphUpdateReceiveEvent::Update(GraphUpdate::VspcCommitted(VspcCommitted { destination, .. })))
+            graph.next_observation().await,
+            Some(GraphUpdateObservation::Update(GraphUpdate::VspcCommitted(VspcCommitted { destination, .. })))
                 if destination == hash(2)
         ));
         assert_eq!(db.state.lock().expect("mock DB mutex").applied.len(), 1);
@@ -1492,7 +1492,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         processor.live().expect("Live");
-        assert!(matches!(graph.next_event().await, Some(GraphUpdateReceiveEvent::Update(GraphUpdate::VspcCommitted(_)))));
+        assert!(matches!(graph.next_observation().await, Some(GraphUpdateObservation::Update(GraphUpdate::VspcCommitted(_)))));
 
         notifications.send(added(&[2])).await.expect("exact replay");
         for _ in 0..20 {
@@ -1518,8 +1518,8 @@ mod tests {
         notifications.send(added(&[2])).await.expect("actionable notification");
 
         assert!(matches!(
-            graph.next_event().await,
-            Some(GraphUpdateReceiveEvent::Update(GraphUpdate::VspcCommitted(VspcCommitted { destination, .. })))
+            graph.next_observation().await,
+            Some(GraphUpdateObservation::Update(GraphUpdate::VspcCommitted(VspcCommitted { destination, .. })))
                 if destination == hash(2)
         ));
         assert_eq!(db.state.lock().expect("mock DB mutex").applied.len(), 1);
@@ -1610,8 +1610,8 @@ mod tests {
         processor.live().expect("Live");
 
         assert!(matches!(
-            graph.next_event().await,
-            Some(GraphUpdateReceiveEvent::Update(GraphUpdate::VspcCommitted(VspcCommitted { removed, added, .. })))
+            graph.next_observation().await,
+            Some(GraphUpdateObservation::Update(GraphUpdate::VspcCommitted(VspcCommitted { removed, added, .. })))
                 if removed.is_empty() && added.as_ref() == [hash(4), hash(5)]
         ));
         let applied = db.state.lock().expect("mock DB mutex").applied.clone();
@@ -1659,8 +1659,8 @@ mod tests {
         processor.submit_synthetic(reorg(&[3, 2, 3], &[4, 5])).await.expect("synthetic reorg");
 
         assert!(matches!(
-            graph.next_event().await,
-            Some(GraphUpdateReceiveEvent::Update(GraphUpdate::VspcCommitted(VspcCommitted { destination, .. })))
+            graph.next_observation().await,
+            Some(GraphUpdateObservation::Update(GraphUpdate::VspcCommitted(VspcCommitted { destination, .. })))
                 if destination == hash(5)
         ));
         {

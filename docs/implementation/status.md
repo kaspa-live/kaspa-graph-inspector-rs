@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 21 October 2026.
+Updated 22 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -18,8 +18,9 @@ has been replaced by Vite and the imported source builds with the workspace's
 React 19 and TypeScript 7 toolchain. The shared `kgi-model` domain, lifecycle,
 fault, status, VSPC, and committed graph-update values are implemented against
 the selected rusty-kaspa `v2.1.0` value crates. The session-scoped graph-update
-ingress implements the shared pre-seal gate, nonblocking ordinary offers,
-lossless lifecycle markers, coalescing gap observation, and ingress metrics.
+ingress implements the accepted AwaitingCatchup gate and Catchup marker,
+along with nonblocking ordinary offers, lossless lifecycle markers, coalescing
+gap observation, and ingress metrics.
 ApiService orchestration remains behavior-free scaffolding; `kgi-api-core`
 contains the in-memory publication kernel described below. The processing
 crate contains the session-scoped BlockProcessor and VspcProcessor slices
@@ -183,19 +184,18 @@ failure, cancellation, terminal backlog preemption, and exact RPC-generation
 release. Unexpected loss of an active processor or descendant command path is
 reported through the typed ownership-fault path rather than interpreted as
 ordinary shutdown.
-The BlockProcessor-owned lifecycle-marker worker provides the nonblocking
-two-command local FIFO, lossless graph-ingress delivery, accepted-command drain
-after local closure, and receiver-closure termination without retaining RPC or
-database generations. Terminal BlockProcessor shutdown joins it after draining
-accepted markers. The BlockProcessor owner loop implements explicit input
+The superseded BlockProcessor-owned lifecycle-marker worker and its API marker
+effects have been removed. The ProcessingSession-owned worker remains scheduled
+for increment 18. The BlockProcessor owner loop implements explicit input
 priority, notification gating, phase-specific materialization policy, PostSeal
 transition, graph-before-persisted delivery, Catchup lower-bound and
 source-overlap accounting, child fault provenance, and typed storage and node
 fault normalization. Focused tests cover inert construction and initialization,
-single launch, final startup-handoff failure, Genesis and non-Genesis marker
-paths, strict sealing, closed-gate discard, late notification filtering, exact
-overlap, post-commit delivery loss, API receiver closure, terminal input
-preemption, complete descendant joining, and session-generation release.
+single launch, final startup-milestone failure, Genesis and non-Genesis sealing
+without API marker publication, closed-gate discard, late notification
+filtering, exact overlap, post-commit delivery loss, API receiver closure,
+terminal input preemption, complete descendant joining, and session-generation
+release.
 The VspcProcessor owner loop now retains its exact session RPC and processing
 database generations, anchor-derived sink and materialization history,
 multi-index pending state, synthetic FIFO, ordered resolved notifications,
@@ -228,7 +228,7 @@ and composition forms, gapless history append, cumulative estimates,
 prefix-only pruning, detached entry lifetime, and retained-range selection.
 Publication, database projection reads, encoding, transport, and ApiService
 runtime behavior remain in the separately numbered increments recorded in
-[the implementation sequence](sequence.md#active-increment-6-canonical-graph-model).
+[the implementation sequence](sequence.md#remaining-reviewable-increments).
 Completion validation passed workspace formatting, Cargo check, 337/337
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.
@@ -305,8 +305,8 @@ through refresh and failed replacement. Focused tests cover encoding limits
 and failures, scheduler priority and saturation, request cancellation and
 terminal draining, delta and Head single-flight, no-waiter and dropped-cache
 completion, shared body allocations, structural pruning, exact Head selection,
-soft refresh, hard-age retry, and prewarming cancellation during cache-job
-shutdown. Logical request operations, client wakeup state, publication
+soft refresh, hard-age retry, and unobserved Head-tier cancellation during
+cache-job shutdown. Logical request operations, client wakeup state, publication
 construction, HTTP routing, and response delivery remain in the later
 increments recorded in
 [the implementation sequence](sequence.md#remaining-reviewable-increments).
@@ -347,5 +347,30 @@ Rebuild gate transitions, both sides of the stop cutoff, terminal waiter
 release, and generation-reference release. Seed construction, public request
 handlers, and ApiService integration remain in later increments.
 Completion validation passed workspace formatting, Cargo check, 486/486
+Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
+with warnings denied, and `git diff --check`.
+
+Implementation increment 13 is implemented: the private
+`kgi-api-core::publication::runtime` module now contains the single
+session-bound graph-publication worker and its repeatable completed shutdown
+barrier. The worker consumes the Catchup-gated session feed, loads one detached
+Head seed through the exact current API database generation, stages concurrent
+commits, aligns independent materialization and VSPC cuts, and synchronously
+submits complete publications through a narrow private installation
+capability. Continuity gaps, staging overflow, database read failures,
+alignment failures, and active projection failures share one intra-session
+reconstruction path. Receiver closure quiesces the worker, while terminal
+shutdown abandons pending construction, makes an active publication Stale,
+releases the receiver, and retains its completion result for repeated callers.
+The implementation adds no ApiService control operation, public request path,
+current-publication slot, or concrete generation fence; those remain in later
+increments recorded in
+[the implementation sequence](sequence.md#remaining-reviewable-increments).
+Focused tests cover marker gating, exact-generation seeding, both alignment
+orders and idle-source waiting, installation supersession, every reconstruction
+failure class, sticky Live and gap fences, staging measurements, shutdown from
+every worker state, quiescent receiver closure, inline seed cancellation,
+Active-to-Stale ordering, and retained worker-loss results.
+Completion validation passed workspace formatting, Cargo check, 511/511
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.
