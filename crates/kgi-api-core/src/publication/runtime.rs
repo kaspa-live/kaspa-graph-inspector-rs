@@ -18,7 +18,7 @@ use kgi_model::{
 use kgi_storage::{error::ApiReadError, generation::ValidatedApiDbClient};
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex as AsyncMutex, watch},
+    sync::{Mutex as AsyncMutex, mpsc::error::TryRecvError, watch},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -208,9 +208,11 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
                 PublicationRuntimePhase::Stopped => unreachable!("a running publication worker is not stopped"),
             };
 
+            let action = if action == LoopAction::RestartConstruction { self.restart_construction()? } else { action };
+
             match action {
                 LoopAction::Continue => {}
-                LoopAction::RestartConstruction => self.begin_reconstruction(),
+                LoopAction::RestartConstruction => unreachable!("reconstruction resolves to a runnable or quiescent state"),
                 LoopAction::Quiescent => return self.quiesce(&cancellation).await,
                 LoopAction::Cancelled => {
                     self.finish().await;
@@ -268,10 +270,8 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
                         self.work = PublicationWork::Aligning(Box::new(ConstructionCandidate::from_seed(seed, origin)));
                         Ok(ConstructionOutcome::Seeded)
                     }
-                    Err(ApiReadError::QueryFailed | ApiReadError::GenerationLost | ApiReadError::InconsistentProjection) => {
-                        self.restart_staging();
-                        Ok(ConstructionOutcome::Restart)
-                    }
+                    Err(ApiReadError::QueryFailed | ApiReadError::GenerationLost | ApiReadError::InconsistentProjection) =>
+                        Ok(ConstructionOutcome::Restart),
                 },
                 observation = self.graph_updates.next_observation() => match observation {
                     Some(observation) => match self.handle_observation(observation).await? {
@@ -309,7 +309,6 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
                 Ok(WorkerAction::Continue)
             }
             (PublicationRuntimePhase::Constructing | PublicationRuntimePhase::Aligning, GraphUpdateObservation::Gap(_)) => {
-                self.restart_staging();
                 Ok(WorkerAction::RestartConstruction)
             }
             (
@@ -330,7 +329,6 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
             }
             (PublicationRuntimePhase::Active, GraphUpdateObservation::Gap(_)) => {
                 self.retire_active().await;
-                self.restart_staging();
                 Ok(WorkerAction::RestartConstruction)
             }
             (PublicationRuntimePhase::Active, GraphUpdateObservation::Update(GraphUpdate::Catchup)) => {
@@ -343,12 +341,7 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
     }
 
     fn stage(&mut self, update: CommittedGraphUpdate) -> WorkerAction {
-        if self.staging.push(update).is_err() {
-            self.restart_staging();
-            WorkerAction::RestartConstruction
-        } else {
-            WorkerAction::Continue
-        }
+        if self.staging.push(update).is_err() { WorkerAction::RestartConstruction } else { WorkerAction::Continue }
     }
 
     fn advance_alignment(&mut self) -> AlignmentOutcome {
@@ -357,7 +350,6 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
             let update = self.staging.pop_front().expect("captured staging frontier remains available");
             let result = self.alignment_candidate_mut().apply_alignment_update(&update);
             if result.is_err() {
-                self.restart_staging();
                 return AlignmentOutcome::Restart;
             }
         }
@@ -366,7 +358,6 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
             return AlignmentOutcome::Waiting;
         }
         if self.graph_updates.gap_generation() != self.construction_gap_generation {
-            self.restart_staging();
             return AlignmentOutcome::Restart;
         }
 
@@ -385,10 +376,7 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
                     PublicationInstallOutcome::Superseded => AlignmentOutcome::Superseded,
                 }
             }
-            Err(_) => {
-                self.restart_staging();
-                AlignmentOutcome::Restart
-            }
+            Err(_) => AlignmentOutcome::Restart,
         }
     }
 
@@ -400,7 +388,6 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
         };
         if result.is_err() {
             self.retire_active().await;
-            self.restart_staging();
             WorkerAction::RestartConstruction
         } else {
             WorkerAction::Continue
@@ -429,15 +416,26 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
         self.work = PublicationWork::None;
     }
 
-    fn begin_reconstruction(&mut self) {
+    fn restart_construction(&mut self) -> Result<LoopAction, PublicationRuntimeError> {
         self.work = PublicationWork::None;
-        self.construction_gap_generation = self.graph_updates.gap_generation();
-        self.shared.set_phase(PublicationRuntimePhase::Constructing);
-    }
-
-    fn restart_staging(&mut self) {
         self.staging.clear();
         self.shared.record_reconstruction();
+
+        loop {
+            match self.graph_updates.try_recv_update() {
+                Ok(GraphUpdate::BlockCommitted(_) | GraphUpdate::VspcCommitted(_)) => {}
+                Ok(GraphUpdate::Live) => {
+                    self.shared.set_target_live();
+                }
+                Ok(GraphUpdate::Catchup) => return Err(PublicationRuntimeError::InvalidMarkerOrder),
+                Err(TryRecvError::Empty) => {
+                    self.construction_gap_generation = self.graph_updates.gap_generation();
+                    self.shared.set_phase(PublicationRuntimePhase::Constructing);
+                    return Ok(LoopAction::Continue);
+                }
+                Err(TryRecvError::Disconnected) => return Ok(LoopAction::Quiescent),
+            }
+        }
     }
 
     async fn finish(&mut self) {
@@ -786,10 +784,14 @@ mod tests {
 
     impl MockSeedDb {
         fn immediate(result: Result<GraphViewSeed, ApiReadError>) -> Arc<Self> {
+            Self::immediate_sequence([result])
+        }
+
+        fn immediate_sequence(results: impl IntoIterator<Item = Result<GraphViewSeed, ApiReadError>>) -> Arc<Self> {
             Arc::new(Self {
                 valid: AtomicBool::new(true),
                 calls: AtomicUsize::new(0),
-                results: Mutex::new(VecDeque::from([result])),
+                results: Mutex::new(results.into_iter().collect()),
                 started: Arc::new(Semaphore::new(0)),
                 release: None,
             })
@@ -826,7 +828,11 @@ mod tests {
             if let Some(release) = &self.release {
                 release.acquire().await.expect("seed gate remains open").forget();
             }
-            self.results.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).pop_front().expect("mock seed result")
+            let result = self.results.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).pop_front().expect("mock seed result");
+            if result == Err(ApiReadError::GenerationLost) {
+                self.valid.store(false, Ordering::SeqCst);
+            }
+            result
         }
     }
 
@@ -963,6 +969,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn staging_overflow_restarts_without_retaining_a_partial_prefix() {
+        let (mut worker, _producer) = aligning_worker_with_producer();
+        for byte in 0..API_STAGING_UPDATE_CAPACITY {
+            assert_eq!(worker.stage(CommittedGraphUpdate::Vspc(vspc_update(byte as u8))), WorkerAction::Continue);
+        }
+
+        assert_eq!(worker.stage(CommittedGraphUpdate::Vspc(vspc_update(0))), WorkerAction::RestartConstruction);
+        assert_eq!(worker.staging.len(), API_STAGING_UPDATE_CAPACITY, "the overflowing update is not partially admitted");
+        assert_eq!(worker.restart_construction(), Ok(LoopAction::Continue));
+        assert_eq!(worker.staging.len(), 0, "reconstruction discards the complete staged prefix");
+        assert_eq!(
+            worker.shared.lock().metrics,
+            PublicationRuntimeMetricsSnapshot {
+                staging_occupancy: 0,
+                staging_high_water_mark: API_STAGING_UPDATE_CAPACITY,
+                staging_overflow_count: 1,
+                reconstruction_count: 1,
+            }
+        );
+    }
+
     #[tokio::test]
     async fn completion_join_ownership_survives_a_cancelled_waiter() {
         let release = Arc::new(Semaphore::new(0));
@@ -1057,6 +1085,54 @@ mod tests {
         api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database.clone())).expect("publish database generation");
         wait_for(&runtime, |snapshot| snapshot.phase == PublicationRuntimePhase::Aligning).await;
         assert_eq!(database.calls(), 1);
+
+        assert_eq!(runtime.shutdown().await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn retained_generation_seed_failures_reconstruct_through_the_same_current_client() {
+        for failure in [ApiReadError::QueryFailed, ApiReadError::InconsistentProjection] {
+            let database = MockSeedDb::immediate_sequence([Err(failure), Ok(seed(14))]);
+            let api_db = Arc::new(ApiDbState::new());
+            api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database.clone())).expect("publish database generation");
+            let (producer, receiver) = graph_update_channel();
+            let runtime = PublicationRuntime::new(receiver, api_db, MockInstaller::installed());
+
+            producer.publish_catchup().expect("runtime receiver is open");
+            let reconstructed = wait_for(&runtime, |snapshot| {
+                snapshot.phase == PublicationRuntimePhase::Aligning && snapshot.metrics.reconstruction_count == 1
+            })
+            .await;
+
+            assert_eq!(reconstructed.metrics.staging_occupancy, 0);
+            assert_eq!(database.calls(), 2, "the same current generation serves the newer seed attempt");
+            assert_eq!(runtime.shutdown().await, Ok(()));
+        }
+    }
+
+    #[tokio::test]
+    async fn generation_lost_reconstructs_and_waits_for_the_forwarded_replacement() {
+        let lost = MockSeedDb::immediate(Err(ApiReadError::GenerationLost));
+        let replacement = MockSeedDb::immediate(Ok(seed(15)));
+        let api_db = Arc::new(ApiDbState::new());
+        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(lost.clone())).expect("publish database generation");
+        let (producer, receiver) = graph_update_channel();
+        let runtime = PublicationRuntime::new(receiver, api_db.clone(), MockInstaller::installed());
+
+        producer.publish_catchup().expect("runtime receiver is open");
+        wait_for(&runtime, |snapshot| {
+            snapshot.phase == PublicationRuntimePhase::Constructing && snapshot.metrics.reconstruction_count == 1
+        })
+        .await;
+        assert_eq!(lost.calls(), 1);
+        assert_eq!(replacement.calls(), 0);
+
+        api_db.update(crate::api_db::ApiDbGenerationEvent::Retired(lost)).expect("retire lost database generation");
+        api_db
+            .update(crate::api_db::ApiDbGenerationEvent::Published(replacement.clone()))
+            .expect("publish replacement database generation");
+        wait_for(&runtime, |snapshot| snapshot.phase == PublicationRuntimePhase::Aligning).await;
+        assert_eq!(replacement.calls(), 1);
 
         assert_eq!(runtime.shutdown().await, Ok(()));
     }
@@ -1165,7 +1241,8 @@ mod tests {
     fn changed_gap_generation_prevents_installation_at_the_alignment_boundary() {
         let (mut worker, producer) = aligning_worker_with_producer();
         producer.publish_catchup().expect("alignment test receiver is open");
-        for byte in 0..(GRAPH_UPDATE_CHANNEL_CAPACITY - 1) {
+        assert_eq!(worker.graph_updates.try_recv_update(), Ok(GraphUpdate::Catchup));
+        for byte in 0..GRAPH_UPDATE_CHANNEL_CAPACITY {
             assert_eq!(
                 producer.offer_vspc_committed(vspc_update(byte as u8)),
                 Ok(GraphUpdateOfferOutcome::Enqueued),
@@ -1179,5 +1256,47 @@ mod tests {
         assert_eq!(worker.advance_alignment(), AlignmentOutcome::Restart);
         assert!(matches!(worker.work, PublicationWork::Aligning(_)), "the run loop still owns abandonment");
         assert!(worker.installer.latest().is_none());
+        assert_eq!(worker.restart_construction(), Ok(LoopAction::Continue));
+        assert!(matches!(worker.work, PublicationWork::None));
+        assert_eq!(worker.shared.lock().phase, PublicationRuntimePhase::Constructing);
+        assert_eq!(worker.construction_gap_generation, 1);
+    }
+
+    #[tokio::test]
+    async fn reconstruction_drains_to_empty_discards_staged_work_and_preserves_live() {
+        let (mut worker, producer) = aligning_worker_with_producer();
+        producer.publish_catchup().expect("alignment test receiver is open");
+        assert_eq!(worker.graph_updates.try_recv_update(), Ok(GraphUpdate::Catchup));
+        assert_eq!(producer.offer_vspc_committed(vspc_update(1)), Ok(GraphUpdateOfferOutcome::Enqueued));
+        producer.publish_live().await.expect("alignment test receiver is open");
+        assert_eq!(producer.offer_vspc_committed(vspc_update(2)), Ok(GraphUpdateOfferOutcome::Enqueued));
+        worker.staging.push(CommittedGraphUpdate::Vspc(vspc_update(3))).expect("staged value fits");
+
+        assert_eq!(worker.restart_construction(), Ok(LoopAction::Continue));
+        assert!(matches!(worker.work, PublicationWork::None));
+        assert_eq!(worker.staging.len(), 0);
+        assert!(worker.shared.lock().target_live);
+        assert_eq!(worker.shared.lock().phase, PublicationRuntimePhase::Constructing);
+        assert_eq!(worker.shared.lock().metrics.reconstruction_count, 1);
+        assert_eq!(producer.metrics().current_occupancy, 0);
+
+        assert_eq!(producer.offer_vspc_committed(vspc_update(4)), Ok(GraphUpdateOfferOutcome::Enqueued));
+        assert_eq!(producer.metrics().current_occupancy, 1, "work after the empty frontier remains for the new attempt");
+    }
+
+    #[tokio::test]
+    async fn active_gap_retires_the_installed_publication_before_reconstruction() {
+        let (mut worker, _producer) = aligning_worker_with_producer();
+        worker.staging.push(CommittedGraphUpdate::Block(block_update(6, 11, 10))).expect("crossing block fits");
+        worker.staging.push(CommittedGraphUpdate::Vspc(vspc_update_at(90, 90))).expect("crossing VSPC fits");
+        assert_eq!(worker.advance_alignment(), AlignmentOutcome::Installed);
+        worker.shared.set_phase(PublicationRuntimePhase::Active);
+        let publication = worker.active_publication().clone();
+
+        assert_eq!(worker.handle_observation(GraphUpdateObservation::Gap(1)).await, Ok(WorkerAction::RestartConstruction));
+        assert_eq!(publication.capture_delta_target().await.state(), GraphPublicationState::Stale);
+        assert!(matches!(worker.work, PublicationWork::None));
+        assert_eq!(worker.restart_construction(), Ok(LoopAction::Continue));
+        assert_eq!(worker.shared.lock().phase, PublicationRuntimePhase::Constructing);
     }
 }
