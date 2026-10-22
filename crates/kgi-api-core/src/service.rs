@@ -46,6 +46,7 @@ pub enum ApiDbGenerationMessage {
 enum ApiRuntimeSlot {
     AwaitReset,
     Running(OwnedPublicationRuntime),
+    Stopping(Option<OwnedPublicationRuntime>),
     Stopped,
 }
 
@@ -266,7 +267,7 @@ impl ApiService {
     /// Replaces the session-bound publication runtime and joins its predecessor.
     pub async fn reset(&self, graph_updates: GraphUpdateReceiver, recovery_mode: RecoveryMode) -> Result<(), ApiServiceError> {
         let mut runtime = self.runtime.lock().await;
-        if matches!(*runtime, ApiRuntimeSlot::Stopped) {
+        if matches!(*runtime, ApiRuntimeSlot::Stopping(_) | ApiRuntimeSlot::Stopped) {
             return Err(ApiServiceError::ControlUnavailable);
         }
 
@@ -301,13 +302,24 @@ impl ApiService {
             return Ok(());
         }
 
+        if matches!(*runtime, ApiRuntimeSlot::AwaitReset | ApiRuntimeSlot::Running(_)) {
+            let previous = std::mem::replace(&mut *runtime, ApiRuntimeSlot::Stopping(None));
+            if let ApiRuntimeSlot::Running(installed) = previous {
+                *runtime = ApiRuntimeSlot::Stopping(Some(installed));
+            }
+        }
+
         self.api_db.stop();
 
         let mut result = Ok(());
-        if let ApiRuntimeSlot::Running(installed) = &*runtime
-            && let Err(error) = installed.shutdown().await
-        {
-            result = Err(error);
+        if let ApiRuntimeSlot::Stopping(Some(installed)) = &*runtime {
+            if let Err(error) = installed.shutdown().await {
+                result = Err(error);
+            }
+            let ApiRuntimeSlot::Stopping(installed) = &mut *runtime else {
+                unreachable!("shutdown retains the terminal runtime slot")
+            };
+            *installed = None;
         }
 
         self.cancellation.sse.cancel();
@@ -343,7 +355,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
         sync::{
-            Arc, Mutex,
+            Arc, Barrier as StdBarrier, Mutex,
             atomic::{AtomicBool, Ordering},
         },
         time::Instant,
@@ -359,7 +371,9 @@ mod tests {
         NodeServiceStatus, NodeServiceStatusState, ProcessingState, ProcessingStatus, RecoveryMode, StorageServiceStatus,
         StorageServiceStatusState, SupervisorLifecycle, SupervisorStatus,
     };
-    use tokio::sync::{mpsc::error::TryRecvError, watch};
+    use serde::{Serialize, Serializer};
+    use tokio::sync::{Semaphore, mpsc::error::TryRecvError, watch};
+    use tokio_util::sync::CancellationToken;
 
     use super::{
         ApiRuntimeSlot, ApiService, ApiServiceEvent, ApiStatusInputs, OwnedPublicationRuntime, PublicationInstallState,
@@ -393,6 +407,22 @@ mod tests {
     impl PublicationSeedDatabase for TestGeneration {
         async fn load_head_seed(&self) -> Result<GraphViewSeed, ApiReadError> {
             panic!("simulated publication-runtime worker loss")
+        }
+    }
+
+    struct BlockingEncoding {
+        started: Arc<Semaphore>,
+        release: Arc<StdBarrier>,
+    }
+
+    impl Serialize for BlockingEncoding {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            self.started.add_permits(1);
+            self.release.wait();
+            serializer.serialize_unit()
         }
     }
 
@@ -690,6 +720,47 @@ mod tests {
         assert_eq!(shutdown.await.expect("shutdown task completes"), Ok(()));
         assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopped));
         assert_eq!(producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_keeps_reset_rejected_and_later_shutdown_resumes() {
+        let (service, mut events) = service();
+        let (installed_producer, installed_receiver) = graph_update_channel();
+        service.reset(installed_receiver, RecoveryMode::Resync).await.expect("runtime starts");
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(StdBarrier::new(2));
+        let encoding = service.encoding.scheduler.clone();
+        let encoding_started = started.clone();
+        let encoding_release = release.clone();
+        let encode = tokio::spawn(async move {
+            encoding
+                .encode_priority(BlockingEncoding { started: encoding_started, release: encoding_release }, CancellationToken::new())
+                .await
+        });
+        started.acquire().await.expect("encoding start signal remains open").forget();
+
+        let shutdown_service = service.clone();
+        let shutdown = tokio::spawn(async move { shutdown_service.shutdown().await });
+        while !service.cancellation.cache_jobs.is_cancelled() {
+            tokio::task::yield_now().await;
+        }
+        shutdown.abort();
+        assert!(shutdown.await.expect_err("shutdown waiter is cancelled").is_cancelled());
+        assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopping(None)));
+        assert_eq!(installed_producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
+
+        let (producer, receiver) = graph_update_channel();
+        assert_eq!(service.reset(receiver, RecoveryMode::Resync).await, Err(crate::error::ApiServiceError::ControlUnavailable));
+        assert_eq!(producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
+        assert_eq!(service.publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).runtime_generation, 1);
+
+        let release_wait = release.clone();
+        tokio::task::spawn_blocking(move || release_wait.wait()).await.expect("encoding release task completes");
+        assert!(encode.await.expect("encoding owner completes").is_err());
+        service.shutdown().await.expect("later shutdown resumes the retained barrier");
+
+        assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopped));
         assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
     }
 
