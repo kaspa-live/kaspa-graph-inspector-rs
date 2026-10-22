@@ -1,12 +1,13 @@
 use std::sync::{Arc, Mutex};
 
+use kgi_api_model::protocol::SystemStatus;
 use kgi_model::lifecycle::{NodeServiceStatus, ProcessingStatus, RecoveryMode, StorageServiceStatus, SupervisorStatus};
 use kgi_storage::generation::ValidatedApiDbClient;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    api_db::{ApiDbGeneration, ApiDbState},
+    api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
     cache::CacheJobTracker,
     encoding::scheduler::EncodingScheduler,
     error::ApiServiceError,
@@ -95,6 +96,18 @@ struct ApiStatusInputs {
     processing: watch::Receiver<ProcessingStatus>,
 }
 
+impl ApiStatusInputs {
+    fn current(&self) -> SystemStatus {
+        SystemStatus {
+            kgi_version: self.kgi_version.to_owned(),
+            supervisor: *self.supervisor.borrow(),
+            node: self.node.borrow().clone(),
+            storage: *self.storage.borrow(),
+            processing: *self.processing.borrow(),
+        }
+    }
+}
+
 /// Permanent owner of API publication, cache, encoding, and transport lifecycles.
 #[allow(dead_code, reason = "the initialized resources are consumed by later increment-14 control points")]
 pub struct ApiService {
@@ -147,6 +160,21 @@ impl ApiService {
         (service, event_rx)
     }
 
+    /// Applies one ordered API database-generation message before returning.
+    pub async fn update_api_db_generation(&self, message: ApiDbGenerationMessage) -> Result<(), ApiServiceError> {
+        let update = match message {
+            ApiDbGenerationMessage::Retired(client) => ApiDbGenerationUpdate::Retired(client),
+            ApiDbGenerationMessage::Published(client) => ApiDbGenerationUpdate::Published(client),
+        };
+        self.api_db.update(update).map_err(|_| ApiServiceError::ControlUnavailable)
+    }
+
+    /// Captures the latest independent component observations without waiting for a common revision.
+    #[allow(dead_code, reason = "the public status operation is implemented in increment 16")]
+    pub(crate) fn system_status(&self) -> SystemStatus {
+        self.status.current()
+    }
+
     /// Returns the complete publication current at this instant, when present.
     #[allow(dead_code, reason = "public graph operations are implemented in later API increments")]
     pub(crate) fn current_publication(&self) -> Option<Arc<GraphPublication>> {
@@ -175,7 +203,7 @@ mod tests {
     };
     use tokio::sync::{mpsc::error::TryRecvError, watch};
 
-    use super::{ApiRuntimeSlot, ApiService, PublicationInstallState, RuntimePublicationInstaller};
+    use super::{ApiRuntimeSlot, ApiService, ApiStatusInputs, PublicationInstallState, RuntimePublicationInstaller};
     use crate::{
         api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
         publication::{
@@ -344,5 +372,31 @@ mod tests {
         assert!(panic.is_err());
         assert_eq!(publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).runtime_generation, u64::MAX);
         assert!(api_db.public_read_client().is_some_and(|current| Arc::ptr_eq(&current, &generation)));
+    }
+
+    #[test]
+    fn status_composition_reads_each_latest_value_without_cross_component_coordination() {
+        let (supervisor_tx, supervisor) = watch::channel(SupervisorStatus {
+            lifecycle: SupervisorLifecycle::Running,
+            desired_recovery: None,
+            active_recovery: None,
+        });
+        let (node_tx, node) = watch::channel(NodeServiceStatus { state: NodeServiceStatusState::Connecting, last_validated: None });
+        let (storage_tx, storage) = watch::channel(StorageServiceStatus { state: StorageServiceStatusState::Connecting });
+        let (processing_tx, processing) = watch::channel(ProcessingStatus { state: ProcessingState::Idle });
+        let inputs = ApiStatusInputs { kgi_version: "test-version", supervisor, node, storage, processing };
+
+        supervisor_tx.send_modify(|status| status.desired_recovery = Some(RecoveryMode::Rebuild));
+        node_tx.send_modify(|status| status.state = NodeServiceStatusState::Unavailable);
+        storage_tx.send_replace(StorageServiceStatus { state: StorageServiceStatusState::Ready });
+        processing_tx.send_replace(ProcessingStatus { state: ProcessingState::Reconciling { mode: RecoveryMode::Resync } });
+
+        let status = inputs.current();
+        assert_eq!(status.kgi_version, "test-version");
+        assert_eq!(status.supervisor.desired_recovery, Some(RecoveryMode::Rebuild));
+        assert_eq!(status.node.state, NodeServiceStatusState::Unavailable);
+        assert_eq!(status.node.last_validated, None);
+        assert_eq!(status.storage.state, StorageServiceStatusState::Ready);
+        assert_eq!(status.processing.state, ProcessingState::Reconciling { mode: RecoveryMode::Resync });
     }
 }
