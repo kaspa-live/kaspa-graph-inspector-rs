@@ -877,7 +877,7 @@ mod tests {
 
     use kaspa_consensus_core::network::{NetworkId, NetworkType};
     use kgi_api_ingress::channel::{
-        GRAPH_UPDATE_CHANNEL_CAPACITY, GraphUpdateOfferOutcome, GraphUpdateReceiveEvent, graph_update_channel,
+        GRAPH_UPDATE_CHANNEL_CAPACITY, GraphUpdateObservation, GraphUpdateOfferOutcome, graph_update_channel,
     };
     use kgi_model::{
         block::{
@@ -1530,8 +1530,8 @@ mod tests {
         processor.submit_synthetic(inserted.clone()).await.expect("inserted block");
 
         assert!(matches!(
-            graph_rx.next_event().await,
-            Some(GraphUpdateReceiveEvent::Update(GraphUpdate::BlockCommitted(update))) if update.hash == inserted.hash
+            graph_rx.next_observation().await,
+            Some(GraphUpdateObservation::Update(GraphUpdate::BlockCommitted(update))) if update.hash == inserted.hash
         ));
         let fault = events.recv().await.expect("delivery fault");
         assert!(matches!(

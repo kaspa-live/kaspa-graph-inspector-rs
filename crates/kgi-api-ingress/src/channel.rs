@@ -45,9 +45,9 @@ pub enum GraphUpdateProducerError {
     ReceiverClosed,
 }
 
-/// One consumer wakeup from the ordered stream or its continuity signal.
+/// One receiver observation from the ordered stream or its continuity signal.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GraphUpdateReceiveEvent {
+pub enum GraphUpdateObservation {
     Update(GraphUpdate),
     Gap(u64),
 }
@@ -317,23 +317,23 @@ impl GraphUpdateReceiver {
     /// An already reported gap takes priority. Call [`Self::recv_update`]
     /// when channel order must be observed independently, including while
     /// awaiting the first `Catchup` marker.
-    pub async fn next_event(&mut self) -> Option<GraphUpdateReceiveEvent> {
+    pub async fn next_observation(&mut self) -> Option<GraphUpdateObservation> {
         loop {
             if let Some(generation) = self.gap.take_pending() {
-                return Some(GraphUpdateReceiveEvent::Gap(generation));
+                return Some(GraphUpdateObservation::Gap(generation));
             }
 
             tokio::select! {
                 biased;
                 generation = self.gap.changed(), if !self.gap.reporter_closed() => {
                     if let Some(generation) = generation {
-                        return Some(GraphUpdateReceiveEvent::Gap(generation));
+                        return Some(GraphUpdateObservation::Gap(generation));
                     }
                 }
                 update = self.rx.recv() => {
                     let update = update?;
                     self.channel_state.record_dequeue();
-                    return Some(GraphUpdateReceiveEvent::Update(update));
+                    return Some(GraphUpdateObservation::Update(update));
                 }
             }
         }
@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(producer.offer_vspc_committed(vspc_update(10)), Ok(GraphUpdateOfferOutcome::GapReported));
         assert_eq!(producer.offer_vspc_committed(vspc_update(11)), Ok(GraphUpdateOfferOutcome::GapReported));
         assert_eq!(receiver.gap_generation(), 2);
-        assert_eq!(receiver.next_event().await, Some(GraphUpdateReceiveEvent::Gap(2)));
+        assert_eq!(receiver.next_observation().await, Some(GraphUpdateObservation::Gap(2)));
         assert_eq!(receiver.take_pending_gap(), None);
         assert_eq!(producer.offer_vspc_committed(vspc_update(12)), Ok(GraphUpdateOfferOutcome::GapReported));
         assert_eq!(receiver.wait_for_gap().await, Some(3));

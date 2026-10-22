@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use kgi_api_ingress::channel::{GraphUpdateReceiveEvent, GraphUpdateReceiver};
+use kgi_api_ingress::channel::{GraphUpdateObservation, GraphUpdateReceiver};
 use kgi_model::graph_update::{BlockCommitted, GraphUpdate, VspcCommitted};
 use thiserror::Error;
 use tokio::{
@@ -128,8 +128,8 @@ impl PublicationRuntimeWorker {
                     self.finish();
                     return Ok(());
                 }
-                event = self.graph_updates.next_event() => match event {
-                    Some(event) => self.handle_event(event)?,
+                observation = self.graph_updates.next_observation() => match observation {
+                    Some(observation) => self.handle_observation(observation)?,
                     None => {
                         self.shared.set_phase(PublicationRuntimePhase::Quiescent);
                         cancellation.cancelled().await;
@@ -141,31 +141,31 @@ impl PublicationRuntimeWorker {
         }
     }
 
-    fn handle_event(&mut self, event: GraphUpdateReceiveEvent) -> Result<(), PublicationRuntimeError> {
+    fn handle_observation(&mut self, observation: GraphUpdateObservation) -> Result<(), PublicationRuntimeError> {
         let phase = self.shared.lock().phase;
-        match (phase, event) {
-            (PublicationRuntimePhase::AwaitingCatchup, GraphUpdateReceiveEvent::Update(GraphUpdate::Catchup)) => {
+        match (phase, observation) {
+            (PublicationRuntimePhase::AwaitingCatchup, GraphUpdateObservation::Update(GraphUpdate::Catchup)) => {
                 self.shared.set_phase(PublicationRuntimePhase::Constructing);
                 Ok(())
             }
             (PublicationRuntimePhase::AwaitingCatchup, _) => Err(PublicationRuntimeError::InvalidMarkerOrder),
-            (PublicationRuntimePhase::Constructing, GraphUpdateReceiveEvent::Update(GraphUpdate::BlockCommitted(update))) => {
+            (PublicationRuntimePhase::Constructing, GraphUpdateObservation::Update(GraphUpdate::BlockCommitted(update))) => {
                 self.stage(StagedGraphUpdate::Block(update));
                 Ok(())
             }
-            (PublicationRuntimePhase::Constructing, GraphUpdateReceiveEvent::Update(GraphUpdate::VspcCommitted(update))) => {
+            (PublicationRuntimePhase::Constructing, GraphUpdateObservation::Update(GraphUpdate::VspcCommitted(update))) => {
                 self.stage(StagedGraphUpdate::Vspc(update));
                 Ok(())
             }
-            (PublicationRuntimePhase::Constructing, GraphUpdateReceiveEvent::Update(GraphUpdate::Live)) => {
+            (PublicationRuntimePhase::Constructing, GraphUpdateObservation::Update(GraphUpdate::Live)) => {
                 self.shared.set_target_live();
                 Ok(())
             }
-            (PublicationRuntimePhase::Constructing, GraphUpdateReceiveEvent::Gap(_)) => {
+            (PublicationRuntimePhase::Constructing, GraphUpdateObservation::Gap(_)) => {
                 self.restart_staging();
                 Ok(())
             }
-            (PublicationRuntimePhase::Constructing, GraphUpdateReceiveEvent::Update(GraphUpdate::Catchup)) => {
+            (PublicationRuntimePhase::Constructing, GraphUpdateObservation::Update(GraphUpdate::Catchup)) => {
                 Err(PublicationRuntimeError::InvalidMarkerOrder)
             }
             (PublicationRuntimePhase::Quiescent | PublicationRuntimePhase::Stopped, _) => {
@@ -428,7 +428,7 @@ mod tests {
         let mut worker = PublicationRuntimeWorker { graph_updates: receiver, staging: StagingBuffer::new(shared.clone()), shared };
 
         assert_eq!(
-            worker.handle_event(GraphUpdateReceiveEvent::Update(GraphUpdate::Live)),
+            worker.handle_observation(GraphUpdateObservation::Update(GraphUpdate::Live)),
             Err(PublicationRuntimeError::InvalidMarkerOrder)
         );
     }
