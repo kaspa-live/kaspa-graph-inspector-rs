@@ -1014,3 +1014,44 @@ terminal mutations on `send_if_modified` as well, leaving the watch value as
 the module's only synchronization domain. The accessor and transition
 semantics remain owned by
 [API Service](../architecture/api-service.md#api-database-generation-binding--settled).
+
+## 22 October 2026: API publication runtime
+
+### Module and capability boundaries
+
+Place the session-bound worker in the private
+`kgi_api_core::publication::runtime` module and add no crate-root re-export.
+Keep database seeding and synchronous installation behind private statically
+dispatched `PublicationSeedDatabase` and `PublicationInstaller` capabilities.
+The production database adapter delegates to the exact
+`ValidatedApiDbClient`; the installer remains a narrow seam for the later
+ApiService integration increment. This keeps the runtime independently
+testable without exposing a mock API, adding trait objects, or introducing an
+ApiService control or public request path.
+
+### Worker ownership and completion
+
+Run one Tokio task for the runtime's complete worker lifetime. The worker
+exclusively owns its graph-update receiver, staging `VecDeque`, current work,
+and gap-generation sample, so those values require no additional lock. Model
+current work as a private `None`/`Aligning`/`Active` enum; box the comparatively
+large construction candidate to keep the enum compact while preserving its
+unique ownership.
+
+Use one cancellation token for terminal signalling. Retain the worker
+`JoinHandle` in an async mutex and its completed typed result in a Tokio watch
+value. A cancelled shutdown waiter therefore leaves join ownership in the
+completion object, concurrent waiters serialize only while the worker remains
+joinable, and every later waiter observes the retained result. The runtime's
+small phase and metric snapshot uses a standard mutex because updates are
+short, nonawaiting, and independent of graph-publication state.
+
+### Construction and reconstruction mechanics
+
+Keep each database-seed future inline in the long-lived worker's selection
+rather than spawning attempt tasks. Use the focused-owner staging capacity as
+the initial `VecDeque` capacity and maintain occupancy, high-water, overflow,
+and reconstruction counters alongside each synchronous buffer mutation.
+Implement the reconstruction drain with the receiver's nonblocking operation
+until its first empty observation; no secondary queue or recovery task is
+introduced.

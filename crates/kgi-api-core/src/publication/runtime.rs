@@ -1284,6 +1284,29 @@ mod tests {
         assert_eq!(runtime.shutdown().await, Ok(()));
     }
 
+    #[tokio::test]
+    async fn gap_reconstruction_drops_the_in_progress_seed_before_starting_its_successor() {
+        let (database, started, _release) = MockSeedDb::gated(Ok(seed(16)));
+        let api_db = Arc::new(ApiDbState::new());
+        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database.clone())).expect("publish database generation");
+        let (producer, receiver) = graph_update_channel();
+        let runtime = PublicationRuntime::new(receiver, api_db, MockInstaller::installed());
+        producer.publish_catchup().expect("runtime receiver is open");
+        started.acquire().await.expect("first seed attempt starts").forget();
+
+        for byte in 0..GRAPH_UPDATE_CHANNEL_CAPACITY {
+            assert_eq!(producer.offer_vspc_committed(vspc_update(byte as u8)), Ok(GraphUpdateOfferOutcome::Enqueued));
+        }
+        assert_eq!(producer.offer_vspc_committed(vspc_update(0)), Ok(GraphUpdateOfferOutcome::GapReported));
+        started.acquire().await.expect("replacement seed attempt starts").forget();
+
+        assert_eq!(database.calls(), 2);
+        assert_eq!(database.active_attempts(), 1, "the predecessor seed future was dropped before its successor started");
+        assert_eq!(runtime.metrics().reconstruction_count, 1);
+        assert_eq!(runtime.shutdown().await, Ok(()));
+        assert_eq!(database.active_attempts(), 0);
+    }
+
     #[test]
     fn loaded_head_seed_becomes_a_revision_zero_candidate_with_its_alignment_cuts() {
         let origin = Instant::now();
@@ -1409,6 +1432,24 @@ mod tests {
         assert_eq!(worker.construction_gap_generation, 1);
     }
 
+    #[test]
+    fn alignment_projection_failure_abandons_the_candidate_and_reconstructs() {
+        let (mut worker, _producer) = aligning_worker_with_producer();
+        worker
+            .alignment_candidate_mut()
+            .view
+            .apply_head_vspc_committed(&vspc_update_at(90, 90), 1)
+            .expect("mutable Head")
+            .expect("fixture update advances only the candidate view");
+        worker.staging.push(CommittedGraphUpdate::Vspc(vspc_update_at(90, 90))).expect("crossing VSPC fits");
+
+        assert_eq!(worker.advance_alignment(), AlignmentOutcome::Restart);
+        assert!(matches!(worker.work, PublicationWork::Aligning(_)), "the run loop still owns candidate abandonment");
+        assert_eq!(worker.restart_construction(), Ok(LoopAction::Continue));
+        assert!(matches!(worker.work, PublicationWork::None));
+        assert_eq!(worker.shared.lock().metrics.reconstruction_count, 1);
+    }
+
     #[tokio::test]
     async fn reconstruction_drains_to_empty_discards_staged_work_and_preserves_live() {
         let (mut worker, producer) = aligning_worker_with_producer();
@@ -1445,5 +1486,33 @@ mod tests {
         assert!(matches!(worker.work, PublicationWork::None));
         assert_eq!(worker.restart_construction(), Ok(LoopAction::Continue));
         assert_eq!(worker.shared.lock().phase, PublicationRuntimePhase::Constructing);
+    }
+
+    #[tokio::test]
+    async fn active_projection_failure_retires_the_publication_before_reconstruction() {
+        let (mut worker, _producer) = aligning_worker_with_producer();
+        worker.staging.push(CommittedGraphUpdate::Block(block_update(6, 11, 10))).expect("crossing block fits");
+        worker.staging.push(CommittedGraphUpdate::Vspc(vspc_update_at(90, 90))).expect("crossing VSPC fits");
+        assert_eq!(worker.advance_alignment(), AlignmentOutcome::Installed);
+        worker.shared.set_phase(PublicationRuntimePhase::Active);
+        let publication = worker.active_publication().clone();
+        {
+            let mut core = publication.core.write().await;
+            let mut detached_view = core.view.clone();
+            let delta = detached_view
+                .apply_head_vspc_committed(&vspc_update_at(91, 91), 1)
+                .expect("mutable Head")
+                .expect("fixture update advances only the publication view");
+            core.history.append(delta, 1).expect("fixture advances only publication history");
+        }
+
+        assert_eq!(
+            worker.handle_observation(GraphUpdateObservation::Update(GraphUpdate::VspcCommitted(vspc_update_at(92, 92)))).await,
+            Ok(WorkerAction::RestartConstruction)
+        );
+        assert_eq!(publication.capture_delta_target().await.state(), GraphPublicationState::Stale);
+        assert!(matches!(worker.work, PublicationWork::None));
+        assert_eq!(worker.restart_construction(), Ok(LoopAction::Continue));
+        assert_eq!(worker.shared.lock().metrics.reconstruction_count, 1);
     }
 }

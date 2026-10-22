@@ -349,3 +349,28 @@ handlers, and ApiService integration remain in later increments.
 Completion validation passed workspace formatting, Cargo check, 486/486
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.
+
+Implementation increment 13 is implemented: the private
+`kgi-api-core::publication::runtime` module now contains the single
+session-bound graph-publication worker and its repeatable completed shutdown
+barrier. The worker consumes the Catchup-gated session feed, loads one detached
+Head seed through the exact current API database generation, stages concurrent
+commits, aligns independent materialization and VSPC cuts, and synchronously
+submits complete publications through a narrow private installation
+capability. Continuity gaps, staging overflow, database read failures,
+alignment failures, and active projection failures share one intra-session
+reconstruction path. Receiver closure quiesces the worker, while terminal
+shutdown abandons pending construction, makes an active publication Stale,
+releases the receiver, and retains its completion result for repeated callers.
+The implementation adds no ApiService control operation, public request path,
+current-publication slot, or concrete generation fence; those remain in later
+increments recorded in
+[the implementation sequence](sequence.md#remaining-reviewable-increments).
+Focused tests cover marker gating, exact-generation seeding, both alignment
+orders and idle-source waiting, installation supersession, every reconstruction
+failure class, sticky Live and gap fences, staging measurements, shutdown from
+every worker state, quiescent receiver closure, inline seed cancellation,
+Active-to-Stale ordering, and retained worker-loss results.
+Completion validation passed workspace formatting, Cargo check, 511/511
+Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
+with warnings denied, and `git diff --check`.
