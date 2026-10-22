@@ -8,3 +8,6 @@ pub(crate) mod client;
 pub(crate) mod codec;
 pub(crate) mod encoding;
 pub(crate) mod publication;
+
+pub mod error;
+pub mod service;
