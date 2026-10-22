@@ -9,10 +9,6 @@ pub enum ApiServiceError {
     #[error("ApiService control is unavailable")]
     ControlUnavailable,
 
-    /// The checked publication-runtime generation cannot advance.
-    #[error("ApiService publication-runtime generation is exhausted")]
-    RuntimeGenerationExhausted,
-
     /// The permanent publication-runtime worker returned or panicked unexpectedly.
     #[error("ApiService publication runtime failed: {diagnostic}")]
     PublicationRuntimeFailed {

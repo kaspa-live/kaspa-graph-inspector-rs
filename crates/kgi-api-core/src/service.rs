@@ -1,16 +1,19 @@
 use std::sync::{Arc, Mutex};
 
-use kgi_model::lifecycle::{NodeServiceStatus, ProcessingStatus, StorageServiceStatus, SupervisorStatus};
+use kgi_model::lifecycle::{NodeServiceStatus, ProcessingStatus, RecoveryMode, StorageServiceStatus, SupervisorStatus};
 use kgi_storage::generation::ValidatedApiDbClient;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    api_db::ApiDbState,
+    api_db::{ApiDbGeneration, ApiDbState},
     cache::CacheJobTracker,
     encoding::scheduler::EncodingScheduler,
     error::ApiServiceError,
-    publication::{GraphPublication, runtime::PublicationRuntime},
+    publication::{
+        GraphPublication,
+        runtime::{PublicationInstallOutcome, PublicationInstaller, PublicationRuntime},
+    },
 };
 
 /// Reliable lifecycle event produced by ApiService.
@@ -42,6 +45,38 @@ enum ApiRuntimeSlot {
 #[allow(dead_code, reason = "the installation boundary is implemented in increment-14 point 2")]
 struct PublicationInstallState {
     runtime_generation: u64,
+}
+
+impl PublicationInstallState {
+    #[allow(dead_code, reason = "ApiService reset advances this generation in increment-14 point 4")]
+    fn advance_runtime_generation(&mut self) -> u64 {
+        let generation = self.runtime_generation.checked_add(1).expect("publication runtime generation fits u64");
+        self.runtime_generation = generation;
+        generation
+    }
+}
+
+#[allow(dead_code, reason = "ApiService reset constructs this capability in increment-14 point 4")]
+struct RuntimePublicationInstaller<G = ValidatedApiDbClient> {
+    publication_install: Arc<Mutex<PublicationInstallState>>,
+    current_publication: watch::Sender<Option<Arc<GraphPublication>>>,
+    api_db: Arc<ApiDbState<G>>,
+    runtime_generation: u64,
+    recovery_mode: RecoveryMode,
+}
+
+impl<G: ApiDbGeneration> PublicationInstaller for RuntimePublicationInstaller<G> {
+    fn install(&self, publication: Arc<GraphPublication>) -> PublicationInstallOutcome {
+        let state = self.publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.runtime_generation != self.runtime_generation {
+            return PublicationInstallOutcome::Superseded;
+        }
+        self.current_publication.send_replace(Some(publication));
+        if self.recovery_mode == RecoveryMode::Rebuild {
+            self.api_db.set_public_reads_enabled(true);
+        }
+        PublicationInstallOutcome::Installed
+    }
 }
 
 #[allow(dead_code, reason = "the cancellation roots are consumed by later increment-14 lifecycle points")]
@@ -85,12 +120,14 @@ impl ApiService {
     ) -> (Arc<Self>, ApiServiceEventReceiver) {
         let (events, event_rx) = mpsc::unbounded_channel();
         let cache_jobs_cancellation = CancellationToken::new();
+        let api_db = Arc::new(ApiDbState::new());
+        let publication_install = Arc::new(Mutex::new(PublicationInstallState { runtime_generation: 0 }));
         let (current_publication, _) = watch::channel(None);
         let service = Arc::new(Self {
             events,
             runtime: AsyncMutex::new(ApiRuntimeSlot::AwaitReset),
-            publication_install: Arc::new(Mutex::new(PublicationInstallState { runtime_generation: 0 })),
-            api_db: Arc::new(ApiDbState::new()),
+            publication_install,
+            api_db,
             current_publication,
             cancellation: ApiCancellation {
                 http: CancellationToken::new(),
@@ -109,17 +146,74 @@ impl ApiService {
         });
         (service, event_rx)
     }
+
+    /// Returns the complete publication current at this instant, when present.
+    #[allow(dead_code, reason = "public graph operations are implemented in later API increments")]
+    pub(crate) fn current_publication(&self) -> Option<Arc<GraphPublication>> {
+        self.current_publication.borrow().clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Instant,
+    };
+
+    use kgi_api_model::{
+        graph::{GraphView, Level, LevelExtent, TrackingPolicy},
+        history::GraphHistory,
+    };
     use kgi_model::lifecycle::{
-        NodeServiceStatus, NodeServiceStatusState, ProcessingState, ProcessingStatus, StorageServiceStatus, StorageServiceStatusState,
-        SupervisorLifecycle, SupervisorStatus,
+        NodeServiceStatus, NodeServiceStatusState, ProcessingState, ProcessingStatus, RecoveryMode, StorageServiceStatus,
+        StorageServiceStatusState, SupervisorLifecycle, SupervisorStatus,
     };
     use tokio::sync::{mpsc::error::TryRecvError, watch};
 
-    use super::{ApiRuntimeSlot, ApiService};
+    use super::{ApiRuntimeSlot, ApiService, PublicationInstallState, RuntimePublicationInstaller};
+    use crate::{
+        api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
+        publication::{
+            GraphPublication, GraphPublicationState,
+            runtime::{PublicationInstallOutcome, PublicationInstaller},
+        },
+    };
+
+    struct TestGeneration {
+        valid: AtomicBool,
+    }
+
+    impl TestGeneration {
+        fn valid() -> Arc<Self> {
+            Arc::new(Self { valid: AtomicBool::new(true) })
+        }
+    }
+
+    impl ApiDbGeneration for TestGeneration {
+        fn is_valid(&self) -> bool {
+            self.valid.load(Ordering::Acquire)
+        }
+    }
+
+    fn publication() -> Arc<GraphPublication> {
+        let view = GraphView::from_database_projection(
+            1,
+            LevelExtent::new(1, 1).expect("valid extent"),
+            TrackingPolicy::Head,
+            BTreeMap::from([(1, Level { size: 1, daa_score: None })]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        Arc::new(
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), view, GraphHistory::new())
+                .expect("coherent publication"),
+        )
+    }
 
     fn service() -> (std::sync::Arc<ApiService>, super::ApiServiceEventReceiver) {
         let (_, supervisor) = watch::channel(SupervisorStatus {
@@ -140,7 +234,7 @@ mod tests {
         assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::AwaitReset));
         assert_eq!(service.publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).runtime_generation, 0);
         assert!(service.api_db.public_read_client().is_none());
-        assert!(service.current_publication.borrow().is_none());
+        assert!(service.current_publication().is_none());
         assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
         assert!(!events.is_closed());
 
@@ -159,5 +253,96 @@ mod tests {
         assert!(service.cancellation.sse.is_cancelled());
         assert!(!service.cancellation.http.is_cancelled());
         assert!(!service.cancellation.cache_jobs.is_cancelled());
+    }
+
+    #[test]
+    fn current_generation_installation_replaces_the_complete_publication_arc() {
+        let api_db = Arc::new(ApiDbState::<TestGeneration>::new());
+        let publication_install = Arc::new(Mutex::new(PublicationInstallState { runtime_generation: 0 }));
+        let (current_publication, _) = watch::channel(None);
+        let generation = publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).advance_runtime_generation();
+        let installer = RuntimePublicationInstaller {
+            publication_install: publication_install.clone(),
+            current_publication: current_publication.clone(),
+            api_db,
+            runtime_generation: generation,
+            recovery_mode: RecoveryMode::Resync,
+        };
+        let first = publication();
+        let replacement = publication();
+
+        assert_eq!(installer.install(first), PublicationInstallOutcome::Installed);
+        assert_eq!(installer.install(replacement.clone()), PublicationInstallOutcome::Installed);
+        assert!(current_publication.borrow().as_ref().is_some_and(|current| Arc::ptr_eq(current, &replacement)));
+
+        publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).advance_runtime_generation();
+        assert_eq!(installer.install(publication()), PublicationInstallOutcome::Superseded);
+        assert!(current_publication.borrow().as_ref().is_some_and(|current| Arc::ptr_eq(current, &replacement)));
+    }
+
+    #[test]
+    fn only_current_rebuild_installation_reopens_public_database_reads() {
+        let api_db = Arc::new(ApiDbState::<TestGeneration>::new());
+        let previous = TestGeneration::valid();
+        api_db.update(ApiDbGenerationUpdate::Published(previous.clone())).expect("initial generation is published");
+        assert!(api_db.public_read_client().is_some_and(|current| Arc::ptr_eq(&current, &previous)));
+
+        let publication_install = Arc::new(Mutex::new(PublicationInstallState { runtime_generation: 0 }));
+        let (current_publication, _) = watch::channel(None);
+        let stale_generation =
+            publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).advance_runtime_generation();
+        let rebuild_generation = {
+            let mut state = publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let generation = state.advance_runtime_generation();
+            api_db.begin_rebuild();
+            generation
+        };
+        assert!(api_db.public_read_client().is_none());
+        assert!(previous.is_valid());
+
+        let replacement = TestGeneration::valid();
+        api_db.update(ApiDbGenerationUpdate::Published(replacement.clone())).expect("replacement is bound");
+        assert!(api_db.public_read_client().is_none());
+
+        let stale = RuntimePublicationInstaller {
+            publication_install: publication_install.clone(),
+            current_publication: current_publication.clone(),
+            api_db: api_db.clone(),
+            runtime_generation: stale_generation,
+            recovery_mode: RecoveryMode::Rebuild,
+        };
+        assert_eq!(stale.install(publication()), PublicationInstallOutcome::Superseded);
+        assert!(api_db.public_read_client().is_none());
+
+        let current = RuntimePublicationInstaller {
+            publication_install,
+            current_publication: current_publication.clone(),
+            api_db: api_db.clone(),
+            runtime_generation: rebuild_generation,
+            recovery_mode: RecoveryMode::Rebuild,
+        };
+        let installed = publication();
+        assert_eq!(current.install(installed.clone()), PublicationInstallOutcome::Installed);
+        assert!(current_publication.borrow().as_ref().is_some_and(|current| Arc::ptr_eq(current, &installed)));
+        assert!(api_db.public_read_client().is_some_and(|current| Arc::ptr_eq(&current, &replacement)));
+    }
+
+    #[test]
+    fn runtime_generation_accepts_u64_max_then_panics_before_rebuild_effects() {
+        let api_db = Arc::new(ApiDbState::<TestGeneration>::new());
+        let generation = TestGeneration::valid();
+        api_db.update(ApiDbGenerationUpdate::Published(generation.clone())).expect("generation is published");
+        let publication_install = Mutex::new(PublicationInstallState { runtime_generation: u64::MAX - 1 });
+
+        assert_eq!(publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).advance_runtime_generation(), u64::MAX);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut state = publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.advance_runtime_generation();
+            api_db.begin_rebuild();
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).runtime_generation, u64::MAX);
+        assert!(api_db.public_read_client().is_some_and(|current| Arc::ptr_eq(&current, &generation)));
     }
 }
