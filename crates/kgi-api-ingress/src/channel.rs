@@ -94,11 +94,11 @@ impl GraphUpdateChannelState {
         self.inner.lock().expect("graph-update channel-state mutex poisoned")
     }
 
-    pub(crate) fn advance_gap_generation(&self) -> Option<u64> {
+    pub(crate) fn advance_gap_generation(&self) -> u64 {
         let mut inner = self.lock();
-        let generation = inner.reported_gap_count.checked_add(1)?;
+        let generation = inner.reported_gap_count.checked_add(1).expect("graph-update gap generation fits u64");
         inner.reported_gap_count = generation;
-        Some(generation)
+        generation
     }
 
     fn record_dequeue(&self) {

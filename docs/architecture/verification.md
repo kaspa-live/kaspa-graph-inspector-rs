@@ -2052,6 +2052,11 @@ and shutting down the encoding scheduler leave no API task or database
 resource at method completion; no graph revision is emitted, and repeated
 `shutdown` is idempotent. Verify ApiDbState becomes `Stopped`, wakes a pending
 `current()`, and rejects later generation updates.
+Hold one owned resource barrier open after ApiService has entered its terminal
+shutdown state, cancel that shutdown waiter, and verify that a concurrent
+`reset` is rejected with `ControlUnavailable` and releases its supplied graph
+receiver. A later `shutdown` call must resume and complete the retained barrier
+without leaking a runtime, task, publication, or database resource.
 Supervisor signals Axum graceful shutdown, then starts ApiService shutdown. A
 pending processing startup is cancelled and polled to its outcome while the
 slot remains `Active`; only afterward does Supervisor move that session to

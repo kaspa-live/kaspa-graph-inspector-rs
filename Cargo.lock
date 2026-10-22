@@ -2933,9 +2933,11 @@ dependencies = [
  "rand 0.8.8",
  "serde",
  "serde_json",
+ "testcontainers-modules",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+ "url",
 ]
 
 [[package]]

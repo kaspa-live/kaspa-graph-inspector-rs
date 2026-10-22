@@ -88,10 +88,22 @@ impl PublicationRuntime {
         self.completion.wait().await
     }
 
+    /// Returns an owned future that observes completion without requesting shutdown.
+    pub(crate) fn completion(&self) -> impl Future<Output = Result<(), PublicationRuntimeError>> + Send + 'static {
+        let completion = self.completion.clone();
+        async move { completion.wait().await }
+    }
+
     /// Returns this runtime's current operational measurements.
     #[must_use]
     pub(crate) fn metrics(&self) -> PublicationRuntimeMetricsSnapshot {
         self.shared.lock().metrics
+    }
+
+    /// Returns the worker state observed at the service lifecycle boundary.
+    #[cfg(test)]
+    pub(crate) fn phase(&self) -> PublicationRuntimePhase {
+        self.shared.lock().phase
     }
 
     #[cfg(test)]
@@ -617,13 +629,20 @@ impl Drop for StagingBuffer {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StagingOverflow;
 
+/// Internal state of one publication-runtime worker.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PublicationRuntimePhase {
+pub(crate) enum PublicationRuntimePhase {
+    /// Waiting for the session's first Catchup marker.
     AwaitingCatchup,
+    /// Loading a coherent database seed while staging updates.
     Constructing,
+    /// Crossing the database-to-stream cut.
     Aligning,
+    /// Applying the ordered stream to the installed publication.
     Active,
+    /// Retaining completed state after ordinary ingress closure or supersession.
     Quiescent,
+    /// Terminal worker state after completed shutdown.
     Stopped,
 }
 
@@ -936,7 +955,7 @@ mod tests {
     async fn start_active_runtime() -> (PublicationRuntime, GraphUpdateProducer, Arc<GraphPublication>) {
         let database = MockSeedDb::immediate(Ok(alignment_seed()));
         let api_db = Arc::new(ApiDbState::new());
-        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database)).expect("publish database generation");
+        api_db.update(crate::api_db::ApiDbGenerationUpdate::Published(database)).expect("publish database generation");
         let installer = MockInstaller::installed();
         let retained_installer = installer.clone();
         let (producer, receiver) = graph_update_channel();
@@ -986,7 +1005,7 @@ mod tests {
 
         let (database, started, _release) = MockSeedDb::gated(Ok(seed(2)));
         let api_db = Arc::new(ApiDbState::new());
-        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database.clone())).expect("publish database generation");
+        api_db.update(crate::api_db::ApiDbGenerationUpdate::Published(database.clone())).expect("publish database generation");
         let runtime = PublicationRuntime::new(receiver, api_db, MockInstaller::installed());
         started.acquire().await.expect("baseline seed attempt starts").forget();
         let constructing = wait_for(&runtime, |snapshot| {
@@ -1028,7 +1047,7 @@ mod tests {
     async fn shutdown_drops_an_in_progress_seed_attempt_without_a_child_task() {
         let (database, started, _release) = MockSeedDb::gated(Ok(seed(3)));
         let api_db = Arc::new(ApiDbState::new());
-        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database.clone())).expect("publish database generation");
+        api_db.update(crate::api_db::ApiDbGenerationUpdate::Published(database.clone())).expect("publish database generation");
         let (producer, receiver) = graph_update_channel();
         let runtime = PublicationRuntime::new(receiver, api_db, MockInstaller::installed());
         producer.publish_catchup().expect("runtime receiver is open");
@@ -1044,7 +1063,7 @@ mod tests {
     async fn shutdown_abandons_an_unpublished_alignment_candidate() {
         let database = MockSeedDb::immediate(Ok(alignment_seed()));
         let api_db = Arc::new(ApiDbState::new());
-        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database)).expect("publish database generation");
+        api_db.update(crate::api_db::ApiDbGenerationUpdate::Published(database)).expect("publish database generation");
         let installer = MockInstaller::installed();
         let (producer, receiver) = graph_update_channel();
         let runtime = PublicationRuntime::new(receiver, api_db, installer.clone());
@@ -1106,7 +1125,7 @@ mod tests {
     async fn superseded_installation_becomes_quiescent_until_shutdown() {
         let database = MockSeedDb::immediate(Ok(alignment_seed()));
         let api_db = Arc::new(ApiDbState::new());
-        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database)).expect("publish database generation");
+        api_db.update(crate::api_db::ApiDbGenerationUpdate::Published(database)).expect("publish database generation");
         let installer = MockInstaller::superseded();
         let (producer, receiver) = graph_update_channel();
         let runtime = PublicationRuntime::new(receiver, api_db, installer.clone());
@@ -1226,7 +1245,7 @@ mod tests {
         let (first, started, release) = MockSeedDb::gated(Ok(seed(7)));
         let second = MockSeedDb::immediate(Ok(seed(8)));
         let api_db = Arc::new(ApiDbState::new());
-        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(first.clone())).expect("publish first generation");
+        api_db.update(crate::api_db::ApiDbGenerationUpdate::Published(first.clone())).expect("publish first generation");
         let (producer, receiver) = graph_update_channel();
         let runtime = PublicationRuntime::new(receiver, api_db.clone(), MockInstaller::installed());
 
@@ -1239,7 +1258,7 @@ mod tests {
         started.acquire().await.expect("seed attempt starts").forget();
         assert_eq!(producer.offer_vspc_committed(vspc_update(9)), Ok(GraphUpdateOfferOutcome::Enqueued));
         producer.publish_live().await.expect("runtime receiver is open");
-        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(second.clone())).expect("publish replacement generation");
+        api_db.update(crate::api_db::ApiDbGenerationUpdate::Published(second.clone())).expect("publish replacement generation");
         release.add_permits(1);
 
         let aligned = wait_for(&runtime, |snapshot| snapshot.phase == PublicationRuntimePhase::Aligning && snapshot.target_live).await;
@@ -1267,7 +1286,7 @@ mod tests {
         assert_eq!(waiting.metrics.staging_high_water_mark, 1);
 
         let database = MockSeedDb::immediate(Ok(seed(13)));
-        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database.clone())).expect("publish database generation");
+        api_db.update(crate::api_db::ApiDbGenerationUpdate::Published(database.clone())).expect("publish database generation");
         wait_for(&runtime, |snapshot| snapshot.phase == PublicationRuntimePhase::Aligning).await;
         assert_eq!(database.calls(), 1);
 
@@ -1279,7 +1298,7 @@ mod tests {
         for failure in [ApiReadError::QueryFailed, ApiReadError::InconsistentProjection] {
             let database = MockSeedDb::immediate_sequence([Err(failure), Ok(seed(14))]);
             let api_db = Arc::new(ApiDbState::new());
-            api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database.clone())).expect("publish database generation");
+            api_db.update(crate::api_db::ApiDbGenerationUpdate::Published(database.clone())).expect("publish database generation");
             let (producer, receiver) = graph_update_channel();
             let runtime = PublicationRuntime::new(receiver, api_db, MockInstaller::installed());
 
@@ -1300,7 +1319,7 @@ mod tests {
         let lost = MockSeedDb::immediate(Err(ApiReadError::GenerationLost));
         let replacement = MockSeedDb::immediate(Ok(seed(15)));
         let api_db = Arc::new(ApiDbState::new());
-        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(lost.clone())).expect("publish database generation");
+        api_db.update(crate::api_db::ApiDbGenerationUpdate::Published(lost.clone())).expect("publish database generation");
         let (producer, receiver) = graph_update_channel();
         let runtime = PublicationRuntime::new(receiver, api_db.clone(), MockInstaller::installed());
 
@@ -1312,9 +1331,9 @@ mod tests {
         assert_eq!(lost.calls(), 1);
         assert_eq!(replacement.calls(), 0);
 
-        api_db.update(crate::api_db::ApiDbGenerationEvent::Retired(lost)).expect("retire lost database generation");
+        api_db.update(crate::api_db::ApiDbGenerationUpdate::Retired(lost)).expect("retire lost database generation");
         api_db
-            .update(crate::api_db::ApiDbGenerationEvent::Published(replacement.clone()))
+            .update(crate::api_db::ApiDbGenerationUpdate::Published(replacement.clone()))
             .expect("publish replacement database generation");
         wait_for(&runtime, |snapshot| snapshot.phase == PublicationRuntimePhase::Aligning).await;
         assert_eq!(replacement.calls(), 1);
@@ -1326,7 +1345,7 @@ mod tests {
     async fn gap_reconstruction_drops_the_in_progress_seed_before_starting_its_successor() {
         let (database, started, _release) = MockSeedDb::gated(Ok(seed(16)));
         let api_db = Arc::new(ApiDbState::new());
-        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database.clone())).expect("publish database generation");
+        api_db.update(crate::api_db::ApiDbGenerationUpdate::Published(database.clone())).expect("publish database generation");
         let (producer, receiver) = graph_update_channel();
         let runtime = PublicationRuntime::new(receiver, api_db, MockInstaller::installed());
         producer.publish_catchup().expect("runtime receiver is open");
@@ -1474,7 +1493,7 @@ mod tests {
     async fn final_fence_gap_starts_one_successor_seed_without_duplicate_reconstruction() {
         let database = MockSeedDb::immediate_sequence([Ok(alignment_seed()), Ok(alignment_seed())]);
         let api_db = Arc::new(ApiDbState::new());
-        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database.clone())).expect("publish database generation");
+        api_db.update(crate::api_db::ApiDbGenerationUpdate::Published(database.clone())).expect("publish database generation");
         let (mut worker, producer) = aligning_worker_with_producer();
         worker.api_db = api_db;
         producer.publish_catchup().expect("alignment test receiver is open");

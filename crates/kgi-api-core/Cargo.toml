@@ -27,3 +27,5 @@ workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+testcontainers-modules.workspace = true
+url.workspace = true

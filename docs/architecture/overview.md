@@ -208,7 +208,7 @@ only their sender handles to `kgi-node`. Their payload types belong to
 persistence, `StorageServiceEvent`, and the API projection read against
 `kgi-api-model` contracts. It must not depend on `kgi-api-core` or
 `kgi-api-ingress`. `kgi-api-core` owns ApiService,
-`ApiDbGenerationEvent`, graph publication behavior, HTTP/SSE, and API runtime
+`ApiDbGenerationMessage`, graph publication behavior, HTTP/SSE, and API runtime
 state.
 `kgi-processing` owns ProcessingSession and the processing workers, consumes the
 graph-update producer, and does not depend on `kgi-api-core`.
@@ -855,8 +855,8 @@ readiness.
   generations. NodeService publishes the RPC generation lifecycle and
   StorageService publishes both DB generation lifecycles to Supervisor.
   Supervisor retains the current RPC and processing DB generations only for a
-  future `ProcessingSession` and maps API-generation events through
-  ApiService's public control surface.
+  future `ProcessingSession` and maps API-generation events to messages passed
+  through ApiService's public control surface.
 - Data channels connect the explicit producers and consumers shown above;
   they do not create lifecycle ownership.
 - The exact validated RPC and DB generations acquired for a processing run

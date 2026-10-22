@@ -8,7 +8,7 @@ use std::{
 
 use kgi_core::timing::Timing;
 use serde::Serialize;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use super::{EncodedGraphBody, GraphEncodingError, encode_graph};
@@ -47,6 +47,9 @@ pub(crate) enum EncodingSchedulerError {
     /// The blocking executor failed before returning the encoding result.
     #[error("graph blocking executor failed")]
     BlockingExecutorFailed,
+    /// An encoding-scheduler orchestration task panicked or was otherwise lost.
+    #[error("graph encoding scheduler task could not be joined")]
+    WorkerFailed,
 }
 
 /// Bounded owner of every graph JSON serialization and gzip operation.
@@ -62,10 +65,12 @@ impl EncodingScheduler {
     }
 
     fn with_dependencies(timing: Timing, executor: Arc<dyn BlockingExecutor>) -> Self {
+        let (completion, _) = watch::channel(None);
         Self {
             inner: Arc::new(EncodingSchedulerInner {
                 state: Mutex::new(SchedulerState::default()),
                 tasks: TaskTracker::new(),
+                completion,
                 timing,
                 executor,
             }),
@@ -93,10 +98,24 @@ impl EncodingScheduler {
 
     /// Rejects new work, cancels queued work, drains active blocking jobs, and joins their owners.
     pub(crate) async fn shutdown(&self) -> Result<(), EncodingSchedulerError> {
+        let completion = self.inner.completion.subscribe();
         self.inner.begin_shutdown();
         self.inner.tasks.close();
         self.inner.tasks.wait().await;
-        Ok(())
+        self.inner.complete(Ok(()));
+        EncodingSchedulerInner::wait_completion(completion).await
+    }
+
+    /// Returns an owned future that observes scheduler completion without requesting shutdown.
+    pub(crate) fn completion(&self) -> impl Future<Output = Result<(), EncodingSchedulerError>> + Send + 'static {
+        let completion = self.inner.completion.subscribe();
+        async move { EncodingSchedulerInner::wait_completion(completion).await }
+    }
+
+    /// Forces the permanent scheduler into its retained worker-failure state.
+    #[cfg(test)]
+    pub(crate) fn fail_worker(&self) {
+        self.inner.record_failure();
     }
 }
 
@@ -133,6 +152,7 @@ impl Drop for HistoricalEncodingReservation {
 struct EncodingSchedulerInner {
     state: Mutex<SchedulerState>,
     tasks: TaskTracker,
+    completion: watch::Sender<Option<Result<(), EncodingSchedulerError>>>,
     timing: Timing,
     executor: Arc<dyn BlockingExecutor>,
 }
@@ -254,10 +274,45 @@ impl EncodingSchedulerInner {
 
     fn spawn(self: &Arc<Self>, job: QueuedJob) {
         let inner = self.clone();
-        self.tasks.spawn(async move {
+        let worker = self.tasks.spawn(async move {
             let result = inner.executor.execute(job.work).await;
             inner.finish(job.id, result);
         });
+        let inner = self.clone();
+        self.tasks.spawn(async move {
+            if worker.await.is_err() {
+                inner.record_failure();
+            }
+        });
+    }
+
+    fn record_failure(&self) {
+        self.begin_shutdown();
+        self.tasks.close();
+        self.complete(Err(EncodingSchedulerError::WorkerFailed));
+    }
+
+    fn complete(&self, result: Result<(), EncodingSchedulerError>) {
+        self.completion.send_if_modified(|completion| {
+            if completion.is_some() {
+                return false;
+            }
+            *completion = Some(result);
+            true
+        });
+    }
+
+    async fn wait_completion(
+        mut completion: watch::Receiver<Option<Result<(), EncodingSchedulerError>>>,
+    ) -> Result<(), EncodingSchedulerError> {
+        loop {
+            if let Some(result) = *completion.borrow_and_update() {
+                return result;
+            }
+            if completion.changed().await.is_err() {
+                return Err(EncodingSchedulerError::WorkerFailed);
+            }
+        }
     }
 
     fn lock_state(&self) -> MutexGuard<'_, SchedulerState> {
@@ -479,6 +534,14 @@ mod tests {
 
     struct ControlledExecutor {
         submitted: mpsc::UnboundedSender<PendingExecution>,
+    }
+
+    struct PanickingExecutor;
+
+    impl BlockingExecutor for PanickingExecutor {
+        fn execute(&self, _job: BlockingJob) -> BlockingFuture {
+            Box::pin(async { panic!("simulated encoding-scheduler task panic") })
+        }
     }
 
     impl BlockingExecutor for ControlledExecutor {
@@ -752,6 +815,18 @@ mod tests {
         next_execution(&mut submitted).await.complete();
         replacement.await.expect("replacement joins").expect("released capacity is reusable");
         scheduler.shutdown().await.expect("scheduler shuts down");
+    }
+
+    #[tokio::test]
+    async fn orchestration_task_panic_is_retained_for_observation_and_shutdown() {
+        let scheduler = EncodingScheduler::with_dependencies(Timing::production(), Arc::new(PanickingExecutor));
+        let completion = scheduler.completion();
+        let request = spawn_priority(&scheduler, "panic");
+
+        assert_eq!(completion.await, Err(EncodingSchedulerError::WorkerFailed));
+        assert_eq!(request.await.expect("request owner joins"), Err(EncodingSchedulerError::ShuttingDown));
+        assert_eq!(scheduler.shutdown().await, Err(EncodingSchedulerError::WorkerFailed));
+        assert_eq!(scheduler.shutdown().await, Err(EncodingSchedulerError::WorkerFailed));
     }
 
     struct ThreadRecordingValue {

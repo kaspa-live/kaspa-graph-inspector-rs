@@ -169,7 +169,12 @@ pub(crate) struct CacheJobTracker {
 impl CacheJobTracker {
     /// Creates an open tracker and cache-job cancellation root.
     pub(crate) fn new() -> Self {
-        Self { registration: Mutex::new(true), cancellation: CancellationToken::new(), tasks: TaskTracker::new() }
+        Self::with_cancellation(CancellationToken::new())
+    }
+
+    /// Creates an open tracker using its ApiService-owned cancellation root.
+    pub(crate) fn with_cancellation(cancellation: CancellationToken) -> Self {
+        Self { registration: Mutex::new(true), cancellation, tasks: TaskTracker::new() }
     }
 
     /// Closes registration, cancels unfinished jobs, and joins every tracked task.

@@ -935,8 +935,8 @@ anchor with the already constructed threshold and exact clients to publish
 The [StorageService lifecycle](storage.md#storageservice-lifecycle--settled)
 owns API database-generation retirement and autonomous reacquisition. From the
 already installed ordered `StorageServiceEvent` stream, Supervisor maps
-`ApiDbRetired(client)` to `ApiDbGenerationEvent::Retired(client)` and
-`ApiDbPublished(client)` to `ApiDbGenerationEvent::Published(client)`, then
+`ApiDbRetired(client)` to `ApiDbGenerationMessage::Retired(client)` and
+`ApiDbPublished(client)` to `ApiDbGenerationMessage::Published(client)`, then
 forwards each result in order through
 `ApiService::update_api_db_generation`. This is a normal downward control call,
 like `reset`; ApiService never calls StorageService and sends no reverse
@@ -951,7 +951,7 @@ does not synthesize a retirement event when storage had no current API
 generation, or another publication event when the call completes.
 
 Supervisor does not start, coalesce, cancel, or classify API-generation
-acquisition tasks. Forwarding a generation event changes neither processing
+acquisition tasks. Forwarding a generation message changes neither processing
 recovery intent nor the current processing run. Supervisor's transition into
 terminal shutdown is the forwarding cutoff: it starts no new
 `update_api_db_generation` call after that transition. StorageService is shut

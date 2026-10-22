@@ -22,7 +22,7 @@ impl GraphUpdateGapReporter {
     ///
     /// Panics if the generation exceeds `u64::MAX`.
     pub(crate) fn report(&self) {
-        let next = self.channel_state.advance_gap_generation().expect("graph-update gap generation overflow");
+        let next = self.channel_state.advance_gap_generation();
         self.generation.send_replace(next);
     }
 }

@@ -995,12 +995,12 @@ introducing a trait object into the production binding.
 
 ### Update linearization
 
-Apply each generation event through `watch::Sender::send_if_modified` rather
+Apply each generation message through `watch::Sender::send_if_modified` rather
 than adding an outer mutex beside the settled watch value. The closure performs
-the event classification while holding the watch value's write guard and uses
+the message classification while holding the watch value's write guard and uses
 its boolean result to control notification. A captured typed result
 distinguishes rejection from an accepted no-op without adding another state
-lock. The event semantics are owned by
+lock. The message semantics are owned by
 [API Service](../architecture/api-service.md#api-database-generation-binding--settled).
 
 ### Snapshot observation and waiting
@@ -1055,3 +1055,53 @@ and reconstruction counters alongside each synchronous buffer mutation.
 Implement the reconstruction drain with the receiver's nonblocking operation
 until its first empty observation; no secondary queue or recovery task is
 introduced.
+
+## 22 October 2026: ApiService lifecycle integration
+
+### Synchronization and installation capability
+
+Keep the complete runtime slot behind one Tokio mutex so each `reset` or
+terminal `shutdown` retains exclusive lifecycle authority across the
+predecessor barrier. Keep the much shorter runtime-generation check,
+publication replacement, and conditional database-read reopening behind a
+separate standard mutex. A private `RuntimePublicationInstaller` carries only
+that installation capability and its captured generation; it does not retain
+`Arc<ApiService>` or create a service/runtime ownership cycle. The lifecycle
+and installation semantics remain owned by
+[API Service](../architecture/api-service.md#reset-control-and-recovery-effects--settled).
+
+Retain an exchanged predecessor in the successor's private owned-runtime
+wrapper before the replacement reset reaches its first await. The wrapper
+stores one `Arc`-backed retiring predecessor behind a short standard mutex;
+joining clones that `Arc` while leaving the authoritative value installed, and
+removes it only after its completed barrier. A later reset first resumes any
+such retained barrier before advancing the generation, while terminal shutdown
+joins it before the successor. This avoids another public or normative runtime
+state and bounds the overlap to the two runtimes already admitted by the reset
+contract.
+
+### Permanent-work completion observation
+
+Pair each publication runtime and encoding scheduler with an owned completion
+observer handle. The observer awaits the component's retained completion
+future and holds the reliable event sender, while the wrapper's shutdown joins
+the observer after the component barrier. Publication runtimes retain join
+ownership in their completion value. Encoding orchestration workers and their
+panic monitors are both registered in the scheduler's `TaskTracker`, and the
+scheduler retains the first terminal result in a watch value. This permits
+independent failure observation without detached tasks or a second command
+path. Keep each observer `JoinHandle` installed in its async mutex while
+awaiting it; remove the handle only after completion so cancellation of a reset
+or shutdown waiter cannot detach the observer.
+
+### Cancellation-resumable terminal barrier
+
+Represent the owner-defined terminal slot as
+`Stopping(Option<OwnedPublicationRuntime>)`. Keep `Some` while the runtime
+barrier is pending and clear it after completion. The terminal transitions and
+resumption contract remain owned by
+[API Service](../architecture/api-service.md#apiservice-shutdown--settled).
+Run cache-job and encoding joins concurrently only after their ordered
+synchronous close/cancel prefixes have executed. Later transport increments
+attach request and connection guards to the existing independent cancellation
+roots without changing this lifecycle structure.

@@ -21,10 +21,9 @@ the selected rusty-kaspa `v2.1.0` value crates. The session-scoped graph-update
 ingress implements the accepted AwaitingCatchup gate and Catchup marker,
 along with nonblocking ordinary offers, lossless lifecycle markers, coalescing
 gap observation, and ingress metrics.
-ApiService orchestration remains behavior-free scaffolding; `kgi-api-core`
-contains the in-memory publication kernel described below. The processing
-crate contains the session-scoped BlockProcessor and VspcProcessor slices
-described below.
+`kgi-api-core` contains the in-memory publication kernel and ApiService
+lifecycle integration described below. The processing crate contains the
+session-scoped BlockProcessor and VspcProcessor slices described below.
 The first
 StorageService implementation slice selects SQLx with PostgreSQL and Rustls,
 embeds the forward-only metadata and processing-schema migrations, acquires the
@@ -374,3 +373,28 @@ Active-to-Stale ordering, and retained worker-loss results.
 Completion validation passed workspace formatting, Cargo check, 511/511
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.
+
+Implementation increment 14 is implemented: `kgi-api-core::ApiService` now
+owns the reliable service-event path, API database binding, current-publication
+slot, publication-runtime lifecycle and installation generation, independent
+cancellation roots, cache-job tracker, encoding scheduler, and latest-value
+status inputs. Resync and Rebuild resets install the successor runtime before
+joining its predecessor; a narrow generation-fenced capability performs
+complete publication replacement and conditionally reopens Rebuild database
+reads. Publication-runtime and encoding-scheduler completion observers remain
+owned and joinable, map unexpected permanent-work loss to the reliable event
+path, and remain silent on expected shutdown. The terminal service barrier is
+serialized with reset, stops database updates and construction waiters, joins
+the runtime, cache work, and encoding scheduler, clears the publication, and
+retains idempotent completion. Logical graph operations, public admission
+lanes, request and SSE guards, and Axum transport remain in increments 15–17.
+Focused verification covers construction, installation fencing, Rebuild gate
+authority, exact publication identity, database binding and status snapshots,
+runtime replacement and receiver release, generation exhaustion, independent
+cancellation domains, exact-once worker-failure reporting, reset/shutdown
+serialization, shutdown from every publication-runtime state, final Stale
+mailbox ordering, database-generation cutoff races, event-path release,
+terminal resource release, and repeated shutdown. Completion validation passed
+workspace formatting, Cargo check, 535/535 Nextest tests including Docker
+PostgreSQL integration, Cargo doctests, Clippy with warnings denied, and
+`git diff --check`.
