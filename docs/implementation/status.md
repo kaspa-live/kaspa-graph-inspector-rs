@@ -392,7 +392,9 @@ Focused verification covers construction, installation fencing, Rebuild gate
 authority, exact publication identity, database binding and status snapshots,
 runtime replacement and receiver release, generation exhaustion, independent
 cancellation domains, exact-once worker-failure reporting, reset/shutdown
-serialization, event-path release, terminal resource release, and repeated
-shutdown. Completion validation passed workspace formatting, Cargo check,
-530/530 Nextest tests including Docker PostgreSQL integration, Cargo doctests,
-Clippy with warnings denied, and `git diff --check`.
+serialization, shutdown from every publication-runtime state, final Stale
+mailbox ordering, database-generation cutoff races, event-path release,
+terminal resource release, and repeated shutdown. Completion validation passed
+workspace formatting, Cargo check, 535/535 Nextest tests including Docker
+PostgreSQL integration, Cargo doctests, Clippy with warnings denied, and
+`git diff --check`.

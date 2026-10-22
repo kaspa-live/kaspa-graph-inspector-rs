@@ -100,6 +100,12 @@ impl PublicationRuntime {
         self.shared.lock().metrics
     }
 
+    /// Returns the worker state observed at the service lifecycle boundary.
+    #[cfg(test)]
+    pub(crate) fn phase(&self) -> PublicationRuntimePhase {
+        self.shared.lock().phase
+    }
+
     #[cfg(test)]
     fn snapshot(&self) -> RuntimeSnapshot {
         *self.shared.lock()
@@ -623,13 +629,20 @@ impl Drop for StagingBuffer {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StagingOverflow;
 
+/// Internal state of one publication-runtime worker.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PublicationRuntimePhase {
+pub(crate) enum PublicationRuntimePhase {
+    /// Waiting for the session's first Catchup marker.
     AwaitingCatchup,
+    /// Loading a coherent database seed while staging updates.
     Constructing,
+    /// Crossing the database-to-stream cut.
     Aligning,
+    /// Applying the ordered stream to the installed publication.
     Active,
+    /// Retaining completed state after ordinary ingress closure or supersession.
     Quiescent,
+    /// Terminal worker state after completed shutdown.
     Stopped,
 }
 

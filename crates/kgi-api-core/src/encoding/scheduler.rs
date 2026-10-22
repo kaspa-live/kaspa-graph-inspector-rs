@@ -111,6 +111,12 @@ impl EncodingScheduler {
         let completion = self.inner.completion.subscribe();
         async move { EncodingSchedulerInner::wait_completion(completion).await }
     }
+
+    /// Forces the permanent scheduler into its retained worker-failure state.
+    #[cfg(test)]
+    pub(crate) fn fail_worker(&self) {
+        self.inner.record_failure();
+    }
 }
 
 /// One historical queue position retained across its database projection phase.

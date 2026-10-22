@@ -408,35 +408,57 @@ mod tests {
             Arc, Barrier as StdBarrier, Mutex,
             atomic::{AtomicBool, Ordering},
         },
-        time::Instant,
+        time::{Duration, Instant},
     };
 
-    use kgi_api_ingress::channel::{GraphUpdateProducerError, graph_update_channel};
+    use kaspa_consensus_core::network::{NetworkId, NetworkType};
+    use kgi_api_ingress::channel::{GraphUpdateOfferOutcome, GraphUpdateProducerError, GraphUpdateReceiver, graph_update_channel};
     use kgi_api_model::{
         graph::{GraphView, Level, LevelExtent, TrackingPolicy},
         history::GraphHistory,
-        projection::GraphViewSeed,
+        projection::{GraphViewSeed, GraphWindowResolution},
     };
-    use kgi_model::lifecycle::{
-        NodeServiceStatus, NodeServiceStatusState, ProcessingState, ProcessingStatus, RecoveryMode, StorageServiceStatus,
-        StorageServiceStatusState, SupervisorLifecycle, SupervisorStatus,
+    use kgi_model::{
+        block::{BlockColor, BlockCoordinate, BlockHash, CompactId},
+        graph_update::{BlockCommitted, LevelCommitted, ParentCommitted, VspcCommitted},
+        lifecycle::{
+            NodeServiceStatus, NodeServiceStatusState, ProcessingState, ProcessingStatus, RecoveryMode, StorageServiceStatus,
+            StorageServiceStatusState, SupervisorLifecycle, SupervisorStatus,
+        },
     };
+    use kgi_storage::service::{StorageService, StorageServiceEvent};
     use serde::{Serialize, Serializer};
-    use tokio::sync::{Semaphore, mpsc::error::TryRecvError, watch};
+    use testcontainers_modules::{
+        postgres::Postgres,
+        testcontainers::{ImageExt, runners::AsyncRunner},
+    };
+    use tokio::{
+        sync::{Semaphore, mpsc::error::TryRecvError, watch},
+        time::timeout,
+    };
     use tokio_util::sync::CancellationToken;
+    use url::Url;
 
     use super::{
-        ApiRuntimeSlot, ApiService, ApiServiceEvent, ApiStatusInputs, OwnedPublicationRuntime, PublicationInstallState,
-        RuntimePublicationInstaller,
+        ApiDbGenerationMessage, ApiRuntimeSlot, ApiService, ApiServiceEvent, ApiStatusInputs, OwnedPublicationRuntime,
+        PublicationInstallState, RuntimePublicationInstaller,
     };
     use crate::{
         api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
+        client::{SseMailbox, SseMessage},
+        codec::sse::PublicationStateDto,
+        error::ApiServiceError,
         publication::{
             GraphPublication, GraphPublicationState,
-            runtime::{PublicationInstallOutcome, PublicationInstaller, PublicationRuntime, PublicationSeedDatabase},
+            runtime::{
+                PublicationInstallOutcome, PublicationInstaller, PublicationRuntime, PublicationRuntimePhase, PublicationSeedDatabase,
+            },
         },
     };
     use kgi_storage::error::ApiReadError;
+
+    const POSTGRES_PORT: u16 = 5432;
+    const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
     struct TestGeneration {
         valid: AtomicBool,
@@ -457,6 +479,50 @@ mod tests {
     impl PublicationSeedDatabase for TestGeneration {
         async fn load_head_seed(&self) -> Result<GraphViewSeed, ApiReadError> {
             panic!("simulated publication-runtime worker loss")
+        }
+    }
+
+    struct ControlledSeedGeneration {
+        valid: AtomicBool,
+        seed: Mutex<Option<GraphViewSeed>>,
+        started: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    impl ControlledSeedGeneration {
+        fn gated(seed: GraphViewSeed) -> (Arc<Self>, Arc<Semaphore>, Arc<Semaphore>) {
+            let started = Arc::new(Semaphore::new(0));
+            let release = Arc::new(Semaphore::new(0));
+            (
+                Arc::new(Self {
+                    valid: AtomicBool::new(true),
+                    seed: Mutex::new(Some(seed)),
+                    started: started.clone(),
+                    release: release.clone(),
+                }),
+                started,
+                release,
+            )
+        }
+
+        fn immediate(seed: GraphViewSeed) -> Arc<Self> {
+            let (generation, _, release) = Self::gated(seed);
+            release.add_permits(1);
+            generation
+        }
+    }
+
+    impl ApiDbGeneration for ControlledSeedGeneration {
+        fn is_valid(&self) -> bool {
+            self.valid.load(Ordering::Acquire)
+        }
+    }
+
+    impl PublicationSeedDatabase for ControlledSeedGeneration {
+        async fn load_head_seed(&self) -> Result<GraphViewSeed, ApiReadError> {
+            self.started.add_permits(1);
+            self.release.acquire().await.expect("seed release path remains open").forget();
+            Ok(self.seed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take().expect("one seed is loaded once"))
         }
     }
 
@@ -489,6 +555,139 @@ mod tests {
             GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), view, GraphHistory::new())
                 .expect("coherent publication"),
         )
+    }
+
+    fn hash(byte: u8) -> BlockHash {
+        BlockHash::from_bytes([byte; 32])
+    }
+
+    fn alignment_seed() -> GraphViewSeed {
+        GraphViewSeed {
+            resolution: GraphWindowResolution { resolved_level: 10, effective_start_level: 8, effective_end_level: 10 },
+            max_depth: 3,
+            levels: BTreeMap::from([
+                (8, Level { size: 0, daa_score: Some(8) }),
+                (9, Level { size: 0, daa_score: Some(9) }),
+                (10, Level { size: 0, daa_score: Some(10) }),
+            ]),
+            blocks: HashMap::new(),
+            edges: HashMap::new(),
+            snapshot_max_materialized_id: CompactId::new(5).expect("positive compact ID"),
+            snapshot_vspc_sink: hash(90),
+        }
+    }
+
+    fn block_update(id: u8, level: u32, parent_level: u32) -> BlockCommitted {
+        BlockCommitted {
+            id: CompactId::new(i64::from(id)).expect("positive compact ID"),
+            hash: hash(id),
+            coordinate: BlockCoordinate::new(level, 0).expect("positive block coordinate"),
+            timestamp: u64::from(id),
+            daa_score: u64::from(id),
+            selected_parent_index: Some(0),
+            direct_parents: Arc::from([ParentCommitted {
+                hash: hash(id.wrapping_add(100)),
+                coordinate: Some(BlockCoordinate::new(parent_level, 0).expect("positive parent coordinate")),
+            }]),
+            blue_merge_set: Arc::from([]),
+            red_merge_set: Arc::from([]),
+            color: BlockColor::Gray,
+            is_in_vspc: false,
+            level_snapshots: Arc::from([
+                LevelCommitted { level: parent_level, size: 1, daa_score: Some(u64::from(parent_level)) },
+                LevelCommitted { level, size: 1, daa_score: Some(u64::from(level)) },
+            ]),
+        }
+    }
+
+    fn vspc_update(source: u8) -> VspcCommitted {
+        VspcCommitted {
+            source: hash(source),
+            destination: hash(source.wrapping_add(1)),
+            removed: Arc::from([]),
+            added: Arc::from([]),
+            level_snapshots: Arc::from([LevelCommitted { level: 10, size: 0, daa_score: Some(u64::from(source)) }]),
+        }
+    }
+
+    async fn install_controlled_runtime(
+        service: &Arc<ApiService>,
+        graph_updates: GraphUpdateReceiver,
+        generation: Arc<ControlledSeedGeneration>,
+    ) {
+        let api_db = Arc::new(ApiDbState::new());
+        api_db.update(ApiDbGenerationUpdate::Published(generation)).expect("test seed generation is published");
+        let runtime_generation =
+            service.publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).advance_runtime_generation();
+        let installer = RuntimePublicationInstaller {
+            publication_install: service.publication_install.clone(),
+            current_publication: service.current_publication.clone(),
+            api_db: api_db.clone(),
+            runtime_generation,
+            recovery_mode: RecoveryMode::Resync,
+        };
+        let runtime = PublicationRuntime::new(graph_updates, api_db, installer);
+        let mut slot = service.runtime.lock().await;
+        assert!(matches!(*slot, ApiRuntimeSlot::AwaitReset));
+        *slot = ApiRuntimeSlot::Running(OwnedPublicationRuntime::observe(runtime, service.events.clone()));
+    }
+
+    async fn wait_for_runtime_phase(service: &ApiService, expected: PublicationRuntimePhase) {
+        for _ in 0..100 {
+            let phase = {
+                let slot = service.runtime.lock().await;
+                let ApiRuntimeSlot::Running(runtime) = &*slot else { panic!("test runtime remains installed") };
+                runtime.runtime.phase()
+            };
+            if phase == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("publication runtime did not reach {expected:?}");
+    }
+
+    async fn postgres_fixture() -> (testcontainers_modules::testcontainers::ContainerAsync<Postgres>, Url) {
+        let container = Postgres::default().with_tag("17-alpine").start().await.expect("PostgreSQL fixture must start");
+        let host = container.get_host().await.expect("fixture host must resolve");
+        let port = container.get_host_port_ipv4(POSTGRES_PORT).await.expect("fixture PostgreSQL port must resolve");
+        let database_url =
+            Url::parse(&format!("postgresql://postgres:postgres@{host}:{port}/postgres?sslmode=disable")).expect("fixture URL");
+        (container, database_url)
+    }
+
+    async fn api_generation_fixture() -> (
+        testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+        Arc<StorageService>,
+        kgi_storage::service::StorageServiceEventReceiver,
+        Arc<kgi_storage::generation::ValidatedApiDbClient>,
+    ) {
+        let (container, database_url) = postgres_fixture().await;
+        let (storage, mut events) = StorageService::start(database_url);
+        let mut status = storage.subscribe_status();
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                if status.borrow().state == StorageServiceStatusState::AwaitingInitialization {
+                    return;
+                }
+                status.changed().await.expect("StorageService remains observable");
+            }
+        })
+        .await
+        .expect("StorageService reaches initialization admission");
+        storage
+            .initialize_if_uninitialized(NetworkId::new(NetworkType::Mainnet), hash(1))
+            .await
+            .expect("database initialization succeeds");
+        match timeout(TEST_TIMEOUT, events.recv()).await.expect("processing publication arrives") {
+            Some(StorageServiceEvent::ProcessingDbPublished(_)) => {}
+            event => panic!("expected processing publication, got {event:?}"),
+        }
+        let api = match timeout(TEST_TIMEOUT, events.recv()).await.expect("API publication arrives") {
+            Some(StorageServiceEvent::ApiDbPublished(api)) => api,
+            event => panic!("expected API publication, got {event:?}"),
+        };
+        (container, storage, events, api)
     }
 
     fn service() -> (std::sync::Arc<ApiService>, super::ApiServiceEventReceiver) {
@@ -719,6 +918,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_cancels_a_constructing_runtime_and_its_seed_attempt() {
+        let (service, mut events) = service();
+        let (generation, started, _release) = ControlledSeedGeneration::gated(alignment_seed());
+        let (producer, receiver) = graph_update_channel();
+        install_controlled_runtime(&service, receiver, generation).await;
+
+        producer.publish_catchup().expect("runtime receiver is open");
+        started.acquire().await.expect("seed start path remains open").forget();
+        wait_for_runtime_phase(&service, PublicationRuntimePhase::Constructing).await;
+
+        service.shutdown().await.expect("shutdown cancels construction");
+
+        assert_eq!(producer.publish_live().await, Err(GraphUpdateProducerError::ReceiverClosed));
+        assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopped));
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn shutdown_abandons_an_aligning_runtime_without_installing_its_candidate() {
+        let (service, mut events) = service();
+        let generation = ControlledSeedGeneration::immediate(alignment_seed());
+        let (producer, receiver) = graph_update_channel();
+        install_controlled_runtime(&service, receiver, generation).await;
+
+        producer.publish_catchup().expect("runtime receiver is open");
+        wait_for_runtime_phase(&service, PublicationRuntimePhase::Aligning).await;
+        assert!(service.current_publication().is_none());
+
+        service.shutdown().await.expect("shutdown abandons alignment");
+
+        assert_eq!(producer.publish_live().await, Err(GraphUpdateProducerError::ReceiverClosed));
+        assert!(service.current_publication().is_none());
+        assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopped));
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn shutdown_publishes_final_stale_before_releasing_an_active_runtime() {
+        let (service, mut events) = service();
+        let generation = ControlledSeedGeneration::immediate(alignment_seed());
+        let (producer, receiver) = graph_update_channel();
+        install_controlled_runtime(&service, receiver, generation).await;
+
+        producer.publish_catchup().expect("runtime receiver is open");
+        assert_eq!(producer.offer_block_committed(block_update(6, 11, 10)), Ok(GraphUpdateOfferOutcome::Enqueued));
+        assert_eq!(producer.offer_vspc_committed(vspc_update(90)), Ok(GraphUpdateOfferOutcome::Enqueued));
+        producer.publish_live().await.expect("runtime receiver is open");
+        wait_for_runtime_phase(&service, PublicationRuntimePhase::Active).await;
+        let publication = service.current_publication().expect("active runtime installs its publication");
+        let target = publication.capture_delta_target().await;
+        assert_eq!(target.state(), GraphPublicationState::Live);
+
+        let mailbox = Arc::new(SseMailbox::new());
+        let identifier = publication
+            .client_registry()
+            .register(target.revision(), &mailbox, CancellationToken::new())
+            .expect("active publication accepts an SSE registration");
+        for expected in [
+            SseMessage::ClientRegistration(identifier.registration()),
+            SseMessage::PublicationState(PublicationStateDto::new(
+                publication.publication_id(),
+                target.revision(),
+                GraphPublicationState::Live,
+            )),
+            SseMessage::PublicationWakeup(crate::codec::sse::PublicationWakeupDto::new(
+                publication.publication_id(),
+                target.revision(),
+            )),
+        ] {
+            assert_eq!(mailbox.recv().await, Some(expected));
+        }
+
+        service.shutdown().await.expect("shutdown retires the active publication");
+
+        assert_eq!(publication.capture_delta_target().await.state(), GraphPublicationState::Stale);
+        assert_eq!(
+            mailbox.recv().await,
+            Some(SseMessage::PublicationState(PublicationStateDto::new(
+                publication.publication_id(),
+                target.revision(),
+                GraphPublicationState::Stale,
+            )))
+        );
+        assert_eq!(producer.publish_live().await, Err(GraphUpdateProducerError::ReceiverClosed));
+        assert!(service.current_publication().is_none());
+        assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopped));
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
     async fn unexpected_runtime_failure_emits_exactly_one_reliable_event() {
         let (producer, receiver) = graph_update_channel();
         let api_db = Arc::new(ApiDbState::<TestGeneration>::new());
@@ -743,6 +1032,54 @@ mod tests {
         assert!(matches!(event, ApiServiceEvent::Failed(crate::error::ApiServiceError::PublicationRuntimeFailed { .. })));
         assert!(owned.shutdown().await.is_err());
         assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn encoding_scheduler_failure_emits_exactly_one_reliable_event() {
+        let (service, mut events) = service();
+
+        service.encoding.scheduler.fail_worker();
+
+        assert!(matches!(events.recv().await, Some(ApiServiceEvent::Failed(ApiServiceError::EncodingSchedulerFailed { .. }))));
+        assert!(matches!(service.shutdown().await, Err(ApiServiceError::EncodingSchedulerFailed { .. })));
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn api_database_update_linearizes_on_both_sides_of_service_shutdown() {
+        let (_container, storage, _storage_events, api) = api_generation_fixture().await;
+        let (service, mut events) = service();
+        service
+            .update_api_db_generation(ApiDbGenerationMessage::Published(api.clone()))
+            .await
+            .expect("a generation update before shutdown is accepted");
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+
+        let update_service = service.clone();
+        let update_start = start.clone();
+        let retired = api.clone();
+        let update = tokio::spawn(async move {
+            update_start.wait().await;
+            update_service.update_api_db_generation(ApiDbGenerationMessage::Retired(retired)).await
+        });
+        let shutdown_service = service.clone();
+        let shutdown_start = start.clone();
+        let shutdown = tokio::spawn(async move {
+            shutdown_start.wait().await;
+            shutdown_service.shutdown().await
+        });
+        start.wait().await;
+
+        let update_result = update.await.expect("generation update task completes");
+        assert!(update_result.is_ok() || update_result == Err(ApiServiceError::ControlUnavailable));
+        assert_eq!(shutdown.await.expect("service shutdown task completes"), Ok(()));
+        assert_eq!(
+            service.update_api_db_generation(ApiDbGenerationMessage::Published(api)).await,
+            Err(ApiServiceError::ControlUnavailable)
+        );
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+
+        storage.shutdown().await.expect("StorageService fixture shuts down");
     }
 
     #[tokio::test]
