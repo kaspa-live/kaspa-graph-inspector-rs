@@ -685,7 +685,7 @@ mod tests {
     };
 
     use kgi_api_ingress::channel::{
-        GRAPH_UPDATE_CHANNEL_CAPACITY, GraphUpdateOfferOutcome, GraphUpdateProducer, graph_update_channel,
+        GRAPH_UPDATE_CHANNEL_CAPACITY, GraphUpdateOfferOutcome, GraphUpdateProducer, GraphUpdateProducerError, graph_update_channel,
     };
     use kgi_api_model::{
         graph::Level,
@@ -777,6 +777,7 @@ mod tests {
     struct MockSeedDb {
         valid: AtomicBool,
         calls: AtomicUsize,
+        active_attempts: AtomicUsize,
         results: Mutex<VecDeque<Result<GraphViewSeed, ApiReadError>>>,
         started: Arc<Semaphore>,
         release: Option<Arc<Semaphore>>,
@@ -791,6 +792,7 @@ mod tests {
             Arc::new(Self {
                 valid: AtomicBool::new(true),
                 calls: AtomicUsize::new(0),
+                active_attempts: AtomicUsize::new(0),
                 results: Mutex::new(results.into_iter().collect()),
                 started: Arc::new(Semaphore::new(0)),
                 release: None,
@@ -803,6 +805,7 @@ mod tests {
             let database = Arc::new(Self {
                 valid: AtomicBool::new(true),
                 calls: AtomicUsize::new(0),
+                active_attempts: AtomicUsize::new(0),
                 results: Mutex::new(VecDeque::from([result])),
                 started: started.clone(),
                 release: Some(release.clone()),
@@ -812,6 +815,18 @@ mod tests {
 
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        fn active_attempts(&self) -> usize {
+            self.active_attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    struct SeedAttemptGuard<'a>(&'a AtomicUsize);
+
+    impl Drop for SeedAttemptGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -824,6 +839,8 @@ mod tests {
     impl PublicationSeedDatabase for MockSeedDb {
         async fn load_head_seed(&self) -> Result<GraphViewSeed, ApiReadError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.active_attempts.fetch_add(1, Ordering::SeqCst);
+            let _attempt = SeedAttemptGuard(&self.active_attempts);
             self.started.add_permits(1);
             if let Some(release) = &self.release {
                 release.acquire().await.expect("seed gate remains open").forget();
@@ -903,6 +920,23 @@ mod tests {
         panic!("publication runtime did not reach the expected state")
     }
 
+    async fn start_active_runtime() -> (PublicationRuntime, GraphUpdateProducer, Arc<GraphPublication>) {
+        let database = MockSeedDb::immediate(Ok(alignment_seed()));
+        let api_db = Arc::new(ApiDbState::new());
+        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database)).expect("publish database generation");
+        let installer = MockInstaller::installed();
+        let retained_installer = installer.clone();
+        let (producer, receiver) = graph_update_channel();
+        let runtime = PublicationRuntime::new(receiver, api_db, installer);
+
+        producer.publish_catchup().expect("runtime receiver is open");
+        assert_eq!(producer.offer_block_committed(block_update(6, 11, 10)), Ok(GraphUpdateOfferOutcome::Enqueued));
+        assert_eq!(producer.offer_vspc_committed(vspc_update_at(90, 90)), Ok(GraphUpdateOfferOutcome::Enqueued));
+        wait_for(&runtime, |snapshot| snapshot.phase == PublicationRuntimePhase::Active).await;
+        let publication = retained_installer.latest().expect("active publication was installed");
+        (runtime, producer, publication)
+    }
+
     #[tokio::test]
     async fn catchup_starts_staging_and_live_is_sticky_without_consuming_capacity() {
         let (producer, receiver) = graph_update_channel();
@@ -929,6 +963,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_from_awaiting_catchup_joins_the_worker_and_releases_the_receiver() {
+        let (producer, receiver) = graph_update_channel();
+        let runtime = PublicationRuntime::new(receiver, empty_api_db(), MockInstaller::installed());
+
+        assert_eq!(runtime.snapshot().phase, PublicationRuntimePhase::AwaitingCatchup);
+        assert_eq!(runtime.shutdown().await, Ok(()));
+        assert_eq!(runtime.snapshot().phase, PublicationRuntimePhase::Stopped);
+        assert_eq!(producer.offer_vspc_committed(vspc_update(1)), Err(GraphUpdateProducerError::ReceiverClosed));
+        assert_eq!(producer.metrics().receiver_closure_count, 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_while_waiting_for_a_database_generation_completes_construction() {
+        let (producer, receiver) = graph_update_channel();
+        let runtime = PublicationRuntime::new(receiver, empty_api_db(), MockInstaller::installed());
+        producer.publish_catchup().expect("runtime receiver is open");
+        wait_for(&runtime, |snapshot| snapshot.phase == PublicationRuntimePhase::Constructing).await;
+
+        assert_eq!(runtime.shutdown().await, Ok(()));
+        assert_eq!(runtime.snapshot().phase, PublicationRuntimePhase::Stopped);
+        assert_eq!(producer.offer_vspc_committed(vspc_update(2)), Err(GraphUpdateProducerError::ReceiverClosed));
+    }
+
+    #[tokio::test]
+    async fn shutdown_drops_an_in_progress_seed_attempt_without_a_child_task() {
+        let (database, started, _release) = MockSeedDb::gated(Ok(seed(3)));
+        let api_db = Arc::new(ApiDbState::new());
+        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database.clone())).expect("publish database generation");
+        let (producer, receiver) = graph_update_channel();
+        let runtime = PublicationRuntime::new(receiver, api_db, MockInstaller::installed());
+        producer.publish_catchup().expect("runtime receiver is open");
+        started.acquire().await.expect("seed attempt starts").forget();
+        assert_eq!(database.active_attempts(), 1);
+
+        assert_eq!(runtime.shutdown().await, Ok(()));
+        assert_eq!(database.active_attempts(), 0, "the joined worker dropped its inline seed future");
+        assert_eq!(runtime.snapshot().phase, PublicationRuntimePhase::Stopped);
+    }
+
+    #[tokio::test]
+    async fn shutdown_abandons_an_unpublished_alignment_candidate() {
+        let database = MockSeedDb::immediate(Ok(alignment_seed()));
+        let api_db = Arc::new(ApiDbState::new());
+        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database)).expect("publish database generation");
+        let installer = MockInstaller::installed();
+        let (producer, receiver) = graph_update_channel();
+        let runtime = PublicationRuntime::new(receiver, api_db, installer.clone());
+        producer.publish_catchup().expect("runtime receiver is open");
+        wait_for(&runtime, |snapshot| snapshot.phase == PublicationRuntimePhase::Aligning).await;
+
+        assert_eq!(runtime.shutdown().await, Ok(()));
+        assert!(installer.latest().is_none());
+        assert_eq!(runtime.snapshot().phase, PublicationRuntimePhase::Stopped);
+    }
+
+    #[tokio::test]
     async fn receiver_closure_is_quiescent_until_explicit_shutdown() {
         let (producer, receiver) = graph_update_channel();
         let runtime = PublicationRuntime::new(receiver, empty_api_db(), MockInstaller::installed());
@@ -946,6 +1036,50 @@ mod tests {
         assert_eq!(runtime.shutdown().await, Ok(()));
         assert_eq!(runtime.snapshot().phase, PublicationRuntimePhase::Stopped);
         assert_eq!(runtime.metrics().staging_occupancy, 0);
+    }
+
+    #[tokio::test]
+    async fn active_receiver_closure_preserves_the_publication_until_shutdown_marks_it_stale() {
+        let (runtime, producer, publication) = start_active_runtime().await;
+        let state_before_closure = publication.capture_delta_target().await.state();
+
+        drop(producer);
+        wait_for(&runtime, |snapshot| snapshot.phase == PublicationRuntimePhase::Quiescent).await;
+        assert_eq!(publication.capture_delta_target().await.state(), state_before_closure);
+
+        assert_eq!(runtime.shutdown().await, Ok(()));
+        assert_eq!(publication.capture_delta_target().await.state(), GraphPublicationState::Stale);
+        assert_eq!(runtime.snapshot().phase, PublicationRuntimePhase::Stopped);
+    }
+
+    #[tokio::test]
+    async fn shutdown_from_active_marks_stale_before_releasing_the_receiver() {
+        let (runtime, producer, publication) = start_active_runtime().await;
+        assert_ne!(publication.capture_delta_target().await.state(), GraphPublicationState::Stale);
+
+        assert_eq!(runtime.shutdown().await, Ok(()));
+        assert_eq!(publication.capture_delta_target().await.state(), GraphPublicationState::Stale);
+        assert_eq!(runtime.snapshot().phase, PublicationRuntimePhase::Stopped);
+        assert_eq!(producer.offer_vspc_committed(vspc_update(4)), Err(GraphUpdateProducerError::ReceiverClosed));
+        assert_eq!(runtime.shutdown().await, Ok(()), "repeated shutdown observes the retained completion result");
+    }
+
+    #[tokio::test]
+    async fn superseded_installation_becomes_quiescent_until_shutdown() {
+        let database = MockSeedDb::immediate(Ok(alignment_seed()));
+        let api_db = Arc::new(ApiDbState::new());
+        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database)).expect("publish database generation");
+        let installer = MockInstaller::superseded();
+        let (producer, receiver) = graph_update_channel();
+        let runtime = PublicationRuntime::new(receiver, api_db, installer.clone());
+        producer.publish_catchup().expect("runtime receiver is open");
+        assert_eq!(producer.offer_block_committed(block_update(6, 11, 10)), Ok(GraphUpdateOfferOutcome::Enqueued));
+        assert_eq!(producer.offer_vspc_committed(vspc_update_at(90, 90)), Ok(GraphUpdateOfferOutcome::Enqueued));
+
+        wait_for(&runtime, |snapshot| snapshot.phase == PublicationRuntimePhase::Quiescent).await;
+        assert!(installer.latest().is_none());
+        assert_eq!(runtime.shutdown().await, Ok(()));
+        assert_eq!(runtime.snapshot().phase, PublicationRuntimePhase::Stopped);
     }
 
     #[test]
@@ -1014,6 +1148,19 @@ mod tests {
         release.add_permits(1);
         assert_eq!(second.await.expect("second waiter joins"), Ok(()));
         assert_eq!(completion.wait().await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn unexpected_worker_loss_is_mapped_and_retained_for_every_waiter() {
+        let join = tokio::spawn(async {
+            panic!("simulated publication-runtime worker loss");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        let completion = PublicationRuntimeCompletion::new(join);
+
+        assert_eq!(completion.wait().await, Err(PublicationRuntimeError::WorkerJoinFailed));
+        assert_eq!(completion.wait().await, Err(PublicationRuntimeError::WorkerJoinFailed));
     }
 
     #[tokio::test]
