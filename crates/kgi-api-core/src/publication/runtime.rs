@@ -183,9 +183,8 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
         loop {
             let phase = self.shared.lock().phase;
             let action = match phase {
-                PublicationRuntimePhase::AwaitingCatchup | PublicationRuntimePhase::Active => {
-                    self.await_observation(&cancellation).await?
-                }
+                PublicationRuntimePhase::AwaitingCatchup => self.await_catchup(&cancellation).await?,
+                PublicationRuntimePhase::Active => self.await_observation(&cancellation).await?,
                 PublicationRuntimePhase::Constructing => match self.construct(&cancellation).await? {
                     ConstructionOutcome::Seeded => {
                         self.shared.set_phase(PublicationRuntimePhase::Aligning);
@@ -218,6 +217,20 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
                     self.finish().await;
                     return Ok(());
                 }
+            }
+        }
+    }
+
+    async fn await_catchup(&mut self, cancellation: &CancellationToken) -> Result<LoopAction, PublicationRuntimeError> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Ok(LoopAction::Cancelled),
+            update = self.graph_updates.recv_update() => match update {
+                Some(update) => match self.handle_observation(GraphUpdateObservation::Update(update)).await? {
+                    WorkerAction::Continue => Ok(LoopAction::Continue),
+                    WorkerAction::RestartConstruction => Ok(LoopAction::RestartConstruction),
+                },
+                None => Ok(LoopAction::Quiescent),
             }
         }
     }
@@ -960,6 +973,25 @@ mod tests {
         assert_eq!(runtime.shutdown().await, Ok(()));
         assert_eq!(runtime.snapshot().phase, PublicationRuntimePhase::Stopped);
         assert_eq!(runtime.metrics().staging_occupancy, 0);
+    }
+
+    #[tokio::test]
+    async fn queued_catchup_precedes_a_gap_reported_before_the_runtime_starts() {
+        let (producer, receiver) = graph_update_channel();
+        producer.publish_catchup().expect("runtime receiver is open");
+        for byte in 0..(GRAPH_UPDATE_CHANNEL_CAPACITY - 1) {
+            assert_eq!(producer.offer_vspc_committed(vspc_update(byte as u8)), Ok(GraphUpdateOfferOutcome::Enqueued));
+        }
+        assert_eq!(producer.offer_vspc_committed(vspc_update(0)), Ok(GraphUpdateOfferOutcome::GapReported));
+
+        let runtime = PublicationRuntime::new(receiver, empty_api_db(), MockInstaller::installed());
+        let reconstructed = wait_for(&runtime, |snapshot| {
+            snapshot.phase == PublicationRuntimePhase::Constructing && snapshot.metrics.reconstruction_count == 1
+        })
+        .await;
+        assert_eq!(reconstructed.metrics.staging_occupancy, 0);
+        assert_eq!(producer.metrics().current_occupancy, 0);
+        assert_eq!(runtime.shutdown().await, Ok(()));
     }
 
     #[tokio::test]
