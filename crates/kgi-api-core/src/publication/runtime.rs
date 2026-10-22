@@ -23,6 +23,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use super::{AppliedLineageUpdate, GraphPublication, GraphPublicationState, OriginalUpdate, revision_timestamp_ms_at};
 use crate::api_db::{ApiDbGeneration, ApiDbState};
 
 /// Maximum number of ordinary committed updates retained during construction.
@@ -61,14 +62,20 @@ pub(crate) struct PublicationRuntime {
 
 impl PublicationRuntime {
     /// Starts the single worker for one fresh processing-session ingress.
-    pub(crate) fn new<G: PublicationSeedDatabase>(graph_updates: GraphUpdateReceiver, api_db: Arc<ApiDbState<G>>) -> Self {
+    pub(crate) fn new<G, I>(graph_updates: GraphUpdateReceiver, api_db: Arc<ApiDbState<G>>, installer: I) -> Self
+    where
+        G: PublicationSeedDatabase,
+        I: PublicationInstaller,
+    {
         let cancellation = CancellationToken::new();
         let shared = Arc::new(RuntimeSharedState::new());
         let worker = PublicationRuntimeWorker {
             graph_updates,
             api_db,
+            installer,
             staging: StagingBuffer::new(shared.clone()),
-            candidate: None,
+            work: PublicationWork::None,
+            construction_gap_generation: 0,
             shared: shared.clone(),
         };
         let join = tokio::spawn(worker.run(cancellation.clone()));
@@ -113,6 +120,21 @@ impl PublicationSeedDatabase for ValidatedApiDbClient {
     }
 }
 
+/// Result of submitting an aligned publication to the owning ApiService boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicationInstallOutcome {
+    /// The publication became the current publication for this runtime generation.
+    Installed,
+    /// A newer runtime generation already owns installation authority.
+    Superseded,
+}
+
+/// Synchronous generation-fenced publication-installation capability.
+pub(crate) trait PublicationInstaller: Send + Sync + 'static {
+    /// Attempts to install one complete aligned publication.
+    fn install(&self, publication: Arc<GraphPublication>) -> PublicationInstallOutcome;
+}
+
 #[derive(Clone)]
 struct PublicationRuntimeCompletion {
     inner: Arc<PublicationRuntimeCompletionInner>,
@@ -146,48 +168,68 @@ impl PublicationRuntimeCompletion {
     }
 }
 
-struct PublicationRuntimeWorker<G: PublicationSeedDatabase> {
+struct PublicationRuntimeWorker<G: PublicationSeedDatabase, I: PublicationInstaller> {
     graph_updates: GraphUpdateReceiver,
     api_db: Arc<ApiDbState<G>>,
+    installer: I,
     staging: StagingBuffer,
-    candidate: Option<ConstructionCandidate>,
+    work: PublicationWork,
+    construction_gap_generation: u64,
     shared: Arc<RuntimeSharedState>,
 }
 
-impl<G: PublicationSeedDatabase> PublicationRuntimeWorker<G> {
+impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWorker<G, I> {
     async fn run(mut self, cancellation: CancellationToken) -> Result<(), PublicationRuntimeError> {
         loop {
             let phase = self.shared.lock().phase;
-            match phase {
-                PublicationRuntimePhase::AwaitingCatchup | PublicationRuntimePhase::Aligning => {
-                    tokio::select! {
-                        biased;
-                        _ = cancellation.cancelled() => {
-                            self.finish();
-                            return Ok(());
-                        }
-                        observation = self.graph_updates.next_observation() => match observation {
-                            Some(observation) => match self.handle_observation(observation)? {
-                                WorkerAction::Continue => {}
-                                WorkerAction::RestartConstruction => self.begin_reconstruction(),
-                            },
-                            None => return self.quiesce(&cancellation).await,
-                        }
-                    }
+            let action = match phase {
+                PublicationRuntimePhase::AwaitingCatchup | PublicationRuntimePhase::Active => {
+                    self.await_observation(&cancellation).await?
                 }
                 PublicationRuntimePhase::Constructing => match self.construct(&cancellation).await? {
                     ConstructionOutcome::Seeded => {
                         self.shared.set_phase(PublicationRuntimePhase::Aligning);
+                        LoopAction::Continue
                     }
-                    ConstructionOutcome::Restart => self.begin_reconstruction(),
-                    ConstructionOutcome::Quiescent => return self.quiesce(&cancellation).await,
-                    ConstructionOutcome::Cancelled => {
-                        self.finish();
-                        return Ok(());
-                    }
+                    ConstructionOutcome::Restart => LoopAction::RestartConstruction,
+                    ConstructionOutcome::Quiescent => LoopAction::Quiescent,
+                    ConstructionOutcome::Cancelled => LoopAction::Cancelled,
                 },
-                PublicationRuntimePhase::Quiescent => return self.quiesce(&cancellation).await,
+                PublicationRuntimePhase::Aligning => match self.advance_alignment() {
+                    AlignmentOutcome::Waiting => self.await_observation(&cancellation).await?,
+                    AlignmentOutcome::Installed => {
+                        self.shared.set_phase(PublicationRuntimePhase::Active);
+                        LoopAction::Continue
+                    }
+                    AlignmentOutcome::Superseded => LoopAction::Quiescent,
+                    AlignmentOutcome::Restart => LoopAction::RestartConstruction,
+                },
+                PublicationRuntimePhase::Quiescent => LoopAction::Quiescent,
                 PublicationRuntimePhase::Stopped => unreachable!("a running publication worker is not stopped"),
+            };
+
+            match action {
+                LoopAction::Continue => {}
+                LoopAction::RestartConstruction => self.begin_reconstruction(),
+                LoopAction::Quiescent => return self.quiesce(&cancellation).await,
+                LoopAction::Cancelled => {
+                    self.finish().await;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    async fn await_observation(&mut self, cancellation: &CancellationToken) -> Result<LoopAction, PublicationRuntimeError> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Ok(LoopAction::Cancelled),
+            observation = self.graph_updates.next_observation() => match observation {
+                Some(observation) => match self.handle_observation(observation).await? {
+                    WorkerAction::Continue => Ok(LoopAction::Continue),
+                    WorkerAction::RestartConstruction => Ok(LoopAction::RestartConstruction),
+                },
+                None => Ok(LoopAction::Quiescent),
             }
         }
     }
@@ -206,7 +248,7 @@ impl<G: PublicationSeedDatabase> PublicationRuntimeWorker<G> {
                     None => return Ok(ConstructionOutcome::Quiescent),
                 },
                 observation = self.graph_updates.next_observation() => match observation {
-                    Some(observation) => match self.handle_observation(observation)? {
+                    Some(observation) => match self.handle_observation(observation).await? {
                         WorkerAction::Continue => {}
                         WorkerAction::RestartConstruction => return Ok(ConstructionOutcome::Restart),
                     },
@@ -223,7 +265,7 @@ impl<G: PublicationSeedDatabase> PublicationRuntimeWorker<G> {
                 _ = cancellation.cancelled() => return Ok(ConstructionOutcome::Cancelled),
                 result = &mut seed => return match result {
                     Ok(seed) => {
-                        self.candidate = Some(ConstructionCandidate::from_seed(seed, origin));
+                        self.work = PublicationWork::Aligning(Box::new(ConstructionCandidate::from_seed(seed, origin)));
                         Ok(ConstructionOutcome::Seeded)
                     }
                     Err(ApiReadError::QueryFailed | ApiReadError::GenerationLost | ApiReadError::InconsistentProjection) => {
@@ -232,7 +274,7 @@ impl<G: PublicationSeedDatabase> PublicationRuntimeWorker<G> {
                     }
                 },
                 observation = self.graph_updates.next_observation() => match observation {
-                    Some(observation) => match self.handle_observation(observation)? {
+                    Some(observation) => match self.handle_observation(observation).await? {
                         WorkerAction::Continue => {}
                         WorkerAction::RestartConstruction => return Ok(ConstructionOutcome::Restart),
                     },
@@ -242,10 +284,11 @@ impl<G: PublicationSeedDatabase> PublicationRuntimeWorker<G> {
         }
     }
 
-    fn handle_observation(&mut self, observation: GraphUpdateObservation) -> Result<WorkerAction, PublicationRuntimeError> {
+    async fn handle_observation(&mut self, observation: GraphUpdateObservation) -> Result<WorkerAction, PublicationRuntimeError> {
         let phase = self.shared.lock().phase;
         match (phase, observation) {
             (PublicationRuntimePhase::AwaitingCatchup, GraphUpdateObservation::Update(GraphUpdate::Catchup)) => {
+                self.construction_gap_generation = self.graph_updates.gap_generation();
                 self.shared.set_phase(PublicationRuntimePhase::Constructing);
                 Ok(WorkerAction::Continue)
             }
@@ -273,6 +316,26 @@ impl<G: PublicationSeedDatabase> PublicationRuntimeWorker<G> {
                 PublicationRuntimePhase::Constructing | PublicationRuntimePhase::Aligning,
                 GraphUpdateObservation::Update(GraphUpdate::Catchup),
             ) => Err(PublicationRuntimeError::InvalidMarkerOrder),
+            (PublicationRuntimePhase::Active, GraphUpdateObservation::Update(GraphUpdate::BlockCommitted(update))) => {
+                Ok(self.apply_active_update(CommittedGraphUpdate::Block(update)).await)
+            }
+            (PublicationRuntimePhase::Active, GraphUpdateObservation::Update(GraphUpdate::VspcCommitted(update))) => {
+                Ok(self.apply_active_update(CommittedGraphUpdate::Vspc(update)).await)
+            }
+            (PublicationRuntimePhase::Active, GraphUpdateObservation::Update(GraphUpdate::Live)) => {
+                if self.shared.set_target_live() {
+                    self.active_publication().transition_live().await;
+                }
+                Ok(WorkerAction::Continue)
+            }
+            (PublicationRuntimePhase::Active, GraphUpdateObservation::Gap(_)) => {
+                self.retire_active().await;
+                self.restart_staging();
+                Ok(WorkerAction::RestartConstruction)
+            }
+            (PublicationRuntimePhase::Active, GraphUpdateObservation::Update(GraphUpdate::Catchup)) => {
+                Err(PublicationRuntimeError::InvalidMarkerOrder)
+            }
             (PublicationRuntimePhase::Quiescent | PublicationRuntimePhase::Stopped, _) => {
                 unreachable!("a quiescent or stopped publication runtime does not consume graph updates")
             }
@@ -288,8 +351,87 @@ impl<G: PublicationSeedDatabase> PublicationRuntimeWorker<G> {
         }
     }
 
+    fn advance_alignment(&mut self) -> AlignmentOutcome {
+        let frontier = self.staging.len();
+        for _ in 0..frontier {
+            let update = self.staging.pop_front().expect("captured staging frontier remains available");
+            let result = self.alignment_candidate_mut().apply_alignment_update(&update);
+            if result.is_err() {
+                self.restart_staging();
+                return AlignmentOutcome::Restart;
+            }
+        }
+
+        if !self.alignment_candidate().is_aligned() {
+            return AlignmentOutcome::Waiting;
+        }
+        if self.graph_updates.gap_generation() != self.construction_gap_generation {
+            self.restart_staging();
+            return AlignmentOutcome::Restart;
+        }
+
+        let initial_state = self.shared.target_publication_state();
+        let PublicationWork::Aligning(candidate) = std::mem::replace(&mut self.work, PublicationWork::None) else {
+            unreachable!("Aligning owns one construction candidate")
+        };
+        match (*candidate).into_publication(initial_state) {
+            Ok(publication) => {
+                let publication = Arc::new(publication);
+                match self.installer.install(publication.clone()) {
+                    PublicationInstallOutcome::Installed => {
+                        self.work = PublicationWork::Active(publication);
+                        AlignmentOutcome::Installed
+                    }
+                    PublicationInstallOutcome::Superseded => AlignmentOutcome::Superseded,
+                }
+            }
+            Err(_) => {
+                self.restart_staging();
+                AlignmentOutcome::Restart
+            }
+        }
+    }
+
+    async fn apply_active_update(&mut self, update: CommittedGraphUpdate) -> WorkerAction {
+        let publication = self.active_publication().clone();
+        let result = match &update {
+            CommittedGraphUpdate::Block(committed) => publication.apply_block_committed(committed).await,
+            CommittedGraphUpdate::Vspc(committed) => publication.apply_vspc_committed(committed).await,
+        };
+        if result.is_err() {
+            self.retire_active().await;
+            self.restart_staging();
+            WorkerAction::RestartConstruction
+        } else {
+            WorkerAction::Continue
+        }
+    }
+
+    fn alignment_candidate(&self) -> &ConstructionCandidate {
+        let PublicationWork::Aligning(candidate) = &self.work else { unreachable!("Aligning owns one construction candidate") };
+        candidate
+    }
+
+    fn alignment_candidate_mut(&mut self) -> &mut ConstructionCandidate {
+        let PublicationWork::Aligning(candidate) = &mut self.work else { unreachable!("Aligning owns one construction candidate") };
+        candidate
+    }
+
+    fn active_publication(&self) -> &Arc<GraphPublication> {
+        let PublicationWork::Active(publication) = &self.work else { unreachable!("Active owns one installed publication") };
+        publication
+    }
+
+    async fn retire_active(&mut self) {
+        if let PublicationWork::Active(publication) = &self.work {
+            publication.transition_stale().await;
+        }
+        self.work = PublicationWork::None;
+    }
+
     fn begin_reconstruction(&mut self) {
-        self.candidate = None;
+        self.work = PublicationWork::None;
+        self.construction_gap_generation = self.graph_updates.gap_generation();
         self.shared.set_phase(PublicationRuntimePhase::Constructing);
     }
 
@@ -298,8 +440,8 @@ impl<G: PublicationSeedDatabase> PublicationRuntimeWorker<G> {
         self.shared.record_reconstruction();
     }
 
-    fn finish(&mut self) {
-        self.candidate = None;
+    async fn finish(&mut self) {
+        self.retire_active().await;
         self.staging.clear();
         self.shared.set_phase(PublicationRuntimePhase::Stopped);
     }
@@ -307,9 +449,15 @@ impl<G: PublicationSeedDatabase> PublicationRuntimeWorker<G> {
     async fn quiesce(mut self, cancellation: &CancellationToken) -> Result<(), PublicationRuntimeError> {
         self.shared.set_phase(PublicationRuntimePhase::Quiescent);
         cancellation.cancelled().await;
-        self.finish();
+        self.finish().await;
         Ok(())
     }
+}
+
+enum PublicationWork {
+    None,
+    Aligning(Box<ConstructionCandidate>),
+    Active(Arc<GraphPublication>),
 }
 
 enum ConstructionOutcome {
@@ -317,6 +465,22 @@ enum ConstructionOutcome {
     Restart,
     Quiescent,
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoopAction {
+    Continue,
+    RestartConstruction,
+    Quiescent,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AlignmentOutcome {
+    Waiting,
+    Installed,
+    Superseded,
+    Restart,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -331,6 +495,8 @@ struct ConstructionCandidate {
     history: GraphHistory,
     snapshot_max_materialized_id: CompactId,
     snapshot_vspc_sink: BlockHash,
+    block_cut_crossed: bool,
+    vspc_cut_crossed: bool,
 }
 
 impl ConstructionCandidate {
@@ -345,7 +511,48 @@ impl ConstructionCandidate {
             history: GraphHistory::new(),
             snapshot_max_materialized_id: seed.snapshot_max_materialized_id,
             snapshot_vspc_sink: seed.snapshot_vspc_sink,
+            block_cut_crossed: false,
+            vspc_cut_crossed: false,
         }
+    }
+
+    fn apply_alignment_update(&mut self, update: &CommittedGraphUpdate) -> Result<(), super::PublicationProjectionError> {
+        match update {
+            CommittedGraphUpdate::Block(committed) if !self.block_cut_crossed => {
+                if committed.id <= self.snapshot_max_materialized_id {
+                    return Ok(());
+                }
+                self.apply_committed_update(update)?;
+                self.block_cut_crossed = true;
+            }
+            CommittedGraphUpdate::Vspc(committed) if !self.vspc_cut_crossed => {
+                if self.snapshot_vspc_sink != committed.source {
+                    return Ok(());
+                }
+                self.apply_committed_update(update)?;
+                self.vspc_cut_crossed = true;
+            }
+            CommittedGraphUpdate::Block(_) | CommittedGraphUpdate::Vspc(_) => self.apply_committed_update(update)?,
+        }
+        Ok(())
+    }
+
+    fn apply_committed_update(&mut self, update: &CommittedGraphUpdate) -> Result<(), super::PublicationProjectionError> {
+        let original = match update {
+            CommittedGraphUpdate::Block(committed) => OriginalUpdate::Block(committed),
+            CommittedGraphUpdate::Vspc(committed) => OriginalUpdate::Vspc(committed),
+        };
+        let timestamp = revision_timestamp_ms_at(self.revision_clock_origin, Instant::now());
+        AppliedLineageUpdate::apply(&mut self.view, &mut self.history, original, timestamp, || {})?;
+        Ok(())
+    }
+
+    fn is_aligned(&self) -> bool {
+        self.block_cut_crossed && self.vspc_cut_crossed
+    }
+
+    fn into_publication(self, initial_state: GraphPublicationState) -> Result<GraphPublication, super::PublicationProjectionError> {
+        GraphPublication::new(initial_state, self.revision_clock_origin, self.view, self.history)
     }
 }
 
@@ -374,6 +581,16 @@ impl StagingBuffer {
         Ok(())
     }
 
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn pop_front(&mut self) -> Option<CommittedGraphUpdate> {
+        let update = self.entries.pop_front()?;
+        self.shared.record_staging_occupancy(self.entries.len());
+        Some(update)
+    }
+
     fn clear(&mut self) {
         self.entries.clear();
         self.shared.record_staging_occupancy(0);
@@ -394,6 +611,7 @@ enum PublicationRuntimePhase {
     AwaitingCatchup,
     Constructing,
     Aligning,
+    Active,
     Quiescent,
     Stopped,
 }
@@ -428,8 +646,15 @@ impl RuntimeSharedState {
         self.lock().phase = phase;
     }
 
-    fn set_target_live(&self) {
-        self.lock().target_live = true;
+    fn set_target_live(&self) -> bool {
+        let mut state = self.lock();
+        let changed = !state.target_live;
+        state.target_live = true;
+        changed
+    }
+
+    fn target_publication_state(&self) -> GraphPublicationState {
+        if self.lock().target_live { GraphPublicationState::Live } else { GraphPublicationState::Synchronizing }
     }
 
     fn record_staging_occupancy(&self, occupancy: usize) {
@@ -461,14 +686,16 @@ mod tests {
         },
     };
 
-    use kgi_api_ingress::channel::{GraphUpdateOfferOutcome, graph_update_channel};
+    use kgi_api_ingress::channel::{
+        GRAPH_UPDATE_CHANNEL_CAPACITY, GraphUpdateOfferOutcome, GraphUpdateProducer, graph_update_channel,
+    };
     use kgi_api_model::{
         graph::Level,
         projection::{GraphViewSeed, GraphWindowResolution},
     };
     use kgi_model::{
-        block::{BlockHash, CompactId},
-        graph_update::{GraphUpdate, VspcCommitted},
+        block::{BlockColor, BlockCoordinate, BlockHash, CompactId},
+        graph_update::{BlockCommitted, GraphUpdate, LevelCommitted, ParentCommitted, VspcCommitted},
     };
     use tokio::sync::Semaphore;
 
@@ -497,6 +724,55 @@ mod tests {
             edges: HashMap::new(),
             snapshot_max_materialized_id: CompactId::new(i64::from(byte.max(1))).expect("positive compact ID"),
             snapshot_vspc_sink: hash(byte),
+        }
+    }
+
+    fn alignment_seed() -> GraphViewSeed {
+        GraphViewSeed {
+            resolution: GraphWindowResolution { resolved_level: 10, effective_start_level: 8, effective_end_level: 10 },
+            max_depth: 3,
+            levels: BTreeMap::from([
+                (8, Level { size: 0, daa_score: Some(8) }),
+                (9, Level { size: 0, daa_score: Some(9) }),
+                (10, Level { size: 0, daa_score: Some(10) }),
+            ]),
+            blocks: HashMap::new(),
+            edges: HashMap::new(),
+            snapshot_max_materialized_id: CompactId::new(5).expect("positive compact ID"),
+            snapshot_vspc_sink: hash(90),
+        }
+    }
+
+    fn block_update(id: u8, level: u32, parent_level: u32) -> BlockCommitted {
+        BlockCommitted {
+            id: CompactId::new(i64::from(id)).expect("positive compact ID"),
+            hash: hash(id),
+            coordinate: BlockCoordinate::new(level, 0).expect("positive block coordinate"),
+            timestamp: u64::from(id),
+            daa_score: u64::from(id),
+            selected_parent_index: Some(0),
+            direct_parents: Arc::from([ParentCommitted {
+                hash: hash(id.wrapping_add(100)),
+                coordinate: Some(BlockCoordinate::new(parent_level, 0).expect("positive parent coordinate")),
+            }]),
+            blue_merge_set: Arc::from([]),
+            red_merge_set: Arc::from([]),
+            color: BlockColor::Gray,
+            is_in_vspc: false,
+            level_snapshots: Arc::from([
+                LevelCommitted { level: parent_level, size: 1, daa_score: Some(u64::from(parent_level)) },
+                LevelCommitted { level, size: 1, daa_score: Some(u64::from(level)) },
+            ]),
+        }
+    }
+
+    fn vspc_update_at(source: u8, daa_score: u64) -> VspcCommitted {
+        VspcCommitted {
+            source: hash(source),
+            destination: hash(source.wrapping_add(1)),
+            removed: Arc::from([]),
+            added: Arc::from([]),
+            level_snapshots: Arc::from([LevelCommitted { level: 10, size: 0, daa_score: Some(daa_score) }]),
         }
     }
 
@@ -554,8 +830,60 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct MockInstaller {
+        outcome: PublicationInstallOutcome,
+        installed: Arc<Mutex<Vec<Arc<GraphPublication>>>>,
+    }
+
+    impl MockInstaller {
+        fn installed() -> Self {
+            Self { outcome: PublicationInstallOutcome::Installed, installed: Arc::new(Mutex::new(Vec::new())) }
+        }
+
+        fn superseded() -> Self {
+            Self { outcome: PublicationInstallOutcome::Superseded, installed: Arc::new(Mutex::new(Vec::new())) }
+        }
+
+        fn latest(&self) -> Option<Arc<GraphPublication>> {
+            self.installed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).last().cloned()
+        }
+    }
+
+    impl PublicationInstaller for MockInstaller {
+        fn install(&self, publication: Arc<GraphPublication>) -> PublicationInstallOutcome {
+            if self.outcome == PublicationInstallOutcome::Installed {
+                self.installed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(publication);
+            }
+            self.outcome
+        }
+    }
+
     fn empty_api_db() -> Arc<ApiDbState<MockSeedDb>> {
         Arc::new(ApiDbState::new())
+    }
+
+    fn aligning_worker() -> PublicationRuntimeWorker<MockSeedDb, MockInstaller> {
+        aligning_worker_with_producer().0
+    }
+
+    fn aligning_worker_with_producer() -> (PublicationRuntimeWorker<MockSeedDb, MockInstaller>, GraphUpdateProducer) {
+        let (producer, graph_updates) = graph_update_channel();
+        let construction_gap_generation = graph_updates.gap_generation();
+        let shared = Arc::new(RuntimeSharedState::new());
+        shared.set_phase(PublicationRuntimePhase::Aligning);
+        (
+            PublicationRuntimeWorker {
+                graph_updates,
+                api_db: empty_api_db(),
+                installer: MockInstaller::installed(),
+                staging: StagingBuffer::new(shared.clone()),
+                work: PublicationWork::Aligning(Box::new(ConstructionCandidate::from_seed(alignment_seed(), Instant::now()))),
+                construction_gap_generation,
+                shared,
+            },
+            producer,
+        )
     }
 
     async fn wait_for(runtime: &PublicationRuntime, predicate: impl Fn(RuntimeSnapshot) -> bool) -> RuntimeSnapshot {
@@ -572,7 +900,7 @@ mod tests {
     #[tokio::test]
     async fn catchup_starts_staging_and_live_is_sticky_without_consuming_capacity() {
         let (producer, receiver) = graph_update_channel();
-        let runtime = PublicationRuntime::new(receiver, empty_api_db());
+        let runtime = PublicationRuntime::new(receiver, empty_api_db(), MockInstaller::installed());
 
         assert_eq!(producer.offer_vspc_committed(vspc_update(1)), Ok(GraphUpdateOfferOutcome::SuppressedAwaitingCatchup));
         assert_eq!(runtime.snapshot().phase, PublicationRuntimePhase::AwaitingCatchup);
@@ -597,7 +925,7 @@ mod tests {
     #[tokio::test]
     async fn receiver_closure_is_quiescent_until_explicit_shutdown() {
         let (producer, receiver) = graph_update_channel();
-        let runtime = PublicationRuntime::new(receiver, empty_api_db());
+        let runtime = PublicationRuntime::new(receiver, empty_api_db(), MockInstaller::installed());
         producer.publish_catchup().expect("runtime receiver is open");
         assert_eq!(producer.offer_vspc_committed(vspc_update(3)), Ok(GraphUpdateOfferOutcome::Enqueued));
         wait_for(&runtime, |snapshot| snapshot.metrics.staging_occupancy == 1).await;
@@ -667,13 +995,15 @@ mod tests {
         let mut worker = PublicationRuntimeWorker {
             graph_updates: receiver,
             api_db: empty_api_db(),
+            installer: MockInstaller::installed(),
             staging: StagingBuffer::new(shared.clone()),
-            candidate: None,
+            work: PublicationWork::None,
+            construction_gap_generation: 0,
             shared,
         };
 
         assert_eq!(
-            worker.handle_observation(GraphUpdateObservation::Update(GraphUpdate::Live)),
+            worker.handle_observation(GraphUpdateObservation::Update(GraphUpdate::Live)).await,
             Err(PublicationRuntimeError::InvalidMarkerOrder)
         );
     }
@@ -685,7 +1015,7 @@ mod tests {
         let api_db = Arc::new(ApiDbState::new());
         api_db.update(crate::api_db::ApiDbGenerationEvent::Published(first.clone())).expect("publish first generation");
         let (producer, receiver) = graph_update_channel();
-        let runtime = PublicationRuntime::new(receiver, api_db.clone());
+        let runtime = PublicationRuntime::new(receiver, api_db.clone(), MockInstaller::installed());
 
         for _ in 0..10 {
             tokio::task::yield_now().await;
@@ -699,10 +1029,8 @@ mod tests {
         api_db.update(crate::api_db::ApiDbGenerationEvent::Published(second.clone())).expect("publish replacement generation");
         release.add_permits(1);
 
-        let aligned = wait_for(&runtime, |snapshot| {
-            snapshot.phase == PublicationRuntimePhase::Aligning && snapshot.target_live && snapshot.metrics.staging_occupancy == 1
-        })
-        .await;
+        let aligned = wait_for(&runtime, |snapshot| snapshot.phase == PublicationRuntimePhase::Aligning && snapshot.target_live).await;
+        assert_eq!(aligned.metrics.staging_occupancy, 0, "alignment consumes the staged update after seeding");
         assert_eq!(aligned.metrics.staging_high_water_mark, 1);
         assert_eq!(first.calls(), 1);
         assert_eq!(second.calls(), 0, "an in-flight attempt never switches generations");
@@ -714,7 +1042,7 @@ mod tests {
     async fn construction_waits_for_a_database_generation_without_stopping_stream_staging() {
         let api_db = Arc::new(ApiDbState::new());
         let (producer, receiver) = graph_update_channel();
-        let runtime = PublicationRuntime::new(receiver, api_db.clone());
+        let runtime = PublicationRuntime::new(receiver, api_db.clone(), MockInstaller::installed());
 
         producer.publish_catchup().expect("runtime receiver is open");
         assert_eq!(producer.offer_vspc_committed(vspc_update(12)), Ok(GraphUpdateOfferOutcome::Enqueued));
@@ -745,5 +1073,111 @@ mod tests {
         assert_eq!(candidate.history.current_revision_id(), 0);
         assert_eq!(candidate.snapshot_max_materialized_id, CompactId::new(11).expect("positive compact ID"));
         assert_eq!(candidate.snapshot_vspc_sink, hash(11));
+        assert!(!candidate.block_cut_crossed);
+        assert!(!candidate.vspc_cut_crossed);
+    }
+
+    #[tokio::test]
+    async fn block_first_alignment_crosses_on_a_no_effect_commit_and_replays_the_captured_frontier() {
+        let mut worker = aligning_worker();
+        worker.staging.push(CommittedGraphUpdate::Block(block_update(5, 7, 6))).expect("covered block fits");
+        worker.staging.push(CommittedGraphUpdate::Vspc(vspc_update_at(89, 89))).expect("covered VSPC fits");
+        worker.staging.push(CommittedGraphUpdate::Block(block_update(6, 7, 6))).expect("crossing block fits");
+        worker.staging.push(CommittedGraphUpdate::Block(block_update(7, 11, 10))).expect("post-cut block fits");
+        worker.staging.push(CommittedGraphUpdate::Vspc(vspc_update_at(90, 90))).expect("crossing VSPC fits");
+        worker.staging.push(CommittedGraphUpdate::Vspc(vspc_update_at(91, 91))).expect("post-cut VSPC fits");
+
+        assert_eq!(worker.advance_alignment(), AlignmentOutcome::Installed);
+        assert_eq!(worker.staging.len(), 0);
+        let publication = worker.active_publication();
+        let target = publication.capture_delta_target().await;
+        let view = publication.capture_view().await.into_view();
+
+        assert_eq!(target.state(), GraphPublicationState::Synchronizing);
+        assert_eq!(target.revision(), 3, "no-effect crossing and covered values create no revisions");
+        assert!(view.block(&hash(5)).is_none(), "the snapshot-covered block is skipped");
+        assert!(view.block(&hash(6)).is_none(), "the below-window crossing block has no retained effect");
+        assert!(view.block(&hash(7)).is_some(), "later block updates apply after the block cut crosses");
+        assert_eq!(view.level(10), Some(&Level { size: 1, daa_score: Some(91) }));
+    }
+
+    #[tokio::test]
+    async fn vspc_first_alignment_keeps_applying_vspc_and_waits_indefinitely_for_the_block_cut() {
+        let mut worker = aligning_worker();
+        worker.staging.push(CommittedGraphUpdate::Vspc(vspc_update_at(90, 90))).expect("crossing VSPC fits");
+        assert_eq!(worker.advance_alignment(), AlignmentOutcome::Waiting);
+        assert_eq!(worker.alignment_candidate().view.current_revision_id(), 1);
+        assert_eq!(worker.advance_alignment(), AlignmentOutcome::Waiting, "an idle source has no synthetic fence or timeout");
+
+        worker.staging.push(CommittedGraphUpdate::Vspc(vspc_update_at(91, 91))).expect("post-cut VSPC fits");
+        worker.staging.push(CommittedGraphUpdate::Block(block_update(5, 7, 6))).expect("covered block fits");
+        assert_eq!(worker.advance_alignment(), AlignmentOutcome::Waiting);
+        assert_eq!(worker.alignment_candidate().view.current_revision_id(), 2);
+
+        worker.shared.set_target_live();
+        worker.staging.push(CommittedGraphUpdate::Block(block_update(6, 11, 10))).expect("crossing block fits");
+        assert_eq!(worker.advance_alignment(), AlignmentOutcome::Installed);
+        let target = worker.active_publication().capture_delta_target().await;
+        assert_eq!(target.state(), GraphPublicationState::Live);
+        assert_eq!(target.revision(), 3);
+    }
+
+    #[tokio::test]
+    async fn live_after_installation_changes_only_the_active_lifecycle_state() {
+        let mut worker = aligning_worker();
+        worker.staging.push(CommittedGraphUpdate::Block(block_update(6, 11, 10))).expect("crossing block fits");
+        worker.staging.push(CommittedGraphUpdate::Vspc(vspc_update_at(90, 90))).expect("crossing VSPC fits");
+        assert_eq!(worker.advance_alignment(), AlignmentOutcome::Installed);
+        worker.shared.set_phase(PublicationRuntimePhase::Active);
+        let publication = worker.active_publication().clone();
+        let before = publication.capture_delta_target().await;
+
+        assert_eq!(worker.handle_observation(GraphUpdateObservation::Update(GraphUpdate::Live)).await, Ok(WorkerAction::Continue));
+        let after = publication.capture_delta_target().await;
+        assert_eq!(before.state(), GraphPublicationState::Synchronizing);
+        assert_eq!(after.state(), GraphPublicationState::Live);
+        assert_eq!(after.revision(), before.revision());
+        assert_eq!(after.revision_timestamp_ms(), before.revision_timestamp_ms());
+
+        assert_eq!(
+            worker.handle_observation(GraphUpdateObservation::Update(GraphUpdate::VspcCommitted(vspc_update_at(91, 91)))).await,
+            Ok(WorkerAction::Continue)
+        );
+        let advanced = publication.capture_delta_target().await;
+        assert_eq!(advanced.state(), GraphPublicationState::Live);
+        assert_eq!(advanced.revision(), after.revision() + 1);
+        assert_eq!(worker.staging.len(), 0, "Active applies new arrivals without a hidden backlog");
+    }
+
+    #[test]
+    fn superseded_installation_abandons_the_aligned_publication() {
+        let mut worker = aligning_worker();
+        worker.installer = MockInstaller::superseded();
+        worker.staging.push(CommittedGraphUpdate::Block(block_update(6, 11, 10))).expect("crossing block fits");
+        worker.staging.push(CommittedGraphUpdate::Vspc(vspc_update_at(90, 90))).expect("crossing VSPC fits");
+
+        assert_eq!(worker.advance_alignment(), AlignmentOutcome::Superseded);
+        assert!(matches!(worker.work, PublicationWork::None));
+        assert!(worker.installer.latest().is_none());
+    }
+
+    #[test]
+    fn changed_gap_generation_prevents_installation_at_the_alignment_boundary() {
+        let (mut worker, producer) = aligning_worker_with_producer();
+        producer.publish_catchup().expect("alignment test receiver is open");
+        for byte in 0..(GRAPH_UPDATE_CHANNEL_CAPACITY - 1) {
+            assert_eq!(
+                producer.offer_vspc_committed(vspc_update(byte as u8)),
+                Ok(GraphUpdateOfferOutcome::Enqueued),
+                "the bounded ingress fills before reporting a gap"
+            );
+        }
+        assert_eq!(producer.offer_vspc_committed(vspc_update(0)), Ok(GraphUpdateOfferOutcome::GapReported));
+        worker.staging.push(CommittedGraphUpdate::Block(block_update(6, 11, 10))).expect("crossing block fits");
+        worker.staging.push(CommittedGraphUpdate::Vspc(vspc_update_at(90, 90))).expect("crossing VSPC fits");
+
+        assert_eq!(worker.advance_alignment(), AlignmentOutcome::Restart);
+        assert!(matches!(worker.work, PublicationWork::Aligning(_)), "the run loop still owns abandonment");
+        assert!(worker.installer.latest().is_none());
     }
 }

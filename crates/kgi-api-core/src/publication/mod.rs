@@ -282,32 +282,22 @@ impl GraphPublication {
     async fn apply_original_update(&self, update: OriginalUpdate<'_>) -> Result<Option<u64>, PublicationProjectionError> {
         let mutation = self.mutation.lock().await;
         let mut core = self.core.write().await;
-        let view_revision = core.view.current_revision_id();
-        let history_revision = core.history.current_revision_id();
-        if view_revision != history_revision {
-            return Err(PublicationProjectionError::RevisionMismatch { view_revision, history_revision });
-        }
-
         assert_ne!(core.state, GraphPublicationState::Stale, "a Stale publication is not mutated");
-        let delta = update.apply(&mut core.view, self.revision_timestamp_ms())?;
-        let Some(delta) = delta else {
+        let GraphPublicationCore { view, history, .. } = &mut *core;
+        let applied = AppliedLineageUpdate::apply(view, history, update, self.revision_timestamp_ms(), || {
+            #[cfg(test)]
+            if let Some(hook) = &self.atomic_mutation_test_hook {
+                hook.pause_after_view_update();
+            }
+        })?;
+        let Some(applied) = applied else {
             return Ok(None);
         };
-        #[cfg(test)]
-        if let Some(hook) = &self.atomic_mutation_test_hook {
-            hook.pause_after_view_update();
-        }
-        let target_revision = delta.to_revision_id();
-        let head_low_level = core.view.low_level();
-        let estimated_raw_bytes = estimate_raw_delta_bytes(&delta);
-        core.history.append(delta, estimated_raw_bytes).expect("a successful Head update extends the locked history");
-        core.history.prune(head_low_level);
-        let head_high_level = core.view.high_level();
         drop(core);
-        self.clients.advance_head(target_revision);
+        self.clients.advance_head(applied.target_revision);
         drop(mutation);
-        self.cache.prune_deltas(head_high_level);
-        Ok(Some(target_revision))
+        self.cache.prune_deltas(applied.head_high_level);
+        Ok(Some(applied.target_revision))
     }
 
     fn revision_timestamp_ms_at(&self, now: Instant) -> u64 {
@@ -326,6 +316,37 @@ impl OriginalUpdate<'_> {
             Self::Block(committed) => Ok(view.apply_head_block_committed(committed, revision_timestamp_ms)?),
             Self::Vspc(committed) => Ok(view.apply_head_vspc_committed(committed, revision_timestamp_ms)?),
         }
+    }
+}
+
+struct AppliedLineageUpdate {
+    target_revision: u64,
+    head_high_level: u32,
+}
+
+impl AppliedLineageUpdate {
+    fn apply(
+        view: &mut GraphView,
+        history: &mut GraphHistory,
+        update: OriginalUpdate<'_>,
+        revision_timestamp_ms: u64,
+        after_view_update: impl FnOnce(),
+    ) -> Result<Option<Self>, PublicationProjectionError> {
+        let view_revision = view.current_revision_id();
+        let history_revision = history.current_revision_id();
+        if view_revision != history_revision {
+            return Err(PublicationProjectionError::RevisionMismatch { view_revision, history_revision });
+        }
+
+        let Some(delta) = update.apply(view, revision_timestamp_ms)? else {
+            return Ok(None);
+        };
+        after_view_update();
+        let target_revision = delta.to_revision_id();
+        let estimated_raw_bytes = estimate_raw_delta_bytes(&delta);
+        history.append(delta, estimated_raw_bytes).expect("a successful Head update extends its matching history");
+        history.prune(view.low_level());
+        Ok(Some(Self { target_revision, head_high_level: view.high_level() }))
     }
 }
 

@@ -15,9 +15,6 @@ pub const HOT_DESTINATION_LEVEL_DISTANCE: u32 = 250;
 /// Depth interval from which the finite Head snapshot cache tiers are derived.
 pub const CACHED_HEAD_WINDOW_DEPTH_STEP: u32 = 50;
 
-/// Head snapshot tier constructed while opening a publication.
-pub const PREWARMED_HEAD_WINDOW_DEPTH: u32 = 50;
-
 /// Head-level distance at which a selected cached snapshot triggers refresh.
 pub const CACHED_WINDOW_REFRESH_LEVEL_DISTANCE: u32 = 40;
 

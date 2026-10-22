@@ -780,7 +780,7 @@ mod tests {
     use bytes::Bytes;
     use kgi_api_model::{
         graph::LevelExtent,
-        protocol::{CACHED_WINDOW_MAX_LEVEL_DISTANCE, CACHED_WINDOW_REFRESH_LEVEL_DISTANCE, PREWARMED_HEAD_WINDOW_DEPTH},
+        protocol::{CACHED_HEAD_WINDOW_DEPTH_STEP, CACHED_WINDOW_MAX_LEVEL_DISTANCE, CACHED_WINDOW_REFRESH_LEVEL_DISTANCE},
     };
     use tokio::sync::{Notify, oneshot};
     use tokio_util::sync::CancellationToken;
@@ -850,7 +850,7 @@ mod tests {
         for (target_depth, expected) in [(1, 50), (50, 50), (51, 100), (149, 150), (200, 200), (201, 250), (250, 250)] {
             assert_eq!(selected_head_depth(target_depth), expected);
         }
-        assert_eq!(selected_head_depth(PREWARMED_HEAD_WINDOW_DEPTH), PREWARMED_HEAD_WINDOW_DEPTH);
+        assert_eq!(selected_head_depth(CACHED_HEAD_WINDOW_DEPTH_STEP), CACHED_HEAD_WINDOW_DEPTH_STEP);
     }
 
     #[test]
@@ -959,7 +959,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hard_aged_candidate_retries_inside_one_pending_prewarm_job() {
+    async fn hard_aged_candidate_retries_inside_one_pending_tier_job() {
         let cache = Arc::new(GraphCache::new());
         let jobs = CacheJobTracker::new();
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -967,7 +967,7 @@ mod tests {
         let access = cache
             .head(
                 &jobs,
-                PREWARMED_HEAD_WINDOW_DEPTH,
+                CACHED_HEAD_WINDOW_DEPTH_STEP,
                 move |depth, _| {
                     let attempt = attempts_builder.fetch_add(1, Ordering::SeqCst);
                     async move {
@@ -980,13 +980,13 @@ mod tests {
             .await;
         let shared_job = match &access.access {
             CacheAccess::Job(job) => job.clone(),
-            CacheAccess::Completed(_) => panic!("prewarming starts one job"),
+            CacheAccess::Completed(_) => panic!("the first tier request starts one job"),
         };
         let concurrent = cache
             .head(
                 &jobs,
-                PREWARMED_HEAD_WINDOW_DEPTH,
-                |_, _| async { panic!("a concurrent prewarm waiter cannot build") },
+                CACHED_HEAD_WINDOW_DEPTH_STEP,
+                |_, _| async { panic!("a concurrent tier waiter cannot build") },
                 || async { 120 },
             )
             .await;
@@ -1314,16 +1314,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracker_shutdown_cancels_unobserved_prewarming_work_preserves_the_old_value_and_rejects_replacement() {
+    async fn tracker_shutdown_cancels_unobserved_head_refresh_preserves_the_old_value_and_rejects_replacement() {
         let cache = Arc::new(GraphCache::new());
         let jobs = CacheJobTracker::new();
-        let previous = cached_head(PREWARMED_HEAD_WINDOW_DEPTH, 1, 100);
+        let previous = cached_head(CACHED_HEAD_WINDOW_DEPTH_STEP, 1, 100);
         seed_head(&cache, previous.clone());
 
         let access = cache
             .head(
                 &jobs,
-                PREWARMED_HEAD_WINDOW_DEPTH,
+                CACHED_HEAD_WINDOW_DEPTH_STEP,
                 |_, _| async { std::future::pending::<Result<Arc<CachedHeadSnapshot>, CacheBuildError>>().await },
                 || async { 140 },
             )
@@ -1333,26 +1333,26 @@ mod tests {
         let running = cache
             .lock_state()
             .head_slots
-            .get(&PREWARMED_HEAD_WINDOW_DEPTH)
+            .get(&CACHED_HEAD_WINDOW_DEPTH_STEP)
             .and_then(|slot| slot.running.clone())
-            .expect("demand starts one tracked prewarming refresh");
+            .expect("demand starts one tracked Head refresh");
 
         jobs.shutdown().await;
         assert_eq!(running.wait(CancellationToken::new()).await, Err(CacheWaitError::Build(CacheBuildError::Cancelled)));
-        assert!(cache.lock_state().head_slots.get(&PREWARMED_HEAD_WINDOW_DEPTH).is_some_and(|slot| {
+        assert!(cache.lock_state().head_slots.get(&CACHED_HEAD_WINDOW_DEPTH_STEP).is_some_and(|slot| {
             slot.running.is_none() && slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &previous))
         }));
 
         let rejected = cache
             .head(
                 &jobs,
-                PREWARMED_HEAD_WINDOW_DEPTH,
-                |_, _| async { panic!("a closed tracker cannot run new prewarming work") },
+                CACHED_HEAD_WINDOW_DEPTH_STEP,
+                |_, _| async { panic!("a closed tracker cannot run new Head work") },
                 || async { 200 },
             )
             .await;
         assert_eq!(rejected.resolve(CancellationToken::new()).await, Err(CacheWaitError::Build(CacheBuildError::Cancelled)));
-        assert!(cache.lock_state().head_slots.get(&PREWARMED_HEAD_WINDOW_DEPTH).is_some_and(|slot| {
+        assert!(cache.lock_state().head_slots.get(&CACHED_HEAD_WINDOW_DEPTH_STEP).is_some_and(|slot| {
             slot.running.is_none() && slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &previous))
         }));
     }
