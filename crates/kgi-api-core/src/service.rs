@@ -46,7 +46,6 @@ pub enum ApiDbGenerationMessage {
 enum ApiRuntimeSlot {
     AwaitReset,
     Running(OwnedPublicationRuntime),
-    #[allow(dead_code, reason = "terminal shutdown enters this state in increment-14 point 6")]
     Stopped,
 }
 
@@ -289,6 +288,37 @@ impl ApiService {
             predecessor.shutdown().await?;
         }
         Ok(())
+    }
+
+    /// Completes the idempotent terminal barrier for every ApiService-owned resource.
+    pub async fn shutdown(&self) -> Result<(), ApiServiceError> {
+        let mut runtime = self.runtime.lock().await;
+        if matches!(*runtime, ApiRuntimeSlot::Stopped) {
+            return Ok(());
+        }
+
+        self.api_db.stop();
+
+        let mut result = Ok(());
+        if let ApiRuntimeSlot::Running(installed) = &*runtime
+            && let Err(error) = installed.shutdown().await
+        {
+            result = Err(error);
+        }
+
+        self.cancellation.sse.cancel();
+        self.cancellation.http.cancel();
+
+        let ((), encoding_result) = tokio::join!(biased; self.cache_jobs.shutdown(), self.encoding.shutdown());
+        if result.is_ok()
+            && let Err(error) = encoding_result
+        {
+            result = Err(error);
+        }
+
+        self.current_publication.send_replace(None);
+        *runtime = ApiRuntimeSlot::Stopped;
+        result
     }
 
     /// Captures the latest independent component observations without waiting for a common revision.
@@ -561,5 +591,35 @@ mod tests {
         assert_eq!(producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
         assert_eq!(service.publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).runtime_generation, 0);
         service.encoding.shutdown().await.expect("encoding scheduler shuts down");
+    }
+
+    #[tokio::test]
+    async fn shutdown_from_await_reset_is_terminal_silent_and_idempotent() {
+        let (service, mut events) = service();
+        service.current_publication.send_replace(Some(publication()));
+
+        service.shutdown().await.expect("shutdown succeeds");
+
+        assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopped));
+        assert!(service.cancellation.sse.is_cancelled());
+        assert!(service.cancellation.http.is_cancelled());
+        assert!(service.cancellation.cache_jobs.is_cancelled());
+        assert!(service.current_publication().is_none());
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+        service.shutdown().await.expect("repeated shutdown succeeds");
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_the_installed_runtime_and_releases_its_receiver() {
+        let (service, mut events) = service();
+        let (producer, receiver) = graph_update_channel();
+        service.reset(receiver, RecoveryMode::Resync).await.expect("runtime starts");
+
+        service.shutdown().await.expect("shutdown succeeds");
+
+        assert_eq!(producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
+        assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopped));
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
     }
 }
