@@ -1055,3 +1055,41 @@ and reconstruction counters alongside each synchronous buffer mutation.
 Implement the reconstruction drain with the receiver's nonblocking operation
 until its first empty observation; no secondary queue or recovery task is
 introduced.
+
+## 22 October 2026: ApiService lifecycle integration
+
+### Synchronization and installation capability
+
+Keep the complete runtime slot behind one Tokio mutex so each `reset` or
+terminal `shutdown` retains exclusive lifecycle authority across the
+predecessor barrier. Keep the much shorter runtime-generation check,
+publication replacement, and conditional database-read reopening behind a
+separate standard mutex. A private `RuntimePublicationInstaller` carries only
+that installation capability and its captured generation; it does not retain
+`Arc<ApiService>` or create a service/runtime ownership cycle. The lifecycle
+and installation semantics remain owned by
+[API Service](../architecture/api-service.md#reset-control-and-recovery-effects--settled).
+
+### Permanent-work completion observation
+
+Pair each publication runtime and encoding scheduler with an owned completion
+observer handle. The observer awaits the component's retained completion
+future and holds the reliable event sender, while the wrapper's shutdown joins
+the observer after the component barrier. Publication runtimes retain join
+ownership in their completion value. Encoding orchestration workers and their
+panic monitors are both registered in the scheduler's `TaskTracker`, and the
+scheduler retains the first terminal result in a watch value. This permits
+independent failure observation without detached tasks or a second command
+path.
+
+### Cancellation-resumable terminal barrier
+
+Leave the installed runtime in the service slot while its terminal barrier is
+awaited, and replace the slot with `Stopped` only after all resources present
+in this increment have completed. A cancelled shutdown caller therefore does
+not lose runtime ownership; a later call resumes through the retained runtime,
+cache-job, and encoding completion barriers. Run cache-job and encoding joins
+concurrently only after their ordered synchronous close/cancel prefixes have
+executed. Later transport increments attach request and connection guards to
+the existing independent cancellation roots without changing this lifecycle
+structure.

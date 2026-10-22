@@ -63,6 +63,10 @@ impl OwnedPublicationRuntime {
         events: mpsc::UnboundedSender<ApiServiceEvent>,
     ) -> Self {
         let runtime = PublicationRuntime::new(graph_updates, api_db, installer);
+        Self::observe(runtime, events)
+    }
+
+    fn observe(runtime: PublicationRuntime, events: mpsc::UnboundedSender<ApiServiceEvent>) -> Self {
         let completion = runtime.completion();
         let observer_events = events.clone();
         let completion_observer = tokio::spawn(async move {
@@ -349,6 +353,7 @@ mod tests {
     use kgi_api_model::{
         graph::{GraphView, Level, LevelExtent, TrackingPolicy},
         history::GraphHistory,
+        projection::GraphViewSeed,
     };
     use kgi_model::lifecycle::{
         NodeServiceStatus, NodeServiceStatusState, ProcessingState, ProcessingStatus, RecoveryMode, StorageServiceStatus,
@@ -356,14 +361,18 @@ mod tests {
     };
     use tokio::sync::{mpsc::error::TryRecvError, watch};
 
-    use super::{ApiRuntimeSlot, ApiService, ApiStatusInputs, PublicationInstallState, RuntimePublicationInstaller};
+    use super::{
+        ApiRuntimeSlot, ApiService, ApiServiceEvent, ApiStatusInputs, OwnedPublicationRuntime, PublicationInstallState,
+        RuntimePublicationInstaller,
+    };
     use crate::{
         api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
         publication::{
             GraphPublication, GraphPublicationState,
-            runtime::{PublicationInstallOutcome, PublicationInstaller},
+            runtime::{PublicationInstallOutcome, PublicationInstaller, PublicationRuntime, PublicationSeedDatabase},
         },
     };
+    use kgi_storage::error::ApiReadError;
 
     struct TestGeneration {
         valid: AtomicBool,
@@ -378,6 +387,12 @@ mod tests {
     impl ApiDbGeneration for TestGeneration {
         fn is_valid(&self) -> bool {
             self.valid.load(Ordering::Acquire)
+        }
+    }
+
+    impl PublicationSeedDatabase for TestGeneration {
+        async fn load_head_seed(&self) -> Result<GraphViewSeed, ApiReadError> {
+            panic!("simulated publication-runtime worker loss")
         }
     }
 
@@ -621,5 +636,70 @@ mod tests {
         assert_eq!(producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
         assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopped));
         assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn unexpected_runtime_failure_emits_exactly_one_reliable_event() {
+        let (producer, receiver) = graph_update_channel();
+        let api_db = Arc::new(ApiDbState::<TestGeneration>::new());
+        api_db.update(ApiDbGenerationUpdate::Published(TestGeneration::valid())).expect("test database generation is published");
+        let (current_publication, _) = watch::channel(None);
+        let runtime = PublicationRuntime::new(
+            receiver,
+            api_db.clone(),
+            RuntimePublicationInstaller {
+                publication_install: Arc::new(Mutex::new(PublicationInstallState { runtime_generation: 0 })),
+                current_publication,
+                api_db,
+                runtime_generation: 0,
+                recovery_mode: RecoveryMode::Resync,
+            },
+        );
+        let (event_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let owned = OwnedPublicationRuntime::observe(runtime, event_tx);
+
+        producer.publish_catchup().expect("runtime receiver is open");
+        let event = events.recv().await.expect("runtime failure is reported");
+        assert!(matches!(event, ApiServiceEvent::Failed(crate::error::ApiServiceError::PublicationRuntimeFailed { .. })));
+        assert!(owned.shutdown().await.is_err());
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn reset_and_shutdown_serialize_to_one_terminal_runtime_state() {
+        let (service, mut events) = service();
+        let (producer, receiver) = graph_update_channel();
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+
+        let reset_service = service.clone();
+        let reset_start = start.clone();
+        let reset = tokio::spawn(async move {
+            reset_start.wait().await;
+            reset_service.reset(receiver, RecoveryMode::Resync).await
+        });
+        let shutdown_service = service.clone();
+        let shutdown_start = start.clone();
+        let shutdown = tokio::spawn(async move {
+            shutdown_start.wait().await;
+            shutdown_service.shutdown().await
+        });
+        start.wait().await;
+
+        let reset_result = reset.await.expect("reset task completes");
+        assert!(reset_result.is_ok() || reset_result == Err(crate::error::ApiServiceError::ControlUnavailable));
+        assert_eq!(shutdown.await.expect("shutdown task completes"), Ok(()));
+        assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopped));
+        assert_eq!(producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn completed_shutdown_releases_the_reliable_event_path_with_the_service() {
+        let (service, mut events) = service();
+
+        service.shutdown().await.expect("shutdown succeeds");
+        drop(service);
+
+        assert_eq!(events.recv().await, None);
     }
 }
