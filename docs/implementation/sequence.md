@@ -156,17 +156,20 @@ Execute increment 14 as these ordered points:
    failures local to their callers.
 6. Implement the idempotent terminal `shutdown` barrier in the architecture's
    prescribed order for every resource present in this increment: close service
-   admission, stop API database binding, take and join the publication runtime,
-   cancel the independent SSE and HTTP roots, close and cancel cache work, stop
-   and join encoding, clear the current publication, release retained resources,
-   and enter `Stopped`. Later transport increments attach their guards to these
-   roots and barriers without changing this ordering.
+   admission, enter the explicit terminal `Stopping` slot, stop API database
+   binding, join the retained publication runtime, cancel the independent SSE
+   and HTTP roots, close and cancel cache work, stop and join encoding, clear
+   the current publication, release retained resources, and enter `Stopped`.
+   Later transport increments attach their guards to these roots and barriers
+   without changing this ordering.
 7. Complete deterministic control-level verification for shutdown from
    `AwaitReset` and every publication-runtime state, reset/shutdown and
    database-update/shutdown races, final Stale propagation, task and generation
-   release, unexpected-worker failure, event-path closure, and repeated
-   shutdown. Record the implementation choices and status, then run the full
-   Rust validation suite.
+   release, cancellation while a shutdown resource barrier remains open,
+   rejected reset after that terminal cutoff, resumed shutdown,
+   unexpected-worker failure, event-path closure, and repeated shutdown. Record
+   the implementation choices and status, then run the full Rust validation
+   suite.
 
 This increment adds no logical Head or anchored-window operation, HTTP admission
 lane or Axum router, request guard, SSE transport connection loop, Supervisor

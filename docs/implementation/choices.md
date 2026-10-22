@@ -1084,12 +1084,12 @@ path.
 
 ### Cancellation-resumable terminal barrier
 
-Leave the installed runtime in the service slot while its terminal barrier is
-awaited, and replace the slot with `Stopped` only after all resources present
-in this increment have completed. A cancelled shutdown caller therefore does
-not lose runtime ownership; a later call resumes through the retained runtime,
-cache-job, and encoding completion barriers. Run cache-job and encoding joins
-concurrently only after their ordered synchronous close/cancel prefixes have
-executed. Later transport increments attach request and connection guards to
-the existing independent cancellation roots without changing this lifecycle
-structure.
+Represent the owner-defined terminal slot as
+`Stopping(Option<OwnedPublicationRuntime>)`. Keep `Some` while the runtime
+barrier is pending and clear it after completion. The terminal transitions and
+resumption contract remain owned by
+[API Service](../architecture/api-service.md#apiservice-shutdown--settled).
+Run cache-job and encoding joins concurrently only after their ordered
+synchronous close/cancel prefixes have executed. Later transport increments
+attach request and connection guards to the existing independent cancellation
+roots without changing this lifecycle structure.

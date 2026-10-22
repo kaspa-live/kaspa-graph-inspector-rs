@@ -183,6 +183,7 @@ ApiService owns exactly one private runtime slot:
 enum ApiRuntimeSlot {
     AwaitReset,
     Running(PublicationRuntime),
+    Stopping(Option<PublicationRuntime>),
     Stopped,
 }
 
@@ -260,6 +261,10 @@ Successful return is a runtime-replacement barrier, but is not a processing,
 publication-installation, or database-replacement barrier. The runtime slot
 contains at most one runtime; during this bounded overlap, `reset` additionally
 retains the exchanged predecessor only until its shutdown barrier completes.
+`reset` is accepted only while the slot is `AwaitReset` or `Running`. A
+`Stopping` or `Stopped` slot rejects it with `ControlUnavailable` without
+advancing the runtime generation or constructing a successor; dropping the
+supplied receiver closes that unused session ingress.
 
 The current-publication slot is a latest-value asynchronous value initialized
 to `None`. `tokio::sync::watch` is the settled primitive. Each runtime receives
@@ -711,25 +716,41 @@ barriers.
 idempotent, valid from `AwaitReset`, `AwaitingCatchup`, `Constructing`, `Aligning`,
 and `Active`, and is serialized with `reset` by the runtime
 lifecycle mutex.
-ApiService performs the local barrier in order:
+ApiService performs or resumes the local barrier in order:
 
 1. close public graph HTTP and status admission;
-2. publish `ApiDbSnapshot::Stopped`, waking pending construction and making
+2. replace `AwaitReset` with `Stopping(None)` or `Running(runtime)` with
+   `Stopping(Some(runtime))`; an existing `Stopping` slot resumes the barrier,
+   while `Stopped` completes immediately;
+3. publish `ApiDbSnapshot::Stopped`, waking pending construction and making
    public database reads unavailable;
-3. take the installed runtime, if any, and await its publication-owned
-   `shutdown()` barrier, allowing its final `Stale` transition to propagate
-   through the normal ordered SSE path to currently registered clients;
-4. cancel `ApiCancellation::sse`, then
+4. while the slot is `Stopping(Some(runtime))`, retain that runtime in the slot
+   and await its publication-owned `shutdown()` barrier, allowing its final
+   `Stale` transition to propagate through the normal ordered SSE path to
+   currently registered clients; replace it with `Stopping(None)` only after
+   that barrier completes;
+5. cancel `ApiCancellation::sse`, then
    `ApiCancellation::http`, and wait for all SSE and request guards to be
    released;
-5. close `cache_jobs` to new registration, cancel
+6. close `cache_jobs` to new registration, cancel
    `ApiCancellation::cache_jobs`, and cancel every unfinished cache job;
-6. signal encoding-scheduler shutdown and await both `cache_jobs.wait()` and
+7. signal encoding-scheduler shutdown and await both `cache_jobs.wait()` and
    `EncodingScheduler::shutdown()`;
-7. replace the current-publication value with `None`, then release every API DB
+8. replace the current-publication value with `None`, then release every API DB
    permit, transaction, connection, validated client, pool handle, publication,
    and cache reference; and
-8. set `ApiRuntimeSlot::Stopped` and complete the `shutdown` call.
+9. replace `Stopping(None)` with `Stopped` and complete the `shutdown` call.
+
+Entering `Stopping` is the irreversible ApiService shutdown cutoff. Admission
+is already closed, and the transition occurs before `ApiDbState::stop()` and
+before the first await. Cancellation of the caller or an early barrier error
+therefore leaves the slot in `Stopping`, retains any runtime whose barrier has
+not completed, and cannot restore reset authority. Every shutdown step is
+idempotent or retains its own completion state, so a later `shutdown` call
+reacquires the lifecycle mutex and resumes the same barrier. `Stopping` can
+advance only to `Stopped`; it never returns to `AwaitReset` or `Running`. Reset
+eligibility is determined solely by this runtime lifecycle slot; ApiService
+must not infer it indirectly from `ApiDbState`.
 
 Shutdown waits for the final Stale state to enter each currently registered
 client's bounded SSE buffer, not for its network delivery. A client whose
@@ -738,11 +759,11 @@ normal slow-client rule before the remaining connections are cancelled.
 
 Successful method completion proves that no API admission, task, graph-update
 receiver, or API database resource remains. A repeated `shutdown` returns
-success for the already completed state. Runtime-lifecycle serialization rejects
-`reset` once shutdown begins. Publishing `ApiDbSnapshot::Stopped` is the
-generation-update cutoff: an update linearized before that transition may
-complete and is then cleared by the transition, while a later update is
-rejected.
+success for the already completed state. Runtime-lifecycle serialization and
+the retained `Stopping` state reject `reset` once shutdown begins. Publishing
+`ApiDbSnapshot::Stopped` is the generation-update cutoff: an update linearized
+before that transition may complete and is then cleared by the transition,
+while a later update is rejected.
 ApiService adds no component-local timeout or escalation to this barrier; the
 Supervisor waiting policy belongs to the
 [processing lifecycle](processing-lifecycle.md#teardown-and-delivery-semantics--settled).
