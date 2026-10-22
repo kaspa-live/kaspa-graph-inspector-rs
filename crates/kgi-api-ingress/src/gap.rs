@@ -46,15 +46,18 @@ impl GraphUpdateGap {
         *self.generation.borrow()
     }
 
+    /// Returns the latest published generation and marks it observed.
+    pub(crate) fn acknowledge_current(&mut self) -> u64 {
+        let generation = *self.generation.borrow_and_update();
+        self.observed_generation = generation;
+        generation
+    }
+
     /// Marks and returns the latest unobserved generation, if one exists.
     pub fn take_pending(&mut self) -> Option<u64> {
-        let generation = *self.generation.borrow_and_update();
-        if generation == self.observed_generation {
-            None
-        } else {
-            self.observed_generation = generation;
-            Some(generation)
-        }
+        let observed_generation = self.observed_generation;
+        let generation = self.acknowledge_current();
+        if generation == observed_generation { None } else { Some(generation) }
     }
 
     pub(crate) async fn changed(&mut self) -> Option<u64> {

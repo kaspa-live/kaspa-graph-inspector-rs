@@ -351,6 +351,11 @@ impl GraphUpdateReceiver {
         self.gap.take_pending()
     }
 
+    /// Returns the latest gap generation and marks it observed as a new baseline.
+    pub fn acknowledge_gap_generation(&mut self) -> u64 {
+        self.gap.acknowledge_current()
+    }
+
     /// Returns the latest gap generation without marking it observed.
     #[must_use]
     pub fn gap_generation(&self) -> u64 {
@@ -497,6 +502,21 @@ mod tests {
         assert_eq!(metrics.current_occupancy, GRAPH_UPDATE_CHANNEL_CAPACITY);
         assert_eq!(metrics.high_water_mark, GRAPH_UPDATE_CHANNEL_CAPACITY);
         assert_eq!(metrics.reported_gap_count, 3);
+    }
+
+    #[tokio::test]
+    async fn acknowledging_a_gap_baseline_suppresses_only_the_current_generation() {
+        let (producer, mut receiver) = graph_update_channel();
+        producer.publish_catchup().expect("receiver is open");
+        for byte in 0..(GRAPH_UPDATE_CHANNEL_CAPACITY - 1) {
+            assert_eq!(producer.offer_vspc_committed(vspc_update(byte as u8)), Ok(GraphUpdateOfferOutcome::Enqueued));
+        }
+        assert_eq!(producer.offer_vspc_committed(vspc_update(10)), Ok(GraphUpdateOfferOutcome::GapReported));
+
+        assert_eq!(receiver.acknowledge_gap_generation(), 1);
+        assert_eq!(receiver.take_pending_gap(), None);
+        assert_eq!(producer.offer_vspc_committed(vspc_update(11)), Ok(GraphUpdateOfferOutcome::GapReported));
+        assert_eq!(receiver.wait_for_gap().await, Some(2));
     }
 
     #[tokio::test]

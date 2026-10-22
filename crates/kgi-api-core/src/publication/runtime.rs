@@ -301,7 +301,7 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
         let phase = self.shared.lock().phase;
         match (phase, observation) {
             (PublicationRuntimePhase::AwaitingCatchup, GraphUpdateObservation::Update(GraphUpdate::Catchup)) => {
-                self.construction_gap_generation = self.graph_updates.gap_generation();
+                self.construction_gap_generation = self.graph_updates.acknowledge_gap_generation();
                 self.shared.set_phase(PublicationRuntimePhase::Constructing);
                 Ok(WorkerAction::Continue)
             }
@@ -442,7 +442,7 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
                 }
                 Ok(GraphUpdate::Catchup) => return Err(PublicationRuntimeError::InvalidMarkerOrder),
                 Err(TryRecvError::Empty) => {
-                    self.construction_gap_generation = self.graph_updates.gap_generation();
+                    self.construction_gap_generation = self.graph_updates.acknowledge_gap_generation();
                     self.shared.set_phase(PublicationRuntimePhase::Constructing);
                     return Ok(LoopAction::Continue);
                 }
@@ -976,7 +976,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_catchup_precedes_a_gap_reported_before_the_runtime_starts() {
+    async fn catchup_acknowledges_a_pending_gap_as_its_construction_baseline() {
         let (producer, receiver) = graph_update_channel();
         producer.publish_catchup().expect("runtime receiver is open");
         for byte in 0..(GRAPH_UPDATE_CHANNEL_CAPACITY - 1) {
@@ -984,12 +984,18 @@ mod tests {
         }
         assert_eq!(producer.offer_vspc_committed(vspc_update(0)), Ok(GraphUpdateOfferOutcome::GapReported));
 
-        let runtime = PublicationRuntime::new(receiver, empty_api_db(), MockInstaller::installed());
-        let reconstructed = wait_for(&runtime, |snapshot| {
-            snapshot.phase == PublicationRuntimePhase::Constructing && snapshot.metrics.reconstruction_count == 1
+        let (database, started, _release) = MockSeedDb::gated(Ok(seed(2)));
+        let api_db = Arc::new(ApiDbState::new());
+        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database.clone())).expect("publish database generation");
+        let runtime = PublicationRuntime::new(receiver, api_db, MockInstaller::installed());
+        started.acquire().await.expect("baseline seed attempt starts").forget();
+        let constructing = wait_for(&runtime, |snapshot| {
+            snapshot.phase == PublicationRuntimePhase::Constructing
+                && snapshot.metrics.staging_occupancy == GRAPH_UPDATE_CHANNEL_CAPACITY - 1
         })
         .await;
-        assert_eq!(reconstructed.metrics.staging_occupancy, 0);
+        assert_eq!(constructing.metrics.reconstruction_count, 0);
+        assert_eq!(database.calls(), 1);
         assert_eq!(producer.metrics().current_occupancy, 0);
         assert_eq!(runtime.shutdown().await, Ok(()));
     }
@@ -1462,6 +1468,67 @@ mod tests {
         assert!(matches!(worker.work, PublicationWork::None));
         assert_eq!(worker.shared.lock().phase, PublicationRuntimePhase::Constructing);
         assert_eq!(worker.construction_gap_generation, 1);
+    }
+
+    #[tokio::test]
+    async fn final_fence_gap_starts_one_successor_seed_without_duplicate_reconstruction() {
+        let database = MockSeedDb::immediate_sequence([Ok(alignment_seed()), Ok(alignment_seed())]);
+        let api_db = Arc::new(ApiDbState::new());
+        api_db.update(crate::api_db::ApiDbGenerationEvent::Published(database.clone())).expect("publish database generation");
+        let (mut worker, producer) = aligning_worker_with_producer();
+        worker.api_db = api_db;
+        producer.publish_catchup().expect("alignment test receiver is open");
+        assert_eq!(worker.graph_updates.try_recv_update(), Ok(GraphUpdate::Catchup));
+        for byte in 0..GRAPH_UPDATE_CHANNEL_CAPACITY {
+            assert_eq!(producer.offer_vspc_committed(vspc_update(byte as u8)), Ok(GraphUpdateOfferOutcome::Enqueued));
+        }
+        assert_eq!(producer.offer_vspc_committed(vspc_update(0)), Ok(GraphUpdateOfferOutcome::GapReported));
+        worker.staging.push(CommittedGraphUpdate::Block(block_update(6, 11, 10))).expect("crossing block fits");
+        worker.staging.push(CommittedGraphUpdate::Vspc(vspc_update_at(90, 90))).expect("crossing VSPC fits");
+
+        let shared = worker.shared.clone();
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let join = tokio::spawn(worker.run(worker_cancellation));
+        for _ in 0..100 {
+            let snapshot = *shared.lock();
+            if snapshot.phase == PublicationRuntimePhase::Aligning
+                && snapshot.metrics.reconstruction_count == 1
+                && database.calls() == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(shared.lock().phase, PublicationRuntimePhase::Aligning);
+        assert_eq!(shared.lock().metrics.reconstruction_count, 1);
+        assert_eq!(database.calls(), 1, "one gap starts exactly one successor seed attempt");
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(shared.lock().metrics.reconstruction_count, 1, "the acknowledged baseline is not observed again");
+        assert_eq!(database.calls(), 1, "the acknowledged baseline starts no duplicate seed attempt");
+
+        for byte in 0..GRAPH_UPDATE_CHANNEL_CAPACITY {
+            assert_eq!(producer.offer_vspc_committed(vspc_update(byte as u8)), Ok(GraphUpdateOfferOutcome::Enqueued));
+        }
+        assert_eq!(producer.offer_vspc_committed(vspc_update(0)), Ok(GraphUpdateOfferOutcome::GapReported));
+        for _ in 0..100 {
+            let snapshot = *shared.lock();
+            if snapshot.phase == PublicationRuntimePhase::Aligning
+                && snapshot.metrics.reconstruction_count == 2
+                && database.calls() == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(shared.lock().metrics.reconstruction_count, 2, "a later gap generation starts a new reconstruction");
+        assert_eq!(database.calls(), 2, "a later gap generation starts one newer seed attempt");
+
+        cancellation.cancel();
+        assert_eq!(join.await.expect("runtime worker joins"), Ok(()));
     }
 
     #[test]
