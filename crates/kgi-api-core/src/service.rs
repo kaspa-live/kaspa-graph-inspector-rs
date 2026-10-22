@@ -52,6 +52,7 @@ enum ApiRuntimeSlot {
 
 struct OwnedPublicationRuntime {
     runtime: PublicationRuntime,
+    retiring_predecessor: Mutex<Option<Arc<OwnedPublicationRuntime>>>,
     completion_observer: AsyncMutex<Option<JoinHandle<()>>>,
     events: mpsc::UnboundedSender<ApiServiceEvent>,
 }
@@ -75,14 +76,49 @@ impl OwnedPublicationRuntime {
                 let _ = observer_events.send(ApiServiceEvent::Failed(Self::failure(error)));
             }
         });
-        Self { runtime, completion_observer: AsyncMutex::new(Some(completion_observer)), events }
+        Self {
+            runtime,
+            retiring_predecessor: Mutex::new(None),
+            completion_observer: AsyncMutex::new(Some(completion_observer)),
+            events,
+        }
     }
 
     async fn shutdown(&self) -> Result<(), ApiServiceError> {
+        let predecessor_result = self.join_retiring_predecessor().await;
+        let result = self.shutdown_self().await;
+        predecessor_result.and(result)
+    }
+
+    fn retain_predecessor(&self, predecessor: OwnedPublicationRuntime) {
+        let mut retained = self.retiring_predecessor.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(retained.is_none(), "a successor retains at most one retiring predecessor");
+        *retained = Some(Arc::new(predecessor));
+    }
+
+    async fn join_retiring_predecessor(&self) -> Result<(), ApiServiceError> {
+        let predecessor = self.retiring_predecessor.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let Some(predecessor) = predecessor else { return Ok(()) };
+        let result = predecessor.shutdown_self().await;
+        let mut retained = self.retiring_predecessor.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if retained.as_ref().is_some_and(|retained| Arc::ptr_eq(retained, &predecessor)) {
+            *retained = None;
+        }
+        result
+    }
+
+    async fn shutdown_self(&self) -> Result<(), ApiServiceError> {
         let result = self.runtime.shutdown().await.map_err(Self::failure);
-        let observer = self.completion_observer.lock().await.take();
-        if let Some(observer) = observer
-            && let Err(error) = observer.await
+        let observer_result = {
+            let mut observer = self.completion_observer.lock().await;
+            let observer_result = match observer.as_mut() {
+                Some(observer) => Some(observer.await),
+                None => None,
+            };
+            *observer = None;
+            observer_result
+        };
+        if let Some(Err(error)) = observer_result
             && result.is_ok()
         {
             let failure = Self::failure(error);
@@ -119,9 +155,16 @@ impl OwnedEncodingScheduler {
     #[allow(dead_code, reason = "terminal shutdown consumes this barrier in increment-14 point 6")]
     async fn shutdown(&self) -> Result<(), ApiServiceError> {
         let result = self.scheduler.shutdown().await.map_err(Self::failure);
-        let observer = self.completion_observer.lock().await.take();
-        if let Some(observer) = observer
-            && let Err(error) = observer.await
+        let observer_result = {
+            let mut observer = self.completion_observer.lock().await;
+            let observer_result = match observer.as_mut() {
+                Some(observer) => Some(observer.await),
+                None => None,
+            };
+            *observer = None;
+            observer_result
+        };
+        if let Some(Err(error)) = observer_result
             && result.is_ok()
         {
             let failure = Self::failure(error);
@@ -270,6 +313,9 @@ impl ApiService {
         if matches!(*runtime, ApiRuntimeSlot::Stopping(_) | ApiRuntimeSlot::Stopped) {
             return Err(ApiServiceError::ControlUnavailable);
         }
+        if let ApiRuntimeSlot::Running(installed) = &*runtime {
+            installed.join_retiring_predecessor().await?;
+        }
 
         let runtime_generation = {
             let mut installation = self.publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -290,7 +336,11 @@ impl ApiService {
         let predecessor = std::mem::replace(&mut *runtime, ApiRuntimeSlot::Running(successor));
 
         if let ApiRuntimeSlot::Running(predecessor) = predecessor {
-            predecessor.shutdown().await?;
+            let ApiRuntimeSlot::Running(successor) = &*runtime else {
+                unreachable!("reset installs its successor before retaining the predecessor")
+            };
+            successor.retain_predecessor(predecessor);
+            successor.join_retiring_predecessor().await?;
         }
         Ok(())
     }
@@ -760,6 +810,59 @@ mod tests {
         assert!(encode.await.expect("encoding owner completes").is_err());
         service.shutdown().await.expect("later shutdown resumes the retained barrier");
 
+        assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopped));
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn cancelled_reset_retains_the_predecessor_until_terminal_shutdown_joins_it() {
+        let (service, mut events) = service();
+        let (predecessor_producer, predecessor_receiver) = graph_update_channel();
+        service.reset(predecessor_receiver, RecoveryMode::Resync).await.expect("predecessor starts");
+
+        let observer_release = Arc::new(Semaphore::new(0));
+        let gated_release = observer_release.clone();
+        let gated_observer = tokio::spawn(async move {
+            gated_release.acquire().await.expect("observer release signal remains open").forget();
+        });
+        let original_observer = {
+            let slot = service.runtime.lock().await;
+            let ApiRuntimeSlot::Running(predecessor) = &*slot else { panic!("predecessor remains current") };
+            predecessor.completion_observer.lock().await.replace(gated_observer)
+        };
+        let original_observer = original_observer.expect("predecessor owns its completion observer");
+        original_observer.abort();
+        assert!(original_observer.await.expect_err("original observer is replaced for the test").is_cancelled());
+
+        let (successor_producer, successor_receiver) = graph_update_channel();
+        let reset_service = service.clone();
+        let reset = tokio::spawn(async move { reset_service.reset(successor_receiver, RecoveryMode::Resync).await });
+        for _ in 0..100 {
+            if predecessor_producer.metrics().receiver_closure_count == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(predecessor_producer.metrics().receiver_closure_count, 1);
+        reset.abort();
+        assert!(reset.await.expect_err("replacement reset waiter is cancelled").is_cancelled());
+
+        {
+            let slot = service.runtime.lock().await;
+            let ApiRuntimeSlot::Running(successor) = &*slot else { panic!("successor remains current") };
+            assert!(successor.retiring_predecessor.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some());
+        }
+
+        let shutdown_service = service.clone();
+        let shutdown = tokio::spawn(async move { shutdown_service.shutdown().await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!shutdown.is_finished(), "terminal shutdown joins the retained predecessor observer");
+
+        observer_release.add_permits(1);
+        assert_eq!(shutdown.await.expect("terminal shutdown task completes"), Ok(()));
+        assert_eq!(successor_producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
         assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopped));
         assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
     }

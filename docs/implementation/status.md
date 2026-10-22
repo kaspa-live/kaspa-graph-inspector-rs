@@ -394,5 +394,5 @@ runtime replacement and receiver release, generation exhaustion, independent
 cancellation domains, exact-once worker-failure reporting, reset/shutdown
 serialization, event-path release, terminal resource release, and repeated
 shutdown. Completion validation passed workspace formatting, Cargo check,
-529/529 Nextest tests including Docker PostgreSQL integration, Cargo doctests,
+530/530 Nextest tests including Docker PostgreSQL integration, Cargo doctests,
 Clippy with warnings denied, and `git diff --check`.

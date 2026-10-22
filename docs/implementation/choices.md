@@ -1070,6 +1070,16 @@ that installation capability and its captured generation; it does not retain
 and installation semantics remain owned by
 [API Service](../architecture/api-service.md#reset-control-and-recovery-effects--settled).
 
+Retain an exchanged predecessor in the successor's private owned-runtime
+wrapper before the replacement reset reaches its first await. The wrapper
+stores one `Arc`-backed retiring predecessor behind a short standard mutex;
+joining clones that `Arc` while leaving the authoritative value installed, and
+removes it only after its completed barrier. A later reset first resumes any
+such retained barrier before advancing the generation, while terminal shutdown
+joins it before the successor. This avoids another public or normative runtime
+state and bounds the overlap to the two runtimes already admitted by the reset
+contract.
+
 ### Permanent-work completion observation
 
 Pair each publication runtime and encoding scheduler with an owned completion
@@ -1080,7 +1090,9 @@ ownership in their completion value. Encoding orchestration workers and their
 panic monitors are both registered in the scheduler's `TaskTracker`, and the
 scheduler retains the first terminal result in a watch value. This permits
 independent failure observation without detached tasks or a second command
-path.
+path. Keep each observer `JoinHandle` installed in its async mutex while
+awaiting it; remove the handle only after completion so cancellation of a reset
+or shutdown waiter cannot detach the observer.
 
 ### Cancellation-resumable terminal barrier
 
