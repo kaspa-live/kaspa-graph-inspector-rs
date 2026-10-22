@@ -58,10 +58,7 @@ impl ApiReplacementGate {
             return Ok(None);
         }
         let lease_id = state.next_lease_id;
-        state.next_lease_id = state
-            .next_lease_id
-            .checked_add(1)
-            .ok_or_else(|| StorageError::replacement_control("API database read-lease identifier overflow"))?;
+        state.next_lease_id = state.next_lease_id.checked_add(1).expect("API database read-lease identifiers fit u64");
         let (cancellation, cancellation_rx) = watch::channel(false);
         state.active_leases.insert(lease_id, cancellation);
         Ok(Some(ApiDbReadLease { gate: self.clone(), lease_id, cancellation: cancellation_rx }))
@@ -71,8 +68,7 @@ impl ApiReplacementGate {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         ensure_control_available(&state)?;
         let epoch = state.next_epoch;
-        state.next_epoch =
-            state.next_epoch.checked_add(1).ok_or_else(|| StorageError::replacement_control("API replacement epoch overflow"))?;
+        state.next_epoch = state.next_epoch.checked_add(1).expect("API replacement epochs fit u64");
         state.admission = Admission::Closed { epoch };
         for cancellation in state.active_leases.values() {
             cancellation.send_replace(true);
