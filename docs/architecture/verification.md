@@ -1462,7 +1462,8 @@ stack traces, SQL or filesystem information, or serialization-library text.
 
 Verify `GET /api/v1/graph/head` requires `target_depth`, rejects zero and every
 value above `MAX_WINDOW_DEPTH`, and accepts the inclusive valid range. Exercise
-rounding immediately below, at, and above each 50-level tier boundary. Every
+selection immediately below, at, and above each configured tier boundary and
+derive exactly `20`, `50`, `100`, `150`, `200`, and `250`. Every
 successful response comes only from one coherent in-memory cached Head extent,
 reports its actual bounds, carries a complete local hash dictionary plus the
 snapshot publication ID, revision, and revision timestamp, and never accesses
@@ -1476,7 +1477,7 @@ remains internally coherent. The endpoint neither accepts nor returns
 
 For every successful Head response, require the body tier to cover
 `target_depth` except for the natural pruning-point boundary. Have the Web trim
-a larger tier to the requested nominal extent, remove edges with removed
+the selected tier to the requested nominal extent, remove edges with removed
 children, retain external parent endpoint levels, and derive its local usage
 counters. No cache-selected response may require a placeholder or
 progressive-fill presentation.
@@ -1549,34 +1550,34 @@ The first indivisible entry exceeding the limit requires a fresh view. A gzip
 body that transfers efficiently does not permit an over-limit uncompressed
 representation.
 
-For tiered Head snapshot reuse, derive exactly `50`, `100`, `150`, `200`, and
-`250` from the initial limits. Install a publication with no encoded tier and
-require the first applicable request, including for tier `50`, to start the
-single-flight job. Every build or refresh is request-driven.
-Exercise selection in this order: eligible selected entry; smallest eligible
-completed larger entry plus selected-tier construction; selected-tier job;
-smallest covering larger job without concurrent selected-tier construction;
-and a new selected-tier job. Concurrent requests joining one tier must share
-one capture, serialization, and compression result.
+For tiered Head snapshot reuse, install a publication with no encoded tier and
+require the first request for each applicable tier, including `20`, to start
+that exact tier's single-flight job. Exercise only these selected-tier cases:
+eligible completed entry, running-job join, and missing-entry construction.
+A completed or running larger tier must never supply the response, start the
+selected-tier job, or suppress its construction. Concurrent requests joining
+one tier share one capture, serialization, and compression result; requests
+for distinct missing tiers may start their distinct jobs.
 
-At distances 39, 40, 99, and 100, verify respectively direct reuse; reuse plus
-one demand-triggered refresh; reuse plus that same single refresh; and complete
-entry exclusion with shared reconstruction. Head advancement without a request
-must start no refresh, including for tier `50`. A successful refresh atomically
-replaces only its tier. Failure gives all on-demand waiters the same typed
-error, preserves the previous entry, removes the job, and permits retry. A
-Stale publication can reuse and construct tiers against its final Head.
+Using publication-local revision timestamps, verify reuse at age 89,999
+milliseconds and physical removal at age 90,000. Head advancement alone must
+neither remove the entry nor start work. A request for another tier must leave
+the obsolete unqueried entry physically present. The first later request for
+that entry's own tier removes it atomically and joins or installs exactly one
+selected-tier job. An eligible hit starts no refresh. Failure gives all
+on-demand waiters the same typed error, removes the job, and permits retry.
 
 Pause a demand-built Head-tier job during detached encoding and advance Head
-across its completion thresholds. A candidate completing at distance 40 or 99
-is installed and delivered; when served as the request's selected tier it
-ensures one successor refresh, while use as a larger covering tier does not.
-A candidate completing at distance 100 is neither inserted nor published as a
-terminal result: the same job remains pending, every concurrent waiter stays
-joined, and a newer capture eventually supplies their one shared eligible
-result. Advancing Head after an eligible candidate's admission must not revoke
-that installed entry or its already waiting responses. Repeat the hard-age
-case for the publication's first tier-50 request.
+across the completion-time age boundary. A candidate completing at age 89,999
+milliseconds is installed and delivered. At age 90,000 it is neither inserted
+nor published as a terminal result: the same job remains pending, every
+concurrent waiter stays joined, and a newer capture eventually supplies their
+one shared eligible result. Advancing Head after an eligible candidate's
+admission must not revoke that installed entry or its already waiting
+responses. Repeat the obsolete-candidate case for the publication's first
+tier-20 request. For a terminal `Stale` publication, verify that age remains
+fixed, an eligible entry remains reusable, and querying an obsolete entry
+removes and rebuilds it from the final Head.
 
 For canonical Head deltas, verify one
 publication-owned job per source revision: concurrent requests join it after

@@ -165,13 +165,13 @@ MAX_WINDOW_DEPTH = 250
 MAX_CACHE_LEVEL_DISTANCE = 500
 MAX_CACHE_LEVEL_DISTANCE + MAX_WINDOW_DEPTH < MAX_CACHE_DEPTH
 
-CACHED_HEAD_WINDOW_DEPTH_STEP = 50
-CACHED_WINDOW_REFRESH_LEVEL_DISTANCE = 40
-CACHED_WINDOW_MAX_LEVEL_DISTANCE = 100
+CACHED_HEAD_WINDOW_DEPTHS = [20, 50, 100, 150, 200, 250]
+CACHED_HEAD_SNAPSHOT_MAX_AGE_MS = 90_000
 ```
 
-These depth and level-distance constants and their derived arithmetic use
-`u32`.
+Depth and level-distance constants and their derived arithmetic use `u32`.
+The Head-snapshot maximum age uses `u64` milliseconds in the
+publication-local monotonic revision-timestamp domain.
 
 With the graph-owned `MAX_CACHE_DEPTH = 1000`, the public limits leave 250
 complete levels beyond the oldest level needed by a maximum-depth client
@@ -181,26 +181,21 @@ cap positive depth to `MAX_WINDOW_DEPTH` and report the effective range. A Head
 invalid request input and cannot fall back to the database. The
 [graph model](api-graph.md) owns `MAX_CACHE_DEPTH` and complete-level retention.
 
-The Head cache derives its finite tiers rather than accepting arbitrary cache
-keys:
+The Head cache accepts only the explicit ordered tier set above rather than
+arbitrary cache keys. Select the smallest configured tier that covers the
+requested presentation depth:
 
 ```text
-selected_depth =
-    min(round_up(target_depth, CACHED_HEAD_WINDOW_DEPTH_STEP),
-        MAX_WINDOW_DEPTH)
+selected_depth = min { depth in CACHED_HEAD_WINDOW_DEPTHS
+                       where depth >= target_depth }
 ```
 
-The initial values therefore produce depths `50`, `100`, `150`, `200`, and
-`250`. Every tier, including tier 50, is constructed only in response to a
-public request; publication installation performs no preemptive tier build.
-The refresh and maximum distances measure the cached snapshot's `high_level`
-behind its publication's current Head and satisfy:
-
-```text
-CACHED_WINDOW_REFRESH_LEVEL_DISTANCE
-    < CACHED_WINDOW_MAX_LEVEL_DISTANCE
-    < MAX_CACHE_LEVEL_DISTANCE
-```
+Every configured tier, including tier `20`, is constructed only in response to
+a public request; publication installation performs no preemptive tier build.
+The explicit set is an initial tuning value. Later evidence from the
+[ApiService operational measurements](api-service.md#resource-isolation-and-saturation--settled)
+may justify removing, changing, or adding a tier without changing the request
+contract.
 
 The domain-owned `CompactId` crosses into ApiService only as the private
 alignment cut and `BlockCommitted.id`; it is never a public block identity or
@@ -1704,76 +1699,57 @@ to `MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES`. The fixed number of tiers and that
 per-entry limit structurally bound this cache without another total byte cap.
 
 For a valid request, derive its selected depth using the public tier formula.
-Choose work and response reuse in this order:
+The request consults only that exact tier; a completed or running larger tier
+never supplies the response and starts no work for the selected tier. Choose
+work and response reuse in this order:
 
-1. If the selected tier has an eligible completed snapshot, serve it.
-2. Otherwise, if one or more larger tiers have eligible completed snapshots,
-   serve the smallest such tier immediately and ensure one selected-tier job
-   is running.
-3. Otherwise, if a selected-tier job is running, join it.
-4. Otherwise, if one or more larger covering jobs are running, join the
-   smallest such job and do not start a concurrent selected-tier job.
-5. Otherwise start and join one selected-tier job.
+1. If the selected tier has an eligible completed snapshot, serve it without
+   starting another job.
+2. Otherwise, if a selected-tier job is running, join it.
+3. Otherwise, start and join one selected-tier job.
 
-Serving or joining a larger tier does not change the request's selected tier.
-Case 2 creates the selected tier for later requests; case 4 avoids duplicating
-expensive extraction, serialization, and compression during the same demand
-burst. If no later request follows a larger running job, the missing selected
-tier requires no speculative construction.
-
-For an entry with captured `high_level = C` and current publication Head level
-`H`, define `distance = H - C`; Head levels do not decrease within a
-publication. An entry is handled as follows:
+For a cached snapshot `C` and the publication's current Head `H`, define:
 
 ```text
-distance < CACHED_WINDOW_REFRESH_LEVEL_DISTANCE
-    eligible; serve without refresh
-
-CACHED_WINDOW_REFRESH_LEVEL_DISTANCE
-    <= distance < CACHED_WINDOW_MAX_LEVEL_DISTANCE
-    eligible; when served as the request's selected tier, ensure one
-    demand-driven refresh job for that tier
-
-distance >= CACHED_WINDOW_MAX_LEVEL_DISTANCE
-    ineligible; never serve it
+age_ms = H.revision_timestamp_ms - C.revision_timestamp_ms
 ```
 
-The current-Head eligibility observation occurs both when selecting a completed
-entry and when admitting a newly encoded Head-tier candidate. After extraction,
-JSON serialization, size checking, and gzip complete, a tier job captures the
-publication's then-current Head level and evaluates the candidate with the same
-distance rules before cache insertion, terminal job completion, or waiter
-delivery. A candidate in the soft refresh range is eligible and may be
-installed and delivered. A waiter receiving that candidate from its selected
-tier ensures one successor refresh under the ordinary rule above; receiving it
-as a larger covering tier does not create another tier or refresh merely due to
-that completion.
+Both values belong to the same publication-local monotonic timestamp domain;
+observing `C` later than `H` is an internal invariant failure. The entry is
+eligible exactly while `age_ms < CACHED_HEAD_SNAPSHOT_MAX_AGE_MS`.
 
-A candidate at or beyond the hard distance is discarded without becoming a
-cache entry, successful job result, or `CacheBuildError`. The same tier job
-remains pending with all current waiters, preserves any previous completed
-entry in that slot, and repeats from a newer coherent Frozen capture through
-the encoding scheduler. Concurrent demand whose selection reaches that running
-tier continues to join the same job. Once a candidate passes this completion
-check, its eligibility is fixed for that cache admission and its already
-waiting responses; later Head advancement does not revoke the entry, terminal
-completion, or an in-flight response. A later request performs a new
-current-Head eligibility check.
+Expiration is lazy and query driven. An incoming query samples the current
+Head timestamp and examines only its selected tier. If that completed entry
+has reached the maximum age, the operation physically removes it before
+joining or installing the selected-tier job. It does not inspect or remove an
+expired entry in any other tier. Head advancement, publication installation,
+and elapsed wall time start no scan, removal, refresh, or construction. The
+fixed tier count and per-entry response limit bound completed entries that
+have not yet been queried again.
 
-Every tier follows the request-driven construction rule above. No tier,
-including `50`, is constructed or refreshed merely because a publication is
-installed or Head advances.
-A refresh retains the previous completed entry until the replacement succeeds
-and atomically replaces only that tier. Failure preserves any previous
-completed entry. Waiter completion, job removal, and retry availability belong
-to the
+After extraction, JSON serialization, size checking, and gzip complete, a tier
+job samples the publication's then-current Head revision timestamp and applies
+the same age check before cache insertion, terminal job completion, or waiter
+delivery. An obsolete candidate is discarded without becoming a cache entry,
+successful result, or `CacheBuildError`. The same logical tier construction
+remains pending, all current waiters remain joined, and it repeats from a newer
+coherent Frozen capture. Concurrent demand for that exact tier continues to
+join the construction.
+
+Once a completed entry or newly encoded candidate passes its request-time or
+completion-time check, later Head advancement does not revoke that admission,
+terminal job result, or in-flight response. A later request performs a new age
+check. Failure removes the selected-tier job and permits a later request to
+retry; there is no preceding entry to preserve as a serve-and-refresh value.
+Waiter completion, job removal, and retry availability belong to the
 [ApiService task contract](api-service.md#api-task-ownership-and-completion--settled).
 
-`Synchronizing` and `Live` use the moving distance rules. A terminal `Stale`
-publication stops advancing, so its eligible entries remain usable and its
-missing tiers can still be built on demand while the publication remains
-addressable. Publication replacement releases the complete tier cache with
-the containing publication under the publication-lifetime contract.
+`Synchronizing` and `Live` compare snapshots with their moving Head timestamp.
+A terminal `Stale` publication stops advancing, so snapshot age becomes fixed;
+an eligible entry remains usable, while a queried obsolete entry is removed
+and rebuilt from the final coherent Head. Publication replacement releases the
+complete tier cache with the containing publication under the
+publication-lifetime contract.
 
 ## Anchored graph windows — settled
 

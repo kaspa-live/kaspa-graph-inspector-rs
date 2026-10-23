@@ -313,6 +313,12 @@ Completion validation passed workspace formatting, Cargo check, 436/436
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.
 
+The implemented Increment 10 Head-cache selection and expiry mechanics predate
+the current [protocol cache contract](../architecture/api-protocol.md#publication-scoped-head-response-cache--settled).
+Increment 15 must adapt that kernel before adding logical Head operations. The
+implemented delta-cache mechanics are unaffected by this Head-only status
+note.
+
 Implementation increment 11 is implemented: each `GraphPublication` now owns
 its publication-local SSE client registry and each connection owns one bounded,
 ordered mailbox. The registry provides atomic initial and replacement batches,

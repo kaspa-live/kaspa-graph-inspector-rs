@@ -417,15 +417,15 @@ struct CacheJob<T> {
 }
 ```
 
-Key meaning, entry eligibility, covering-tier selection, and checks which must
+Key meaning, entry eligibility, exact-tier selection, and checks which must
 precede cache lookup belong to the
 [protocol cache contract](api-protocol.md#publication-scoped-head-response-cache--settled).
 After those checks, one short cache-state critical section applies the required
-slot operation atomically. A miss joins the running job or installs a
-`Pending` job and designates that caller as its only builder. Head selection
-may instead return an eligible completed covering entry while installing the
-required selected-tier or refresh job in another slot. The pending slot is
-installed before the builder performs cache-build target selection,
+slot operation atomically. For a Head request it uses the protocol-selected
+tier key to return its eligible completed entry, physically remove its
+obsolete completed entry, join its running job, or install one `Pending` job
+and designate that caller as its only builder. For any miss, the pending slot
+is installed before the builder performs cache-build target selection,
 build-input retention, extraction, serialization, or compression. This
 prevents a concurrent miss burst from duplicating preparation or encoding
 work. The builder leaves the cache-state critical section before every such
@@ -487,12 +487,12 @@ bounded level pruning removes it.
 For a Head-tier job, successful encoding is one candidate attempt rather than
 terminal job completion. The orchestration task applies the protocol-owned
 completion-time eligibility check against the containing publication. A
-hard-aged candidate is dropped, while the same `CacheJob` stays `Pending` in
+obsolete candidate is dropped, while the same `CacheJob` stays `Pending` in
 the same running slot and captures and submits a newer Frozen attempt. It does
-not notify waiters or expose the discarded bytes. Only an eligible candidate
-continues into the success path below. This retry remains one tracked
-single-flight job; later requests join it rather than creating another capture
-or encoding task for that tier.
+not notify waiters or expose the discarded bytes. Only a timestamp-eligible
+candidate continues into the success path below. This retry remains one
+tracked single-flight job; later requests for that exact tier join it rather
+than creating another capture or encoding task.
 
 Each waiter subscribes to the job's `watch` sender and selects terminal job
 completion against its own request cancellation token. Cancelling one request
@@ -506,12 +506,12 @@ its `Weak<GraphCache>`, enters the cache-state critical section, and verifies
 that the applicable running slot still points to that exact job. It then
 installs the shared completed `Arc`, updates the applicable delta pruning
 index, clears the running slot, leaves the critical section, and publishes the
-same terminal result through `watch`. A Head-tier refresh atomically replaces
-only that tier. An aged delta success clears the matching running slot without
-insertion and publishes its successful terminal result after leaving the
-critical section. On failure or terminal cancellation, it clears the matching
-running slot while preserving any prior completed entry, leaves the critical
-section, and then publishes one shared result. Job completion uses
+same terminal result through `watch`. A Head-tier success installs into its
+originating tier slot. An aged delta success clears the matching running slot
+without insertion and publishes its successful terminal result after leaving
+the critical section. On failure or terminal cancellation, it clears the
+matching running slot while preserving any prior completed entry, leaves the
+critical section, and then publishes one shared result. Job completion uses
 `watch::Sender::send_replace`, so the terminal value is stored even if every
 current waiter has already detached. A later request may therefore retry
 without rejoining the failed job. If the originating cache can no longer be
@@ -959,9 +959,10 @@ V2 exposes these operational measurements:
 - active and rejected SSE clients, per-client buffer high-water marks, graph
   wakeup coalescing, and slow-client disconnects;
 - encoded-response cache hits, misses, pruned entries, and coalesced identical
-  requests, including raw requested Head depth, selected Head tier, tier age,
-  larger-tier fallback, tier-job joins, construction and refresh duration,
-  construction failure, and hard-age tier retries;
+  requests, including raw requested Head depth, selected Head tier,
+  publication-local tier age in milliseconds, query-time obsolete-entry
+  removal, tier-job joins, construction duration, construction failure, and
+  completion-time obsolete-candidate retries;
 - destination concentration, request-source counts, cached segment length,
   per-client revision wakeups, requests per catch-up, and size-limited
   short-prefix frequency;
