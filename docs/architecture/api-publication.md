@@ -289,9 +289,9 @@ cache decision before consulting history. A protocol-adequate completed value
 or a running job is retained without a history lookup. Only a decision that
 requires construction asks that same history for a range ending at the
 captured revision, then performs a second source-slot cache election before
-releasing the lock. That second election either joins a job installed while
-the immutable range was captured or installs the one pending job backed by
-that range.
+releasing the lock. That election completely re-evaluates the source slot
+under the [ApiService-owned cache contract](api-service.md#cache-and-encoding-jobs);
+the history capture is retained only when this caller becomes the builder.
 The revision and timestamp form the coherent Head pair carried in the
 protocol-owned response headers. At that capture instant, history has the same
 current revision. When needed, the immutable range capture remains bounded by

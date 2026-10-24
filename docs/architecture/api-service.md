@@ -443,10 +443,14 @@ running job, or reports that construction may be required. The first two
 outcomes consult no history. Only the construction-required outcome captures
 the atomic history range and first revision timestamp needed for the source-
 keyed slot, then performs a second cache operation. Concurrent callers may
-duplicate that immutable capture, but the second operation either joins a job
-installed meanwhile or installs the one pending job and elects its builder.
-This prevents a miss burst from duplicating expensive encoding work without
-placing an incompletely timestamped slot in the ordered cache. The
+duplicate that immutable capture, so the second operation completely
+re-evaluates the source slot against this request's captured target. It returns
+an adequate completed value, joins a running job, installs an enlargement job
+while preserving an inadequate completed value, or installs the new job in an
+otherwise empty slot. Only either installation elects this caller as builder
+and retains its captured entries; returning or joining discards that redundant
+capture. This prevents a miss burst from duplicating expensive encoding work
+without placing an incompletely timestamped slot in the ordered cache. The
 [publication-owned capture linearization](api-publication.md#publication-synchronization-and-request-capture--settled)
 encloses this cache operation. A request needing a farther target joins the
 current job and re-evaluates after it completes. Once elected, the builder

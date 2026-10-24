@@ -1646,6 +1646,14 @@ waiter needing a farther target re-enters after successful completion, starts
 or joins the serialized enlargement, and never receives the inadequate shorter
 body. Ordinary failure gives that job's waiters the same request-local error
 and preserves the preceding completed value.
+Pause one caller after its initial source miss and immutable history capture but
+before its second cache election. Let another caller install and complete that
+source job. When the result is adequate for the paused caller's captured
+target, require the second election to return the same completed value without
+another job or encoding. When it is inadequate, require the second election to
+preserve it and install only the one required enlargement job. In both cases,
+the paused caller releases its redundant captured entries unless it becomes
+the enlargement builder.
 Wrap one cached batch body with different valid request-specific publication
 and coherent Head revision/timestamp headers without serializing, compressing,
 or decompressing it. Verify that `CachedDelta` retains its boundaries,
