@@ -1749,6 +1749,16 @@ identifier. Cover both `ClientRegistrationRequired` arriving before the fresh
 registration and arriving after it: only the former reconnects SSE again. The
 successful retry must atomically arm the fresh registration.
 
+Exercise the
+[Web-owned fresh-view recovery contract](web.md#update-acquisition--settled)
+for every `FreshViewReason` under both Head-following and Fixed policies.
+Include a same-publication replay-floor advance, queued unapplied batches,
+wakeups during Head snapshot reacquisition, retained-registration rearming,
+registration disappearance during recovery, and publication replacement
+racing the reload. Assert every owner-defined cancellation, queue, SSE,
+snapshot, cursor, reload, and freeze effect without treating a typed fresh-view
+outcome as an ordinary retry from the rejected cursor.
+
 Replace a publication without reconnecting its SSE transport and verify the
 old ID is invalidated before the same three-message sequence reports the
 replacement. A state transition emits only `PublicationStateDto`, does not
