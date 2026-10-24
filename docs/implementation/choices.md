@@ -809,18 +809,24 @@ coordinate, each edge excludes four pairs for its endpoint coordinates, and a
 level mutation excludes one or two pairs according to whether it removes or
 installs a level.
 
-The estimator remains additive across history entries. Consequently, a hash
-repeated by different entries can still be charged once per entry even though
+The estimator remains additive across atomic history entries. Consequently, a
+hash repeated by different entries can still be charged once per entry even though
 the later batch serializer shares one response-local dictionary. This bounded
 cross-entry overestimate avoids constructing the eventual batch dictionary
 during publication while removing the much larger within-entry overestimate.
 
+These weights are usable only while they satisfy the protocol-owned
+[soft-to-hard estimator guarantee](../architecture/api-protocol.md#graph-http-compression--settled).
+Increment 16 must validate the stronger implementation bound
+`encoded_delta_json_bytes <= 4 * estimated_raw_bytes` across the maximum wire
+widths reachable below the soft limit. If the current representative weights
+do not establish that bound, raise the affected weights before using the
+estimator for replay-floor or target-selection decisions. Such correction is
+conformance to the existing protocol contract, not a new tuning choice.
+
 Use checked `u64` arithmetic for every contribution. Exhausting the estimate
 is an internal invariant failure under the same physically unattainable
-publication-lifetime workload rationale as cumulative history overflow. A
-later composed history entry obtains its estimate by adding its constituent
-entry estimates rather than re-estimating the composed mutation maps, so
-composition cancellation cannot retroactively change planning cost.
+publication-lifetime workload rationale as cumulative history overflow.
 
 ## 16 October 2026: graph wire codec foundation
 
@@ -876,6 +882,14 @@ arbitrarily oversized JSON buffer, and retain the successful compressed body
 as shared immutable `bytes::Bytes`. The bounded encoding scheduler introduced
 by the same increment remains the sole production caller and the sole
 submitter of this work to Tokio's blocking executor.
+
+Increment 16 adapts that module with a canonical-delta mode. A delta admitted
+by the soft estimator continues serialization beyond the diagnostic hard
+threshold, returns its complete observed byte count and body, and lets the
+request owner emit the required estimator-invariant error before gzip/cache
+success. The limit-enforcing writer remains unchanged for Head snapshots,
+anchored windows, and Head-level lookups. Both modes remain scheduler-owned
+blocking work.
 
 ### Scheduler admission and execution
 

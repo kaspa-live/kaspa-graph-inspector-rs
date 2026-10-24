@@ -1,10 +1,13 @@
 # Head delta cache effectiveness estimate
 
-Status: non-normative predictive analysis, recorded 1 October 2026 and updated
-4 October 2026 for ordered delta-batch replay.
+Status: superseded non-normative predictive analysis, recorded 1 October 2026
+and updated 4 October 2026 for ordered delta-batch replay. Its fixed 15/30
+interval, destination-heat, bridge, and level-distance assumptions were
+replaced on 23 October 2026 by the current focused protocol and must not guide
+implementation.
 
 This document preserves the initial effectiveness estimate and proposed
-observability for the settled Head delta cache and convergence design. It is
+observability for the former Head delta cache and convergence design. It is
 not an architecture contract, accepted performance target, resource limit, or
 verification requirement. The focused [API protocol](../architecture/api-protocol.md)
 owns current cache and delivery behavior. Measurements from implementation may

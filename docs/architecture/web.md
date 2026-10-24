@@ -76,8 +76,8 @@ cursor. Its body contains an ordered, gapless batch of retained history entries
 and one response-wide hash dictionary. The Web validates the complete batch
 before admission, including that its first boundary equals
 `received_revision_id`, advances its received cursor to the final entry boundary,
-and replays entries one at a time. It never assumes one response reaches the
-original target.
+requires every entry to advance exactly one revision, and replays entries one
+at a time. It never assumes one response reaches the original target.
 
 For both Head replay and a locally filtered Fixed candidate, the Web stages the
 complete entry and commits it atomically under the sole
@@ -183,15 +183,58 @@ wakeup before requesting again; once it arrives, acquisition may proceed from
 capacity permits. An HTTP-only client follows the protocol-owned retry delay
 under the same capacity rule. SSE wakeups received while acquisition is paused
 coalesce to the newest desired cursor. A no-delta wait response leaves both
-graph cursors unchanged.
+graph cursors unchanged. A body-bearing prefix with `WaitForWakeup` first
+admits and replays its entries normally, but starts no immediate continuation
+request; its retained continuation waits for the same SSE wakeup or HTTP-only
+retry rule.
 
 Transport or request failure does not discard a valid admitted queue. The Web
 retries from `received_revision_id` when its ordinary transport policy permits.
 A malformed, nongapless, wrong-publication, or otherwise invalid batch is never
-partially admitted and requires the applicable fresh-view recovery. Publication
-replacement, explicit refresh, fixed-view destruction, and Web shutdown cancel
-in-flight acquisition and replay timers and release every queued batch. A
-replacement snapshot establishes the new publication's timestamp domain.
+partially admitted and enters the applicable fresh-view recovery below.
+Publication replacement, explicit refresh, fixed-view destruction, and Web
+shutdown cancel in-flight acquisition and replay timers and release every
+queued batch. A replacement snapshot establishes the new publication's
+timestamp domain.
+
+Every `FreshViewRequired` outcome is terminal for the current acquisition
+lineage and is never retried from the unchanged cursor. This applies to
+`PublicationMismatch`, `StartPruned`, `StartUnavailable`,
+`DeltaSourceExpired`, and `DeltaReplayBarrier`. A browser-detected invalid
+batch uses the same view-policy recovery rather than retaining any part of
+that batch.
+
+For a Head-following view, fresh-view recovery:
+
+1. invalidates the current acquisition generation, cancels its in-flight
+   request and replay timer, and releases every admitted batch;
+2. retains the current SSE transport and registration when they still belong
+   to the selected publication, coalescing graph wakeups received during
+   recovery to the newest desired cursor;
+3. requests a fresh Head snapshot with the view's retained `target_depth`;
+4. atomically replaces the visible graph, applied and received cursors,
+   observed Head pair, publication-local timestamp domain, and empty replay
+   queue from that snapshot; and
+5. as soon as a registration for the snapshot publication is available,
+   immediately issues coordinated delta acquisition from the snapshot cursor,
+   even when the snapshot was captured at Head, so that registration is
+   completed and rearmed through the ordinary delta path.
+
+A completion from an invalidated acquisition generation is ignored in full.
+When recovery selects another publication, the snapshot and subsequent SSE
+registration establish that publication's lineage under the ordinary
+replacement rules. When a same-publication registration disappears during
+recovery, the existing `ClientRegistrationRequired` path obtains a fresh
+registration before acquisition continues. Wakeups coalesced for the previous
+publication never become demand for a replacement publication.
+
+For a Fixed view, every fresh-view reason cancels acquisition and replay,
+releases every unapplied batch, preserves the last completely applied image
+and cursor, and freezes the view. Later graph wakeups do not restart
+acquisition for that view. This does not require disconnecting an SSE transport
+that another view or browser concern can still use. Only explicit refresh may
+replace the frozen image and establish another optional Head lineage; the Web
+does not reinterpret a fresh Head snapshot as the same fixed image.
 
 Adopting a fresh `client_id` for the same publication cancels an in-flight
 delta request issued with the previous identifier but preserves every admitted
@@ -234,9 +277,10 @@ Serialized graph-window contents follow the API-owned extraction contract.
 
 The Web requests the canonical Head endpoint with its presentation
 `target_depth`. It retains that value locally; the response body does not echo
-it. The API can return any cached tier whose nominal depth covers the target.
-The Web trims a larger snapshot to exactly its presentation depth before
-constructing the visible image.
+it. The API returns the exact tier selected by the
+[protocol-owned Head-cache rule](api-protocol.md#publication-scoped-head-response-cache--settled),
+whose nominal depth covers the target. The Web trims that snapshot to exactly
+its presentation depth before constructing the visible image.
 
 For response `high_level = H` and target depth `D`, the desired nominal lower
 bound is `max(1, H - D + 1)`. Retain blocks within that nominal extent. Remove
@@ -283,7 +327,7 @@ SSE wakeup updates only the desired cursor and publication state.
 
 A Head-backed fixed view adds no distance-based delay or separate pacing
 policy. It follows the same continuation and SSE-wakeup flow as any canonical
-Head-delta consumer. The shared convergence interval and cached delta lane
+Head-delta consumer. The protocol-owned continuation and cached delta lane
 already group work, while another scheduler would deliberately increase cursor
 lag and exposure to Head-history expiry.
 
@@ -292,9 +336,7 @@ its target Head lower bound from that entry's `head_level` and
 `MAX_CACHE_DEPTH`. If the target Head no longer contains the complete fixed
 extent, do not apply that entry or any later queued entry. Keep every earlier
 successfully replayed entry, preserve the last coherent image and applied
-cursor, and mark the view frozen. An already composed history entry remains
-one indivisible replay unit; the Web does not reconstruct an intermediate
-prefix hidden inside it.
+cursor, and mark the view frozen.
 
 While the complete extent remains contained, filter that entry as one atomic
 candidate:

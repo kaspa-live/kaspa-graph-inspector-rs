@@ -392,14 +392,19 @@ struct GraphCacheState {
 }
 
 struct DeltaCache {
-    slots_by_source: HashMap<u64, CacheSlot<CachedDelta>>,
-    sources_by_target_level: BTreeMap<u32, Vec<u64>>,
-    destination_heat: DestinationHeat,
+    slots_by_source: BTreeMap<u64, DeltaCacheSlot>,
 }
 
-struct DestinationHeat {
-    counts_by_revision: HashMap<u64, u64>,
-    revisions_by_level: BTreeMap<u32, Vec<u64>>,
+struct DeltaCacheSlot {
+    first_revision_timestamp_ms: u64,
+    size_ceiling_revision: Option<u64>,
+    completed: Option<Arc<CachedDelta>>,
+    running: Option<RunningDeltaJob>,
+}
+
+struct RunningDeltaJob {
+    target_revision: u64,
+    job: Arc<CacheJob<CachedDelta>>,
 }
 
 struct CacheSlot<T> {
@@ -410,89 +415,127 @@ struct CacheSlot<T> {
 enum CacheJobState<T> {
     Pending,
     Complete(Arc<Result<Arc<T>, CacheBuildError>>),
+    InvalidatedByReplayFloor {
+        replay_floor_revision: u64,
+    },
 }
 
 struct CacheJob<T> {
+    cancellation: CancellationToken,
     state: tokio::sync::watch::Sender<CacheJobState<T>>,
 }
 ```
 
-Key meaning, entry eligibility, covering-tier selection, and checks which must
+Key meaning, entry eligibility, exact-tier selection, and checks which must
 precede cache lookup belong to the
 [protocol cache contract](api-protocol.md#publication-scoped-head-response-cache--settled).
 After those checks, one short cache-state critical section applies the required
-slot operation atomically. A miss joins the running job or installs a
-`Pending` job and designates that caller as its only builder. Head selection
-may instead return an eligible completed covering entry while installing the
-required selected-tier or refresh job in another slot. The pending slot is
-installed before the builder performs cache-build target selection,
-build-input retention, extraction, serialization, or compression. This
-prevents a concurrent miss burst from duplicating preparation or encoding
-work. The builder leaves the cache-state critical section before every such
-operation and spawns one tracked orchestration task with a child of
+slot operation atomically. For a Head request it uses the protocol-selected
+tier key to return its eligible completed entry, physically remove its
+obsolete completed entry, join its running job, or install one `Pending` job
+and designate that caller as its only builder. A missing Head-tier slot is
+therefore installed before its builder performs extraction, serialization, or
+compression.
+
+For a delta request, the initial cache operation performs pruning and exact-
+source lookup. It returns an adequate completed value, joins the existing
+running job, or reports that construction may be required. The first two
+outcomes consult no history. Only the construction-required outcome captures
+the atomic history range and first revision timestamp needed for the source-
+keyed slot, then performs a second cache operation. Concurrent callers may
+duplicate that immutable capture, so the second operation completely
+re-evaluates the source slot against this request's captured target. It returns
+an adequate completed value, joins a running job, installs an enlargement job
+while preserving an inadequate completed value, or installs the new job in an
+otherwise empty slot. Only either installation elects this caller as builder
+and retains its captured entries; returning or joining discards that redundant
+capture. This prevents a miss burst from duplicating expensive encoding work
+without placing an incompletely timestamped slot in the ordered cache. The
+[publication-owned capture linearization](api-publication.md#publication-synchronization-and-request-capture--settled)
+encloses this cache operation. A request needing a farther target joins the
+current job and re-evaluates after it completes. Once elected, the builder
+performs the soft estimate and any encoding outside the cache critical section.
+The builder spawns one tracked orchestration task with a child of
 `ApiCancellation::cache_jobs`.
 
-A source-keyed delta job captures its immutable history-entry Arcs and fixed
-target. A Head snapshot tier job captures one immutable Frozen extraction.
+A source-keyed delta job captures its immutable atomic history-entry Arcs and
+current dyadic candidate target. Each individual encoding attempt keeps that
+target fixed; size evidence may make the same pending job descend before its
+next attempt. A Head snapshot tier job captures one immutable Frozen
+extraction.
 Head-tier job creation follows the request-driven policy owned by the
 [protocol cache contract](api-protocol.md#publication-scoped-head-response-cache--settled).
 Every such job uses the same tracked scheduler and final response construction
-path. Every job
-holds only detached immutable inputs during JSON serialization and gzip and no
+path. Every job holds only detached immutable inputs during JSON serialization
+and gzip and no
 publication-core or cache-state guard.
 
 `DeltaCache` is a nested value accessed only within the enclosing
 `GraphCache` state critical section. It is not another synchronization or
-lifecycle owner. It alone mutates the source-keyed slots, their target-level
-pruning index, and destination heat. `slots_by_source` supplies exact source
-lookup and single-flight ownership, while `sources_by_target_level` supplies
-structural pruning without scanning retained slots. Its private operations own
-access, completed insertion, completion without insertion, failed-job
-removal, and target-level prefix pruning so callers cannot update only one
-side of an index invariant.
+lifecycle owner and stores no copy of the history-owned replay floor.
+`slots_by_source` supplies exact lookup, source-keyed single-flight ownership,
+replacement, and query-driven prefix pruning in one index. Every slot records
+the first selected revision timestamp before either a completed value or
+running job is exposed. Because these timestamps are nondecreasing with source
+revision, pruning removes successive first entries and stops at the first
+unexpired slot; it never scans a retained suffix or consults history.
 
-`DestinationHeat` owns its count and level index as one value. After each
-successful canonical delta delivery, it saturatingly increments the actual
-destination revision. The first stored observation also appends that
-revision once to the vector at the delivered delta's `head_level`.
-Later deliveries of the same revision update only its count. Its level index
-is separate from the completed-delta index because heat and completed entries
-have different protocol-owned retention distances.
+The protocol owner decides cache adequacy and whether a request must enlarge.
+Under one short critical section, `DeltaCache` retains an older completed value
+while installing at most one running job for the source. Every later request
+joins that job. After completion, a waiter whose captured target remains
+farther re-enters the slot and elects or joins the next enlargement. On
+successful completion, exact job identity removes the running job and
+atomically replaces the completed value only when the candidate reaches
+farther. On ordinary failure it removes the matching running job and preserves
+the preceding completed value.
 
-When a delta candidate completes, the orchestration task first
-compares its `head_level` with the containing publication's then-current
-Head. An aged candidate clears the matching running slot and completes its
-existing waiters without cache insertion. An eligible candidate atomically
-installs its completed source-keyed slot and appends that source revision to
-the vector at its target-level key. Completed delta entries are immutable and
-never promoted or replaced while retained, so no ordinary operation removes
-one source from the middle of a target-level vector.
+`size_ceiling_revision` is the exclusive candidate target known to reach the
+soft estimate bound. The running job lowers that ceiling under the cache
+critical section, updates its recorded target to the next lower protocol
+target, and continues while remaining `Pending`. Its waiters stay subscribed
+to the same job. If the next lower completed value already exists, the job
+installs an equivalent `size_limited` cached value sharing its encoded bytes
+rather than starting another encoding.
 
-After Head advancement, derive the inclusive retained boundary with
-`head_high_level.saturating_sub(MAX_CACHE_LEVEL_DISTANCE)`. Repeatedly remove
-the first `BTreeMap` bucket while its target-level key is below that boundary,
-then remove exactly those bucketed source revisions from `slots_by_source`.
-Multiple entries targeting the same level share one vector. Running-only slots
-have no completed target and do not enter the pruning index. This work is
-proportional to expired buckets and entries and performs no retained-slot scan
-or history lookup.
+At the beginning of a delta query, the caller supplies the protocol-captured
+Head timestamp. `DeltaCache` removes its expired source prefix before lookup.
+Removing a slot detaches its job from cache insertion; that job and already
+admitted waiters may still finish through their retained Arcs. No Head
+update or background task calls this age-pruning operation.
 
-Prune destination heat through its own level index in the same way, using
-`HOT_DESTINATION_LEVEL_DISTANCE` as its inclusive retained distance. Remove
-each expired level bucket and its indexed revision counters. A revision that
-has ceased to be a retained complete history boundary is already ineligible
-for target selection; its counter may remain physically stored until this
-bounded level pruning removes it.
+The publication mutation tail invokes a distinct synchronous replay-floor
+invalidation when history advances its floor. Under one cache critical section
+it applies the
+[protocol-owned invalidation set](api-protocol.md#publication-scoped-head-response-cache--settled)
+to both slot collections and, before releasing that same guard, changes every
+detached running job from `Pending` to `InvalidatedByReplayFloor`. A running
+slot selected by this operation must still contain a `Pending` job; any other
+state is an internal invariant failure. The operation returns those already
+terminal job handles. After leaving the cache critical section, the caller
+cancels their work without awaiting it. Delta waiters re-enter the operation
+and obtain the protocol-owned fresh-view outcome from the history floor;
+Head-tier waiters re-enter their exact tier and build or join a new capture.
+Exact slot/job identity prevents any detached result from repopulating the
+cache or replacing the invalidation state.
+
+If ordinary completion acquired the cache guard first, removed its matching
+running job, and installed its completed value, later floor invalidation
+removes that value but does not rewrite the job's terminal result; the common
+final floor-admission check rejects public use. If floor invalidation acquired
+the guard first, completion finds no matching slot and cannot insert or change
+the already published invalidation state. These are the only two race orders.
 
 For a Head-tier job, successful encoding is one candidate attempt rather than
 terminal job completion. The orchestration task applies the protocol-owned
-completion-time eligibility check against the containing publication. A
-hard-aged candidate is dropped, while the same `CacheJob` stays `Pending` in
+completion-time eligibility check against the containing publication. An
+obsolete candidate is dropped, while the same `CacheJob` stays `Pending` in
 the same running slot and captures and submits a newer Frozen attempt. It does
-not notify waiters or expose the discarded bytes. Only an eligible candidate
-continues into the success path below. This retry remains one tracked
-single-flight job; later requests join it rather than creating another capture
-or encoding task for that tier.
+not notify waiters or expose the discarded bytes. Only a candidate passing the
+complete protocol-owned age, replay-floor, and ordinary-history eligibility
+check continues into the success path below. This retry remains one tracked
+single-flight job; later requests for that exact tier join it rather than
+creating another capture or encoding task.
 
 Each waiter subscribes to the job's `watch` sender and selects terminal job
 completion against its own request cancellation token. Cancelling one request
@@ -501,29 +544,34 @@ shared job. The job may finish and populate its originating publication cache
 after its last current waiter disappears. Publication replacement likewise
 does not cancel a job holding captured immutable inputs or remaining waiters.
 
-On eligible delta success or an eligible Head-tier success, the job upgrades
-its `Weak<GraphCache>`, enters the cache-state critical section, and verifies
-that the applicable running slot still points to that exact job. It then
-installs the shared completed `Arc`, updates the applicable delta pruning
-index, clears the running slot, leaves the critical section, and publishes the
-same terminal result through `watch`. A Head-tier refresh atomically replaces
-only that tier. An aged delta success clears the matching running slot without
-insertion and publishes its successful terminal result after leaving the
-critical section. On failure or terminal cancellation, it clears the matching
-running slot while preserving any prior completed entry, leaves the critical
-section, and then publishes one shared result. Job completion uses
-`watch::Sender::send_replace`, so the terminal value is stored even if every
-current waiter has already detached. A later request may therefore retry
-without rejoining the failed job. If the originating cache can no longer be
-upgraded, the job skips insertion but still completes its existing receivers.
+On delta success or an eligible Head-tier success, the job upgrades its
+`Weak<GraphCache>`, enters the cache-state critical section, and verifies that
+the applicable exact tier or source slot still points to that job. A delta
+success removes the matching source job and installs the shared completed
+`Arc` when it reaches farther than the prior completed value. A Head-tier
+success installs into its originating tier slot. On ordinary failure or
+terminal cancellation, the job
+clears only its matching tier or source job while preserving every unrelated
+job and prior completed entry. Each ordinary completion, failure, or
+cancellation path leaves the critical section before atomically changing
+`Pending` to its terminal state through `watch`; replay-floor invalidation is
+the sole exception and performs that transition under the cache guard as
+defined above. The terminal value is stored even if every current waiter has
+already detached, and no competing completion may replace it. A later request
+may therefore retry without rejoining the failed job. If the originating cache
+can no longer be upgraded, the job skips insertion but still completes its
+existing receivers.
 
-Cache-state synchronization protects only map and pruning-index operations,
-counter changes, and pointer identity checks. No guard may cross an `.await`,
-extraction, history capture, serialization, compression, response delivery,
-or waiter suspension. The custom slots are required because completed-value
-reuse, exact running-job identity, weak publication-local insertion,
-destination heat, and structural pruning form one cache protocol; a
-general-purpose cache would not replace that synchronization.
+Cache-state synchronization protects only map and prefix-pruning operations,
+replay-floor invalidation, size-ceiling advancement, and pointer identity
+checks. No guard may
+cross an `.await`, extraction, history capture, size estimation,
+serialization, compression, response delivery, or waiter suspension. The
+custom slots are required because
+completed-value reuse, exact source-job identity, weak publication-local
+insertion, source-ordered pruning, and monotonic
+replacement form one cache protocol; a general-purpose cache would not replace
+that synchronization.
 
 Publication installation starts no cache job and has no cache-readiness
 condition. The [publication lifecycle](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled)
@@ -959,12 +1007,16 @@ V2 exposes these operational measurements:
 - active and rejected SSE clients, per-client buffer high-water marks, graph
   wakeup coalescing, and slow-client disconnects;
 - encoded-response cache hits, misses, pruned entries, and coalesced identical
-  requests, including raw requested Head depth, selected Head tier, tier age,
-  larger-tier fallback, tier-job joins, construction and refresh duration,
-  construction failure, and hard-age tier retries;
-- destination concentration, request-source counts, cached segment length,
-  per-client revision wakeups, requests per catch-up, and size-limited
-  short-prefix frequency;
+  requests, including raw requested Head depth, selected Head tier,
+  publication-local tier age in milliseconds, query-time obsolete-entry
+  removal, tier-job joins, construction duration, construction failure, and
+  completion-time obsolete-candidate retries;
+- delta cache hits, joins, builds, enlargements, cache age and prefix pruning,
+  serialized source jobs, size-ceiling reductions and in-job descent,
+  dyadic target and delivered spans, active interval, per-client revision
+  wakeups, requests per catch-up, size-limited short-prefix frequency,
+  replay-floor advances, invalidated delta and Head-tier jobs, estimated versus
+  actual canonical-delta JSON bytes, and estimator-invariant violations;
 - database pool and public-read permit occupancy, query duration, and query
   timeouts;
 - encoding reservation, queue, and active-job occupancy, queue timeouts, and

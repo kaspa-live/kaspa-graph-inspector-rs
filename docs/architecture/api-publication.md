@@ -159,31 +159,53 @@ path rather than defining another publication transition.
 transitions. It is a writer gate rather than a container for graph state.
 `GraphPublication.core` publishes lifecycle state, the complete `GraphView`,
 and `GraphHistory` as one atomically observed in-memory value. Cache and
-client-registry synchronization is private to those values. Cache work never
-participates in the graph mutation critical section. The short nonblocking
-client-registry operations described below run at its tail so SSE observation
-preserves graph and lifecycle order.
+client-registry synchronization is private to those values. Ordinary cache
+work never participates in the graph mutation critical section. The sole
+exception is bounded invalidation after history reports a replay-floor
+advance. The short nonblocking cache and client-registry operations described
+below run at its tail so cache admission and SSE observation preserve graph
+order.
 
 For an original `BlockCommitted` or `VspcCommitted` update, the runtime:
 
 1. acquires `mutation`, then the core write lock, and requires the starting
    view and history revisions to be equal;
-2. applies the original update; when it produces a revision, it samples
-   elapsed publication-local milliseconds at delta creation, estimates the
-   returned delta, appends it to history, and prunes history against the
-   resulting Head extent while retaining the same core write lock;
-3. releases the core write lock; and
-4. when a delta was appended, calls the ApiService-owned client registry's
-   nonblocking `advance_head` with that revision, then releases `mutation`.
+2. during that original-update application, when `GraphView::apply` produces a
+   revision, samples elapsed publication-local milliseconds at delta creation,
+   estimates the returned delta, and applies the
+   [protocol-owned soft-limit classification](api-protocol.md#graph-http-compression--settled),
+   yielding `Replayable` or `ReplayBarrier`;
+3. appends the delta to history with that classification and prunes history
+   against the resulting Head extent while retaining the same core write lock;
+4. for `ReplayBarrier`, calls the cache owner's synchronous replay-floor
+   invalidation with the delta's target revision while still retaining the
+   core write lock, records the detached cache jobs only after that
+   ApiService-owned operation has completed its terminal notifications, and
+   then releases the core write lock;
+5. cancels the detached jobs' work without awaiting it; and
+6. calls the ApiService-owned client registry's nonblocking `advance_head`
+   with the appended revision, then releases `mutation`.
+
+Replay-floor invalidation applies the
+[protocol-owned cache eligibility rule](api-protocol.md#publication-scoped-head-response-cache--settled)
+before the new core becomes externally visible. Because the core write lock
+prevents a concurrent new capture, every running Head-tier job selected by
+that rule captured a revision below the newly appended floor. The
+[ApiService cache owner](api-service.md#cache-and-encoding-jobs) defines the
+bounded removal, terminal job notification, and exact-identity mechanics. The
+cache stores no independent copy of the history-owned floor.
 
 A no-effect update changes neither graph value. The complete update from the
 first graph mutation through history append and pruning is synchronous: it
 contains no await or cancellation point, starts only after both asynchronous
 locks have been acquired, and becomes visible only when the core write lock is
-released. Dropping a caller while it waits for either lock leaves the core
-unchanged. Completion never moves into a spawned task or publication-owned
-pending mutation, so dropping an unpublished publication cannot leave mutation
-work or retained publication resources behind.
+released. Replay-floor cache invalidation remains a synchronous nonblocking
+tail operation under the core write lock and `mutation`; it performs no
+encoding or extraction.
+Dropping a caller while it waits for either lock leaves the core unchanged.
+Completion never moves into a spawned task or publication-owned pending
+mutation, so dropping an unpublished publication cannot leave mutation work or
+retained publication resources behind.
 
 This sacrifices the former opportunity to expose a new view while its history
 append waited behind readers. The added capture latency is bounded by the
@@ -207,13 +229,16 @@ await. Consequently, becoming terminally `Stale` waits for an in-progress
 graph mutation to finish, its final view revision is already present in
 history, and its state message precedes any later mutation's graph wakeup.
 
-The core read lock protects only bounded in-memory capture. Serialization,
-compression, cache work, database access, network delivery, and request
-waiting never hold it. The private capture values are:
+The core read lock protects bounded in-memory capture and, where applicable,
+the immediately following nonblocking cache lookup or job election.
+Serialization, compression, cache construction, database access, network
+delivery, and request waiting never hold it. The private capture values are:
 
 ```rust
 struct GraphViewCapture {
     publication_id: u64,
+    replay_floor_revision: u64,
+    oldest_available_revision: u64,
     view: GraphView,
 }
 
@@ -223,6 +248,7 @@ struct GraphDeltaTargetCapture {
     revision: u64,
     revision_timestamp_ms: u64,
     head_level: u32,
+    replay_floor_revision: u64,
 }
 
 struct GraphLevelCapture {
@@ -241,27 +267,54 @@ supplied by ApiService's
 The slot owner defines acquisition and replacement behavior.
 
 A Head snapshot-cache job or Head-backed window holds one core read lock while
-it captures an owned `Frozen` graph view. A window performs its complete
-extraction against that same view. A level lookup similarly captures the
-revision and every requested complete level under one core read lock; an
-unavailable level produces no partial capture. Public publication identity and
-state headers are finalized separately under the
+it captures an owned `Frozen` graph view, the history-owned replay floor, and
+`oldest_available_revision`. For a cache operation, the request also performs
+its short nonblocking cache lookup or exact-slot job election before releasing
+that core read lock. The lock order is always core read lock followed by cache-
+state synchronization; no cache-state guard may acquire the core. This makes a
+pre-floor capture either visible to the later floor invalidation or impossible
+after that invalidation, without retaining either guard for extraction or
+encoding, and gives Head eligibility one coherent ordinary-history boundary. A
+window performs its complete extraction against that same Frozen view. A level
+lookup similarly captures the revision and every requested complete level
+under one core read lock; an unavailable level produces no partial capture.
+Public publication identity and state headers are finalized separately under the
 [protocol-owned publication-context rule](api-protocol.md#publication-context-response-headers--settled).
 
 A canonical delta operation briefly captures its publication ID, state, view
-revision, revision timestamp, and high level under one core read lock,
-releases it, and then asks history for a range ending at the captured revision.
+revision, revision timestamp, high level, and history replay floor under one
+core read lock, derives the protocol target from those captured values, then
+performs the protocol-required query-driven cache pruning and exact-source
+cache decision before consulting history. A protocol-adequate completed value
+or a running job is retained without a history lookup. Only a decision that
+requires construction asks that same history for a range ending at the
+captured revision, then performs a second source-slot cache election before
+releasing the lock. That election completely re-evaluates the source slot
+under the [ApiService-owned cache contract](api-service.md#cache-and-encoding-jobs);
+the history capture is retained only when this caller becomes the builder.
 The revision and timestamp form the coherent Head pair carried in the
 protocol-owned response headers. At that capture instant, history has the same
-current revision. The later core read may observe further advancement and
-pruning; range selection remains bounded by the captured target and returns its
-ordinary retained-range outcome without waiting or recapturing the view.
+current revision. When needed, the immutable range capture remains bounded by
+that target and returns its ordinary retained-range outcome without waiting or
+recapturing the view. Ordinary history pruning therefore cannot make an
+otherwise valid completed cache hit unusable.
 
-History range capture clones the selected immutable
-`Arc<GraphHistoryEntry>` values under the core read lock. Target selection,
-budgeting, response-wide dictionary construction, JSON serialization, and gzip
-compression then proceed without the lock. Later history pruning cannot
-invalidate those captured entries.
+Construction-side history range capture clones the selected immutable
+`Arc<GraphHistoryEntry>` values under the core read lock. Budgeting,
+response-wide dictionary construction, JSON serialization, and gzip compression
+then proceed without the lock. Later history pruning cannot invalidate those
+captured entries. Replay-floor invalidation detaches their cache jobs before
+releasing the mutation barrier, so a pre-floor capture cannot become a newly
+admitted public cache result afterward.
+
+Immediately before replay-floor admission of a completed cached delta or Head
+snapshot, the request briefly reacquires the core read lock, applies the
+protocol-owned final comparison, records the immutable response as
+floor-admitted when eligible, and releases the lock. It holds no cache guard
+during this check and retains no publication lock for network delivery. The
+core write lock used by replay-floor advancement therefore supplies the exact
+before-or-after ordering required by the protocol; independent completion
+checks remain applicable afterward.
 
 ## Database seed extent and projection — settled
 
@@ -421,7 +474,7 @@ cancellation. Installation creates no graph revision.
 Installation has no cache-readiness condition. A newly Active publication may
 have no encoded Head tier. The
 [protocol cache contract](api-protocol.md#publication-scoped-head-response-cache--settled)
-owns tier values, request-driven construction, request-local failure, distance
+owns tier values, request-driven construction, request-local failure, age
 rules, and public selection behavior. No such cache outcome can prevent or
 invalidate publication installation.
 
@@ -544,7 +597,7 @@ owns detached-job completion, insertion after cache release, and terminal
 job cancellation. The protocol owner defines how live SSE transports receive
 replacement identifiers. Stale transition and client-registration behavior
 follow the protocol owner. Public access while Stale and ordinary entry
-eviction belong to the
+pruning belong to the
 [API protocol](api-protocol.md#publication-scoped-head-response-cache--settled).
 
 `GraphPublication` owns lifecycle state; the contained graph values retain the

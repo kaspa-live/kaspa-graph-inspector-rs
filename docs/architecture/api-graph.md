@@ -87,6 +87,15 @@ enum GraphHistoryAppendError {
         history_revision: u64,
         delta_from: u64,
     },
+    NonAtomicDelta {
+        from_revision_id: u64,
+        to_revision_id: u64,
+    },
+}
+
+enum GraphHistoryReplayability {
+    Replayable,
+    ReplayBarrier,
 }
 
 enum GraphHistoryRangeError {
@@ -101,6 +110,10 @@ enum GraphHistoryRangeError {
     StartUnavailable {
         requested: u64,
         current: u64,
+    },
+    StartBeforeReplayFloor {
+        requested: u64,
+        replay_floor_revision: u64,
     },
 }
 
@@ -218,6 +231,7 @@ type GraphHistoryEntryList = Arc<[Arc<GraphHistoryEntry>]>;
 struct GraphHistory {
     current_revision_id: u64,
     current_cumulative_estimated_bytes: u64,
+    replay_floor_revision: u64,
     entries: VecDeque<Arc<GraphHistoryEntry>>,
 }
 
@@ -486,8 +500,9 @@ constructor rejects `to_revision_id <= from_revision_id` with
 Revision ordering is checked first, so an input violating both invariants
 returns `NonForwardRevision`.
 Direct view mutation produces one-step deltas, and composition constructs its
-results through the same checked constructor. Delta application and history
-append trust these construction invariants and do not check them again.
+results through the same checked constructor. Delta application trusts these
+construction invariants. History additionally accepts only original atomic
+one-step deltas under the append contract below.
 
 `revision_timestamp_ms` is the timestamp of the target revision. The graph
 model treats it as an opaque, nondecreasing value within one lineage. The
@@ -509,6 +524,7 @@ impl GraphHistory {
         &mut self,
         delta: GraphDelta,
         estimated_raw_bytes: u64,
+        replayability: GraphHistoryReplayability,
     ) -> Result<(), GraphHistoryAppendError>;
 }
 ```
@@ -526,8 +542,9 @@ the complete delta atomically in this canonical phase order:
 5. the applicable bounds, revision, and revision-timestamp advancement.
 
 This phase order governs the semantic collections of every original or
-composed delta, including a decoded public delta entry. Projection or filtering
-may omit mutations but cannot reorder the retained phases. Membership and
+composed delta. Every decoded public entry is an original atomic delta and
+uses the same order. Projection or filtering may omit mutations but cannot
+reorder the retained phases. Membership and
 color maps therefore supersede projection values carried by a block upsert in
 the same delta. In the final phase, a Head view sets:
 
@@ -547,9 +564,15 @@ required context.
 
 `append` first requires
 `history.current_revision_id == delta.from_revision_id`. A mismatch returns
-`RevisionMismatch` without evaluating cumulative-cost arithmetic, and all
-values remain unchanged. For a gapless append, checked addition of the
-protocol-supplied `estimated_raw_bytes` to
+`RevisionMismatch` without evaluating any later condition, and all values
+remain unchanged. It then requires
+`delta.to_revision_id == delta.from_revision_id + 1`; every other forward
+interval returns `NonAtomicDelta` without evaluating cumulative-cost
+arithmetic. `GraphHistory` therefore stores exactly one original graph
+revision per entry and never stores a composed or otherwise aggregated delta.
+
+For an atomic gapless append, checked addition of the
+publication-supplied, protocol-defined `estimated_raw_bytes` to
 `current_cumulative_estimated_bytes` occurs before any history mutation. An
 exact cumulative result of `u64::MAX` is valid. Overflow is an internal
 invariant failure and panics; it is not a typed `GraphHistoryAppendError`, and
@@ -558,24 +581,37 @@ counter would require an unattainable volume of estimated graph data within
 one publication lifetime given the memory, throughput, and process-lifetime
 resources required to produce it.
 
-On success, `append` takes ownership of the delta, appends the resulting
-`GraphHistoryEntry`, and sets both current fields to the entry's target values
-atomically. A new revision-zero history starts with cumulative value zero. A
-stored entry may hold
-either a direct one-step delta or an already aggregated delta. For an aggregate,
-`estimated_raw_bytes` is the sum of its constituents and
-`cumulative_estimated_bytes` is the final constituent's cumulative value.
-Consecutive stored entries remain gapless by their outer interval boundaries;
-history neither requires nor reconstructs internal revision boundaries within
-an aggregate. Once appended, a `GraphHistoryEntry` is immutable and shared by
-`Arc`. Append and pruning mutate the ordered stored collection within the
-enclosing publication's exclusive section. A range capture clones the selected
-entry Arcs into an immutable `GraphHistoryEntryList`, so later pruning cannot
-invalidate work already detached by a reader.
+On success, `append` takes ownership of the delta and sets the history revision
+and cumulative estimate to the entry's target values atomically. A new
+revision-zero history starts with cumulative value zero and replay floor zero.
 
-The exact raw-byte estimator belongs to the
+The publication owner supplies `replayability` from the protocol-owned
+estimator decision made inside the original-update critical section.
+`GraphHistory` does not inspect the soft limit or independently classify the
+estimate. `Replayable` retains the new atomic entry. Consecutive retained
+entries are therefore gapless at every individual revision boundary.
+
+`ReplayBarrier` records an uncrossable public replay boundary. Append does not
+retain the entry. It clears the retained entry collection and advances
+`replay_floor_revision` to the delta's target revision. The current revision
+and cumulative estimate still advance normally because the canonical Head
+view has accepted the delta. Every later retained entry therefore starts at or
+after the inclusive floor. Repeating this case can only move the floor
+forward.
+
+Once retained, a `GraphHistoryEntry` is immutable and shared by `Arc`. Append
+and pruning mutate the ordered stored collection within the enclosing
+publication's exclusive section. A range capture clones the selected entry
+Arcs into an immutable `GraphHistoryEntryList`, so later pruning or replay-floor
+advancement cannot invalidate work already detached by a reader. The
+publication owner prevents such detached pre-floor work from becoming a public
+cache result or newly committed response.
+
+The exact raw-byte estimator and replayability classification belong to the
 [canonical Head-delta protocol](api-protocol.md#canonical-head-delta-responses--settled).
-The estimate is planning metadata rather than graph state or a wire field.
+The estimate is planning metadata rather than graph state or a wire field, but
+its soft-budget classification permanently determines replayability within the
+publication.
 Composition cancellations, response-local hash deduplication, and compression
 may make it differ from the final encoded size.
 
@@ -732,17 +768,20 @@ structure until its terminal transition to Frozen under the contract above.
 the ordered, continuity-certified `VspcProcessor` output and does not duplicate
 its continuity validation.
 
-GraphHistory retention is level-scoped. All revisions and deltas produced while
-a graph level remains within the retained head window are preserved. History
-associated with that level becomes eligible for pruning only when the level
-itself leaves the retained window. No independent revision-count or memory-size
-cap is required or permitted by this design.
+GraphHistory ordinary retention is level-scoped. Every replayable revision and
+delta produced while a graph level remains within the retained head window is
+preserved. History associated with that level becomes eligible for ordinary
+pruning only when the level itself leaves the retained window. Advancing the
+replay floor is the sole independent prefix-removal rule: it reflects an
+uncrossable semantic boundary rather than a revision-count or memory-size cap.
 
 ```rust
 impl GraphHistory {
     fn prune(&mut self, head_low_level: u32);
 
     fn oldest_available_revision(&self) -> u64;
+
+    fn replay_floor_revision(&self) -> u64;
 
     fn range(
         &self,
@@ -752,21 +791,20 @@ impl GraphHistory {
 }
 ```
 
-Pruning removes the longest stored prefix for which:
+Ordinary pruning removes the longest stored prefix for which:
 
 ```text
 delta.head_level < head_low_level
 ```
 
-It never removes a middle entry. An aggregated stored delta is indivisible and
-uses the `head_level` of its final constituent: retain the whole aggregate
-until that level leaves the Head extent, then remove the whole aggregate. This
-may retain older constituent history longer than necessary and is safe.
-Pruning changes neither current field. If entries remain,
+It never removes a middle entry. Every entry represents exactly one revision,
+so no hidden constituent boundary affects pruning. Pruning changes neither the
+current revision nor cumulative field. If entries remain,
 `oldest_available_revision()` is the first entry's `from_revision_id`;
 otherwise it is `current_revision_id`.
 
-Pruning preserves absolute `cumulative_estimated_bytes` values rather than
+Both ordinary pruning and replay-floor clearing preserve absolute
+`cumulative_estimated_bytes` values rather than
 rebasing retained entries. Each cost boundary is the corresponding
 `entry.delta.to_revision_id`. For two retained boundaries `from < to`:
 
@@ -781,8 +819,7 @@ value as:
 first.cumulative_estimated_bytes - first.estimated_raw_bytes
 ```
 
-Only stored entry boundaries are cost boundaries. An aggregate therefore
-offers one selectable right boundary, not reconstructed internal ones.
+Every revision retained in history is a stored cost boundary.
 
 The enclosing publication prunes against the current complete Head `low_level`
 after append and before exposing the new core. A history reader therefore
@@ -813,31 +850,29 @@ Composition requires exact equality between the left `to` and right `from`
 revisions. The result uses `a` as `from`, `c` as `to`, and delta `c`'s
 `head_level` and `revision_timestamp_ms`. Composition is associative by
 graph-state effect. A composed delta must have the same graph-state effect as
-applying its constituent deltas in order. It is one replay unit whose timestamp
-therefore represents its final target revision; discarded internal timestamps
-are not reconstructed.
+applying its constituent deltas in order. It is not appendable to
+`GraphHistory`; public retained history and replay preserve every original
+atomic revision and timestamp.
 
 ### Retained history range
 
 For a range request, compare the target with the start before inspecting
 retained history. A target below the start returns `BackwardTarget` and creates
-no delta. When the target equals the start, return `UpToDate`. Otherwise, the
-starting revision must be an exact retained entry boundary. A start before
+no delta. When the target equals the start, return `UpToDate`. Otherwise, a
+start below `replay_floor_revision` returns `StartBeforeReplayFloor` carrying
+the inclusive first replayable revision. A remaining starting revision must be
+an exact retained entry boundary. A start before
 `oldest_available_revision()` returns `StartPruned`; a start inside an
-aggregate, after current history, or otherwise absent returns
+already-pruned interval, after current history, or otherwise absent returns
 `StartUnavailable`. A valid forward request selects gapless entries beginning
 exactly at the start.
 
-The target need not be a retained boundary. If it lies inside an aggregated
-entry, include that complete entry and set `actual_target` to its right
-boundary. If it is beyond current history, use the current history right
-boundary. The returned range always records both the requested and actual
-targets. If that available right boundary equals the start, return `UpToDate`.
-An aggregated entry is never split and its discarded internal boundaries are
-not reconstructed.
-
-`GraphHistoryRange::Deltas.actual_target` may be later than the requested
-target because an aggregate was indivisible, or equal to the current history
-right boundary because the requested target was in the future. Public outcome
-mapping, response budgeting, dictionaries, encoding, and delivery belong to
-the [canonical Head-delta protocol](api-protocol.md#canonical-head-delta-responses--settled).
+Every retained revision is a boundary. If the requested target is beyond
+current history, use the current history right boundary; otherwise select
+through the exact requested revision. The returned range always records both
+the requested and actual targets. If that available right boundary equals the
+start, return `UpToDate`. `GraphHistoryRange::Deltas.actual_target` can differ
+from the requested target only because the request named a future revision.
+Public outcome mapping, response budgeting, dictionaries, encoding, and
+delivery belong to the
+[canonical Head-delta protocol](api-protocol.md#canonical-head-delta-responses--settled).
