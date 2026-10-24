@@ -76,8 +76,8 @@ cursor. Its body contains an ordered, gapless batch of retained history entries
 and one response-wide hash dictionary. The Web validates the complete batch
 before admission, including that its first boundary equals
 `received_revision_id`, advances its received cursor to the final entry boundary,
-and replays entries one at a time. It never assumes one response reaches the
-original target.
+requires every entry to advance exactly one revision, and replays entries one
+at a time. It never assumes one response reaches the original target.
 
 For both Head replay and a locally filtered Fixed candidate, the Web stages the
 complete entry and commits it atomically under the sole
@@ -183,7 +183,10 @@ wakeup before requesting again; once it arrives, acquisition may proceed from
 capacity permits. An HTTP-only client follows the protocol-owned retry delay
 under the same capacity rule. SSE wakeups received while acquisition is paused
 coalesce to the newest desired cursor. A no-delta wait response leaves both
-graph cursors unchanged.
+graph cursors unchanged. A body-bearing prefix with `WaitForWakeup` first
+admits and replays its entries normally, but starts no immediate continuation
+request; its retained continuation waits for the same SSE wakeup or HTTP-only
+retry rule.
 
 Transport or request failure does not discard a valid admitted queue. The Web
 retries from `received_revision_id` when its ordinary transport policy permits.
@@ -292,9 +295,7 @@ its target Head lower bound from that entry's `head_level` and
 `MAX_CACHE_DEPTH`. If the target Head no longer contains the complete fixed
 extent, do not apply that entry or any later queued entry. Keep every earlier
 successfully replayed entry, preserve the last coherent image and applied
-cursor, and mark the view frozen. An already composed history entry remains
-one indivisible replay unit; the Web does not reconstruct an intermediate
-prefix hidden inside it.
+cursor, and mark the view frozen.
 
 While the complete extent remains contained, filter that entry as one atomic
 candidate:

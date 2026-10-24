@@ -421,7 +421,7 @@ cancellation. Installation creates no graph revision.
 Installation has no cache-readiness condition. A newly Active publication may
 have no encoded Head tier. The
 [protocol cache contract](api-protocol.md#publication-scoped-head-response-cache--settled)
-owns tier values, request-driven construction, request-local failure, distance
+owns tier values, request-driven construction, request-local failure, age
 rules, and public selection behavior. No such cache outcome can prevent or
 invalidate publication installation.
 
@@ -544,7 +544,7 @@ owns detached-job completion, insertion after cache release, and terminal
 job cancellation. The protocol owner defines how live SSE transports receive
 replacement identifiers. Stale transition and client-registration behavior
 follow the protocol owner. Public access while Stale and ordinary entry
-eviction belong to the
+pruning belong to the
 [API protocol](api-protocol.md#publication-scoped-head-response-cache--settled).
 
 `GraphPublication` owns lifecycle state; the contained graph values retain the

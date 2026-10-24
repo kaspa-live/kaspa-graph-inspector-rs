@@ -1017,8 +1017,9 @@ revision `n`. A retained view mutation returns `GraphDelta(n,n+1)`, and the
 enclosing publication appends that delta before atomically exposing both values
 at revision `n+1`. No capture can observe adjacent revisions. A no-effect
 update returns no delta and advances neither revision. History rejects a
-nongapless append and accepts a gapless aggregated interval without requiring
-internal one-step boundaries. Construct
+nongapless append and rejects every forward interval wider than one revision
+with `NonAtomicDelta`. The accepted atomic delta retains its target revision
+timestamp without adding a source timestamp to history. Construct
 direct and composed deltas only through `GraphDelta::new`; verify it
 rejects equal and backward revision endpoints, exposes the accepted endpoints
 and target timestamp through read-only accessors, and offers no revision
@@ -1089,10 +1090,10 @@ mutation; and DAA score changes. Verify each delta carries the `head_level` of
 the lineage that owns its revision interval and carries no lower coverage
 object. Retain all Head deltas whose `head_level` remains in the retained head
 window, including multiple revisions at one level, and make them eligible for
-pruning only after that level leaves the window. Cover indivisible aggregated
-entries, longest-prefix pruning, derived oldest available revision, and
-unchanged current revision. No count or byte pressure may prune history
-earlier.
+pruning only after that level leaves the window. Cover longest-prefix pruning,
+derived oldest available revision, every retained revision as an exact range
+and cumulative-cost boundary, and unchanged current revision.
+No count or byte pressure may prune history earlier.
 
 Verify the [graph-view edge and absolute-map contract](api-graph.md#graph-values-views-revisions-and-history--settled)
 with zero, one, and two endpoint blocks retained; Head child addition and
@@ -1198,9 +1199,7 @@ omitted canonical block and edge removals do not remove fixed objects. Then
 supply a batch in which earlier entries remain eligible and a later entry's
 target Head has crossed the fixed lower bound. The Web applies the earlier
 entries, rejects the first ineligible entry and every later entry, preserves
-its last coherent image and applied cursor, and freezes. Repeat with one
-indivisible composed entry crossing the boundary and require that complete
-entry to remain unapplied. Also cover publication replacement and expired
+its last coherent image and applied cursor, and freezes. Also cover publication replacement and expired
 history. A terminal Stale publication remains addressable: canonical catch-up
 and missing-level lookup continue through its final stalled Head.
 
@@ -1242,7 +1241,7 @@ complete remaining queue. Cover equal entry timestamps, zero remaining server
 interval, an expired deadline, and a calculated zero delay with immediate
 replay. Each graph entry applies atomically.
 
-Replay an indivisible composed wire entry whose block upsert carries earlier
+Replay one atomic wire entry whose block upsert carries earlier
 membership and color values while that same hash also has final membership and
 color mutations. Under both ordinary Head replay and retained Fixed replay,
 apply the graph-owned phases once and require the visible block to end with
@@ -1503,14 +1502,11 @@ and final target-timestamp selection; and rejection of nongapless composition.
 Protocol selection must reject a publication mismatch before history work.
 
 For one body-bearing response, select an ordered gapless
-`GraphHistoryEntryList` containing ordinary one-step entries, an already
-composed entry, and both forms together. Require one `GraphDeltaEntryDto` per
-selected history entry and never reconstruct the composed entry's discarded
-internal boundaries. The first entry starts at the requested revision, every
-adjacent boundary matches, and the final entry supplies the returned cursor.
-A requested target inside an aggregate extends through its right boundary; a
-future target returns through available history; a starting cursor inside an
-aggregate is unavailable.
+`GraphHistoryEntryList` of atomic one-step entries. Require one
+`GraphDeltaEntryDto` per revision, exact adjacent boundaries, preservation of
+every target timestamp, and the final entry as the returned cursor. A future
+target returns through available history; every retained starting revision is
+an exact boundary.
 
 At the serialization boundary, verify that every in-memory canonical delta
 retains its complete change maps and composition `before` values while its
@@ -1525,30 +1521,41 @@ level context.
 
 For every appended history entry, verify `estimated_raw_bytes` and the absolute
 `cumulative_estimated_bytes` boundary at `delta.to_revision_id`. Cover range
-cost subtraction before and after prefix pruning, the first retained left
-boundary derivation, and an aggregated entry exposing only its final cost
-boundary. Verify an exact cumulative value of `u64::MAX` is accepted and that
+cost subtraction before and after prefix pruning and the first retained left
+boundary derivation. Verify an exact cumulative value of `u64::MAX` is accepted and that
 the next positive estimate panics before changing the revision, cumulative
 value, or retained entries. A simultaneous revision mismatch must return
-`RevisionMismatch` before cumulative arithmetic and must not panic. Exercise
-the delta-to-Head regions at the exact half-distance and 80%
-level boundaries. In the heat region, cover no heated boundary, competing
-destination counts, the outgoing-cache/job and youngest-revision tie breaks,
-and exclusion when a boundary leaves retained history or the moving heat
-region. Confirm request-from counts and continuation kinds do not change heat.
-In the CPU-oriented region, cover an exact cache hit, the shortest bridge to
-the nearest reachable completed cached source, exclusion of a running job as a
-bridge destination, and bounded fallback when no bridge is reachable.
+`RevisionMismatch` before cumulative arithmetic and must not panic. A matching
+revision with a multi-revision delta must return `NonAtomicDelta` before
+cumulative arithmetic and leave the history unchanged.
 
-Exercise the preferred 15-revision destination, heat-selected extensions
-through revision 30, a nearer captured or terminal Head, and an affordable
-short prefix. No newly selected ordinary batch crosses 30 revisions; an
-indivisible stored aggregate may do so. Force the complete batch's final
-uncompressed JSON over its hard limit and verify removal of complete entries
-from the right, rebuilding the shared dictionary for each candidate prefix.
-The first indivisible entry exceeding the limit requires a fresh view. A gzip
-body that transfers efficiently does not permit an over-limit uncompressed
-representation.
+Verify dyadic successor selection from zero, unaligned sources, every power of
+two through the 128-revision cap, and sources divisible by larger powers. Cover
+the exact normalization spans `4..=7`, including `17 -> 24`, followed by
+`24 -> 32 -> 64 -> 128`. For `F = 32`, verify the descending boundaries
+`64, 48, 40, 36, 34, 33`; for `F = 17`, verify `24, 20, 18`. A moving Live
+Head applies the active interval only to descent, while Synchronizing and
+Stale can descend through the final atomic revision. Verify every allowed
+active interval from 1 through 128 and reject any controller output outside
+that set. ApiService must initialize the interval to 4 and retain its current
+value across publication reset and replacement; the open controller decision
+supplies no further executable policy.
+
+Force the soft estimate and final uncompressed JSON limit to descend through
+successive dyadic boundaries while rebuilding one shared dictionary for each
+encoded candidate. Permit descent below both the four-revision base and active
+interval to one atomic entry. Mark a shortened successful value
+`size_limited`, reuse it without another enlargement attempt, and distinguish
+Head- or state-limited shortening that remains enlargeable. A gzip body that
+transfers efficiently must not permit an over-limit uncompressed body.
+
+Make one atomic `R -> R + 1` entry exceed the hard limit. Require the fresh-view
+outcome, monotonic advancement of the delta-serving floor through `R + 1`, and
+physical removal of every earlier source slot. Later requests below the floor
+must perform no history or encoding work, while a request from `R + 1` remains
+eligible. The atomic case has no smaller redirect target: invalidate all
+affected jobs and give their waiters the same fresh-view outcome. Repeat with a
+later oversized atomic entry and prove the floor never moves backward.
 
 For tiered Head snapshot reuse, install a publication with no encoded tier and
 require the first request for each applicable tier, including `20`, to start
@@ -1579,35 +1586,50 @@ tier-20 request. For a terminal `Stale` publication, verify that age remains
 fixed, an eligible entry remains reusable, and querying an obsolete entry
 removes and rebuilds it from the final Head.
 
-For canonical Head deltas, verify one
-publication-owned job per source revision: concurrent requests join it after
-its target is captured, success publishes one `CachedDelta`, and failure gives
-all waiters the same request-local error after removing the job. Count every
-successfully delivered waiter independently toward the destination heat. A
-cache hit reuses the exact gzip bytes and is never
-promoted or replaced because Head advanced; publication ID and state, outcome,
-continuation, wake boundary, and retry delay remain outside those bytes. Wrap
-one cached batch body with different valid request-specific publication and
-coherent Head revision/timestamp headers without
-serializing, compressing, or decompressing it. Verify that `CachedDelta`
-retains the first and last boundaries, final `head_level`, checked
-uncompressed JSON byte count, and final gzip body without duplicating entry
-timestamps or count as semantic fields. Verify
-one immutable outgoing entry per source revision and
-convergence of distinct sources on a heated destination. Exercise an
-SSE-coordinated and an HTTP-only request from the same source and verify both
-reuse the same cache entry or join the same job.
-After constructing a completed cache entry, prune its exact source boundary
-from `GraphHistory` while its target remains within
-`MAX_CACHE_LEVEL_DISTANCE`; the exact cache hit must still succeed without a
-history range lookup. Remove that cache entry and repeat the request to verify
-that the miss follows the ordinary `StartPruned` or `StartUnavailable`
-history outcome.
+For canonical Head deltas, verify at most one publication-owned job per source.
+Concurrent requests join it even when they selected different targets. A
+waiter needing a farther target re-enters after successful completion, starts
+or joins the serialized enlargement, and never receives the inadequate shorter
+body. Ordinary failure gives that job's waiters the same request-local error
+and preserves the preceding completed value.
+Wrap one cached batch body with different valid request-specific publication
+and coherent Head revision/timestamp headers without serializing, compressing,
+or decompressing it. Verify that `CachedDelta` retains its boundaries,
+`size_limited` state, checked uncompressed JSON byte count, and final gzip body
+without duplicating target timestamps, Head levels, or entry count as semantic
+fields. Its source slot separately retains the first atomic entry's target
+timestamp. Exercise an SSE-coordinated and HTTP-only request from the same
+source and verify both use the same source slot.
 
-For a Live publication and preferred interval 15, cover no-delta waiting at
-Head distances one through fourteen; target eligibility beginning at
-`F + 15`; heat extension through `F + 30`; no-heat fallback; `ReachedHead`,
-`ContinueImmediately`, and `WaitForWakeup`; one wakeup
+Complete a short non-size-limited value, advance Head so the dyadic target is
+farther while its job is still running, and require the next request to join
+that job. After the shorter completion, require the waiter to elect or join the
+farther enlargement without receiving the shorter body. Preserve the previous
+completed value throughout enlargement and replace it only after successful
+farther completion. A response already committed to delivery remains valid.
+
+Make one target cross the soft estimate and, separately, the hard uncompressed
+limit. Lower the exclusive source ceiling and require the same pending source
+job to descend to each next-lower target without exposing an intermediate
+public error or detaching its waiters. Repeat until a fitting result is marked
+`size_limited`.
+When the selected lower boundary already exists as the completed value, reuse
+its bytes and promote it without encoding. Serialization, gzip, cancellation,
+and unrelated job failures must establish no ceiling.
+
+For query-time pruning, populate sparse source revisions with nondecreasing and
+equal timestamps in one ordered cache. At cache ages 299,999 and 300,000
+milliseconds, respectively retain and physically remove the complete expired
+prefix before exact lookup, touching no retained suffix. Verify that Head
+advancement and idle wall time alone remove nothing, a later query performs the
+accumulated pruning, and Stale fixes cache age. A detached job removed with an
+expired slot may complete admitted waiters but cannot reinsert. After pruning,
+an absent source inside the horizon constructs on demand from atomic history;
+an absent source at the boundary returns `DeltaSourceExpired` without
+resurrection. A retained completed hit requires no history lookup.
+
+For a Live publication, cover `ReachedHead`, `ContinueImmediately`, and
+`WaitForWakeup`; one wakeup
 at the armed boundary; suppression of further graph wakeups until rearming;
 and `PublicationState` or the replacement sequence bypassing the schedule.
 Verify the canonical
@@ -1617,9 +1639,10 @@ Verify the canonical
 Head revision/timestamp, outcome, and continuation headers required by the
 protocol. Require a batch body for
 `complete` and `prefix`; require an empty `200 OK` body for `up-to-date` and
-`wait-for-wakeup`. The wake-boundary header appears only for
-`wait-for-wakeup`. Neither typed `409 Conflict` delta error carries the delta
-success headers. Verify body-bearing results advance the cursor to the final entry's right
+`wait-for-wakeup`. The wake-boundary header appears exactly when the
+continuation is `wakeup`, including on a body-bearing prefix, and is absent for
+`head` and `continue`. Neither typed `409 Conflict` delta error carries the
+delta success headers. Verify body-bearing results advance the cursor to the final entry's right
 boundary while the two empty success outcomes preserve the request
 cursor. The opaque client ID selects only wake state, while every HTTP
 `from_revision_id` remains the authoritative graph cursor. Its omission must
@@ -1699,19 +1722,31 @@ the final stalled Head revision. Verify `Last-Event-ID` has no graph-cursor,
 publication, registration, or replay meaning. Cover saturation rather than
 wrap at the maximum revision. Synchronizing never parks for the interval.
 Entering Stale reports state independently of graph-wakeup arming and permits
-an interval shorter than 15 through the final stalled Head without rearming.
+descent through the final stalled Head without rearming.
 For HTTP-only `head` and `wakeup`, verify the protocol-owned calculated
-`KGI-Delta-Retry-After-Ms` values at representative lags zero through fourteen
+`KGI-Delta-Retry-After-Ms` values at representative selected wake boundaries
 and its absence
 from `continue` and SSE-coordinated responses. At a Stale final Head require
 1000 milliseconds, repeated same-endpoint polling while that publication
 remains current, and a publication-mismatch outcome followed by a replacement
 Head snapshot after replacement. The SSE-coordinated Web must wait for the
 replacement wakeup instead.
-Force both an estimated and a final uncompressed JSON budget to select a
-shorter prefix; that prefix remains valid and cacheable and derives
-continuation from its remaining Head distance. Also cover a CPU-oriented
-bridge shorter than 15.
+Change the active interval upward while registrations are armed and retain
+their old boundaries. Cover the wake already underway and one further early
+alignment wake before new schedules use the larger interval. Change it
+downward without rescheduling; at the retained later wake, let the first
+response stop below the now-current Head, require its immediate continuation
+request, and let the second response converge under the smaller interval. No
+interval change may cancel or duplicate a registration.
+
+Derive Live continuation from the nearest eligible `N(T, A)`, not solely from
+raw revision distance. Cover an aligned cursor where comparison with `A`
+directly selects all three continuations and the normalization exception
+`T = 17`, `A = 8`, `H = 24`, which must continue immediately. Make a
+body-bearing prefix end in `T < H < N(T, A)` and require it to carry `wakeup`,
+the exact `KGI-Delta-Wake-At-Revision`, and no immediate follow-up request.
+The empty `wait-for-wakeup` outcome follows the same boundary rule while
+leaving both cursors unchanged.
 
 Verify Stale preserves cache entries and permits existing and new jobs to
 finish against the stalled Head. Publication replacement must allow a running
@@ -1721,16 +1756,12 @@ publication has no remaining runtime, slot, request, or SSE reference, its
 cache and client registry are released; a detached job may complete its
 remaining waiters, but its weak cache insertion must then fail harmlessly.
 Terminal ApiService shutdown cancels and joins unfinished jobs. Retaining or
-pruning a source history boundary must not prune a completed delta. At target
-distance exactly `MAX_CACHE_LEVEL_DISTANCE`, retain it; one level later, prune
-the complete target-level bucket and every source revision indexed there while
-leaving younger buckets untouched. Cover multiple source revisions in one
-bucket and advancement with no expired bucket. Pause a delta job until its
-target ages beyond the limit, then verify that its existing waiters receive the
-successful result while neither the completed slot nor its target-level index
-entry is installed. At
-`DELTA_RELOAD_LEVEL_DISTANCE`, require a fresh window before starting a job.
-Historical DB
+pruning a source history boundary must not itself retain or prune a completed
+delta; history and response-cache lifetimes remain independent. Cover
+source-ordered query-time pruning, source-slot replacement, and
+oversized-revision floor advancement through the focused cases above; no
+Head-advance or target-level pruning path may remain. At the five-minute source
+boundary, require a fresh window before starting a job. Historical database
 windows bypass this cache.
 Head-level lookups also bypass cache lookup, insertion, and cache single-flight,
 return `Cache-Control: no-store`, and produce no ETag. Fixed-window consumers
@@ -1744,11 +1775,9 @@ Historical database-backed windows and
 Head-level lookups serialize, check their uncompressed JSON size, compress,
 deliver, and discard without entering `GraphCache`.
 
-Under the strict
-`MAX_CACHE_LEVEL_DISTANCE + MAX_WINDOW_DEPTH < MAX_CACHE_DEPTH` bound, verify
-the composed in-memory Head delta still contains every canonical block and edge
-removal immediately before serialization, while its cached wire body omits
-those removal entries and their now-unused dictionary hashes. Advance a
+Verify every atomic in-memory Head delta still contains each canonical block
+and edge removal immediately before serialization, while its cached wire body
+omits those removal entries and their now-unused dictionary hashes. Advance a
 maximum-depth eligible browser window and prove its local `high_level`/depth
 pruning produces the same retained blocks and child-owned edges as the complete
 canonical history. Retain every VSPC membership, color, and required level
@@ -1990,27 +2019,27 @@ publication state. An unexpected worker exit emits exactly one reliable
 no failure event.
 
 Exercise source-keyed cache single-flight with multiple waiters, one cancelled
-waiter, shared success and shared request-local failure, running-job removal,
-and weak insertion both before and after the origin cache is dropped. Verify
-that one short cache critical section elects exactly one builder, installs its
-pending job after required pre-cache checks and before cache-build target
-selection or build-input retention, and lets every concurrent miss join that
-job. No cache-state guard may survive into capture, extraction, an `.await`,
-encoding, delivery, or waiter suspension. On success, require completed
-insertion before the shared `watch`
-result; on failure, require matching-job removal before the shared error so an
-immediate retry starts new work. A cancelled receiver must not alter the job,
-and a dropped origin cache must prevent insertion without preventing receiver
+waiter, serialized shorter and farther targets, shared success and shared
+request-local failure, exact job removal, and weak insertion both
+before and after the origin cache is dropped. Verify that one short cache
+critical section elects exactly one builder per source after required pre-cache
+checks and the immutable history/first-revision-timestamp capture. Concurrent
+callers may duplicate that cheap capture but must join the elected source job
+before encoding. No cache-state guard may survive into capture, extraction, an
+`.await`, encoding, delivery, or waiter suspension. On success, require
+completed insertion before the shared `watch` result; on ordinary
+failure, require exact-job removal before the shared error so an immediate
+retry starts new work. A cancelled receiver must not alter the job, and a
+dropped origin cache must prevent insertion without preventing receiver
 completion. Exercise completion after every waiter has detached and require
 `send_replace` to retain the terminal job value without restoring a cache slot.
-Exercise `DestinationHeat` through successful delivery accounting: repeated
-deliveries to one revision saturatingly change one counter without duplicating
-its level-index entry, and distinct destinations at one level share one bucket.
-At distance exactly `HOT_DESTINATION_LEVEL_DISTANCE`, retain the bucket; one
-level later, prune the bucket and all its revision counters while leaving
-younger heat untouched. A destination that ceases to be a retained complete
-history boundary must become ineligible for selection immediately even though
-its stored counter may remain until level pruning.
+
+Exercise `DeltaCache` as one source-revision-ordered value under the enclosing
+cache critical section. Exact lookup, running-job election, completed
+replacement, serialized enlargement, monotonic size-ceiling reduction,
+expired-prefix pruning, and oversized-floor invalidation must preserve one
+coherent slot map. Prove that equal first-revision timestamps do not break
+prefix pruning and that no destination-heat or target-level side index remains.
 
 Verify all cache orchestration tasks are registered in the ApiService task
 tracker. Include every demand-triggered tier-keyed Head snapshot job in the
@@ -2227,9 +2256,9 @@ the focused-owner active and historical encoding limits. Publication and Head
 work must continue while historical encoders are saturated. Assert that at
 most four encodes run concurrently and at most two are historical, that no
 second response-memory semaphore is acquired before or after encoding, and
-that many waiters on one source-keyed job still produce one encode. Track the
-transient encoding buffers, completed uncached delivery bodies, and cache-owned
-encoded bytes independently while exercising these paths.
+that many waiters on one source job still produce one encode.
+Track the transient encoding buffers, completed uncached delivery bodies, and
+cache-owned encoded bytes independently while exercising these paths.
 
 For historical request resource lifetime, stall response delivery after the
 complete database projection has been materialized and verify that no

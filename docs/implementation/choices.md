@@ -809,18 +809,15 @@ coordinate, each edge excludes four pairs for its endpoint coordinates, and a
 level mutation excludes one or two pairs according to whether it removes or
 installs a level.
 
-The estimator remains additive across history entries. Consequently, a hash
-repeated by different entries can still be charged once per entry even though
+The estimator remains additive across atomic history entries. Consequently, a
+hash repeated by different entries can still be charged once per entry even though
 the later batch serializer shares one response-local dictionary. This bounded
 cross-entry overestimate avoids constructing the eventual batch dictionary
 during publication while removing the much larger within-entry overestimate.
 
 Use checked `u64` arithmetic for every contribution. Exhausting the estimate
 is an internal invariant failure under the same physically unattainable
-publication-lifetime workload rationale as cumulative history overflow. A
-later composed history entry obtains its estimate by adding its constituent
-entry estimates rather than re-estimating the composed mutation maps, so
-composition cancellation cannot retroactively change planning cost.
+publication-lifetime workload rationale as cumulative history overflow.
 
 ## 16 October 2026: graph wire codec foundation
 

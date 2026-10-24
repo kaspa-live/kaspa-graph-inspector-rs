@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 22 October 2026.
+Updated 24 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -313,11 +313,20 @@ Completion validation passed workspace formatting, Cargo check, 436/436
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.
 
-The implemented Increment 10 Head-cache selection and expiry mechanics predate
-the current [protocol cache contract](../architecture/api-protocol.md#publication-scoped-head-response-cache--settled).
-Increment 15 must adapt that kernel before adding logical Head operations. The
-implemented delta-cache mechanics are unaffected by this Head-only status
-note.
+The implemented Increment 10 Head-cache selection, delta target selection,
+destination heat, immutable source slots, and level-based pruning predate the
+current [protocol cache contract](../architecture/api-protocol.md#publication-scoped-head-response-cache--settled).
+Increment 15 must adapt retained history and both cache kernels before adding
+logical Head operations. The current history still accepts composed intervals;
+the new contract requires atomic entries. The delta-cache adaptation removes
+heat, makes source entries
+enlargeable through one serialized source job, converges size-limited work
+inside that job through a monotonic source ceiling, adopts atomic dyadic
+targets and query-driven cache-age pruning, and adds the oversized-revision
+floor.
+Increment 15 initializes the active
+interval to 4 and keeps it fixed; dynamic adjustment remains the explicit open
+architecture decision recorded in the decision register.
 
 Implementation increment 11 is implemented: each `GraphPublication` now owns
 its publication-local SSE client registry and each connection owns one bounded,
