@@ -237,9 +237,10 @@ Serialized graph-window contents follow the API-owned extraction contract.
 
 The Web requests the canonical Head endpoint with its presentation
 `target_depth`. It retains that value locally; the response body does not echo
-it. The API can return any cached tier whose nominal depth covers the target.
-The Web trims a larger snapshot to exactly its presentation depth before
-constructing the visible image.
+it. The API returns the exact tier selected by the
+[protocol-owned Head-cache rule](api-protocol.md#publication-scoped-head-response-cache--settled),
+whose nominal depth covers the target. The Web trims that snapshot to exactly
+its presentation depth before constructing the visible image.
 
 For response `high_level = H` and target depth `D`, the desired nominal lower
 bound is `max(1, H - D + 1)`. Retain blocks within that nominal extent. Remove
@@ -286,7 +287,7 @@ SSE wakeup updates only the desired cursor and publication state.
 
 A Head-backed fixed view adds no distance-based delay or separate pacing
 policy. It follows the same continuation and SSE-wakeup flow as any canonical
-Head-delta consumer. The shared convergence interval and cached delta lane
+Head-delta consumer. The protocol-owned continuation and cached delta lane
 already group work, while another scheduler would deliberately increase cursor
 lag and exposure to Head-history expiry.
 

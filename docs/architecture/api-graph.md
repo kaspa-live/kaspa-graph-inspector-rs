@@ -93,6 +93,11 @@ enum GraphHistoryAppendError {
     },
 }
 
+enum GraphHistoryReplayability {
+    Replayable,
+    ReplayBarrier,
+}
+
 enum GraphHistoryRangeError {
     BackwardTarget {
         from_revision_id: u64,
@@ -105,6 +110,10 @@ enum GraphHistoryRangeError {
     StartUnavailable {
         requested: u64,
         current: u64,
+    },
+    StartBeforeReplayFloor {
+        requested: u64,
+        replay_floor_revision: u64,
     },
 }
 
@@ -222,6 +231,7 @@ type GraphHistoryEntryList = Arc<[Arc<GraphHistoryEntry>]>;
 struct GraphHistory {
     current_revision_id: u64,
     current_cumulative_estimated_bytes: u64,
+    replay_floor_revision: u64,
     entries: VecDeque<Arc<GraphHistoryEntry>>,
 }
 
@@ -514,6 +524,7 @@ impl GraphHistory {
         &mut self,
         delta: GraphDelta,
         estimated_raw_bytes: u64,
+        replayability: GraphHistoryReplayability,
     ) -> Result<(), GraphHistoryAppendError>;
 }
 ```
@@ -561,7 +572,7 @@ arithmetic. `GraphHistory` therefore stores exactly one original graph
 revision per entry and never stores a composed or otherwise aggregated delta.
 
 For an atomic gapless append, checked addition of the
-protocol-supplied `estimated_raw_bytes` to
+publication-supplied, protocol-defined `estimated_raw_bytes` to
 `current_cumulative_estimated_bytes` occurs before any history mutation. An
 exact cumulative result of `u64::MAX` is valid. Overflow is an internal
 invariant failure and panics; it is not a typed `GraphHistoryAppendError`, and
@@ -572,17 +583,35 @@ resources required to produce it.
 
 On success, `append` takes ownership of the delta and sets the history revision
 and cumulative estimate to the entry's target values atomically. A new
-revision-zero history starts with cumulative value zero. Consecutive stored
-entries are therefore gapless at every individual revision boundary. Once
-appended, a `GraphHistoryEntry` is immutable and shared by `Arc`. Append and pruning mutate
-the ordered stored collection within the enclosing publication's exclusive
-section. A range capture clones the selected entry Arcs into an immutable
-`GraphHistoryEntryList`, so later pruning cannot invalidate work already
-detached by a reader.
+revision-zero history starts with cumulative value zero and replay floor zero.
 
-The exact raw-byte estimator belongs to the
+The publication owner supplies `replayability` from the protocol-owned
+estimator decision made inside the original-update critical section.
+`GraphHistory` does not inspect the soft limit or independently classify the
+estimate. `Replayable` retains the new atomic entry. Consecutive retained
+entries are therefore gapless at every individual revision boundary.
+
+`ReplayBarrier` records an uncrossable public replay boundary. Append does not
+retain the entry. It clears the retained entry collection and advances
+`replay_floor_revision` to the delta's target revision. The current revision
+and cumulative estimate still advance normally because the canonical Head
+view has accepted the delta. Every later retained entry therefore starts at or
+after the inclusive floor. Repeating this case can only move the floor
+forward.
+
+Once retained, a `GraphHistoryEntry` is immutable and shared by `Arc`. Append
+and pruning mutate the ordered stored collection within the enclosing
+publication's exclusive section. A range capture clones the selected entry
+Arcs into an immutable `GraphHistoryEntryList`, so later pruning or replay-floor
+advancement cannot invalidate work already detached by a reader. The
+publication owner prevents such detached pre-floor work from becoming a public
+cache result or newly committed response.
+
+The exact raw-byte estimator and replayability classification belong to the
 [canonical Head-delta protocol](api-protocol.md#canonical-head-delta-responses--settled).
-The estimate is planning metadata rather than graph state or a wire field.
+The estimate is planning metadata rather than graph state or a wire field, but
+its soft-budget classification permanently determines replayability within the
+publication.
 Composition cancellations, response-local hash deduplication, and compression
 may make it differ from the final encoded size.
 
@@ -739,17 +768,20 @@ structure until its terminal transition to Frozen under the contract above.
 the ordered, continuity-certified `VspcProcessor` output and does not duplicate
 its continuity validation.
 
-GraphHistory retention is level-scoped. All revisions and deltas produced while
-a graph level remains within the retained head window are preserved. History
-associated with that level becomes eligible for pruning only when the level
-itself leaves the retained window. No independent revision-count or memory-size
-cap is required or permitted by this design.
+GraphHistory ordinary retention is level-scoped. Every replayable revision and
+delta produced while a graph level remains within the retained head window is
+preserved. History associated with that level becomes eligible for ordinary
+pruning only when the level itself leaves the retained window. Advancing the
+replay floor is the sole independent prefix-removal rule: it reflects an
+uncrossable semantic boundary rather than a revision-count or memory-size cap.
 
 ```rust
 impl GraphHistory {
     fn prune(&mut self, head_low_level: u32);
 
     fn oldest_available_revision(&self) -> u64;
+
+    fn replay_floor_revision(&self) -> u64;
 
     fn range(
         &self,
@@ -759,7 +791,7 @@ impl GraphHistory {
 }
 ```
 
-Pruning removes the longest stored prefix for which:
+Ordinary pruning removes the longest stored prefix for which:
 
 ```text
 delta.head_level < head_low_level
@@ -771,7 +803,8 @@ current revision nor cumulative field. If entries remain,
 `oldest_available_revision()` is the first entry's `from_revision_id`;
 otherwise it is `current_revision_id`.
 
-Pruning preserves absolute `cumulative_estimated_bytes` values rather than
+Both ordinary pruning and replay-floor clearing preserve absolute
+`cumulative_estimated_bytes` values rather than
 rebasing retained entries. Each cost boundary is the corresponding
 `entry.delta.to_revision_id`. For two retained boundaries `from < to`:
 
@@ -825,8 +858,10 @@ atomic revision and timestamp.
 
 For a range request, compare the target with the start before inspecting
 retained history. A target below the start returns `BackwardTarget` and creates
-no delta. When the target equals the start, return `UpToDate`. Otherwise, the
-starting revision must be an exact retained entry boundary. A start before
+no delta. When the target equals the start, return `UpToDate`. Otherwise, a
+start below `replay_floor_revision` returns `StartBeforeReplayFloor` carrying
+the inclusive first replayable revision. A remaining starting revision must be
+an exact retained entry boundary. A start before
 `oldest_available_revision()` returns `StartPruned`; a start inside an
 already-pruned interval, after current history, or otherwise absent returns
 `StartUnavailable`. A valid forward request selects gapless entries beginning

@@ -141,15 +141,32 @@ SOFT_DELTA_ESTIMATED_BYTES = 4 MiB
 MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES = 16 MiB
 ```
 
-The soft limit guides only canonical-delta target selection. Crossing it moves
-selection to an earlier dyadic boundary, down to one complete atomic history
-entry; it never splits an entry or authorizes an oversized result.
+The soft limit governs canonical-delta replayability and target selection. The
+canonical estimator must be conservative enough that:
 
-The hard limit measures the complete uncompressed JSON body of every Head
-snapshot, canonical delta, anchored window, and Head-level lookup response.
-Compression ratio never authorizes a larger logical response. Gzip runs only
-after JSON serialization and that size check succeed. A compression failure
-retains the common request-local failure policy and publishes no cache entry.
+```text
+estimated_raw_bytes < SOFT_DELTA_ESTIMATED_BYTES
+    implies
+encoded_delta_json_bytes <= MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES
+```
+
+This implication applies both to one atomic history entry and to the additive
+estimate of every candidate batch. Reaching the soft limit moves a multi-entry
+candidate to an earlier dyadic boundary; it never splits an entry. One atomic
+entry that reaches the soft limit is instead an uncrossable replay boundary
+under the history-owned rule. A canonical delta candidate below the soft limit
+still measures its final JSON against the hard limit. If the stated implication
+is unexpectedly false, emit an error-level estimator-invariant diagnostic and
+continue with the complete response. The observation is not a public fallback,
+cursor-recovery outcome, or cache-admission failure.
+
+The hard limit is enforced against the complete uncompressed JSON body of every
+Head snapshot, anchored window, and Head-level lookup response. Compression
+ratio never authorizes a larger logical response. Canonical deltas use the
+soft-limit admission guarantee above and retain the hard comparison as a
+diagnostic invariant check rather than an enforcement point. Gzip runs after
+JSON serialization and the applicable check. A compression failure retains
+the common request-local failure policy and publishes no cache entry.
 
 Compression does not alter graph semantics. Gzip quality does not change
 `representation_version`, graph revision, cache identity, or the weak Head
@@ -1172,10 +1189,10 @@ After future-cursor rejection and any supplied-client validation, every valid
 delta query, including the equality case, performs the
 [query-driven cache pruning](#publication-scoped-head-response-cache--settled)
 against the captured Head timestamp before exact-source lookup. An equality
-request then returns `UpToDate`. A forward request first checks the
-publication-local oversized-revision floor. A source below that floor returns
-`FreshViewRequired(FirstStoredDeltaExceedsBudget)` without history or encoding
-work.
+request then returns `UpToDate`. A forward request first compares its source
+with the history-owned `replay_floor_revision`. A source below that inclusive
+first-replayable revision returns
+`FreshViewRequired(FirstStoredDeltaExceedsBudget)` without encoding work.
 
 An exact completed cache entry is adequate when it reaches at least the target
 selected for this request, or when it is marked `size_limited`. An adequate
@@ -1217,6 +1234,9 @@ Public outcomes map as follows:
   at response completion;
 - on a completed-cache miss, `GraphHistoryRangeError::StartPruned` returns
   `FreshViewRequired(StartPruned)`;
+- on a completed-cache miss,
+  `GraphHistoryRangeError::StartBeforeReplayFloor` returns
+  `FreshViewRequired(FirstStoredDeltaExceedsBudget)`;
 - on a completed-cache miss, `GraphHistoryRangeError::StartUnavailable` returns
   `FreshViewRequired(StartUnavailable)`; and
 - `GraphHistoryRange::UpToDate` returns `DeltaResponseOutcome::UpToDate`.
@@ -1243,60 +1263,64 @@ policy requires no finer precision. At
 source response from history; return `FreshViewRequired(DeltaSourceExpired)`.
 A Stale publication has a fixed final `HT`, so its cache ages stop advancing.
 
-When appending a canonical Head delta, ApiService supplies its cheap
-`estimated_raw_bytes` from mutation counts and approximate field sizes for the
-cacheable wire representation. The estimate discounts the block and edge
-removals that the serializer will omit, is additive across entries, and
-performs no graph encoding or compression. The concrete weights are recorded
-as a durable [implementation choice](../implementation/choices.md#canonical-delta-raw-byte-estimate);
-the estimate selects a candidate and never authorizes an oversized response.
+Each original canonical Head delta receives a cheap `estimated_raw_bytes` from
+mutation counts and approximate field sizes for the cacheable wire
+representation. The estimate discounts the block and edge removals that the
+serializer will omit, is additive across entries, and performs no graph
+encoding or compression. The concrete weights are recorded as a durable
+[implementation choice](../implementation/choices.md#canonical-delta-raw-byte-estimate);
+those weights must preserve the estimator implication owned by the compression
+contract above. An atomic estimate below the soft limit is `Replayable`; one at
+or above it is `ReplayBarrier` and is never eligible for cache construction.
+The [publication owner](api-publication.md#publication-synchronization-and-request-capture--settled)
+defines where this classification occurs and its ordering with cache
+invalidation. The [graph owner](api-graph.md#revision-and-history-advancement--settled)
+defines the classification's history effect.
 
 Once an elected builder captures its exact target, that target does not advance
 with Head while the job runs. Preserve the chosen atomic history
 entries as ordered replay units, construct one response-local hash dictionary
-across the complete list, serialize one `GraphDeltaBatchDto`, and check its
+across the complete list, serialize one `GraphDeltaBatchDto`, and measure its
 uncompressed byte length against the hard response limit.
 
-The soft estimate and hard size limit may shorten only along the same
-descending target ladder. Excluding candidate target `X` under
-`SOFT_DELTA_ESTIMATED_BYTES`, or measuring its final JSON above
-`MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES`, is source-wide size evidence rather
-than an ordinary job failure. The running source job atomically lowers its
-exclusive source-wide size ceiling through `X` and continues at the farthest
-descending target below that ceiling. Its waiters remain attached to the same
-pending job and observe no intermediate public failure. Repeated size evidence
-can lower the ceiling again, down to the single atomic `F -> F + 1` target even
-when that is below the base or active interval. The soft estimate never
-excludes that final atomic target from its mandatory hard-size check. If the
-selected fallback already exists as the completed value, the job promotes the
-same encoded bytes to the size-limited result without re-encoding. Otherwise,
-the first successful fallback becomes that result.
+The soft estimate may shorten only along the same descending target ladder.
+When candidate target `X` makes the additive estimate reach
+`SOFT_DELTA_ESTIMATED_BYTES`, that is source-wide size evidence rather than an
+ordinary job failure. The running source job atomically lowers its exclusive
+source-wide size ceiling through `X` and continues at the farthest descending
+target below that ceiling. Its waiters remain attached to the same pending job
+and observe no intermediate public failure. Repeated size evidence can lower
+the ceiling again. It cannot reach an atomic target whose own estimate reaches
+the soft limit because history already made that revision an uncrossable
+replay boundary at append time. If the selected fallback already exists as the
+completed value, the job promotes the same encoded bytes to the size-limited
+result without re-encoding. Otherwise, the first successful fallback becomes
+that result.
 The cache records `size_limited = true`, and later requests reuse it without
 attempting an impossible enlargement. Head- or state-limited shortening
 records `size_limited = false` and remains eligible for later dyadic
 enlargement.
 
-Serialization, gzip, cancellation, and other non-size failures establish no
-ceiling and retain their ordinary request-local dispositions.
-
-If the single atomic revision `R -> R + 1` exceeds the hard limit, return
-`FreshViewRequired(FirstStoredDeltaExceedsBudget)` and advance the
-publication-local delta-serving floor through `R + 1`. Physically remove every
-cache slot with a source below that floor. No later request may serve or rebuild
-from an earlier source; `R + 1` is the first source from which delta delivery
-can resume. There is no lower target to which affected waiters can be
-redirected; they receive that fresh-view outcome. Repeating this discovery can
-only move the floor forward.
+Every candidate admitted to canonical-delta serialization has an estimate
+strictly below the soft limit. Measuring its final JSON above the hard limit is
+therefore an estimator-invariant violation. Emit an error-level diagnostic
+containing the estimate and observed uncompressed size, then continue to gzip,
+cache, and serve the complete response. The violation does not lower a size
+ceiling, advance the replay floor, select a smaller public result, or become a
+request failure. Serialization, gzip, cancellation, and other non-size
+failures retain their ordinary request-local dispositions and establish no
+ceiling.
 
 Every returned entry is complete under the public Head-window contract and
 every batch ends exactly at its selected atomic boundary. Cache construction
 never composes selected entries. Gzip compression and cache insertion occur
-only after the complete batch passes the hard check.
+only after the complete batch has been measured and any estimator-invariant
+diagnostic has been emitted.
 
 For each delivery, return `Complete` when the actual returned right boundary
 reaches or extends through that request's coherently captured Head revision.
-Return `Prefix` when cache-destination selection or uncompressed-JSON-size
-fallback stops at an earlier complete boundary. These are request-specific
+Return `Prefix` when cache-destination selection or soft-estimate descent stops
+at an earlier complete boundary. These are request-specific
 envelope outcomes rather than fields of the encoded batch. A later request may
 therefore wrap the same cached body differently as Head advances.
 
@@ -1523,10 +1547,13 @@ uncompressed JSON exceeds `MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES` returns
 `422 Unprocessable Content` with code `graph-response-too-large`, identifies
 the hard byte limit and the observed uncompressed JSON size, and returns no
 partial graph. The client may retry with a smaller depth or fewer levels.
-Canonical deltas descend through their dyadic target ladder to one atomic
-revision. If that single revision cannot fit, they return
-`FreshViewRequired(FirstStoredDeltaExceedsBudget)` and advance the
-publication-local delta-serving floor.
+Canonical deltas admit only candidates whose estimate is below the soft limit,
+which guarantees that the encoded body fits the hard limit. An atomic entry at
+or above the soft limit has already advanced the history-owned replay floor;
+requests below it return
+`FreshViewRequired(FirstStoredDeltaExceedsBudget)`. An unexpectedly oversized
+below-soft canonical delta logs the estimator-invariant violation and remains
+a successful complete or prefix response.
 
 Rejection before response commitment because the applicable bounded public
 HTTP, status, historical-read, serialization, or SSE admission lane is full
@@ -1659,8 +1686,8 @@ struct CachedDelta {
 
 `gzip_body` is the final compressed JSON encoding of
 [`GraphDeltaBatchDto`](#canonical-delta-response-dtos--settled).
-`uncompressed_json_bytes` is the byte length checked against the hard response
-limit before compression; `gzip_body.len()` is the transferred body size. The
+`uncompressed_json_bytes` is the measured byte length compared with the hard
+response limit before compression; `gzip_body.len()` is the transferred body size. The
 cached `from_revision_id` and `to_revision_id` are the first and last entry
 boundaries. `size_limited` has the enlargement meaning fixed by the canonical-
 delta contract. Target entry timestamps, target Head levels, and entry count
@@ -1674,10 +1701,13 @@ boundary, or retry delay. ApiService reuses
 those exact compressed bytes and adds request-specific HTTP headers. Whether
 that lightweight HTTP wrapper is also retained is an implementation detail.
 
-Every `CachedDelta` is individually bounded by
-`MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES`. `GraphCache` has no independent total
-encoded-byte cap; publication lifetime, the five-minute cache-age horizon,
-and demand-driven construction provide its structural bound.
+Every `CachedDelta` is admitted below `SOFT_DELTA_ESTIMATED_BYTES` and is
+therefore expected to remain within
+`MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES`. An estimator-invariant violation does
+not prevent retaining the observed larger value. `GraphCache` has no
+independent total encoded-byte cap; publication lifetime, the five-minute
+cache-age horizon, demand-driven construction, and the estimator guarantee
+provide its structural bound.
 
 The delta cache and its source-keyed single-flight jobs serve both
 SSE-coordinated and HTTP-only delta-to-current requests and are ordered by
@@ -1689,8 +1719,8 @@ captured request. Normal completion installs a farther completed value, and an
 ordinary failure affects only that source job.
 
 Each source slot retains its optional exclusive size ceiling. The first
-linearized soft- or hard-size exclusion lowers that ceiling. The same pending
-source job descends to the next lower target, retaining its waiters and exact
+linearized soft-estimate exclusion lowers that ceiling. The same pending source
+job descends to the next lower target, retaining its waiters and exact
 cache-slot identity until it completes or fails. No competing construction for
 that source exists to invalidate or cancel.
 
@@ -1724,6 +1754,23 @@ The [ApiService operational measurements](api-service.md#resource-isolation-and-
 observe cache and dyadic delivery behavior. Controller selection remains
 governed by the open controller decision; observations never alter cursor
 validity or graph contents before that decision is settled.
+
+The history-owned replay floor is not duplicated in `GraphCache`. When an
+append advances it, publication synchronization physically removes every
+delta source slot below the new floor and invalidates each detached job before
+the mutation becomes externally available. A completed delta acquired before
+that invalidation must compare its source with the current floor again before
+final response admission. A source exactly equal to the floor remains
+eligible.
+
+For both cached delta and Head responses, final floor comparison and admission
+must be linearized with replay-floor advancement. A floor advance that occurs
+first forces rejection or recapture; one that occurs after admission does not
+revoke that immutable response. The
+[publication synchronization owner](api-publication.md#publication-synchronization-and-request-capture--settled)
+defines the concrete critical section and lock lifetime. Other completion
+checks, including client-registration validation, retain their ordinary
+authority.
 
 ### Tiered Head snapshot cache
 
@@ -1769,33 +1816,50 @@ age_ms = H.revision_timestamp_ms - C.revision_timestamp_ms
 
 Both values belong to the same publication-local monotonic timestamp domain;
 observing `C` later than `H` is an internal invariant failure. The entry is
-eligible exactly while `age_ms < CACHED_HEAD_SNAPSHOT_MAX_AGE_MS`.
+eligible exactly while:
+
+```text
+C.revision >= H.replay_floor_revision
+and age_ms < CACHED_HEAD_SNAPSHOT_MAX_AGE_MS
+```
 
 Expiration is lazy and query driven. An incoming query samples the current
-Head timestamp and examines only its selected tier. If that completed entry
-has reached the maximum age, the operation physically removes it before
-joining or installing the selected-tier job. It does not inspect or remove an
-expired entry in any other tier. Head advancement, publication installation,
-and elapsed wall time start no scan, removal, refresh, or construction. The
-fixed tier count and per-entry response limit bound completed entries that
-have not yet been queried again.
+Head timestamp and replay floor and examines only its selected tier. If that
+completed entry has reached the maximum age, the operation physically removes
+it before joining or installing the selected-tier job. It does not inspect or
+remove an expired entry in any other tier. Head advancement, publication
+installation, and elapsed wall time start no scan, removal, refresh, or
+construction. The fixed tier count and per-entry response limit bound
+completed entries that have not yet been queried again.
 
 After extraction, JSON serialization, size checking, and gzip complete, a tier
-job samples the publication's then-current Head revision timestamp and applies
-the same age check before cache insertion, terminal job completion, or waiter
-delivery. An obsolete candidate is discarded without becoming a cache entry,
-successful result, or `CacheBuildError`. The same logical tier construction
-remains pending, all current waiters remain joined, and it repeats from a newer
-coherent Frozen capture. Concurrent demand for that exact tier continues to
-join the construction.
+job samples the publication's then-current Head revision timestamp and replay
+floor and applies the same eligibility check before cache insertion, terminal
+job completion, or waiter delivery. An age-obsolete candidate is discarded
+without becoming a cache entry, successful result, or `CacheBuildError`. The
+same logical tier construction remains pending, all current waiters remain
+joined, and it repeats from a newer coherent Frozen capture. A below-floor job
+has already been detached and receives the replay-floor terminal state instead.
+Concurrent demand for that exact tier continues to join the applicable
+construction.
 
 Once a completed entry or newly encoded candidate passes its request-time or
-completion-time check, later Head advancement does not revoke that admission,
-terminal job result, or in-flight response. A later request performs a new age
-check. Failure removes the selected-tier job and permits a later request to
-retry; there is no preceding entry to preserve as a serve-and-refresh value.
+completion-time check, ordinary later Head advancement that does not advance
+the replay floor does not revoke that admission, terminal job result, or
+in-flight response. A later request performs a new age check. Failure removes
+the selected-tier job and permits a later request to retry; there is no
+preceding entry to preserve as a serve-and-refresh value.
 Waiter completion, job removal, and retry availability belong to the
 [ApiService task contract](api-service.md#api-task-ownership-and-completion--settled).
+
+Replay-floor advancement is distinct from age expiration. It synchronously
+removes every completed Head snapshot whose revision is below the floor and
+invalidates every running Head-tier job, because each such job captured its
+view before the floor-advancing mutation. A Head snapshot acquired before that
+invalidation must compare its revision with the current floor again at the
+common final replay-floor-admission point. A snapshot at the floor remains
+eligible. An invalidated waiter re-enters its selected exact tier and builds or
+joins a new capture.
 
 `Synchronizing` and `Live` compare snapshots with their moving Head timestamp.
 A terminal `Stale` publication stops advancing, so snapshot age becomes fixed;

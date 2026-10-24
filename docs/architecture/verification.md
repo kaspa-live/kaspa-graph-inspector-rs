@@ -1529,6 +1529,16 @@ value, or retained entries. A simultaneous revision mismatch must return
 revision with a multi-revision delta must return `NonAtomicDelta` before
 cumulative arithmetic and leave the history unchanged.
 
+Drive `GraphPublication` original-update application with an estimate one byte
+below `SOFT_DELTA_ESTIMATED_BYTES` and require it to supply `Replayable` so
+history retains the atomic entry. At the exact soft limit and above it, require
+the publication to supply `ReplayBarrier`; history advances the replay floor
+to the target revision, clears retained entries, omits the uncrossable entry,
+and preserves normal current-revision and cumulative-cost advancement.
+Repeating the case must move the floor only forward. A forward range from below
+the floor returns `StartBeforeReplayFloor`; a source exactly at the floor
+remains eligible for later retained entries.
+
 Verify dyadic successor selection from zero, unaligned sources, every power of
 two through the 128-revision cap, and sources divisible by larger powers. Cover
 the exact normalization spans `4..=7`, including `17 -> 24`, followed by
@@ -1541,21 +1551,41 @@ that set. ApiService must initialize the interval to 4 and retain its current
 value across publication reset and replacement; the open controller decision
 supplies no further executable policy.
 
-Force the soft estimate and final uncompressed JSON limit to descend through
-successive dyadic boundaries while rebuilding one shared dictionary for each
-encoded candidate. Permit descent below both the four-revision base and active
-interval to one atomic entry. Mark a shortened successful value
-`size_limited`, reuse it without another enlargement attempt, and distinguish
-Head- or state-limited shortening that remains enlargeable. A gzip body that
-transfers efficiently must not permit an over-limit uncompressed body.
+Force additive estimates to reach the soft limit at successive dyadic
+boundaries while rebuilding one shared dictionary for each admitted candidate.
+Permit descent below both the four-revision base and active interval. Mark a
+shortened successful value `size_limited`, reuse it without another enlargement
+attempt, and distinguish Head- or state-limited shortening that remains
+enlargeable. Prove, at worst-case integer, dictionary-reference, and framing
+widths, that every canonical candidate whose estimate is below the soft limit
+fits the hard uncompressed limit. A gzip body that transfers efficiently must
+not permit a Head snapshot, anchored window, or Head-level lookup to exceed its
+hard logical-body limit.
 
-Make one atomic `R -> R + 1` entry exceed the hard limit. Require the fresh-view
-outcome, monotonic advancement of the delta-serving floor through `R + 1`, and
-physical removal of every earlier source slot. Later requests below the floor
-must perform no history or encoding work, while a request from `R + 1` remains
-eligible. The atomic case has no smaller redirect target: invalidate all
-affected jobs and give their waiters the same fresh-view outcome. Repeat with a
-later oversized atomic entry and prove the floor never moves backward.
+Make one atomic `R -> R + 1` entry reach the soft limit. During application of
+that original update, require `GraphPublication` to classify the entry, advance
+the history replay floor through `R + 1`, and prune the affected caches without
+attempting delta JSON encoding or exposing the new core between those actions.
+Physically remove every earlier delta source slot and every below-floor
+completed Head tier, and invalidate the affected delta jobs plus all running
+Head-tier jobs. Later requests below the floor must perform no encoding work,
+while a request or snapshot from exactly `R + 1` remains eligible. Give delta
+waiters the fresh-view outcome and make Head-tier waiters re-enter their
+selected tier. Repeat with a later uncrossable atomic entry and prove the floor
+never moves backward. Inject a deliberately broken estimator whose below-soft
+candidate exceeds the hard limit. Require one error-level diagnostic with the
+estimate and observed size, followed by successful compression, cache
+insertion, and delivery of the complete response. It must not descend, advance
+the replay floor, or produce fresh-view recovery.
+
+Pause delta and Head responses after they acquire completed pre-floor cache
+values but before replay-floor admission, then advance the replay floor. Both
+must reject those values at their final floor check; the delta request returns
+the fresh-view outcome and the Head request re-enters its exact tier. Admit a
+response first and prove that later floor advancement does not revoke it. Race
+invalidation against job completion and require exactly one terminal
+transition: the replay-floor state cannot be overwritten by encoding success,
+ordinary failure, or cancellation.
 
 For tiered Head snapshot reuse, install a publication with no encoded tier and
 require the first request for each applicable tier, including `20`, to start
@@ -1595,7 +1625,7 @@ and preserves the preceding completed value.
 Wrap one cached batch body with different valid request-specific publication
 and coherent Head revision/timestamp headers without serializing, compressing,
 or decompressing it. Verify that `CachedDelta` retains its boundaries,
-`size_limited` state, checked uncompressed JSON byte count, and final gzip body
+`size_limited` state, measured uncompressed JSON byte count, and final gzip body
 without duplicating target timestamps, Head levels, or entry count as semantic
 fields. Its source slot separately retains the first atomic entry's target
 timestamp. Exercise an SSE-coordinated and HTTP-only request from the same
@@ -1609,10 +1639,12 @@ completed value throughout enlargement and replace it only after successful
 farther completion. A response already committed to delivery remains valid.
 
 Make one target cross the soft estimate and, separately, the hard uncompressed
-limit. Lower the exclusive source ceiling and require the same pending source
-job to descend to each next-lower target without exposing an intermediate
-public error or detaching its waiters. Repeat until a fitting result is marked
-`size_limited`.
+limit. The soft crossing lowers the exclusive source ceiling and requires the
+same pending source job to descend to each next-lower target without exposing
+an intermediate public error or detaching its waiters. The injected hard-limit
+crossing below the soft estimate logs the estimator-invariant violation, must
+not lower the ceiling, and still publishes the complete cached result. Repeat
+ordinary soft descent until a fitting result is marked `size_limited`.
 When the selected lower boundary already exists as the completed value, reuse
 its bytes and promote it without encoding. Serialization, gzip, cancellation,
 and unrelated job failures must establish no ceiling.
@@ -1759,7 +1791,7 @@ Terminal ApiService shutdown cancels and joins unfinished jobs. Retaining or
 pruning a source history boundary must not itself retain or prune a completed
 delta; history and response-cache lifetimes remain independent. Cover
 source-ordered query-time pruning, source-slot replacement, and
-oversized-revision floor advancement through the focused cases above; no
+history-owned replay-floor advancement through the focused cases above; no
 Head-advance or target-level pruning path may remain. At the five-minute source
 boundary, require a fresh window before starting a job. Historical database
 windows bypass this cache.
@@ -2032,14 +2064,16 @@ failure, require exact-job removal before the shared error so an immediate
 retry starts new work. A cancelled receiver must not alter the job, and a
 dropped origin cache must prevent insertion without preventing receiver
 completion. Exercise completion after every waiter has detached and require
-`send_replace` to retain the terminal job value without restoring a cache slot.
+the one-way `Pending` transition to retain the terminal job value without
+restoring a cache slot.
 
 Exercise `DeltaCache` as one source-revision-ordered value under the enclosing
 cache critical section. Exact lookup, running-job election, completed
 replacement, serialized enlargement, monotonic size-ceiling reduction,
-expired-prefix pruning, and oversized-floor invalidation must preserve one
-coherent slot map. Prove that equal first-revision timestamps do not break
-prefix pruning and that no destination-heat or target-level side index remains.
+expired-prefix pruning, and history-floor invalidation must preserve one
+coherent slot map without storing an independent floor. Prove that equal
+first-revision timestamps do not break prefix pruning and that no
+destination-heat or target-level side index remains.
 
 Verify all cache orchestration tasks are registered in the ApiService task
 tracker. Include every demand-triggered tier-keyed Head snapshot job in the

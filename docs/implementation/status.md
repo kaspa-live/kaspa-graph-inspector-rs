@@ -322,8 +322,15 @@ the new contract requires atomic entries. The delta-cache adaptation removes
 heat, makes source entries
 enlargeable through one serialized source job, converges size-limited work
 inside that job through a monotonic source ceiling, adopts atomic dyadic
-targets and query-driven cache-age pruning, and adds the oversized-revision
-floor.
+targets and query-driven cache-age pruning, and makes `GraphPublication`
+classify an atomic estimate reaching the soft limit so `GraphHistory` records
+an append-time replay floor.
+The same adaptation must synchronously invalidate pre-floor delta and Head
+cache work and validate the conservative estimator implication before using
+the existing weights for target or replay-floor decisions. It must also adapt
+the currently limit-enforcing encoder so a soft-admitted canonical delta logs
+an unexpected hard-threshold overrun but still completes gzip and cache
+construction; the enforced limit remains unchanged for other graph bodies.
 Increment 15 initializes the active
 interval to 4 and keeps it fixed; dynamic adjustment remains the explicit open
 architecture decision recorded in the decision register.
