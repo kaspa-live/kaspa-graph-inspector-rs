@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Instant};
 use kgi_api_model::{
     delta::GraphDelta,
     graph::{GraphView, GraphViewExtractError, LevelExtent, TrackingPolicy},
-    history::{GraphHistory, GraphHistoryRange, GraphHistoryRangeError, GraphHistoryReplayability},
+    history::{GraphHistory, GraphHistoryRange, GraphHistoryRangeError},
 };
 use kgi_model::graph_update::{BlockCommitted, VspcCommitted};
 use rand::{RngCore, rngs::OsRng};
@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::{cache::GraphCache, client::SseClientRegistry};
 
 pub(crate) use self::error::PublicationProjectionError;
-use self::estimate::estimate_raw_delta_bytes;
+use self::estimate::{classify_replayability, estimate_raw_delta_bytes};
 
 /// Externally meaningful lifecycle state of one graph publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +43,8 @@ pub(crate) struct GraphPublicationCore {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GraphViewCapture {
     publication_id: u64,
+    replay_floor_revision: u64,
+    oldest_available_revision: u64,
     view: GraphView,
 }
 
@@ -50,6 +52,16 @@ impl GraphViewCapture {
     /// Returns the publication that supplied this view.
     pub(crate) const fn publication_id(&self) -> u64 {
         self.publication_id
+    }
+
+    /// Returns the inclusive replay floor observed with this view.
+    pub(crate) const fn replay_floor_revision(&self) -> u64 {
+        self.replay_floor_revision
+    }
+
+    /// Returns the oldest retained history boundary observed with this view.
+    pub(crate) const fn oldest_available_revision(&self) -> u64 {
+        self.oldest_available_revision
     }
 
     /// Returns the captured frozen graph view.
@@ -71,6 +83,7 @@ pub(crate) struct GraphDeltaTargetCapture {
     revision: u64,
     revision_timestamp_ms: u64,
     head_level: u32,
+    replay_floor_revision: u64,
 }
 
 impl GraphDeltaTargetCapture {
@@ -98,6 +111,11 @@ impl GraphDeltaTargetCapture {
     pub(crate) const fn head_level(self) -> u32 {
         self.head_level
     }
+
+    /// Returns the inclusive replay floor observed with the target Head.
+    pub(crate) const fn replay_floor_revision(self) -> u64 {
+        self.replay_floor_revision
+    }
 }
 
 /// One publication-local graph lineage and its synchronization boundary.
@@ -110,6 +128,8 @@ pub(crate) struct GraphPublication {
     clients: SseClientRegistry,
     #[cfg(test)]
     atomic_mutation_test_hook: Option<std::sync::Arc<AtomicMutationTestHook>>,
+    #[cfg(test)]
+    delta_estimate_test_override: Option<u64>,
 }
 
 #[cfg(test)]
@@ -176,6 +196,8 @@ impl GraphPublication {
             clients: SseClientRegistry::new(publication_id, initial_state, view_revision),
             #[cfg(test)]
             atomic_mutation_test_hook: None,
+            #[cfg(test)]
+            delta_estimate_test_override: None,
         })
     }
 
@@ -231,14 +253,24 @@ impl GraphPublication {
     pub(crate) async fn capture_view(&self) -> GraphViewCapture {
         let core = self.core.read().await;
         let view = core.view.extract_subview(core.view.extent()).expect("a graph view contains its own extent");
-        GraphViewCapture { publication_id: self.publication_id, view }
+        GraphViewCapture {
+            publication_id: self.publication_id,
+            replay_floor_revision: core.history.replay_floor_revision(),
+            oldest_available_revision: core.history.oldest_available_revision(),
+            view,
+        }
     }
 
     /// Captures one contained extent from the current Head as an owned frozen view.
     pub(crate) async fn capture_subview(&self, extent: LevelExtent) -> Result<GraphViewCapture, GraphViewExtractError> {
         let core = self.core.read().await;
         let view = core.view.extract_subview(extent)?;
-        Ok(GraphViewCapture { publication_id: self.publication_id, view })
+        Ok(GraphViewCapture {
+            publication_id: self.publication_id,
+            replay_floor_revision: core.history.replay_floor_revision(),
+            oldest_available_revision: core.history.oldest_available_revision(),
+            view,
+        })
     }
 
     /// Captures one coherent canonical-delta target from the current core.
@@ -250,6 +282,7 @@ impl GraphPublication {
             revision: core.view.current_revision_id(),
             revision_timestamp_ms: core.view.current_revision_timestamp_ms(),
             head_level: core.view.high_level(),
+            replay_floor_revision: core.history.replay_floor_revision(),
         }
     }
 
@@ -284,12 +317,25 @@ impl GraphPublication {
         let mut core = self.core.write().await;
         assert_ne!(core.state, GraphPublicationState::Stale, "a Stale publication is not mutated");
         let GraphPublicationCore { view, history, .. } = &mut *core;
-        let applied = AppliedLineageUpdate::apply(view, history, update, self.revision_timestamp_ms(), || {
-            #[cfg(test)]
-            if let Some(hook) = &self.atomic_mutation_test_hook {
-                hook.pause_after_view_update();
-            }
-        })?;
+        let applied = AppliedLineageUpdate::apply(
+            view,
+            history,
+            update,
+            self.revision_timestamp_ms(),
+            |delta| {
+                #[cfg(test)]
+                if let Some(estimated_raw_bytes) = self.delta_estimate_test_override {
+                    return estimated_raw_bytes;
+                }
+                estimate_raw_delta_bytes(delta)
+            },
+            || {
+                #[cfg(test)]
+                if let Some(hook) = &self.atomic_mutation_test_hook {
+                    hook.pause_after_view_update();
+                }
+            },
+        )?;
         let Some(applied) = applied else {
             return Ok(None);
         };
@@ -330,6 +376,7 @@ impl AppliedLineageUpdate {
         history: &mut GraphHistory,
         update: OriginalUpdate<'_>,
         revision_timestamp_ms: u64,
+        estimate_delta: impl FnOnce(&GraphDelta) -> u64,
         after_view_update: impl FnOnce(),
     ) -> Result<Option<Self>, PublicationProjectionError> {
         let view_revision = view.current_revision_id();
@@ -343,10 +390,9 @@ impl AppliedLineageUpdate {
         };
         after_view_update();
         let target_revision = delta.to_revision_id();
-        let estimated_raw_bytes = estimate_raw_delta_bytes(&delta);
-        history
-            .append(delta, estimated_raw_bytes, GraphHistoryReplayability::Replayable)
-            .expect("a successful Head update extends its matching history");
+        let estimated_raw_bytes = estimate_delta(&delta);
+        let replayability = classify_replayability(estimated_raw_bytes);
+        history.append(delta, estimated_raw_bytes, replayability).expect("a successful Head update extends its matching history");
         history.prune(view.low_level());
         Ok(Some(Self { target_revision, head_high_level: view.high_level() }))
     }
@@ -383,7 +429,7 @@ mod tests {
     use kgi_api_model::{
         delta::GraphDelta,
         graph::{GraphViewUpdateError, Level, LevelExtent},
-        history::{GraphHistoryRange, GraphHistoryRangeError},
+        history::{GraphHistoryRange, GraphHistoryRangeError, GraphHistoryReplayability},
     };
     use kgi_model::{
         block::{BlockColor, BlockCoordinate, BlockHash, CompactId},
@@ -595,6 +641,48 @@ mod tests {
         let core = publication.core.read().await;
         assert_eq!(core.view.current_revision_id(), 2);
         assert_eq!(core.history.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn original_update_classifies_the_exact_soft_estimate_boundary() {
+        for (estimated_raw_bytes, expected_replayability) in [
+            (estimate::SOFT_DELTA_ESTIMATED_BYTES - 1, GraphHistoryReplayability::Replayable),
+            (estimate::SOFT_DELTA_ESTIMATED_BYTES, GraphHistoryReplayability::ReplayBarrier),
+            (estimate::SOFT_DELTA_ESTIMATED_BYTES + 1, GraphHistoryReplayability::ReplayBarrier),
+        ] {
+            let expected_replay_floor = match expected_replayability {
+                GraphHistoryReplayability::Replayable => 0,
+                GraphHistoryReplayability::ReplayBarrier => 1,
+            };
+            let mut publication =
+                GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view(), GraphHistory::new())
+                    .expect("matching candidate");
+            publication.delta_estimate_test_override = Some(estimated_raw_bytes);
+
+            assert_eq!(publication.apply_block_committed(&committed_block(2)).await.expect("block update"), Some(1));
+
+            let core = publication.core.read().await;
+            assert_eq!(core.view.current_revision_id(), 1);
+            assert_eq!(core.history.current_revision_id(), 1);
+            assert_eq!(core.history.current_cumulative_estimated_bytes(), estimated_raw_bytes);
+            match expected_replayability {
+                GraphHistoryReplayability::Replayable => {
+                    assert_eq!(core.history.replay_floor_revision(), 0);
+                    assert_eq!(core.history.len(), 1);
+                }
+                GraphHistoryReplayability::ReplayBarrier => {
+                    assert_eq!(core.history.replay_floor_revision(), 1);
+                    assert!(core.history.is_empty());
+                }
+            }
+            drop(core);
+
+            let view = publication.capture_view().await;
+            let target = publication.capture_delta_target().await;
+            assert_eq!(view.replay_floor_revision(), expected_replay_floor);
+            assert_eq!(view.oldest_available_revision(), expected_replay_floor);
+            assert_eq!(target.replay_floor_revision(), expected_replay_floor);
+        }
     }
 
     #[tokio::test]
@@ -824,10 +912,14 @@ mod tests {
 
         let full = publication.capture_view().await;
         assert_eq!(full.publication_id(), publication.publication_id());
+        assert_eq!(full.replay_floor_revision(), 0);
+        assert_eq!(full.oldest_available_revision(), 0);
         assert_eq!(full.view().tracking_policy(), TrackingPolicy::Frozen);
         assert_eq!(full.view().current_revision_id(), 1);
         assert!(full.view().block(&hash(2)).is_some());
         let subview = publication.capture_subview(LevelExtent::new(1, 1).expect("valid extent")).await.expect("contained extent");
+        assert_eq!(subview.replay_floor_revision(), full.replay_floor_revision());
+        assert_eq!(subview.oldest_available_revision(), full.oldest_available_revision());
         assert_eq!(subview.view().extent(), LevelExtent::new(1, 1).expect("valid extent"));
         assert_eq!(
             publication.capture_subview(LevelExtent::new(2, 3).expect("valid extent")).await,
@@ -837,6 +929,7 @@ mod tests {
         publication.apply_block_committed(&committed_block(3)).await.expect("second block update");
         let target = publication.capture_delta_target().await;
         assert_eq!(target.publication_id(), publication.publication_id());
+        assert_eq!(target.replay_floor_revision(), 0);
         let retained = publication.capture_history_range(0, target).await.expect("retained history");
         let GraphHistoryRange::Deltas { actual_target, entries, .. } = retained else {
             panic!("two updates produce retained deltas");

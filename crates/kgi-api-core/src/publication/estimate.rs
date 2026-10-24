@@ -1,7 +1,11 @@
 use std::collections::HashSet;
 
 use kgi_api_model::delta::GraphDelta;
+use kgi_api_model::history::GraphHistoryReplayability;
 use kgi_model::block::BlockHash;
+
+/// Soft raw-byte estimate at which an atomic delta becomes a replay barrier.
+pub(super) const SOFT_DELTA_ESTIMATED_BYTES: u64 = 4 * 1024 * 1024;
 
 const ENTRY_AND_BATCH_FRAMING_BYTES: u64 = 230;
 const DISTINCT_HASH_BYTES: u64 = 68;
@@ -48,6 +52,14 @@ pub(super) fn estimate_raw_delta_bytes(delta: &GraphDelta) -> u64 {
     add_weighted(&mut estimate, delta.is_in_vspc_changes().len(), MEMBERSHIP_MUTATION_BYTES);
     add_weighted(&mut estimate, delta.color_changes().len(), COLOR_MUTATION_BYTES);
     estimate
+}
+
+pub(super) const fn classify_replayability(estimated_raw_bytes: u64) -> GraphHistoryReplayability {
+    if estimated_raw_bytes < SOFT_DELTA_ESTIMATED_BYTES {
+        GraphHistoryReplayability::Replayable
+    } else {
+        GraphHistoryReplayability::ReplayBarrier
+    }
 }
 
 fn collect_hashes(hashes: &mut HashSet<BlockHash>, values: &[BlockHash]) {
@@ -121,5 +133,12 @@ mod tests {
             .expect("valid empty delta");
 
         assert_eq!(estimate_raw_delta_bytes(&delta), ENTRY_AND_BATCH_FRAMING_BYTES);
+    }
+
+    #[test]
+    fn replayability_boundary_is_exact() {
+        assert_eq!(classify_replayability(SOFT_DELTA_ESTIMATED_BYTES - 1), GraphHistoryReplayability::Replayable);
+        assert_eq!(classify_replayability(SOFT_DELTA_ESTIMATED_BYTES), GraphHistoryReplayability::ReplayBarrier);
+        assert_eq!(classify_replayability(SOFT_DELTA_ESTIMATED_BYTES + 1), GraphHistoryReplayability::ReplayBarrier);
     }
 }
