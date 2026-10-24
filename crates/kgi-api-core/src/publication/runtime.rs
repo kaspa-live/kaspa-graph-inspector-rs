@@ -23,7 +23,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{AppliedLineageUpdate, GraphPublication, GraphPublicationState, OriginalUpdate, revision_timestamp_ms_at};
+use super::{
+    AppliedLineageUpdate, GraphPublication, GraphPublicationState, OriginalUpdate, estimate_raw_delta_bytes, revision_timestamp_ms_at,
+};
 use crate::api_db::{ApiDbGeneration, ApiDbState};
 
 /// Maximum number of ordinary committed updates retained during construction.
@@ -566,7 +568,7 @@ impl ConstructionCandidate {
             CommittedGraphUpdate::Vspc(committed) => OriginalUpdate::Vspc(committed),
         };
         let timestamp = revision_timestamp_ms_at(self.revision_clock_origin, Instant::now());
-        AppliedLineageUpdate::apply(&mut self.view, &mut self.history, original, timestamp, || {})?;
+        AppliedLineageUpdate::apply(&mut self.view, &mut self.history, original, timestamp, estimate_raw_delta_bytes, || {})?;
         Ok(())
     }
 
@@ -721,6 +723,7 @@ mod tests {
     };
     use kgi_api_model::{
         graph::Level,
+        history::GraphHistoryReplayability,
         projection::{GraphViewSeed, GraphWindowResolution},
     };
     use kgi_model::{
@@ -1621,7 +1624,7 @@ mod tests {
                 .apply_head_vspc_committed(&vspc_update_at(91, 91), 1)
                 .expect("mutable Head")
                 .expect("fixture update advances only the publication view");
-            core.history.append(delta, 1).expect("fixture advances only publication history");
+            core.history.append(delta, 1, GraphHistoryReplayability::Replayable).expect("fixture advances only publication history");
         }
 
         assert_eq!(

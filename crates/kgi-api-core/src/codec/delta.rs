@@ -116,7 +116,7 @@ mod tests {
     use kgi_api_model::{
         delta::{FieldChange, GraphDelta, LevelChange},
         graph::{EdgeId, GraphBlock, GraphEdge, Level},
-        history::{GraphHistory, GraphHistoryRange},
+        history::{GraphHistory, GraphHistoryRange, GraphHistoryReplayability},
     };
     use kgi_model::block::{BlockColor, BlockCoordinate, BlockHash};
     use serde_json::{Value, json};
@@ -180,7 +180,7 @@ mod tests {
     fn entries_for(delta: GraphDelta) -> kgi_api_model::history::GraphHistoryEntryList {
         let target = delta.to_revision_id();
         let mut history = GraphHistory::new();
-        history.append(delta, 1).expect("history entry");
+        history.append(delta, 1, GraphHistoryReplayability::Replayable).expect("history entry");
         match history.range(0, target).expect("retained range") {
             GraphHistoryRange::Deltas { entries, .. } => entries,
             GraphHistoryRange::UpToDate { .. } => panic!("range contains a delta"),
@@ -258,10 +258,10 @@ mod tests {
             HashMap::from([(hash(1), FieldChange { before: BlockColor::Gray, after: BlockColor::Blue })]),
         )
         .expect("first delta");
-        let aggregate = GraphDelta::new(
+        let second = GraphDelta::new(
             1,
-            3,
-            30,
+            2,
+            20,
             5,
             HashMap::new(),
             HashMap::new(),
@@ -269,12 +269,12 @@ mod tests {
             HashMap::from([(hash(1), FieldChange { before: true, after: false })]),
             HashMap::from([(hash(3), FieldChange { before: BlockColor::Blue, after: BlockColor::Red })]),
         )
-        .expect("aggregate delta");
+        .expect("second delta");
 
         let mut history = GraphHistory::new();
-        history.append(first, 100).expect("first history entry");
-        history.append(aggregate, 200).expect("aggregate history entry");
-        let entries = match history.range(0, 3).expect("retained range") {
+        history.append(first, 100, GraphHistoryReplayability::Replayable).expect("first history entry");
+        history.append(second, 200, GraphHistoryReplayability::Replayable).expect("second history entry");
+        let entries = match history.range(0, 2).expect("retained range") {
             GraphHistoryRange::Deltas { entries, .. } => entries,
             GraphHistoryRange::UpToDate { .. } => panic!("range contains deltas"),
         };
@@ -324,8 +324,8 @@ mod tests {
             encoded["deltas"][1],
             json!({
                 "from_revision_id": "1",
-                "to_revision_id": "3",
-                "revision_timestamp_ms": "30",
+                "to_revision_id": "2",
+                "revision_timestamp_ms": "20",
                 "head_level": 5,
                 "block_upserts": [],
                 "edge_upserts": [],
@@ -350,18 +350,19 @@ mod tests {
     #[test]
     fn empty_mutation_body_still_serializes_its_complete_interval() {
         let delta =
-            GraphDelta::new(7, 9, u64::MAX, u32::MAX, HashMap::new(), HashMap::new(), Vec::new(), HashMap::new(), HashMap::new())
+            GraphDelta::new(1, 2, u64::MAX, u32::MAX, HashMap::new(), HashMap::new(), Vec::new(), HashMap::new(), HashMap::new())
                 .expect("empty forward delta");
         let mut history = GraphHistory::new();
         history
             .append(
-                GraphDelta::new(0, 7, 1, 1, HashMap::new(), HashMap::new(), Vec::new(), HashMap::new(), HashMap::new())
+                GraphDelta::new(0, 1, 1, 1, HashMap::new(), HashMap::new(), Vec::new(), HashMap::new(), HashMap::new())
                     .expect("prefix delta"),
                 1,
+                GraphHistoryReplayability::Replayable,
             )
             .expect("prefix entry");
-        history.append(delta, 1).expect("empty entry");
-        let entries = match history.range(7, 9).expect("empty mutation range") {
+        history.append(delta, 1, GraphHistoryReplayability::Replayable).expect("empty entry");
+        let entries = match history.range(1, 2).expect("empty mutation range") {
             GraphHistoryRange::Deltas { entries, .. } => entries,
             GraphHistoryRange::UpToDate { .. } => panic!("range contains one delta"),
         };
@@ -371,8 +372,8 @@ mod tests {
             json!({
                 "hashes": [],
                 "deltas": [{
-                    "from_revision_id": "7",
-                    "to_revision_id": "9",
+                    "from_revision_id": "1",
+                    "to_revision_id": "2",
                     "revision_timestamp_ms": u64::MAX.to_string(),
                     "head_level": u32::MAX,
                     "block_upserts": [],

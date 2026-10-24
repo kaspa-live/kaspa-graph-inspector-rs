@@ -9,16 +9,19 @@ use std::{sync::Arc, time::Instant};
 use kgi_api_model::{
     delta::GraphDelta,
     graph::{GraphView, GraphViewExtractError, LevelExtent, TrackingPolicy},
-    history::{GraphHistory, GraphHistoryRange, GraphHistoryRangeError},
+    history::{GraphHistory, GraphHistoryRange, GraphHistoryRangeError, GraphHistoryReplayability},
 };
 use kgi_model::graph_update::{BlockCommitted, VspcCommitted};
 use rand::{RngCore, rngs::OsRng};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::{cache::GraphCache, client::SseClientRegistry};
+use crate::{
+    cache::{CachedDelta, CachedHeadSnapshot, GraphCache},
+    client::SseClientRegistry,
+};
 
 pub(crate) use self::error::PublicationProjectionError;
-use self::estimate::estimate_raw_delta_bytes;
+use self::estimate::{classify_replayability, estimate_raw_delta_bytes};
 
 /// Externally meaningful lifecycle state of one graph publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +46,8 @@ pub(crate) struct GraphPublicationCore {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GraphViewCapture {
     publication_id: u64,
+    replay_floor_revision: u64,
+    oldest_available_revision: u64,
     view: GraphView,
 }
 
@@ -50,6 +55,16 @@ impl GraphViewCapture {
     /// Returns the publication that supplied this view.
     pub(crate) const fn publication_id(&self) -> u64 {
         self.publication_id
+    }
+
+    /// Returns the inclusive replay floor observed with this view.
+    pub(crate) const fn replay_floor_revision(&self) -> u64 {
+        self.replay_floor_revision
+    }
+
+    /// Returns the oldest retained history boundary observed with this view.
+    pub(crate) const fn oldest_available_revision(&self) -> u64 {
+        self.oldest_available_revision
     }
 
     /// Returns the captured frozen graph view.
@@ -71,6 +86,7 @@ pub(crate) struct GraphDeltaTargetCapture {
     revision: u64,
     revision_timestamp_ms: u64,
     head_level: u32,
+    replay_floor_revision: u64,
 }
 
 impl GraphDeltaTargetCapture {
@@ -98,6 +114,23 @@ impl GraphDeltaTargetCapture {
     pub(crate) const fn head_level(self) -> u32 {
         self.head_level
     }
+
+    /// Returns the inclusive replay floor observed with the target Head.
+    pub(crate) const fn replay_floor_revision(self) -> u64 {
+        self.replay_floor_revision
+    }
+}
+
+/// Result of linearizing one immutable cached response against the current
+/// history replay floor.
+pub(crate) enum ReplayFloorAdmission<T> {
+    /// The immutable response may proceed even if the floor advances later.
+    Admitted(Arc<T>),
+    /// The response revision already precedes the inclusive replay floor.
+    Rejected {
+        /// Floor observed while holding the publication core read lock.
+        replay_floor_revision: u64,
+    },
 }
 
 /// One publication-local graph lineage and its synchronization boundary.
@@ -110,6 +143,10 @@ pub(crate) struct GraphPublication {
     clients: SseClientRegistry,
     #[cfg(test)]
     atomic_mutation_test_hook: Option<std::sync::Arc<AtomicMutationTestHook>>,
+    #[cfg(test)]
+    delta_estimate_test_override: Option<u64>,
+    #[cfg(test)]
+    replay_floor_admission_test_hook: Option<std::sync::Arc<ReplayFloorAdmissionTestHook>>,
 }
 
 #[cfg(test)]
@@ -145,6 +182,32 @@ impl AtomicMutationTestHook {
     }
 }
 
+#[cfg(test)]
+struct ReplayFloorAdmissionTestHook {
+    core_locked: std::sync::Barrier,
+    finish_admission: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl ReplayFloorAdmissionTestHook {
+    fn new() -> Self {
+        Self { core_locked: std::sync::Barrier::new(2), finish_admission: std::sync::Barrier::new(2) }
+    }
+
+    fn pause_with_core_lock(&self) {
+        self.core_locked.wait();
+        self.finish_admission.wait();
+    }
+
+    fn wait_for_core_lock(&self) {
+        self.core_locked.wait();
+    }
+
+    fn resume_admission(&self) {
+        self.finish_admission.wait();
+    }
+}
+
 impl GraphPublication {
     /// Creates an aligned unpublished publication from one construction candidate.
     pub(crate) fn new(
@@ -176,6 +239,10 @@ impl GraphPublication {
             clients: SseClientRegistry::new(publication_id, initial_state, view_revision),
             #[cfg(test)]
             atomic_mutation_test_hook: None,
+            #[cfg(test)]
+            delta_estimate_test_override: None,
+            #[cfg(test)]
+            replay_floor_admission_test_hook: None,
         })
     }
 
@@ -231,14 +298,24 @@ impl GraphPublication {
     pub(crate) async fn capture_view(&self) -> GraphViewCapture {
         let core = self.core.read().await;
         let view = core.view.extract_subview(core.view.extent()).expect("a graph view contains its own extent");
-        GraphViewCapture { publication_id: self.publication_id, view }
+        GraphViewCapture {
+            publication_id: self.publication_id,
+            replay_floor_revision: core.history.replay_floor_revision(),
+            oldest_available_revision: core.history.oldest_available_revision(),
+            view,
+        }
     }
 
     /// Captures one contained extent from the current Head as an owned frozen view.
     pub(crate) async fn capture_subview(&self, extent: LevelExtent) -> Result<GraphViewCapture, GraphViewExtractError> {
         let core = self.core.read().await;
         let view = core.view.extract_subview(extent)?;
-        Ok(GraphViewCapture { publication_id: self.publication_id, view })
+        Ok(GraphViewCapture {
+            publication_id: self.publication_id,
+            replay_floor_revision: core.history.replay_floor_revision(),
+            oldest_available_revision: core.history.oldest_available_revision(),
+            view,
+        })
     }
 
     /// Captures one coherent canonical-delta target from the current core.
@@ -250,6 +327,7 @@ impl GraphPublication {
             revision: core.view.current_revision_id(),
             revision_timestamp_ms: core.view.current_revision_timestamp_ms(),
             head_level: core.view.high_level(),
+            replay_floor_revision: core.history.replay_floor_revision(),
         }
     }
 
@@ -261,6 +339,21 @@ impl GraphPublication {
     ) -> Result<GraphHistoryRange, GraphHistoryRangeError> {
         assert_eq!(target.publication_id, self.publication_id, "delta target belongs to this publication");
         self.core.read().await.history.range(from_revision_id, target.revision)
+    }
+
+    /// Linearizes one completed cached delta against the current replay floor.
+    pub(crate) async fn admit_cached_delta_replay_floor(&self, candidate: Arc<CachedDelta>) -> ReplayFloorAdmission<CachedDelta> {
+        let source_revision = candidate.source_revision_id();
+        self.admit_replay_floor(source_revision, candidate).await
+    }
+
+    /// Linearizes one completed cached Head snapshot against the current replay floor.
+    pub(crate) async fn admit_cached_head_replay_floor(
+        &self,
+        candidate: Arc<CachedHeadSnapshot>,
+    ) -> ReplayFloorAdmission<CachedHeadSnapshot> {
+        let revision = candidate.revision();
+        self.admit_replay_floor(revision, candidate).await
     }
 
     /// Applies one committed block and publishes any resulting history entry.
@@ -284,20 +377,52 @@ impl GraphPublication {
         let mut core = self.core.write().await;
         assert_ne!(core.state, GraphPublicationState::Stale, "a Stale publication is not mutated");
         let GraphPublicationCore { view, history, .. } = &mut *core;
-        let applied = AppliedLineageUpdate::apply(view, history, update, self.revision_timestamp_ms(), || {
-            #[cfg(test)]
-            if let Some(hook) = &self.atomic_mutation_test_hook {
-                hook.pause_after_view_update();
-            }
-        })?;
+        let applied = AppliedLineageUpdate::apply(
+            view,
+            history,
+            update,
+            self.revision_timestamp_ms(),
+            |delta| {
+                #[cfg(test)]
+                if let Some(estimated_raw_bytes) = self.delta_estimate_test_override {
+                    return estimated_raw_bytes;
+                }
+                estimate_raw_delta_bytes(delta)
+            },
+            || {
+                #[cfg(test)]
+                if let Some(hook) = &self.atomic_mutation_test_hook {
+                    hook.pause_after_view_update();
+                }
+            },
+        )?;
         let Some(applied) = applied else {
             return Ok(None);
         };
+        let invalidation =
+            applied.replay_floor_advance.map(|replay_floor_revision| self.cache.invalidate_replay_floor(replay_floor_revision));
         drop(core);
+        if let Some(invalidation) = invalidation {
+            invalidation.cancel();
+        }
         self.clients.advance_head(applied.target_revision);
         drop(mutation);
         self.cache.prune_deltas(applied.head_high_level);
         Ok(Some(applied.target_revision))
+    }
+
+    async fn admit_replay_floor<T>(&self, candidate_revision: u64, candidate: Arc<T>) -> ReplayFloorAdmission<T> {
+        let core = self.core.read().await;
+        #[cfg(test)]
+        if let Some(hook) = &self.replay_floor_admission_test_hook {
+            hook.pause_with_core_lock();
+        }
+        let replay_floor_revision = core.history.replay_floor_revision();
+        if candidate_revision < replay_floor_revision {
+            ReplayFloorAdmission::Rejected { replay_floor_revision }
+        } else {
+            ReplayFloorAdmission::Admitted(candidate)
+        }
     }
 
     fn revision_timestamp_ms_at(&self, now: Instant) -> u64 {
@@ -322,6 +447,7 @@ impl OriginalUpdate<'_> {
 struct AppliedLineageUpdate {
     target_revision: u64,
     head_high_level: u32,
+    replay_floor_advance: Option<u64>,
 }
 
 impl AppliedLineageUpdate {
@@ -330,6 +456,7 @@ impl AppliedLineageUpdate {
         history: &mut GraphHistory,
         update: OriginalUpdate<'_>,
         revision_timestamp_ms: u64,
+        estimate_delta: impl FnOnce(&GraphDelta) -> u64,
         after_view_update: impl FnOnce(),
     ) -> Result<Option<Self>, PublicationProjectionError> {
         let view_revision = view.current_revision_id();
@@ -343,10 +470,12 @@ impl AppliedLineageUpdate {
         };
         after_view_update();
         let target_revision = delta.to_revision_id();
-        let estimated_raw_bytes = estimate_raw_delta_bytes(&delta);
-        history.append(delta, estimated_raw_bytes).expect("a successful Head update extends its matching history");
+        let estimated_raw_bytes = estimate_delta(&delta);
+        let replayability = classify_replayability(estimated_raw_bytes);
+        let replay_floor_advance = (replayability == GraphHistoryReplayability::ReplayBarrier).then_some(target_revision);
+        history.append(delta, estimated_raw_bytes, replayability).expect("a successful Head update extends its matching history");
         history.prune(view.low_level());
-        Ok(Some(Self { target_revision, head_high_level: view.high_level() }))
+        Ok(Some(Self { target_revision, head_high_level: view.high_level(), replay_floor_advance }))
     }
 }
 
@@ -381,7 +510,7 @@ mod tests {
     use kgi_api_model::{
         delta::GraphDelta,
         graph::{GraphViewUpdateError, Level, LevelExtent},
-        history::{GraphHistoryRange, GraphHistoryRangeError},
+        history::{GraphHistoryRange, GraphHistoryRangeError, GraphHistoryReplayability},
     };
     use kgi_model::{
         block::{BlockColor, BlockCoordinate, BlockHash, CompactId},
@@ -390,9 +519,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        cache::{CacheAccess, CacheJobTracker, CachedDelta},
+        cache::{CacheAccess, CacheBuildError, CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot},
         client::{DeltaCompletionResult, DeltaScheduleAction, SseMailbox, SseMessage},
-        codec::sse::{PublicationStateDto, PublicationWakeupDto},
+        codec::{
+            HeadEtagInput,
+            sse::{PublicationStateDto, PublicationWakeupDto},
+        },
     };
 
     fn head_view() -> GraphView {
@@ -454,6 +586,20 @@ mod tests {
             .expect("valid advancing delta")
     }
 
+    fn cached_head_candidate(publication_id: u64, revision: u64) -> Arc<CachedHeadSnapshot> {
+        let extent = LevelExtent::new(1, 1).expect("valid cached Head extent");
+        Arc::new(CachedHeadSnapshot::new(
+            50,
+            revision,
+            revision * 10,
+            1,
+            1,
+            4,
+            HeadEtagInput::new(publication_id, revision, extent),
+            Bytes::from_static(b"head"),
+        ))
+    }
+
     fn publication_with_atomic_mutation_hook(max_depth: u32) -> (Arc<GraphPublication>, Arc<AtomicMutationTestHook>) {
         let hook = Arc::new(AtomicMutationTestHook::new());
         let mut publication = GraphPublication::new(
@@ -505,7 +651,7 @@ mod tests {
         let mut view = head_view();
         view.apply_delta(&delta).expect("matching Head delta");
         let mut history = GraphHistory::new();
-        history.append(delta, 1).expect("matching history delta");
+        history.append(delta, 1, GraphHistoryReplayability::Replayable).expect("matching history delta");
 
         let origin = Instant::now().checked_sub(Duration::from_millis(123)).expect("valid fixture origin");
         let publication =
@@ -596,11 +742,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn original_update_classifies_the_exact_soft_estimate_boundary() {
+        for (estimated_raw_bytes, expected_replayability) in [
+            (estimate::SOFT_DELTA_ESTIMATED_BYTES - 1, GraphHistoryReplayability::Replayable),
+            (estimate::SOFT_DELTA_ESTIMATED_BYTES, GraphHistoryReplayability::ReplayBarrier),
+            (estimate::SOFT_DELTA_ESTIMATED_BYTES + 1, GraphHistoryReplayability::ReplayBarrier),
+        ] {
+            let expected_replay_floor = match expected_replayability {
+                GraphHistoryReplayability::Replayable => 0,
+                GraphHistoryReplayability::ReplayBarrier => 1,
+            };
+            let mut publication =
+                GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view(), GraphHistory::new())
+                    .expect("matching candidate");
+            publication.delta_estimate_test_override = Some(estimated_raw_bytes);
+
+            assert_eq!(publication.apply_block_committed(&committed_block(2)).await.expect("block update"), Some(1));
+
+            let core = publication.core.read().await;
+            assert_eq!(core.view.current_revision_id(), 1);
+            assert_eq!(core.history.current_revision_id(), 1);
+            assert_eq!(core.history.current_cumulative_estimated_bytes(), estimated_raw_bytes);
+            match expected_replayability {
+                GraphHistoryReplayability::Replayable => {
+                    assert_eq!(core.history.replay_floor_revision(), 0);
+                    assert_eq!(core.history.len(), 1);
+                }
+                GraphHistoryReplayability::ReplayBarrier => {
+                    assert_eq!(core.history.replay_floor_revision(), 1);
+                    assert!(core.history.is_empty());
+                }
+            }
+            drop(core);
+
+            let view = publication.capture_view().await;
+            let target = publication.capture_delta_target().await;
+            assert_eq!(view.replay_floor_revision(), expected_replay_floor);
+            assert_eq!(view.oldest_available_revision(), expected_replay_floor);
+            assert_eq!(target.replay_floor_revision(), expected_replay_floor);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_barrier_invalidates_cache_before_publishing_core_and_sse_head() {
+        let (mut publication, hook) = publication_with_atomic_mutation_hook(2);
+        Arc::get_mut(&mut publication).expect("fixture publication is not yet shared").delta_estimate_test_override =
+            Some(estimate::SOFT_DELTA_ESTIMATED_BYTES);
+        let cache = publication.cache();
+        let jobs = CacheJobTracker::new();
+
+        let CacheAccess::Job(initial_delta) = cache.delta(
+            &jobs,
+            0,
+            |_| async { Ok(Arc::new(CachedDelta::new(0, 1, 1, 4, Bytes::from_static(b"old-delta")))) },
+            || async { 1 },
+        ) else {
+            panic!("fixture delta installs one cache job");
+        };
+        initial_delta.wait(tokio_util::sync::CancellationToken::new()).await.expect("fixture delta completes");
+
+        let head_access = cache
+            .head(
+                &jobs,
+                50,
+                |_, _| async { std::future::pending::<Result<Arc<CachedHeadSnapshot>, CacheBuildError>>().await },
+                || async { 1 },
+            )
+            .await;
+
+        let mailbox = Arc::new(SseMailbox::new());
+        let identifier = publication
+            .client_registry()
+            .register(0, &mailbox, tokio_util::sync::CancellationToken::new())
+            .expect("registration succeeds");
+        for _ in 0..3 {
+            mailbox.recv().await.expect("initial registration message");
+        }
+        assert_eq!(
+            publication
+                .client_registry()
+                .complete_delta(identifier, DeltaScheduleAction::Replace { wake_at_revision_id: 1, wake_sent: false }),
+            DeltaCompletionResult::Accepted
+        );
+
+        let update_publication = publication.clone();
+        let update = tokio::spawn(async move { update_publication.apply_block_committed(&committed_block(2)).await });
+        hook.wait_for_view_update();
+
+        let capture_publication = publication.clone();
+        let capture = tokio::spawn(async move { capture_publication.capture_delta_target().await });
+        tokio::task::yield_now().await;
+        assert!(!capture.is_finished(), "the new core remains hidden before replay-floor invalidation");
+        assert!(matches!(
+            cache.delta(
+                &jobs,
+                0,
+                |_| async { panic!("the pre-floor completed value still exists before invalidation") },
+                || async { 1 }
+            ),
+            CacheAccess::Completed(_)
+        ));
+
+        hook.resume_core_update();
+        assert_eq!(update.await.expect("update task").expect("replay-barrier update"), Some(1));
+        let captured = capture.await.expect("capture task");
+        assert_eq!(captured.revision(), 1);
+        assert_eq!(captured.replay_floor_revision(), 1);
+        assert_eq!(
+            mailbox.recv().await,
+            Some(SseMessage::PublicationWakeup(PublicationWakeupDto::new(publication.publication_id(), 1)))
+        );
+        assert_eq!(
+            head_access.resolve(tokio_util::sync::CancellationToken::new()).await,
+            Err(CacheWaitError::InvalidatedByReplayFloor { replay_floor_revision: 1 })
+        );
+        assert!(matches!(cache.delta(&jobs, 0, |_| async { Err(CacheBuildError::Cancelled) }, || async { 2 }), CacheAccess::Job(_)));
+
+        jobs.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_floor_advance_wins_before_final_admission() {
+        let (mut publication, hook) = publication_with_atomic_mutation_hook(2);
+        Arc::get_mut(&mut publication).expect("fixture publication is not yet shared").delta_estimate_test_override =
+            Some(estimate::SOFT_DELTA_ESTIMATED_BYTES);
+        let old_delta = Arc::new(CachedDelta::new(0, 1, 1, 4, Bytes::from_static(b"delta")));
+        let old_head = cached_head_candidate(publication.publication_id(), 0);
+
+        let update_publication = publication.clone();
+        let update = tokio::spawn(async move { update_publication.apply_block_committed(&committed_block(2)).await });
+        hook.wait_for_view_update();
+
+        let admission_publication = publication.clone();
+        let admission_delta = old_delta.clone();
+        let admission = tokio::spawn(async move { admission_publication.admit_cached_delta_replay_floor(admission_delta).await });
+        tokio::task::yield_now().await;
+        assert!(!admission.is_finished(), "final admission waits behind replay-floor advancement");
+
+        hook.resume_core_update();
+        assert_eq!(update.await.expect("update task").expect("replay-barrier update"), Some(1));
+        assert!(matches!(admission.await.expect("admission task"), ReplayFloorAdmission::Rejected { replay_floor_revision: 1 }));
+        assert!(matches!(
+            publication.admit_cached_head_replay_floor(old_head).await,
+            ReplayFloorAdmission::Rejected { replay_floor_revision: 1 }
+        ));
+
+        let floor_delta = Arc::new(CachedDelta::new(1, 2, 2, 4, Bytes::from_static(b"floor-delta")));
+        assert!(matches!(publication.admit_cached_delta_replay_floor(floor_delta).await, ReplayFloorAdmission::Admitted(_)));
+        let floor_head = cached_head_candidate(publication.publication_id(), 1);
+        assert!(matches!(publication.admit_cached_head_replay_floor(floor_head).await, ReplayFloorAdmission::Admitted(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_admission_wins_before_later_replay_floor_advance() {
+        let mut publication =
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view_with_depth(2), GraphHistory::new())
+                .expect("matching candidate");
+        publication.delta_estimate_test_override = Some(estimate::SOFT_DELTA_ESTIMATED_BYTES);
+        let delta = Arc::new(CachedDelta::new(0, 1, 1, 4, Bytes::from_static(b"delta")));
+        let admitted_delta = publication.admit_cached_delta_replay_floor(delta.clone()).await;
+
+        let hook = Arc::new(ReplayFloorAdmissionTestHook::new());
+        publication.replay_floor_admission_test_hook = Some(hook.clone());
+        let publication = Arc::new(publication);
+        let head = cached_head_candidate(publication.publication_id(), 0);
+        let admission_publication = publication.clone();
+        let admission_head = head.clone();
+        let admission = tokio::spawn(async move { admission_publication.admit_cached_head_replay_floor(admission_head).await });
+        hook.wait_for_core_lock();
+
+        let update_publication = publication.clone();
+        let update = tokio::spawn(async move { update_publication.apply_block_committed(&committed_block(2)).await });
+        tokio::task::yield_now().await;
+        assert!(!update.is_finished(), "floor advancement waits for final admission's core read lock");
+
+        hook.resume_admission();
+        let admitted_head = admission.await.expect("admission task");
+        assert_eq!(update.await.expect("update task").expect("replay-barrier update"), Some(1));
+        assert_eq!(publication.core.read().await.history.replay_floor_revision(), 1);
+
+        match admitted_delta {
+            ReplayFloorAdmission::Admitted(candidate) => assert!(Arc::ptr_eq(&candidate, &delta)),
+            ReplayFloorAdmission::Rejected { .. } => panic!("delta admission precedes the floor advance"),
+        }
+        match admitted_head {
+            ReplayFloorAdmission::Admitted(candidate) => assert!(Arc::ptr_eq(&candidate, &head)),
+            ReplayFloorAdmission::Rejected { .. } => panic!("Head admission precedes the floor advance"),
+        }
+    }
+
+    #[tokio::test]
     async fn starting_revision_mismatch_refuses_before_applying_the_update() {
         let publication =
             GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view(), GraphHistory::new())
                 .expect("matching candidate");
-        publication.core.write().await.history.append(advanced_delta(), 1).expect("fixture history drift");
+        publication
+            .core
+            .write()
+            .await
+            .history
+            .append(advanced_delta(), 1, GraphHistoryReplayability::Replayable)
+            .expect("fixture history drift");
 
         assert_eq!(
             publication.apply_vspc_committed(&vspc_added(2, None)).await,
@@ -816,10 +1158,14 @@ mod tests {
 
         let full = publication.capture_view().await;
         assert_eq!(full.publication_id(), publication.publication_id());
+        assert_eq!(full.replay_floor_revision(), 0);
+        assert_eq!(full.oldest_available_revision(), 0);
         assert_eq!(full.view().tracking_policy(), TrackingPolicy::Frozen);
         assert_eq!(full.view().current_revision_id(), 1);
         assert!(full.view().block(&hash(2)).is_some());
         let subview = publication.capture_subview(LevelExtent::new(1, 1).expect("valid extent")).await.expect("contained extent");
+        assert_eq!(subview.replay_floor_revision(), full.replay_floor_revision());
+        assert_eq!(subview.oldest_available_revision(), full.oldest_available_revision());
         assert_eq!(subview.view().extent(), LevelExtent::new(1, 1).expect("valid extent"));
         assert_eq!(
             publication.capture_subview(LevelExtent::new(2, 3).expect("valid extent")).await,
@@ -829,6 +1175,7 @@ mod tests {
         publication.apply_block_committed(&committed_block(3)).await.expect("second block update");
         let target = publication.capture_delta_target().await;
         assert_eq!(target.publication_id(), publication.publication_id());
+        assert_eq!(target.replay_floor_revision(), 0);
         let retained = publication.capture_history_range(0, target).await.expect("retained history");
         let GraphHistoryRange::Deltas { actual_target, entries, .. } = retained else {
             panic!("two updates produce retained deltas");
