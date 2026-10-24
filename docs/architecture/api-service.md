@@ -504,14 +504,23 @@ The publication mutation tail invokes a distinct synchronous replay-floor
 invalidation when history advances its floor. Under one cache critical section
 it applies the
 [protocol-owned invalidation set](api-protocol.md#publication-scoped-head-response-cache--settled)
-to both slot collections and returns the detached job handles. After leaving
-the cache critical section, the caller changes each still-`Pending` job to
-`InvalidatedByReplayFloor`, then cancels its work. This is a terminal job
-state: an encoding or cancellation completion that loses the transition from
-`Pending` must not replace it. Delta waiters re-enter the operation and obtain
-the protocol-owned fresh-view outcome from the history floor; Head-tier
-waiters re-enter their exact tier and build or join a new capture. Exact
-slot/job identity prevents any detached result from repopulating the cache.
+to both slot collections and, before releasing that same guard, changes every
+detached running job from `Pending` to `InvalidatedByReplayFloor`. A running
+slot selected by this operation must still contain a `Pending` job; any other
+state is an internal invariant failure. The operation returns those already
+terminal job handles. After leaving the cache critical section, the caller
+cancels their work without awaiting it. Delta waiters re-enter the operation
+and obtain the protocol-owned fresh-view outcome from the history floor;
+Head-tier waiters re-enter their exact tier and build or join a new capture.
+Exact slot/job identity prevents any detached result from repopulating the
+cache or replacing the invalidation state.
+
+If ordinary completion acquired the cache guard first, removed its matching
+running job, and installed its completed value, later floor invalidation
+removes that value but does not rewrite the job's terminal result; the common
+final floor-admission check rejects public use. If floor invalidation acquired
+the guard first, completion finds no matching slot and cannot insert or change
+the already published invalidation state. These are the only two race orders.
 
 For a Head-tier job, successful encoding is one candidate attempt rather than
 terminal job completion. The orchestration task applies the protocol-owned
@@ -538,13 +547,15 @@ success removes the matching source job and installs the shared completed
 success installs into its originating tier slot. On ordinary failure or
 terminal cancellation, the job
 clears only its matching tier or source job while preserving every unrelated
-job and prior completed entry. Each path leaves the critical section before
-atomically changing `Pending` to its terminal state through `watch`. The
-terminal value is stored even if every current waiter has already detached,
-and no competing completion may replace it. A later request may therefore
-retry without rejoining the failed job. If the originating cache can no longer
-be upgraded, the job skips insertion but still completes its existing
-receivers.
+job and prior completed entry. Each ordinary completion, failure, or
+cancellation path leaves the critical section before atomically changing
+`Pending` to its terminal state through `watch`; replay-floor invalidation is
+the sole exception and performs that transition under the cache guard as
+defined above. The terminal value is stored even if every current waiter has
+already detached, and no competing completion may replace it. A later request
+may therefore retry without rejoining the failed job. If the originating cache
+can no longer be upgraded, the job skips insertion but still completes its
+existing receivers.
 
 Cache-state synchronization protects only map and prefix-pruning operations,
 replay-floor invalidation, size-ceiling advancement, and pointer identity

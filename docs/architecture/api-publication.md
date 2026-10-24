@@ -179,10 +179,10 @@ For an original `BlockCommitted` or `VspcCommitted` update, the runtime:
    against the resulting Head extent while retaining the same core write lock;
 4. for `ReplayBarrier`, calls the cache owner's synchronous replay-floor
    invalidation with the delta's target revision while still retaining the
-   core write lock, records the detached cache jobs, and then releases the core
-   write lock;
-5. publishes the internal replay-floor terminal state to those detached jobs
-   and cancels their work without awaiting it; and
+   core write lock, records the detached cache jobs only after that
+   ApiService-owned operation has completed its terminal notifications, and
+   then releases the core write lock;
+5. cancels the detached jobs' work without awaiting it; and
 6. calls the ApiService-owned client registry's nonblocking `advance_head`
    with the appended revision, then releases `mutation`.
 

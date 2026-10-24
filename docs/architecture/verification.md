@@ -1586,9 +1586,16 @@ values but before replay-floor admission, then advance the replay floor. Both
 must reject those values at their final floor check; the delta request returns
 the fresh-view outcome and the Head request re-enters its exact tier. Admit a
 response first and prove that later floor advancement does not revoke it. Race
-invalidation against job completion and require exactly one terminal
-transition: the replay-floor state cannot be overwritten by encoding success,
-ordinary failure, or cancellation.
+invalidation against job completion in both cache-lock orders and require
+exactly one terminal transition. In the invalidation-first order, pause after
+slot removal but before terminal-state publication while the invalidator still
+holds the cache guard, let completion contend for that guard, then require
+`InvalidatedByReplayFloor` to become terminal before completion proceeds.
+Encoding success, ordinary failure, and cancellation must not overwrite it.
+In the completion-first order, let completion remove its running slot and
+install its value before invalidation acquires the guard; require `Complete` to
+remain the job result, the completed cache value to be removed, and final floor
+admission to reject its public delivery.
 
 For tiered Head snapshot reuse, install a publication with no encoded tier and
 require the first request for each applicable tier, including `20`, to start
