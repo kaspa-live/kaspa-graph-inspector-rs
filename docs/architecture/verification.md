@@ -1661,7 +1661,10 @@ accumulated pruning, and Stale fixes cache age. A detached job removed with an
 expired slot may complete admitted waiters but cannot reinsert. After pruning,
 an absent source inside the horizon constructs on demand from atomic history;
 an absent source at the boundary returns `DeltaSourceExpired` without
-resurrection. A retained completed hit requires no history lookup.
+resurrection. Construct a completed source entry, ordinarily prune that source
+from `GraphHistory` while its cache entry remains within the five-minute
+horizon, and require the retained completed hit to succeed without any history
+lookup.
 
 For a Live publication, cover `ReachedHead`, `ContinueImmediately`, and
 `WaitForWakeup`; one wakeup

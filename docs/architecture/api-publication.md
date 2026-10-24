@@ -281,22 +281,29 @@ Public publication identity and state headers are finalized separately under the
 
 A canonical delta operation briefly captures its publication ID, state, view
 revision, revision timestamp, high level, and history replay floor under one
-core read lock, then asks that same history for a range ending at the captured
-revision and performs the source-slot cache lookup or job election before
-releasing the lock.
+core read lock, derives the protocol target from those captured values, then
+performs the protocol-required query-driven cache pruning and exact-source
+cache decision before consulting history. A protocol-adequate completed value
+or a running job is retained without a history lookup. Only a decision that
+requires construction asks that same history for a range ending at the
+captured revision, then performs a second source-slot cache election before
+releasing the lock. That second election either joins a job installed while
+the immutable range was captured or installs the one pending job backed by
+that range.
 The revision and timestamp form the coherent Head pair carried in the
 protocol-owned response headers. At that capture instant, history has the same
-current revision. The immutable range capture remains bounded by that target
-and returns its ordinary retained-range outcome without waiting or recapturing
-the view.
+current revision. When needed, the immutable range capture remains bounded by
+that target and returns its ordinary retained-range outcome without waiting or
+recapturing the view. Ordinary history pruning therefore cannot make an
+otherwise valid completed cache hit unusable.
 
-History range capture clones the selected immutable
-`Arc<GraphHistoryEntry>` values under the core read lock. Target selection,
-budgeting, response-wide dictionary construction, JSON serialization, and gzip
-compression then proceed without the lock. Later history pruning cannot
-invalidate those captured entries. Replay-floor invalidation detaches their
-cache jobs before releasing the mutation barrier, so a pre-floor capture cannot
-become a newly admitted public cache result afterward.
+Construction-side history range capture clones the selected immutable
+`Arc<GraphHistoryEntry>` values under the core read lock. Budgeting,
+response-wide dictionary construction, JSON serialization, and gzip compression
+then proceed without the lock. Later history pruning cannot invalidate those
+captured entries. Replay-floor invalidation detaches their cache jobs before
+releasing the mutation barrier, so a pre-floor capture cannot become a newly
+admitted public cache result afterward.
 
 Immediately before replay-floor admission of a completed cached delta or Head
 snapshot, the request briefly reacquires the core read lock, applies the

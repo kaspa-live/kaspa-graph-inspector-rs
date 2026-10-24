@@ -1215,7 +1215,8 @@ requests for which it is adequate until a successful farther construction
 replaces it. An ordinary job failure remains request-local, removes the one
 running job, and leaves the completed value unchanged.
 
-On a completed-cache miss, ApiService calls the graph-owned
+Only when exact-source lookup supplies neither an adequate completed value nor
+a running job to join does ApiService call the graph-owned
 [`GraphHistory::range`](api-graph.md#retained-history-range) operation for the
 exact atomic interval selected above. It returns the selected gapless
 `GraphHistoryEntryList`. If the source is inside the five-minute cache horizon,
@@ -1232,12 +1233,14 @@ Public outcomes map as follows:
   `ClientRegistrationRequired` before cache or history work, and the same
   outcome replaces a selected success when that registration no longer exists
   at response completion;
-- on a completed-cache miss, `GraphHistoryRangeError::StartPruned` returns
+- when construction proceeds to history,
+  `GraphHistoryRangeError::StartPruned` returns
   `FreshViewRequired(StartPruned)`;
-- on a completed-cache miss,
+- when construction proceeds to history,
   `GraphHistoryRangeError::StartBeforeReplayFloor` returns
   `FreshViewRequired(DeltaReplayBarrier)`;
-- on a completed-cache miss, `GraphHistoryRangeError::StartUnavailable` returns
+- when construction proceeds to history,
+  `GraphHistoryRangeError::StartUnavailable` returns
   `FreshViewRequired(StartUnavailable)`; and
 - `GraphHistoryRange::UpToDate` returns `DeltaResponseOutcome::UpToDate`.
 
