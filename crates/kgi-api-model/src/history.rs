@@ -10,6 +10,19 @@ pub enum GraphHistoryAppendError {
     /// The delta does not begin at the history's current revision.
     #[error("graph history revision {history_revision} does not match delta source {delta_from}")]
     RevisionMismatch { history_revision: u64, delta_from: u64 },
+
+    /// The delta spans more than one original graph revision.
+    #[error("graph history delta {from_revision_id} -> {to_revision_id} is not atomic")]
+    NonAtomicDelta { from_revision_id: u64, to_revision_id: u64 },
+}
+
+/// Whether one accepted original revision remains publicly replayable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphHistoryReplayability {
+    /// Retain the atomic delta as the next replay unit.
+    Replayable,
+    /// Advance history without retaining the uncrossable delta.
+    ReplayBarrier,
 }
 
 /// Failure to select a retained graph-history range.
@@ -18,6 +31,10 @@ pub enum GraphHistoryRangeError {
     /// The requested target precedes the starting revision.
     #[error("graph history target revision {target_revision_id} precedes source revision {from_revision_id}")]
     BackwardTarget { from_revision_id: u64, target_revision_id: u64 },
+
+    /// The requested starting boundary precedes an uncrossable replay barrier.
+    #[error("graph history start {requested} precedes replay floor {replay_floor_revision}")]
+    StartBeforeReplayFloor { requested: u64, replay_floor_revision: u64 },
 
     /// The requested starting boundary has already been pruned.
     #[error("graph history start {requested} precedes oldest available revision {oldest_available}")]
@@ -86,6 +103,7 @@ pub enum GraphHistoryRange {
 pub struct GraphHistory {
     current_revision_id: u64,
     current_cumulative_estimated_bytes: u64,
+    replay_floor_revision: u64,
     entries: VecDeque<Arc<GraphHistoryEntry>>,
 }
 
@@ -99,7 +117,7 @@ impl GraphHistory {
     /// Constructs empty revision-zero graph history.
     #[must_use]
     pub const fn new() -> Self {
-        Self { current_revision_id: 0, current_cumulative_estimated_bytes: 0, entries: VecDeque::new() }
+        Self { current_revision_id: 0, current_cumulative_estimated_bytes: 0, replay_floor_revision: 0, entries: VecDeque::new() }
     }
 
     /// Returns the right boundary of the complete retained lineage.
@@ -112,6 +130,12 @@ impl GraphHistory {
     #[must_use]
     pub const fn current_cumulative_estimated_bytes(&self) -> u64 {
         self.current_cumulative_estimated_bytes
+    }
+
+    /// Returns the inclusive first revision from which replay may begin.
+    #[must_use]
+    pub const fn replay_floor_revision(&self) -> u64 {
+        self.replay_floor_revision
     }
 
     /// Returns the number of retained replay units.
@@ -131,13 +155,18 @@ impl GraphHistory {
         self.entries.iter()
     }
 
-    /// Appends one gapless direct or aggregated delta.
+    /// Appends one gapless original-revision delta.
     ///
     /// # Panics
     ///
     /// Panics before modifying history if the cumulative estimated-byte cost
     /// would overflow `u64`.
-    pub fn append(&mut self, delta: GraphDelta, estimated_raw_bytes: u64) -> Result<(), GraphHistoryAppendError> {
+    pub fn append(
+        &mut self,
+        delta: GraphDelta,
+        estimated_raw_bytes: u64,
+        replayability: GraphHistoryReplayability,
+    ) -> Result<(), GraphHistoryAppendError> {
         if self.current_revision_id != delta.from_revision_id() {
             return Err(GraphHistoryAppendError::RevisionMismatch {
                 history_revision: self.current_revision_id,
@@ -145,12 +174,27 @@ impl GraphHistory {
             });
         }
 
+        let target_revision = delta.to_revision_id();
+        if target_revision != delta.from_revision_id().checked_add(1).expect("graph revision successor fits u64") {
+            return Err(GraphHistoryAppendError::NonAtomicDelta {
+                from_revision_id: delta.from_revision_id(),
+                to_revision_id: target_revision,
+            });
+        }
+
         let cumulative_estimated_bytes = self
             .current_cumulative_estimated_bytes
             .checked_add(estimated_raw_bytes)
             .expect("graph history cumulative estimate fits u64");
-        let target_revision = delta.to_revision_id();
-        self.entries.push_back(Arc::new(GraphHistoryEntry { delta, estimated_raw_bytes, cumulative_estimated_bytes }));
+        match replayability {
+            GraphHistoryReplayability::Replayable => {
+                self.entries.push_back(Arc::new(GraphHistoryEntry { delta, estimated_raw_bytes, cumulative_estimated_bytes }));
+            }
+            GraphHistoryReplayability::ReplayBarrier => {
+                self.entries.clear();
+                self.replay_floor_revision = target_revision;
+            }
+        }
         self.current_revision_id = target_revision;
         self.current_cumulative_estimated_bytes = cumulative_estimated_bytes;
         Ok(())
@@ -176,6 +220,13 @@ impl GraphHistory {
         }
         if target_revision_id == from_revision_id {
             return Ok(GraphHistoryRange::UpToDate { revision: from_revision_id });
+        }
+
+        if from_revision_id < self.replay_floor_revision {
+            return Err(GraphHistoryRangeError::StartBeforeReplayFloor {
+                requested: from_revision_id,
+                replay_floor_revision: self.replay_floor_revision,
+            });
         }
 
         let oldest_available = self.oldest_available_revision();
@@ -242,11 +293,19 @@ mod tests {
             .expect("valid fixture delta")
     }
 
+    fn append_replayable(
+        history: &mut GraphHistory,
+        delta: GraphDelta,
+        estimated_raw_bytes: u64,
+    ) -> Result<(), GraphHistoryAppendError> {
+        history.append(delta, estimated_raw_bytes, GraphHistoryReplayability::Replayable)
+    }
+
     fn history() -> GraphHistory {
         let mut history = GraphHistory::new();
-        history.append(delta(0, 1, 2), 10).expect("first entry");
-        history.append(delta(1, 4, 5), 30).expect("aggregated entry");
-        history.append(delta(4, 5, 5), 20).expect("final entry");
+        append_replayable(&mut history, delta(0, 1, 2), 10).expect("first entry");
+        append_replayable(&mut history, delta(1, 2, 5), 30).expect("second entry");
+        append_replayable(&mut history, delta(2, 3, 5), 20).expect("final entry");
         history
     }
 
@@ -256,6 +315,7 @@ mod tests {
 
         assert_eq!(history.current_revision_id(), 0);
         assert_eq!(history.current_cumulative_estimated_bytes(), 0);
+        assert_eq!(history.replay_floor_revision(), 0);
         assert_eq!(history.oldest_available_revision(), 0);
         assert!(history.is_empty());
         assert_eq!(history.len(), 0);
@@ -263,11 +323,11 @@ mod tests {
     }
 
     #[test]
-    fn append_accepts_outer_aggregate_boundaries_and_accumulates_absolute_cost() {
+    fn append_accepts_atomic_boundaries_and_accumulates_absolute_cost() {
         let history = history();
         let entries: Vec<_> = history.entries().collect();
 
-        assert_eq!(history.current_revision_id(), 5);
+        assert_eq!(history.current_revision_id(), 3);
         assert_eq!(history.current_cumulative_estimated_bytes(), 60);
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].delta().from_revision_id(), 0);
@@ -275,7 +335,7 @@ mod tests {
         assert_eq!(entries[0].estimated_raw_bytes(), 10);
         assert_eq!(entries[0].cumulative_estimated_bytes(), 10);
         assert_eq!(entries[1].delta().from_revision_id(), 1);
-        assert_eq!(entries[1].delta().to_revision_id(), 4);
+        assert_eq!(entries[1].delta().to_revision_id(), 2);
         assert_eq!(entries[1].estimated_raw_bytes(), 30);
         assert_eq!(entries[1].cumulative_estimated_bytes(), 40);
         assert_eq!(entries[2].cumulative_estimated_bytes(), 60);
@@ -285,7 +345,7 @@ mod tests {
     fn append_accepts_the_maximum_cumulative_cost_boundary() {
         let mut history = GraphHistory::new();
 
-        history.append(delta(0, 1, 1), u64::MAX).expect("maximum cumulative cost is valid");
+        append_replayable(&mut history, delta(0, 1, 1), u64::MAX).expect("maximum cumulative cost is valid");
 
         assert_eq!(history.current_revision_id(), 1);
         assert_eq!(history.current_cumulative_estimated_bytes(), u64::MAX);
@@ -295,10 +355,10 @@ mod tests {
     #[test]
     fn cumulative_cost_overflow_panics_before_mutating_history() {
         let mut history = GraphHistory::new();
-        history.append(delta(0, 1, 1), u64::MAX).expect("maximum cumulative cost is valid");
+        append_replayable(&mut history, delta(0, 1, 1), u64::MAX).expect("maximum cumulative cost is valid");
         let before = history.clone();
 
-        let result = catch_unwind(AssertUnwindSafe(|| history.append(delta(1, 2, 2), 1)));
+        let result = catch_unwind(AssertUnwindSafe(|| append_replayable(&mut history, delta(1, 2, 2), 1)));
 
         assert!(result.is_err());
         assert_eq!(history, before);
@@ -307,14 +367,46 @@ mod tests {
     #[test]
     fn revision_mismatch_precedes_cumulative_cost_overflow() {
         let mut history = GraphHistory::new();
-        history.append(delta(0, 1, 1), u64::MAX).expect("maximum cumulative cost is valid");
+        append_replayable(&mut history, delta(0, 1, 1), u64::MAX).expect("maximum cumulative cost is valid");
         let before = history.clone();
 
         assert_eq!(
-            history.append(delta(0, 2, 2), 1),
+            append_replayable(&mut history, delta(0, 2, 2), 1),
             Err(GraphHistoryAppendError::RevisionMismatch { history_revision: 1, delta_from: 0 })
         );
         assert_eq!(history, before);
+    }
+
+    #[test]
+    fn non_atomic_delta_precedes_cumulative_cost_overflow() {
+        let mut history = GraphHistory::new();
+        append_replayable(&mut history, delta(0, 1, 1), u64::MAX).expect("maximum cumulative cost is valid");
+        let before = history.clone();
+
+        assert_eq!(
+            append_replayable(&mut history, delta(1, 3, 3), 1),
+            Err(GraphHistoryAppendError::NonAtomicDelta { from_revision_id: 1, to_revision_id: 3 })
+        );
+        assert_eq!(history, before);
+    }
+
+    #[test]
+    fn replay_barrier_clears_entries_and_advances_the_inclusive_floor() {
+        let mut history = GraphHistory::new();
+        append_replayable(&mut history, delta(0, 1, 1), 10).expect("first entry");
+
+        history.append(delta(1, 2, 2), 20, GraphHistoryReplayability::ReplayBarrier).expect("gapless replay barrier");
+
+        assert_eq!(history.current_revision_id(), 2);
+        assert_eq!(history.current_cumulative_estimated_bytes(), 30);
+        assert_eq!(history.replay_floor_revision(), 2);
+        assert_eq!(history.oldest_available_revision(), 2);
+        assert!(history.is_empty());
+        assert_eq!(
+            history.range(1, 2),
+            Err(GraphHistoryRangeError::StartBeforeReplayFloor { requested: 1, replay_floor_revision: 2 })
+        );
+        assert_eq!(history.range(2, 2), Ok(GraphHistoryRange::UpToDate { revision: 2 }));
     }
 
     #[test]
@@ -323,8 +415,8 @@ mod tests {
         let before = history.clone();
 
         assert_eq!(
-            history.append(delta(3, 6, 6), 100),
-            Err(GraphHistoryAppendError::RevisionMismatch { history_revision: 5, delta_from: 3 })
+            append_replayable(&mut history, delta(2, 4, 4), 100),
+            Err(GraphHistoryAppendError::RevisionMismatch { history_revision: 3, delta_from: 2 })
         );
         assert_eq!(history, before);
     }
@@ -332,9 +424,9 @@ mod tests {
     #[test]
     fn pruning_removes_only_the_longest_eligible_prefix() {
         let mut history = GraphHistory::new();
-        history.append(delta(0, 1, 1), 10).expect("first entry");
-        history.append(delta(1, 2, 5), 20).expect("retained entry");
-        history.append(delta(2, 4, 2), 30).expect("eligible non-prefix aggregate");
+        append_replayable(&mut history, delta(0, 1, 1), 10).expect("first entry");
+        append_replayable(&mut history, delta(1, 2, 5), 20).expect("retained entry");
+        append_replayable(&mut history, delta(2, 3, 2), 30).expect("eligible non-prefix entry");
 
         history.prune(4);
 
@@ -343,31 +435,31 @@ mod tests {
         assert_eq!(entries[0].delta().from_revision_id(), 1);
         assert_eq!(entries[1].delta().from_revision_id(), 2);
         assert_eq!(history.oldest_available_revision(), 1);
-        assert_eq!(history.current_revision_id(), 4);
+        assert_eq!(history.current_revision_id(), 3);
         assert_eq!(history.current_cumulative_estimated_bytes(), 60);
         assert_eq!(entries[0].cumulative_estimated_bytes() - entries[0].estimated_raw_bytes(), 10);
     }
 
     #[test]
-    fn pruning_treats_aggregates_as_indivisible_and_preserves_detached_entries() {
+    fn pruning_preserves_detached_atomic_entries() {
         let mut history = history();
-        let captured = match history.range(1, 2).expect("target inside aggregate") {
+        let captured = match history.range(1, 2).expect("retained atomic target") {
             GraphHistoryRange::Deltas { actual_target, entries, .. } => {
-                assert_eq!(actual_target, 4);
+                assert_eq!(actual_target, 2);
                 entries
             }
-            GraphHistoryRange::UpToDate { .. } => panic!("range contains an aggregate"),
+            GraphHistoryRange::UpToDate { .. } => panic!("range contains an entry"),
         };
         let retained_entry = Arc::clone(&captured[0]);
 
         history.prune(6);
 
         assert!(history.is_empty());
-        assert_eq!(history.oldest_available_revision(), 5);
-        assert_eq!(history.current_revision_id(), 5);
+        assert_eq!(history.oldest_available_revision(), 3);
+        assert_eq!(history.current_revision_id(), 3);
         assert_eq!(history.current_cumulative_estimated_bytes(), 60);
         assert_eq!(retained_entry.delta().from_revision_id(), 1);
-        assert_eq!(retained_entry.delta().to_revision_id(), 4);
+        assert_eq!(retained_entry.delta().to_revision_id(), 2);
         assert_eq!(retained_entry.cumulative_estimated_bytes(), 40);
         assert!(Arc::ptr_eq(&retained_entry, &captured[0]));
     }
@@ -382,7 +474,7 @@ mod tests {
             Ok(GraphHistoryRange::UpToDate { revision: 0 }),
             "equality is decided before the pruned-boundary check"
         );
-        assert_eq!(history.range(4, 3), Err(GraphHistoryRangeError::BackwardTarget { from_revision_id: 4, target_revision_id: 3 }));
+        assert_eq!(history.range(3, 2), Err(GraphHistoryRangeError::BackwardTarget { from_revision_id: 3, target_revision_id: 2 }));
     }
 
     #[test]
@@ -390,32 +482,27 @@ mod tests {
         let mut history = history();
         history.prune(5);
 
-        assert_eq!(history.range(0, 5), Err(GraphHistoryRangeError::StartPruned { requested: 0, oldest_available: 1 }));
-        assert_eq!(
-            history.range(2, 5),
-            Err(GraphHistoryRangeError::StartUnavailable { requested: 2, current: 5 }),
-            "an internal aggregate revision is not reconstructed"
-        );
-        assert_eq!(history.range(6, 7), Err(GraphHistoryRangeError::StartUnavailable { requested: 6, current: 5 }));
+        assert_eq!(history.range(0, 3), Err(GraphHistoryRangeError::StartPruned { requested: 0, oldest_available: 1 }));
+        assert_eq!(history.range(4, 5), Err(GraphHistoryRangeError::StartUnavailable { requested: 4, current: 3 }));
     }
 
     #[test]
-    fn unavailable_internal_aggregate_boundary_uses_bounded_search() {
+    fn unavailable_future_boundary_uses_bounded_search() {
         let mut history = GraphHistory::new();
-        history.append(delta(0, 100, 100), 10).expect("aggregate entry");
-        for revision in 100..4_196 {
+        for revision in 0..4_096 {
             history
-                .append(delta(revision, revision + 1, u32::try_from(revision + 1).expect("test level fits u32")), 1)
+                .append(
+                    delta(revision, revision + 1, u32::try_from(revision + 1).expect("test level fits u32")),
+                    1,
+                    GraphHistoryReplayability::Replayable,
+                )
                 .expect("later entry");
         }
 
         let mut inspected = 0;
-        assert_eq!(find_boundary_index(&history.entries, 50, || inspected += 1), None);
+        assert_eq!(find_boundary_index(&history.entries, 5_000, || inspected += 1), None);
         assert!(inspected <= 13, "binary search inspected {inspected} of {} entries", history.len());
-        assert_eq!(
-            history.range(50, history.current_revision_id()),
-            Err(GraphHistoryRangeError::StartUnavailable { requested: 50, current: 4_196 })
-        );
+        assert_eq!(history.range(5_000, 5_001), Err(GraphHistoryRangeError::StartUnavailable { requested: 5_000, current: 4_096 }));
     }
 
     #[test]
@@ -434,10 +521,10 @@ mod tests {
         };
 
         assert_range(1, 1, &[1]);
-        assert_range(2, 4, &[1, 4]);
-        assert_range(4, 4, &[1, 4]);
-        assert_range(99, 5, &[1, 4, 5]);
-        assert_eq!(history.range(5, 99), Ok(GraphHistoryRange::UpToDate { revision: 5 }));
+        assert_range(2, 2, &[1, 2]);
+        assert_range(3, 3, &[1, 2, 3]);
+        assert_range(99, 3, &[1, 2, 3]);
+        assert_eq!(history.range(3, 99), Ok(GraphHistoryRange::UpToDate { revision: 3 }));
     }
 
     #[test]

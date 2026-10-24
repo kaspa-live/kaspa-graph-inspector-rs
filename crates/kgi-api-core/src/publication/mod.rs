@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Instant};
 use kgi_api_model::{
     delta::GraphDelta,
     graph::{GraphView, GraphViewExtractError, LevelExtent, TrackingPolicy},
-    history::{GraphHistory, GraphHistoryRange, GraphHistoryRangeError},
+    history::{GraphHistory, GraphHistoryRange, GraphHistoryRangeError, GraphHistoryReplayability},
 };
 use kgi_model::graph_update::{BlockCommitted, VspcCommitted};
 use rand::{RngCore, rngs::OsRng};
@@ -344,7 +344,9 @@ impl AppliedLineageUpdate {
         after_view_update();
         let target_revision = delta.to_revision_id();
         let estimated_raw_bytes = estimate_raw_delta_bytes(&delta);
-        history.append(delta, estimated_raw_bytes).expect("a successful Head update extends its matching history");
+        history
+            .append(delta, estimated_raw_bytes, GraphHistoryReplayability::Replayable)
+            .expect("a successful Head update extends its matching history");
         history.prune(view.low_level());
         Ok(Some(Self { target_revision, head_high_level: view.high_level() }))
     }
@@ -505,7 +507,7 @@ mod tests {
         let mut view = head_view();
         view.apply_delta(&delta).expect("matching Head delta");
         let mut history = GraphHistory::new();
-        history.append(delta, 1).expect("matching history delta");
+        history.append(delta, 1, GraphHistoryReplayability::Replayable).expect("matching history delta");
 
         let origin = Instant::now().checked_sub(Duration::from_millis(123)).expect("valid fixture origin");
         let publication =
@@ -600,7 +602,13 @@ mod tests {
         let publication =
             GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view(), GraphHistory::new())
                 .expect("matching candidate");
-        publication.core.write().await.history.append(advanced_delta(), 1).expect("fixture history drift");
+        publication
+            .core
+            .write()
+            .await
+            .history
+            .append(advanced_delta(), 1, GraphHistoryReplayability::Replayable)
+            .expect("fixture history drift");
 
         assert_eq!(
             publication.apply_vspc_committed(&vspc_added(2, None)).await,

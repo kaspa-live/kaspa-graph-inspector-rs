@@ -721,6 +721,7 @@ mod tests {
     };
     use kgi_api_model::{
         graph::Level,
+        history::GraphHistoryReplayability,
         projection::{GraphViewSeed, GraphWindowResolution},
     };
     use kgi_model::{
@@ -1621,7 +1622,7 @@ mod tests {
                 .apply_head_vspc_committed(&vspc_update_at(91, 91), 1)
                 .expect("mutable Head")
                 .expect("fixture update advances only the publication view");
-            core.history.append(delta, 1).expect("fixture advances only publication history");
+            core.history.append(delta, 1, GraphHistoryReplayability::Replayable).expect("fixture advances only publication history");
         }
 
         assert_eq!(
