@@ -1790,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_floor_invalidation_wins_before_contending_completion_and_cannot_be_overwritten() {
+    fn delta_replay_floor_invalidation_wins_before_contending_completion_and_cannot_be_overwritten() {
         let cache = Arc::new(GraphCache::new());
         let job = Arc::new(super::CacheJob::pending(CancellationToken::new()));
         cache.lock_state().deltas.slots_by_source.insert(3, super::CacheSlot { completed: None, running: Some(job.clone()) });
@@ -1830,8 +1830,50 @@ mod tests {
         invalidation.cancel();
     }
 
+    #[test]
+    fn head_replay_floor_invalidation_wins_before_contending_completion_and_cannot_be_overwritten() {
+        let cache = Arc::new(GraphCache::new());
+        let depth = CACHED_HEAD_WINDOW_DEPTH_STEP;
+        let job = Arc::new(super::CacheJob::pending(CancellationToken::new()));
+        cache.lock_state().head_slots.insert(depth, super::CacheSlot { completed: None, running: Some(job.clone()) });
+
+        let detached = Arc::new(Barrier::new(2));
+        let release_invalidator = Arc::new(Barrier::new(2));
+        let invalidation_cache = cache.clone();
+        let invalidation_detached = detached.clone();
+        let invalidation_release = release_invalidator.clone();
+        let invalidator = std::thread::spawn(move || {
+            invalidation_cache.invalidate_replay_floor_with(4, || {
+                invalidation_detached.wait();
+                invalidation_release.wait();
+            })
+        });
+        detached.wait();
+
+        let completion_started = Arc::new(Barrier::new(2));
+        let completion_cache = Arc::downgrade(&cache);
+        let completion_job = job.clone();
+        let completion_barrier = completion_started.clone();
+        let completion = std::thread::spawn(move || {
+            completion_barrier.wait();
+            super::finish_head_job(&completion_cache, depth, &completion_job, Ok((cached_head(depth, 3, 20), 20)));
+        });
+        completion_started.wait();
+        release_invalidator.wait();
+
+        let invalidation = invalidator.join().expect("invalidation thread succeeds");
+        completion.join().expect("completion thread succeeds");
+        assert!(!cache.lock_state().head_slots.contains_key(&depth));
+        assert!(matches!(&*job.state.borrow(), super::CacheJobState::InvalidatedByReplayFloor { replay_floor_revision: 4 }));
+
+        job.complete(Err(CacheBuildError::Encoding(EncodingSchedulerError::BlockingExecutorFailed)));
+        job.complete(Err(CacheBuildError::Cancelled));
+        assert!(matches!(&*job.state.borrow(), super::CacheJobState::InvalidatedByReplayFloor { replay_floor_revision: 4 }));
+        invalidation.cancel();
+    }
+
     #[tokio::test]
-    async fn ordinary_completion_wins_before_replay_floor_invalidation() {
+    async fn delta_ordinary_completion_wins_before_replay_floor_invalidation() {
         let cache = Arc::new(GraphCache::new());
         let job = Arc::new(super::CacheJob::pending(CancellationToken::new()));
         cache.lock_state().deltas.slots_by_source.insert(3, super::CacheSlot { completed: None, running: Some(job.clone()) });
@@ -1846,6 +1888,27 @@ mod tests {
         assert!(invalidation.delta_jobs.is_empty());
         assert!(invalidation.head_jobs.is_empty());
         assert!(!cache.lock_state().deltas.slots_by_source.contains_key(&3));
+        let observed = job.wait(CancellationToken::new()).await.expect("ordinary completion remains terminal");
+        assert!(Arc::ptr_eq(&observed, &completed));
+    }
+
+    #[tokio::test]
+    async fn head_ordinary_completion_wins_before_replay_floor_invalidation() {
+        let cache = Arc::new(GraphCache::new());
+        let depth = CACHED_HEAD_WINDOW_DEPTH_STEP;
+        let job = Arc::new(super::CacheJob::pending(CancellationToken::new()));
+        cache.lock_state().head_slots.insert(depth, super::CacheSlot { completed: None, running: Some(job.clone()) });
+
+        let completed = cached_head(depth, 3, 20);
+        super::finish_head_job(&Arc::downgrade(&cache), depth, &job, Ok((completed.clone(), 20)));
+        assert!(cache.lock_state().head_slots.get(&depth).is_some_and(|slot| {
+            slot.running.is_none() && slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &completed))
+        }));
+
+        let invalidation = cache.invalidate_replay_floor(4);
+        assert!(invalidation.delta_jobs.is_empty());
+        assert!(invalidation.head_jobs.is_empty());
+        assert!(!cache.lock_state().head_slots.contains_key(&depth));
         let observed = job.wait(CancellationToken::new()).await.expect("ordinary completion remains terminal");
         assert!(Arc::ptr_eq(&observed, &completed));
     }

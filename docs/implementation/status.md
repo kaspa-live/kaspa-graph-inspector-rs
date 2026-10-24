@@ -434,6 +434,6 @@ publication ordering, and both final-admission linearizations. Logical graph
 operations and the broader response-cache redesign remain in the later
 increments recorded in
 [the implementation sequence](sequence.md#remaining-reviewable-increments).
-Completion validation passed workspace formatting, Cargo check, 551/551
+Completion validation passed workspace formatting, Cargo check, 553/553
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.
