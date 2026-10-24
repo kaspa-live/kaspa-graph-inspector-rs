@@ -185,7 +185,7 @@ reported through the typed ownership-fault path rather than interpreted as
 ordinary shutdown.
 The superseded BlockProcessor-owned lifecycle-marker worker and its API marker
 effects have been removed. The ProcessingSession-owned worker remains scheduled
-for increment 18. The BlockProcessor owner loop implements explicit input
+for increment 21. The BlockProcessor owner loop implements explicit input
 priority, notification gating, phase-specific materialization policy, PostSeal
 transition, graph-before-persisted delivery, Catchup lower-bound and
 source-overlap accounting, child fault provenance, and typed storage and node
@@ -316,24 +316,23 @@ with warnings denied, and `git diff --check`.
 The implemented Increment 10 Head-cache selection, delta target selection,
 destination heat, immutable source slots, and level-based pruning predate the
 current [protocol cache contract](../architecture/api-protocol.md#publication-scoped-head-response-cache--settled).
-Increment 15 must adapt retained history and both cache kernels before adding
-logical Head operations. The current history still accepts composed intervals;
-the new contract requires atomic entries. The delta-cache adaptation removes
-heat, makes source entries
-enlargeable through one serialized source job, converges size-limited work
-inside that job through a monotonic source ceiling, adopts atomic dyadic
-targets and query-driven cache-age pruning, and makes `GraphPublication`
-classify an atomic estimate reaching the soft limit so `GraphHistory` records
-an append-time replay floor.
-The same adaptation must synchronously invalidate pre-floor delta and Head
-cache work and validate the conservative estimator implication before using
-the existing weights for target or replay-floor decisions. It must also adapt
-the currently limit-enforcing encoder so a soft-admitted canonical delta logs
-an unexpected hard-threshold overrun but still completes gzip and cache
-construction; the enforced limit remains unchanged for other graph bodies.
-Increment 15 initializes the active
-interval to 4 and keeps it fixed; dynamic adjustment remains the explicit open
-architecture decision recorded in the decision register.
+Increment 15 adapts retained history to atomic entries, cumulative estimates,
+and the history-owned replay floor, then integrates publication-time
+classification with synchronized cache invalidation and final-admission
+ordering. The current history still accepts composed intervals and therefore
+requires this foundation before logical graph operations are added.
+Increment 16 adapts both cache kernels and the encoder: it removes destination
+heat and target-level indexes, makes source entries enlargeable through one
+serialized job, adds monotonic size ceilings and query-driven age pruning, and
+permits a soft-admitted canonical delta to log an unexpected invariant-
+threshold overrun while still completing gzip and cache construction. The
+enforced non-delta response limit remains unchanged.
+Increment 17 implements logical Head snapshot and retained-level operations.
+Increment 18 implements the canonical delta operation, including atomic
+dyadic targets, continuation, and registration completion. It stores one
+mutable ApiService-wide active interval initialized to 4; every decision reads
+the current value, but production does not update it until the controller in
+the open architecture register is settled.
 
 Implementation increment 11 is implemented: each `GraphPublication` now owns
 its publication-local SSE client registry and each connection owns one bounded,
@@ -409,7 +408,7 @@ path, and remain silent on expected shutdown. The terminal service barrier is
 serialized with reset, stops database updates and construction waiters, joins
 the runtime, cache work, and encoding scheduler, clears the publication, and
 retains idempotent completion. Logical graph operations, public admission
-lanes, request and SSE guards, and Axum transport remain in increments 15–17.
+lanes, request and SSE guards, and Axum transport remain in increments 15–20.
 Focused verification covers construction, installation fencing, Rebuild gate
 authority, exact publication identity, database binding and status snapshots,
 runtime replacement and receiver release, generation exhaustion, independent

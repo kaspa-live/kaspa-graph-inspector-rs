@@ -817,7 +817,7 @@ during publication while removing the much larger within-entry overestimate.
 
 These weights are usable only while they satisfy the protocol-owned
 [soft-to-hard estimator guarantee](../architecture/api-protocol.md#graph-http-compression--settled).
-Increment 15 must validate the stronger implementation bound
+Increment 16 must validate the stronger implementation bound
 `encoded_delta_json_bytes <= 4 * estimated_raw_bytes` across the maximum wire
 widths reachable below the soft limit. If the current representative weights
 do not establish that bound, raise the affected weights before using the
@@ -883,7 +883,7 @@ as shared immutable `bytes::Bytes`. The bounded encoding scheduler introduced
 by the same increment remains the sole production caller and the sole
 submitter of this work to Tokio's blocking executor.
 
-Increment 15 adapts that module with a canonical-delta mode. A delta admitted
+Increment 16 adapts that module with a canonical-delta mode. A delta admitted
 by the soft estimator continues serialization beyond the diagnostic hard
 threshold, returns its complete observed byte count and body, and lets the
 request owner emit the required estimator-invariant error before gzip/cache
