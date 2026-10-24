@@ -1751,18 +1751,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_floor_cancellation_stops_detached_work_without_replacing_its_terminal_state() {
+    async fn replay_floor_cancellation_stops_detached_work_releases_resources_and_preserves_terminal_state() {
         let cache = Arc::new(GraphCache::new());
         let jobs = CacheJobTracker::new();
         let started = Arc::new(Notify::new());
         let started_builder = started.clone();
         let dropped = Arc::new(AtomicBool::new(false));
         let dropped_builder = dropped.clone();
+        let resource = Arc::new(());
+        let weak_resource = Arc::downgrade(&resource);
+        let builder_resource = resource.clone();
         let running = job(delta(&cache, &jobs, 3, 20, move |_| async move {
             let _drop_signal = DropSignal(dropped_builder);
+            let _resource = builder_resource;
             started_builder.notify_one();
             std::future::pending::<Result<Arc<CachedDelta>, CacheBuildError>>().await
         }));
+        drop(resource);
         started.notified().await;
 
         let invalidation = cache.invalidate_replay_floor(4);
@@ -1781,6 +1786,7 @@ mod tests {
             Err(CacheWaitError::InvalidatedByReplayFloor { replay_floor_revision: 4 })
         );
         jobs.shutdown().await;
+        assert!(weak_resource.upgrade().is_none(), "joined cancellation releases resources retained by detached work");
     }
 
     #[test]

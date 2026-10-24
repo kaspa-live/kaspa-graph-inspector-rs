@@ -316,11 +316,10 @@ with warnings denied, and `git diff --check`.
 The implemented Increment 10 Head-cache selection, delta target selection,
 destination heat, immutable source slots, and level-based pruning predate the
 current [protocol cache contract](../architecture/api-protocol.md#publication-scoped-head-response-cache--settled).
-Increment 15 adapts retained history to atomic entries, cumulative estimates,
-and the history-owned replay floor, then integrates publication-time
-classification with synchronized cache invalidation and final-admission
-ordering. The current history still accepts composed intervals and therefore
-requires this foundation before logical graph operations are added.
+Increment 15 has replaced the former composed history with atomic entries,
+absolute cumulative estimates, append-time replay barriers, synchronized
+cache invalidation, and the final-admission seam used by later logical graph
+operations.
 Increment 16 adapts both cache kernels and the encoder: it removes destination
 heat and target-level indexes, makes source entries enlargeable through one
 serialized job, adds monotonic size ceilings and query-driven age pruning, and
@@ -419,3 +418,22 @@ terminal resource release, and repeated shutdown. Completion validation passed
 workspace formatting, Cargo check, 535/535 Nextest tests including Docker
 PostgreSQL integration, Cargo doctests, Clippy with warnings denied, and
 `git diff --check`.
+
+Implementation increment 15 is implemented: `GraphHistory` now retains only
+atomic one-revision entries with absolute cumulative byte estimates, an
+inclusive replay floor, append-time replayability, and detached immutable range
+handles. The publication mutation kernel classifies every original update,
+advances replay barriers inside the coherent core mutation, synchronously
+invalidates affected publication-local cache state, and cancels detached work
+after releasing bounded locks. Delta and Head candidates share a narrow final
+replay-floor admission result for later logical operations. Focused tests cover
+validation precedence, cumulative-cost boundaries, ordinary pruning, monotonic
+barriers, detached ranges, exact cache invalidation, invalidated waiters,
+construction cancellation and resource release, both completion race orders,
+publication ordering, and both final-admission linearizations. Logical graph
+operations and the broader response-cache redesign remain in the later
+increments recorded in
+[the implementation sequence](sequence.md#remaining-reviewable-increments).
+Completion validation passed workspace formatting, Cargo check, 551/551
+Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
+with warnings denied, and `git diff --check`.

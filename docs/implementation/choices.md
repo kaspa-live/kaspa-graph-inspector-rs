@@ -924,8 +924,14 @@ cancellation root that the later service lifecycle will own.
 Use Tokio `watch` for one retained pending-or-terminal job state. This lets
 independent request cancellation detach one receiver, preserves the terminal
 result after every current receiver has gone, and avoids a separate waiter
-collection. Cache insertion or exact running-slot removal occurs under the
-short standard mutex before `send_replace` publishes that terminal value.
+collection. Ordinary completion performs cache insertion or exact running-slot
+removal under the short standard mutex, releases that mutex, and then uses
+`send_if_modified` to replace `Pending` with the terminal result. Replay-floor
+invalidation is the exceptional inverse ordering: it detaches the exact slots
+and changes their jobs from `Pending` to the invalidated terminal state while
+holding the same cache mutex. The conditional one-way state transition keeps a
+late completion from overwriting invalidation without extending ordinary cache
+critical sections.
 
 ## 19 October 2026: API client scheduling foundation
 
@@ -1119,3 +1125,25 @@ Run cache-job and encoding joins concurrently only after their ordered
 synchronous close/cancel prefixes have executed. Later transport increments
 attach request and connection guards to the existing independent cancellation
 roots without changing this lifecycle structure.
+
+## 24 October 2026: atomic history and replay-floor foundation
+
+### Cache invalidation handoff
+
+Return replay-floor-invalidated jobs from the synchronous cache mutation in a
+private `ReplayFloorInvalidation` value. The publication kernel can therefore
+publish every terminal waiter state while holding the bounded cache critical
+section, then cancel the detached construction work after releasing both cache
+and publication-core locks. Each builder selects between its job-local
+cancellation and the service-level cache-work cancellation, so the existing
+service tracker remains the sole join owner.
+
+### Final response admission token
+
+Represent the result of final replay-floor admission with one private generic
+`ReplayFloorAdmission<T>` that owns the admitted `Arc<T>`. Type-specific
+`GraphPublication` entry points select the delta source revision or Head
+snapshot revision, then share one comparison while briefly holding only the
+publication-core read lock. This keeps the final candidate alive across the
+check without coupling the publication kernel to later logical-operation
+outcomes or holding a cache guard.
