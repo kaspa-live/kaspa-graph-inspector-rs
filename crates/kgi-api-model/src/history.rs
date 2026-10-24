@@ -91,7 +91,7 @@ pub enum GraphHistoryRange {
         from: u64,
         /// Target originally requested by the caller.
         requested_target: u64,
-        /// Right boundary of the final indivisible retained entry.
+        /// Right boundary of the final selected atomic entry.
         actual_target: u64,
         /// Detached immutable entries selected for replay.
         entries: GraphHistoryEntryList,
@@ -246,7 +246,7 @@ impl GraphHistory {
         for entry in self.entries.range(start_index..) {
             actual_target = entry.delta.to_revision_id();
             selected.push(Arc::clone(entry));
-            if actual_target >= target_revision_id {
+            if actual_target == target_revision_id {
                 break;
             }
         }
@@ -307,6 +307,13 @@ mod tests {
         append_replayable(&mut history, delta(1, 2, 5), 30).expect("second entry");
         append_replayable(&mut history, delta(2, 3, 5), 20).expect("final entry");
         history
+    }
+
+    fn estimated_cost(entries: &GraphHistoryEntryList) -> u64 {
+        let first = entries.first().expect("nonempty retained range");
+        let last = entries.last().expect("nonempty retained range");
+        let left_boundary = first.cumulative_estimated_bytes() - first.estimated_raw_bytes();
+        last.cumulative_estimated_bytes() - left_boundary
     }
 
     #[test]
@@ -410,6 +417,44 @@ mod tests {
     }
 
     #[test]
+    fn replay_barriers_preserve_absolute_cost_and_move_the_floor_only_forward() {
+        let mut history = GraphHistory::new();
+        append_replayable(&mut history, delta(0, 1, 1), 10).expect("first entry");
+        append_replayable(&mut history, delta(1, 2, 2), 20).expect("second entry");
+        history.append(delta(2, 3, 3), 30, GraphHistoryReplayability::ReplayBarrier).expect("first barrier");
+        append_replayable(&mut history, delta(3, 4, 4), 40).expect("post-barrier entry");
+
+        let range = history.range(3, 4).expect("source at the floor remains replayable");
+        let GraphHistoryRange::Deltas { entries, actual_target, .. } = range else {
+            panic!("post-barrier range contains one entry");
+        };
+        assert_eq!(actual_target, 4);
+        assert_eq!(entries[0].cumulative_estimated_bytes(), 100);
+        assert_eq!(entries[0].cumulative_estimated_bytes() - entries[0].estimated_raw_bytes(), 60);
+        assert_eq!(estimated_cost(&entries), 40);
+
+        history.append(delta(4, 5, 5), 50, GraphHistoryReplayability::ReplayBarrier).expect("second barrier");
+
+        assert_eq!(history.current_revision_id(), 5);
+        assert_eq!(history.current_cumulative_estimated_bytes(), 150);
+        assert_eq!(history.replay_floor_revision(), 5);
+        assert_eq!(history.oldest_available_revision(), 5);
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn replay_barrier_overflow_panics_before_clearing_or_advancing() {
+        let mut history = GraphHistory::new();
+        append_replayable(&mut history, delta(0, 1, 1), u64::MAX).expect("maximum cumulative cost is valid");
+        let before = history.clone();
+
+        let result = catch_unwind(AssertUnwindSafe(|| history.append(delta(1, 2, 2), 1, GraphHistoryReplayability::ReplayBarrier)));
+
+        assert!(result.is_err());
+        assert_eq!(history, before);
+    }
+
+    #[test]
     fn nongapless_append_leaves_history_unchanged() {
         let mut history = history();
         let before = history.clone();
@@ -465,6 +510,46 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_pruning_preserves_absolute_range_cost_boundaries() {
+        let mut history = history();
+        let complete = match history.range(0, 3).expect("complete retained range") {
+            GraphHistoryRange::Deltas { entries, .. } => entries,
+            GraphHistoryRange::UpToDate { .. } => panic!("range contains entries"),
+        };
+        assert_eq!(estimated_cost(&complete), 60);
+
+        history.prune(5);
+
+        let retained = match history.range(1, 3).expect("retained suffix") {
+            GraphHistoryRange::Deltas { entries, .. } => entries,
+            GraphHistoryRange::UpToDate { .. } => panic!("range contains entries"),
+        };
+        assert_eq!(retained[0].cumulative_estimated_bytes(), 40);
+        assert_eq!(retained[0].cumulative_estimated_bytes() - retained[0].estimated_raw_bytes(), 10);
+        assert_eq!(estimated_cost(&retained), 50);
+        assert_eq!(history.replay_floor_revision(), 0, "ordinary pruning does not create a replay barrier");
+    }
+
+    #[test]
+    fn replay_floor_advancement_preserves_detached_entry_handles() {
+        let mut history = history();
+        let captured = match history.range(0, 2).expect("retained prefix") {
+            GraphHistoryRange::Deltas { entries, .. } => entries,
+            GraphHistoryRange::UpToDate { .. } => panic!("range contains entries"),
+        };
+        let first = Arc::clone(&captured[0]);
+
+        history.append(delta(3, 4, 6), 70, GraphHistoryReplayability::ReplayBarrier).expect("replay barrier");
+
+        assert!(history.is_empty());
+        assert_eq!(history.replay_floor_revision(), 4);
+        assert_eq!(first.delta().from_revision_id(), 0);
+        assert_eq!(first.delta().to_revision_id(), 1);
+        assert_eq!(first.cumulative_estimated_bytes(), 10);
+        assert!(Arc::ptr_eq(&first, &captured[0]));
+    }
+
+    #[test]
     fn range_checks_target_order_before_retention() {
         let mut history = history();
         history.prune(5);
@@ -475,6 +560,19 @@ mod tests {
             "equality is decided before the pruned-boundary check"
         );
         assert_eq!(history.range(3, 2), Err(GraphHistoryRangeError::BackwardTarget { from_revision_id: 3, target_revision_id: 2 }));
+    }
+
+    #[test]
+    fn target_order_and_equality_precede_the_replay_floor() {
+        let mut history = GraphHistory::new();
+        history.append(delta(0, 1, 1), 10, GraphHistoryReplayability::ReplayBarrier).expect("replay barrier");
+
+        assert_eq!(history.range(0, 0), Ok(GraphHistoryRange::UpToDate { revision: 0 }));
+        assert_eq!(history.range(1, 0), Err(GraphHistoryRangeError::BackwardTarget { from_revision_id: 1, target_revision_id: 0 }));
+        assert_eq!(
+            history.range(0, 1),
+            Err(GraphHistoryRangeError::StartBeforeReplayFloor { requested: 0, replay_floor_revision: 1 })
+        );
     }
 
     #[test]
@@ -525,6 +623,16 @@ mod tests {
         assert_range(3, 3, &[1, 2, 3]);
         assert_range(99, 3, &[1, 2, 3]);
         assert_eq!(history.range(3, 99), Ok(GraphHistoryRange::UpToDate { revision: 3 }));
+
+        let GraphHistoryRange::Deltas { from, requested_target, actual_target, entries } =
+            history.range(1, 2).expect("exact interior range")
+        else {
+            panic!("interior range contains one entry");
+        };
+        assert_eq!(from, 1);
+        assert_eq!(requested_target, 2);
+        assert_eq!(actual_target, 2);
+        assert_eq!(entries.iter().map(|entry| entry.delta().to_revision_id()).collect::<Vec<_>>(), [2]);
     }
 
     #[test]
