@@ -88,8 +88,8 @@ sequence first.
 
 The former broad Step 6 is now increments 6–20, former Step 7 is increments
 21–25, and former Step 8 is increments 26–30. Increments 6–14 are complete;
-the next production work is increment 15 after its accepted architecture
-prerequisites, without an additional nesting level.
+the active production work is increment 15, without an additional nesting
+level.
 
 | Increment / PR | Isolated production scope | Completion evidence |
 |---|---|---|
@@ -119,67 +119,73 @@ prerequisites, without an additional nesting level.
 | 29. Deployment and release artifacts | Complete the conventional and Docker layouts, runtime log directories, systemd and Compose examples, static-asset cache behavior, and atomic `xtask` bundle/container construction against the composed binary and Web build. | Reproducible bundle and image checks, matching binary/assets and provenance, missing-root failure, unprivileged/read-only deployment, writable logs, direct signal delivery, and atomic failure cleanup. |
 | 30. Full-stack acceptance | Add only the remaining cross-component fixtures and acceptance coverage needed to prove the focused verification contract across node RPC, PostgreSQL, recovery, API/Web, packaging, logging, and resource isolation; update implementation status with the final evidence. | Full Rust, PostgreSQL, Vitest, deterministic and complete-stack Playwright, parity, packaging, shutdown, and load/isolation suites pass from a clean checkout. |
 
-### Increment 14: ApiService lifecycle and publication installation
+### Active increment 15: atomic history and replay-floor foundation
 
-Increment 14 is exactly one reviewable PR. It integrates the publication,
-database-binding, cache-job, and encoding capabilities completed by increments
-8–13 behind the Supervisor-facing `ApiService` control boundary. The focused
-[ApiService contract](../architecture/api-service.md) owns the lifecycle and
-resource ordering; this plan records only the implementation sequence.
+Increment 15 is exactly one reviewable PR. It adapts the graph-model and
+publication kernel to the settled atomic-history and replay-barrier contracts,
+then establishes the ordering seam through which a replay-floor advance
+invalidates publication-local cache work and fences final response admission.
+The focused [graph model](../architecture/api-graph.md),
+[publication](../architecture/api-publication.md),
+[protocol](../architecture/api-protocol.md), and
+[ApiService](../architecture/api-service.md) documents remain the sole owners
+of those contracts; this plan records only their implementation sequence.
 
-Execute increment 14 as these ordered points:
+Execute increment 15 as these ordered points:
 
-1. Add the ApiService module boundary and its documented public control, event,
-   and error values. Construct the reliable event path before any permanent
-   work, initialize the API database state, empty current-publication watch,
-   generation-zero installation state, `AwaitReset` runtime slot, independent
-   cancellation roots, cache-job tracker, encoding scheduler, and latest-value
-   status inputs. Add no publication runtime at construction time.
-2. Implement the synchronous publication-installation capability used by
-   `PublicationRuntime`. Under the single installation boundary, validate the
-   captured runtime generation, replace the complete publication `Arc`, and
-   reopen Rebuild database-read admission only for an accepted current
-   generation. Verify exact publication identity, stale and repeated install
-   attempts, current-publication capture, and Rebuild gate behavior.
-3. Implement reliable API database-generation forwarding and latest-value
-   status aggregation. Preserve the existing exact-generation database-state
-   dispositions, reject updates after stop, and compose status without adding
-   dependencies from `kgi-api-core` to NodeService or processing crates or
-   allowing observations to influence lifecycle decisions.
-4. Implement `reset` under the runtime lifecycle mutex. Advance the checked
-   installation generation and apply the Resync or Rebuild database effect
-   before starting the successor; install the successor runtime before awaiting
-   its predecessor's completed shutdown barrier. Verify first reset, both
-   recovery modes, bounded predecessor overlap, superseded installation,
-   receiver release, and reset serialization.
-5. Add owned completion observation for permanent work. Adapt
-   `PublicationRuntime` completion narrowly enough for ApiService to observe an
-   unexpected return or panic without detached tasks, emit `ApiServiceEvent::Failed`
-   exactly once, and keep expected shutdown silent. Apply the same owner-level
-   rule to encoding-scheduler termination while leaving cache-job and request
-   failures local to their callers.
-6. Implement the idempotent terminal `shutdown` barrier in the architecture's
-   prescribed order for every resource present in this increment: close service
-   admission, enter the explicit terminal `Stopping` slot, stop API database
-   binding, join the retained publication runtime, cancel the independent SSE
-   and HTTP roots, close and cancel cache work, stop and join encoding, clear
-   the current publication, release retained resources, and enter `Stopped`.
-   Later transport increments attach their guards to these roots and barriers
-   without changing this ordering.
-7. Complete deterministic control-level verification for shutdown from
-   `AwaitReset` and every publication-runtime state, reset/shutdown and
-   database-update/shutdown races, final Stale propagation, task and generation
-   release, cancellation while a shutdown resource barrier remains open,
-   rejected reset after that terminal cutoff, resumed shutdown,
-   unexpected-worker failure, event-path closure, and repeated shutdown. Record
-   the implementation choices and status, then run the full Rust validation
-   suite.
+1. Adapt `GraphHistory` and its public model values to the atomic-entry
+   contract. Add the replayability input, replay-floor state and accessor,
+   `NonAtomicDelta`, and `StartBeforeReplayFloor`, preserving the documented
+   validation precedence and the panic-on-cumulative-overflow invariant. Update
+   exports and focused constructors without introducing protocol or cache
+   dependencies into `kgi-api-model`.
+2. Implement replayable append, replay-barrier append, ordinary level pruning,
+   oldest-available and replay-floor boundaries, and exact atomic range
+   selection. Preserve absolute cumulative estimates across both forms of
+   prefix removal and expose immutable entry lists suitable for later response
+   budgeting. Replace the former aggregate-entry tests with boundary-focused
+   tests for one-revision continuity, error precedence, exact target selection,
+   future targets, pruning, replay barriers, and maximum cumulative values.
+3. Add the publication-owned replayability classification at the original
+   update boundary using the existing canonical estimator and the
+   protocol-owned soft threshold. Keep view application, timestamping,
+   estimation, classification, history append, and ordinary pruning inside the
+   existing atomic mutation; add the replay floor and oldest available revision
+   to the documented coherent captures. An update classified as a replay
+   barrier must never enter retained history or start encoding work.
+4. Add the narrow replay-floor invalidation operation to the existing
+   publication-local graph cache and cache-job state machine. Under one cache
+   critical section, detach the architecture-selected delta and Head entries
+   and make affected pending jobs terminal before returning their handles;
+   perform cancellation only after leaving that section. Preserve exact
+   slot/job identity so either invalidation or ordinary completion wins the
+   documented two-order race without repopulating an invalidated slot.
+5. Integrate that invalidation into the original-update tail. When history
+   reports a floor advance, invoke the synchronous bounded cache operation
+   before publishing the new core, then release the core lock, cancel detached
+   work without awaiting it, advance the SSE client registry, and finally
+   release mutation ownership. Add deterministic interleavings proving that no
+   new pre-floor capture can escape the mutation boundary.
+6. Implement the publication-owned final replay-floor-admission primitive for
+   immutable cached delta and Head candidates. It must compare and record
+   admission while briefly holding the core read side and hold no cache guard;
+   later operation increments will call this primitive immediately before
+   response commitment. Verify both possible orders between admission and a
+   concurrent floor advance, including a completed job removed after winning
+   its race with invalidation.
+7. Complete focused model, publication, cache-job, and concurrency coverage for
+   replay-floor monotonicity, detached range handles, invalidated waiters,
+   cancellation, completion races, and resource release. Record only genuine
+   implementation choices and the increment status, run the full Rust
+   validation suite, and keep the PR limited to this foundation.
 
-This increment adds no logical Head or anchored-window operation, HTTP admission
-lane or Axum router, request guard, SSE transport connection loop, Supervisor
-implementation, or process composition. Increments 15–20 complete the graph
-foundations and attach the public operations and transports to the lifecycle
-boundary established here.
+This increment adds no logical Head, level, canonical-delta, anchored-window,
+or status operation; no HTTP admission lane, Axum route, or SSE transport; and
+no adaptive-interval controller. It does not perform the broader response-cache
+redesign assigned to increment 16: exact Head-tier policy, source-ordered
+`DeltaCache`, query-driven age pruning, source-job enlargement, size ceilings,
+and canonical response encoding remain out of scope. Increments 17 and 18 own
+the first consumers of the capture and final-admission primitives.
 
 ## Cross-increment ordering
 
