@@ -993,7 +993,8 @@ V2 exposes these operational measurements:
   serialized source jobs, size-ceiling reductions and in-job descent,
   dyadic target and delivered spans, active interval, per-client revision
   wakeups, requests per catch-up, size-limited short-prefix frequency,
-  replay-floor advances, and invalidated delta and Head-tier jobs;
+  replay-floor advances, invalidated delta and Head-tier jobs, estimated versus
+  actual canonical-delta JSON bytes, and estimator-invariant violations;
 - database pool and public-read permit occupancy, query duration, and query
   timeouts;
 - encoding reservation, queue, and active-job occupancy, queue timeouts, and

@@ -138,7 +138,7 @@ Define:
 
 ```text
 SOFT_DELTA_ESTIMATED_BYTES = 4 MiB
-MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES = 16 MiB
+MAX_UNCOMPRESSED_NON_DELTA_GRAPH_RESPONSE_BYTES = 16 MiB
 ```
 
 The soft limit governs canonical-delta replayability and target selection. The
@@ -147,7 +147,7 @@ canonical estimator must be conservative enough that:
 ```text
 estimated_raw_bytes < SOFT_DELTA_ESTIMATED_BYTES
     implies
-encoded_delta_json_bytes <= MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES
+encoded_delta_json_bytes <= MAX_UNCOMPRESSED_NON_DELTA_GRAPH_RESPONSE_BYTES
 ```
 
 This implication applies both to one atomic history entry and to the additive
@@ -730,7 +730,7 @@ carry the exact `reason` string `level-not-retained`,
 `block-not-materialized`, or `no-retained-daa-match`. `FreshViewRequired`
 carries the exact reason string `publication-mismatch`, `start-pruned`,
 `start-unavailable`, `delta-source-expired`, or
-`first-stored-delta-exceeds-budget`.
+`delta-replay-barrier`.
 
 Categories and codes use these exact lowercase kebab-case values:
 
@@ -781,7 +781,7 @@ enum FreshViewReason {
     StartPruned,
     StartUnavailable,
     DeltaSourceExpired,
-    FirstStoredDeltaExceedsBudget,
+    DeltaReplayBarrier,
 }
 
 enum DeltaResponseOutcome {
@@ -1192,7 +1192,7 @@ against the captured Head timestamp before exact-source lookup. An equality
 request then returns `UpToDate`. A forward request first compares its source
 with the history-owned `replay_floor_revision`. A source below that inclusive
 first-replayable revision returns
-`FreshViewRequired(FirstStoredDeltaExceedsBudget)` without encoding work.
+`FreshViewRequired(DeltaReplayBarrier)` without encoding work.
 
 An exact completed cache entry is adequate when it reaches at least the target
 selected for this request, or when it is marked `size_limited`. An adequate
@@ -1236,7 +1236,7 @@ Public outcomes map as follows:
   `FreshViewRequired(StartPruned)`;
 - on a completed-cache miss,
   `GraphHistoryRangeError::StartBeforeReplayFloor` returns
-  `FreshViewRequired(FirstStoredDeltaExceedsBudget)`;
+  `FreshViewRequired(DeltaReplayBarrier)`;
 - on a completed-cache miss, `GraphHistoryRangeError::StartUnavailable` returns
   `FreshViewRequired(StartUnavailable)`; and
 - `GraphHistoryRange::UpToDate` returns `DeltaResponseOutcome::UpToDate`.
@@ -1543,7 +1543,8 @@ repairing the current transport or graph lineage, so v2 does not divide them
 between `409 Conflict` and `410 Gone`.
 
 A complete Head snapshot, anchored window, or Head-level lookup whose
-uncompressed JSON exceeds `MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES` returns
+uncompressed JSON exceeds
+`MAX_UNCOMPRESSED_NON_DELTA_GRAPH_RESPONSE_BYTES` returns
 `422 Unprocessable Content` with code `graph-response-too-large`, identifies
 the hard byte limit and the observed uncompressed JSON size, and returns no
 partial graph. The client may retry with a smaller depth or fewer levels.
@@ -1551,7 +1552,7 @@ Canonical deltas admit only candidates whose estimate is below the soft limit,
 which guarantees that the encoded body fits the hard limit. An atomic entry at
 or above the soft limit has already advanced the history-owned replay floor;
 requests below it return
-`FreshViewRequired(FirstStoredDeltaExceedsBudget)`. An unexpectedly oversized
+`FreshViewRequired(DeltaReplayBarrier)`. An unexpectedly oversized
 below-soft canonical delta logs the estimator-invariant violation and remains
 a successful complete or prefix response.
 
@@ -1703,11 +1704,11 @@ that lightweight HTTP wrapper is also retained is an implementation detail.
 
 Every `CachedDelta` is admitted below `SOFT_DELTA_ESTIMATED_BYTES` and is
 therefore expected to remain within
-`MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES`. An estimator-invariant violation does
-not prevent retaining the observed larger value. `GraphCache` has no
-independent total encoded-byte cap; publication lifetime, the five-minute
-cache-age horizon, demand-driven construction, and the estimator guarantee
-provide its structural bound.
+`MAX_UNCOMPRESSED_NON_DELTA_GRAPH_RESPONSE_BYTES`. An estimator-invariant
+violation does not prevent retaining the observed larger value. `GraphCache`
+has no independent total encoded-byte cap; publication lifetime, the
+five-minute cache-age horizon, demand-driven construction, and the estimator
+guarantee provide its structural bound.
 
 The delta cache and its source-keyed single-flight jobs serve both
 SSE-coordinated and HTTP-only delta-to-current requests and are ordered by
@@ -1795,8 +1796,9 @@ The containing publication supplies the publication ID. The gzip body is the
 final encoding of `HeadSnapshotResponseDto` and therefore contains that ID and
 the snapshot cursor and revision timestamp, but contains no publication state,
 request `target_depth`, or cache-tier field. Each entry is individually subject
-to `MAX_UNCOMPRESSED_GRAPH_RESPONSE_BYTES`. The fixed number of tiers and that
-per-entry limit structurally bound this cache without another total byte cap.
+to `MAX_UNCOMPRESSED_NON_DELTA_GRAPH_RESPONSE_BYTES`. The fixed number of tiers
+and that per-entry limit structurally bound this cache without another total
+byte cap.
 
 For a valid request, derive its selected depth using the public tier formula.
 The request consults only that exact tier; a completed or running larger tier

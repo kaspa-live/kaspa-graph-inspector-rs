@@ -1576,7 +1576,10 @@ never moves backward. Inject a deliberately broken estimator whose below-soft
 candidate exceeds the hard limit. Require one error-level diagnostic with the
 estimate and observed size, followed by successful compression, cache
 insertion, and delivery of the complete response. It must not descend, advance
-the replay floor, or produce fresh-view recovery.
+the replay floor, or produce fresh-view recovery. Require the canonical-delta
+estimate-versus-actual measurement for admitted candidates and increment the
+estimator-invariant-violation measurement exactly once for this shared
+construction rather than once per waiter.
 
 Pause delta and Head responses after they acquire completed pre-floor cache
 values but before replay-floor admission, then advance the replay floor. Both
