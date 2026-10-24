@@ -15,7 +15,10 @@ use kgi_model::graph_update::{BlockCommitted, VspcCommitted};
 use rand::{RngCore, rngs::OsRng};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::{cache::GraphCache, client::SseClientRegistry};
+use crate::{
+    cache::{CachedDelta, CachedHeadSnapshot, GraphCache},
+    client::SseClientRegistry,
+};
 
 pub(crate) use self::error::PublicationProjectionError;
 use self::estimate::{classify_replayability, estimate_raw_delta_bytes};
@@ -118,6 +121,18 @@ impl GraphDeltaTargetCapture {
     }
 }
 
+/// Result of linearizing one immutable cached response against the current
+/// history replay floor.
+pub(crate) enum ReplayFloorAdmission<T> {
+    /// The immutable response may proceed even if the floor advances later.
+    Admitted(Arc<T>),
+    /// The response revision already precedes the inclusive replay floor.
+    Rejected {
+        /// Floor observed while holding the publication core read lock.
+        replay_floor_revision: u64,
+    },
+}
+
 /// One publication-local graph lineage and its synchronization boundary.
 pub(crate) struct GraphPublication {
     publication_id: u64,
@@ -130,6 +145,8 @@ pub(crate) struct GraphPublication {
     atomic_mutation_test_hook: Option<std::sync::Arc<AtomicMutationTestHook>>,
     #[cfg(test)]
     delta_estimate_test_override: Option<u64>,
+    #[cfg(test)]
+    replay_floor_admission_test_hook: Option<std::sync::Arc<ReplayFloorAdmissionTestHook>>,
 }
 
 #[cfg(test)]
@@ -162,6 +179,32 @@ impl AtomicMutationTestHook {
 
     fn resume_core_update(&self) {
         self.finish_core_update.wait();
+    }
+}
+
+#[cfg(test)]
+struct ReplayFloorAdmissionTestHook {
+    core_locked: std::sync::Barrier,
+    finish_admission: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl ReplayFloorAdmissionTestHook {
+    fn new() -> Self {
+        Self { core_locked: std::sync::Barrier::new(2), finish_admission: std::sync::Barrier::new(2) }
+    }
+
+    fn pause_with_core_lock(&self) {
+        self.core_locked.wait();
+        self.finish_admission.wait();
+    }
+
+    fn wait_for_core_lock(&self) {
+        self.core_locked.wait();
+    }
+
+    fn resume_admission(&self) {
+        self.finish_admission.wait();
     }
 }
 
@@ -198,6 +241,8 @@ impl GraphPublication {
             atomic_mutation_test_hook: None,
             #[cfg(test)]
             delta_estimate_test_override: None,
+            #[cfg(test)]
+            replay_floor_admission_test_hook: None,
         })
     }
 
@@ -296,6 +341,21 @@ impl GraphPublication {
         self.core.read().await.history.range(from_revision_id, target.revision)
     }
 
+    /// Linearizes one completed cached delta against the current replay floor.
+    pub(crate) async fn admit_cached_delta_replay_floor(&self, candidate: Arc<CachedDelta>) -> ReplayFloorAdmission<CachedDelta> {
+        let source_revision = candidate.source_revision_id();
+        self.admit_replay_floor(source_revision, candidate).await
+    }
+
+    /// Linearizes one completed cached Head snapshot against the current replay floor.
+    pub(crate) async fn admit_cached_head_replay_floor(
+        &self,
+        candidate: Arc<CachedHeadSnapshot>,
+    ) -> ReplayFloorAdmission<CachedHeadSnapshot> {
+        let revision = candidate.revision();
+        self.admit_replay_floor(revision, candidate).await
+    }
+
     /// Applies one committed block and publishes any resulting history entry.
     ///
     /// Returns the newly published target revision, or `None` when the update
@@ -349,6 +409,20 @@ impl GraphPublication {
         drop(mutation);
         self.cache.prune_deltas(applied.head_high_level);
         Ok(Some(applied.target_revision))
+    }
+
+    async fn admit_replay_floor<T>(&self, candidate_revision: u64, candidate: Arc<T>) -> ReplayFloorAdmission<T> {
+        let core = self.core.read().await;
+        #[cfg(test)]
+        if let Some(hook) = &self.replay_floor_admission_test_hook {
+            hook.pause_with_core_lock();
+        }
+        let replay_floor_revision = core.history.replay_floor_revision();
+        if candidate_revision < replay_floor_revision {
+            ReplayFloorAdmission::Rejected { replay_floor_revision }
+        } else {
+            ReplayFloorAdmission::Admitted(candidate)
+        }
     }
 
     fn revision_timestamp_ms_at(&self, now: Instant) -> u64 {
@@ -447,7 +521,10 @@ mod tests {
     use crate::{
         cache::{CacheAccess, CacheBuildError, CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot},
         client::{DeltaCompletionResult, DeltaScheduleAction, SseMailbox, SseMessage},
-        codec::sse::{PublicationStateDto, PublicationWakeupDto},
+        codec::{
+            HeadEtagInput,
+            sse::{PublicationStateDto, PublicationWakeupDto},
+        },
     };
 
     fn head_view() -> GraphView {
@@ -507,6 +584,20 @@ mod tests {
     fn advanced_delta() -> GraphDelta {
         GraphDelta::new(0, 1, 123, 1, HashMap::new(), HashMap::new(), Vec::new(), HashMap::new(), HashMap::new())
             .expect("valid advancing delta")
+    }
+
+    fn cached_head_candidate(publication_id: u64, revision: u64) -> Arc<CachedHeadSnapshot> {
+        let extent = LevelExtent::new(1, 1).expect("valid cached Head extent");
+        Arc::new(CachedHeadSnapshot::new(
+            50,
+            revision,
+            revision * 10,
+            1,
+            1,
+            4,
+            HeadEtagInput::new(publication_id, revision, extent),
+            Bytes::from_static(b"head"),
+        ))
     }
 
     fn publication_with_atomic_mutation_hook(max_depth: u32) -> (Arc<GraphPublication>, Arc<AtomicMutationTestHook>) {
@@ -768,6 +859,76 @@ mod tests {
         assert!(matches!(cache.delta(&jobs, 0, |_| async { Err(CacheBuildError::Cancelled) }, || async { 2 }), CacheAccess::Job(_)));
 
         jobs.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_floor_advance_wins_before_final_admission() {
+        let (mut publication, hook) = publication_with_atomic_mutation_hook(2);
+        Arc::get_mut(&mut publication).expect("fixture publication is not yet shared").delta_estimate_test_override =
+            Some(estimate::SOFT_DELTA_ESTIMATED_BYTES);
+        let old_delta = Arc::new(CachedDelta::new(0, 1, 1, 4, Bytes::from_static(b"delta")));
+        let old_head = cached_head_candidate(publication.publication_id(), 0);
+
+        let update_publication = publication.clone();
+        let update = tokio::spawn(async move { update_publication.apply_block_committed(&committed_block(2)).await });
+        hook.wait_for_view_update();
+
+        let admission_publication = publication.clone();
+        let admission_delta = old_delta.clone();
+        let admission = tokio::spawn(async move { admission_publication.admit_cached_delta_replay_floor(admission_delta).await });
+        tokio::task::yield_now().await;
+        assert!(!admission.is_finished(), "final admission waits behind replay-floor advancement");
+
+        hook.resume_core_update();
+        assert_eq!(update.await.expect("update task").expect("replay-barrier update"), Some(1));
+        assert!(matches!(admission.await.expect("admission task"), ReplayFloorAdmission::Rejected { replay_floor_revision: 1 }));
+        assert!(matches!(
+            publication.admit_cached_head_replay_floor(old_head).await,
+            ReplayFloorAdmission::Rejected { replay_floor_revision: 1 }
+        ));
+
+        let floor_delta = Arc::new(CachedDelta::new(1, 2, 2, 4, Bytes::from_static(b"floor-delta")));
+        assert!(matches!(publication.admit_cached_delta_replay_floor(floor_delta).await, ReplayFloorAdmission::Admitted(_)));
+        let floor_head = cached_head_candidate(publication.publication_id(), 1);
+        assert!(matches!(publication.admit_cached_head_replay_floor(floor_head).await, ReplayFloorAdmission::Admitted(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_admission_wins_before_later_replay_floor_advance() {
+        let mut publication =
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view_with_depth(2), GraphHistory::new())
+                .expect("matching candidate");
+        publication.delta_estimate_test_override = Some(estimate::SOFT_DELTA_ESTIMATED_BYTES);
+        let delta = Arc::new(CachedDelta::new(0, 1, 1, 4, Bytes::from_static(b"delta")));
+        let admitted_delta = publication.admit_cached_delta_replay_floor(delta.clone()).await;
+
+        let hook = Arc::new(ReplayFloorAdmissionTestHook::new());
+        publication.replay_floor_admission_test_hook = Some(hook.clone());
+        let publication = Arc::new(publication);
+        let head = cached_head_candidate(publication.publication_id(), 0);
+        let admission_publication = publication.clone();
+        let admission_head = head.clone();
+        let admission = tokio::spawn(async move { admission_publication.admit_cached_head_replay_floor(admission_head).await });
+        hook.wait_for_core_lock();
+
+        let update_publication = publication.clone();
+        let update = tokio::spawn(async move { update_publication.apply_block_committed(&committed_block(2)).await });
+        tokio::task::yield_now().await;
+        assert!(!update.is_finished(), "floor advancement waits for final admission's core read lock");
+
+        hook.resume_admission();
+        let admitted_head = admission.await.expect("admission task");
+        assert_eq!(update.await.expect("update task").expect("replay-barrier update"), Some(1));
+        assert_eq!(publication.core.read().await.history.replay_floor_revision(), 1);
+
+        match admitted_delta {
+            ReplayFloorAdmission::Admitted(candidate) => assert!(Arc::ptr_eq(&candidate, &delta)),
+            ReplayFloorAdmission::Rejected { .. } => panic!("delta admission precedes the floor advance"),
+        }
+        match admitted_head {
+            ReplayFloorAdmission::Admitted(candidate) => assert!(Arc::ptr_eq(&candidate, &head)),
+            ReplayFloorAdmission::Rejected { .. } => panic!("Head admission precedes the floor advance"),
+        }
     }
 
     #[tokio::test]
