@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Instant};
 use kgi_api_model::{
     delta::GraphDelta,
     graph::{GraphView, GraphViewExtractError, LevelExtent, TrackingPolicy},
-    history::{GraphHistory, GraphHistoryRange, GraphHistoryRangeError},
+    history::{GraphHistory, GraphHistoryRange, GraphHistoryRangeError, GraphHistoryReplayability},
 };
 use kgi_model::graph_update::{BlockCommitted, VspcCommitted};
 use rand::{RngCore, rngs::OsRng};
@@ -339,7 +339,12 @@ impl GraphPublication {
         let Some(applied) = applied else {
             return Ok(None);
         };
+        let invalidation =
+            applied.replay_floor_advance.map(|replay_floor_revision| self.cache.invalidate_replay_floor(replay_floor_revision));
         drop(core);
+        if let Some(invalidation) = invalidation {
+            invalidation.cancel();
+        }
         self.clients.advance_head(applied.target_revision);
         drop(mutation);
         self.cache.prune_deltas(applied.head_high_level);
@@ -368,6 +373,7 @@ impl OriginalUpdate<'_> {
 struct AppliedLineageUpdate {
     target_revision: u64,
     head_high_level: u32,
+    replay_floor_advance: Option<u64>,
 }
 
 impl AppliedLineageUpdate {
@@ -392,9 +398,10 @@ impl AppliedLineageUpdate {
         let target_revision = delta.to_revision_id();
         let estimated_raw_bytes = estimate_delta(&delta);
         let replayability = classify_replayability(estimated_raw_bytes);
+        let replay_floor_advance = (replayability == GraphHistoryReplayability::ReplayBarrier).then_some(target_revision);
         history.append(delta, estimated_raw_bytes, replayability).expect("a successful Head update extends its matching history");
         history.prune(view.low_level());
-        Ok(Some(Self { target_revision, head_high_level: view.high_level() }))
+        Ok(Some(Self { target_revision, head_high_level: view.high_level(), replay_floor_advance }))
     }
 }
 
@@ -438,7 +445,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        cache::{CacheAccess, CacheJobTracker, CachedDelta},
+        cache::{CacheAccess, CacheBuildError, CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot},
         client::{DeltaCompletionResult, DeltaScheduleAction, SseMailbox, SseMessage},
         codec::sse::{PublicationStateDto, PublicationWakeupDto},
     };
@@ -683,6 +690,84 @@ mod tests {
             assert_eq!(view.oldest_available_revision(), expected_replay_floor);
             assert_eq!(target.replay_floor_revision(), expected_replay_floor);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_barrier_invalidates_cache_before_publishing_core_and_sse_head() {
+        let (mut publication, hook) = publication_with_atomic_mutation_hook(2);
+        Arc::get_mut(&mut publication).expect("fixture publication is not yet shared").delta_estimate_test_override =
+            Some(estimate::SOFT_DELTA_ESTIMATED_BYTES);
+        let cache = publication.cache();
+        let jobs = CacheJobTracker::new();
+
+        let CacheAccess::Job(initial_delta) = cache.delta(
+            &jobs,
+            0,
+            |_| async { Ok(Arc::new(CachedDelta::new(0, 1, 1, 4, Bytes::from_static(b"old-delta")))) },
+            || async { 1 },
+        ) else {
+            panic!("fixture delta installs one cache job");
+        };
+        initial_delta.wait(tokio_util::sync::CancellationToken::new()).await.expect("fixture delta completes");
+
+        let head_access = cache
+            .head(
+                &jobs,
+                50,
+                |_, _| async { std::future::pending::<Result<Arc<CachedHeadSnapshot>, CacheBuildError>>().await },
+                || async { 1 },
+            )
+            .await;
+
+        let mailbox = Arc::new(SseMailbox::new());
+        let identifier = publication
+            .client_registry()
+            .register(0, &mailbox, tokio_util::sync::CancellationToken::new())
+            .expect("registration succeeds");
+        for _ in 0..3 {
+            mailbox.recv().await.expect("initial registration message");
+        }
+        assert_eq!(
+            publication
+                .client_registry()
+                .complete_delta(identifier, DeltaScheduleAction::Replace { wake_at_revision_id: 1, wake_sent: false }),
+            DeltaCompletionResult::Accepted
+        );
+
+        let update_publication = publication.clone();
+        let update = tokio::spawn(async move { update_publication.apply_block_committed(&committed_block(2)).await });
+        hook.wait_for_view_update();
+
+        let capture_publication = publication.clone();
+        let capture = tokio::spawn(async move { capture_publication.capture_delta_target().await });
+        tokio::task::yield_now().await;
+        assert!(!capture.is_finished(), "the new core remains hidden before replay-floor invalidation");
+        assert!(matches!(
+            cache.delta(
+                &jobs,
+                0,
+                |_| async { panic!("the pre-floor completed value still exists before invalidation") },
+                || async { 1 }
+            ),
+            CacheAccess::Completed(_)
+        ));
+
+        hook.resume_core_update();
+        assert_eq!(update.await.expect("update task").expect("replay-barrier update"), Some(1));
+        let captured = capture.await.expect("capture task");
+        assert_eq!(captured.revision(), 1);
+        assert_eq!(captured.replay_floor_revision(), 1);
+        assert_eq!(
+            mailbox.recv().await,
+            Some(SseMessage::PublicationWakeup(PublicationWakeupDto::new(publication.publication_id(), 1)))
+        );
+        assert_eq!(
+            head_access.resolve(tokio_util::sync::CancellationToken::new()).await,
+            Err(CacheWaitError::InvalidatedByReplayFloor { replay_floor_revision: 1 })
+        );
+        assert!(matches!(cache.delta(&jobs, 0, |_| async { Err(CacheBuildError::Cancelled) }, || async { 2 }), CacheAccess::Job(_)));
+
+        jobs.shutdown().await;
     }
 
     #[tokio::test]
