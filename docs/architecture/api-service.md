@@ -527,10 +527,11 @@ terminal job completion. The orchestration task applies the protocol-owned
 completion-time eligibility check against the containing publication. An
 obsolete candidate is dropped, while the same `CacheJob` stays `Pending` in
 the same running slot and captures and submits a newer Frozen attempt. It does
-not notify waiters or expose the discarded bytes. Only a timestamp-eligible
-candidate continues into the success path below. This retry remains one
-tracked single-flight job; later requests for that exact tier join it rather
-than creating another capture or encoding task.
+not notify waiters or expose the discarded bytes. Only a candidate passing the
+complete protocol-owned age, replay-floor, and ordinary-history eligibility
+check continues into the success path below. This retry remains one tracked
+single-flight job; later requests for that exact tier join it rather than
+creating another capture or encoding task.
 
 Each waiter subscribes to the job's `watch` sender and selects terminal job
 completion against its own request cancellation token. Cancelling one request

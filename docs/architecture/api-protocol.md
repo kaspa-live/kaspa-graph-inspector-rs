@@ -1820,56 +1820,67 @@ age_ms = H.revision_timestamp_ms - C.revision_timestamp_ms
 ```
 
 Both values belong to the same publication-local monotonic timestamp domain;
-observing `C` later than `H` is an internal invariant failure. The entry is
-eligible exactly while:
+observing `C` later than `H` is an internal invariant failure.
+`H.replay_floor_revision` and `H.oldest_available_revision` are sampled from
+the same current publication core as that Head timestamp. The entry is eligible
+exactly while:
 
 ```text
 C.revision >= H.replay_floor_revision
+and C.revision >= H.oldest_available_revision
 and age_ms < CACHED_HEAD_SNAPSHOT_MAX_AGE_MS
 ```
 
-Expiration is lazy and query driven. An incoming query samples the current
-Head timestamp and replay floor and examines only its selected tier. If that
-completed entry has reached the maximum age, the operation physically removes
-it before joining or installing the selected-tier job. It does not inspect or
-remove an expired entry in any other tier. Head advancement, publication
-installation, and elapsed wall time start no scan, removal, refresh, or
-construction. The fixed tier count and per-entry response limit bound
-completed entries that have not yet been queried again.
+Age and ordinary-history obsolescence are lazy and query driven. An incoming
+query samples the current Head timestamp, replay floor, and ordinary-history
+boundary and examines only its selected tier. If that completed entry has
+reached the maximum age or its cursor precedes `oldest_available_revision`, the
+operation physically removes it before joining or installing the selected-tier
+job and before evaluating `If-None-Match`; an ineligible entry never produces
+`304 Not Modified`. It does not inspect or remove an ineligible entry in any
+other tier. Head advancement, publication installation, and elapsed wall time
+start no scan, removal, refresh, or construction. The fixed tier count and per-
+entry response limit bound completed entries that have not yet been queried
+again.
 
 After extraction, JSON serialization, size checking, and gzip complete, a tier
-job samples the publication's then-current Head revision timestamp and replay
-floor and applies the same eligibility check before cache insertion, terminal
-job completion, or waiter delivery. An age-obsolete candidate is discarded
-without becoming a cache entry, successful result, or `CacheBuildError`. The
-same logical tier construction remains pending, all current waiters remain
-joined, and it repeats from a newer coherent Frozen capture. A below-floor job
-has already been detached and receives the replay-floor terminal state instead.
-Concurrent demand for that exact tier continues to join the applicable
-construction.
+job samples the publication's then-current Head revision timestamp, replay
+floor, and `oldest_available_revision` and applies the same eligibility check
+before cache insertion, terminal job completion, or waiter delivery. A
+candidate obsolete by age or ordinary history is discarded without becoming a
+cache entry, successful result, or `CacheBuildError`. The same logical tier
+construction remains pending, all current waiters remain joined, and it
+repeats from a newer coherent Frozen capture. A below-floor job has already
+been detached and receives the replay-floor terminal state instead. Concurrent
+demand for that exact tier continues to join the applicable construction.
 
 Once a completed entry or newly encoded candidate passes its request-time or
 completion-time check, ordinary later Head advancement that does not advance
 the replay floor does not revoke that admission, terminal job result, or
-in-flight response. A later request performs a new age check. Failure removes
-the selected-tier job and permits a later request to retry; there is no
-preceding entry to preserve as a serve-and-refresh value.
+in-flight response, even when it later advances the ordinary-history boundary.
+A later request performs a new complete eligibility check. Failure removes the
+selected-tier job and permits a later request to retry; there is no preceding
+entry to preserve as a serve-and-refresh value.
 Waiter completion, job removal, and retry availability belong to the
 [ApiService task contract](api-service.md#api-task-ownership-and-completion--settled).
 
-Replay-floor advancement is distinct from age expiration. It synchronously
-removes every completed Head snapshot whose revision is below the floor and
-invalidates every running Head-tier job, because each such job captured its
-view before the floor-advancing mutation. A Head snapshot acquired before that
-invalidation must compare its revision with the current floor again at the
-common final replay-floor-admission point. A snapshot at the floor remains
-eligible. An invalidated waiter re-enters its selected exact tier and builds or
-joins a new capture.
+Replay-floor advancement is distinct from age expiration and ordinary-history
+obsolescence. It synchronously removes every completed Head snapshot whose
+revision is below the floor and invalidates every running Head-tier job,
+because each such job captured its view before the floor-advancing mutation. A
+Head snapshot acquired before that invalidation must compare its revision with
+the current floor again at the common final replay-floor-admission point. A
+snapshot at the floor remains eligible only when it also passes the other
+eligibility conditions. An invalidated waiter re-enters its selected exact tier
+and builds or joins a new capture. Ordinary pruning performs no cache scan or
+job invalidation; the next exact-tier query or job completion observes its new
+boundary.
 
 `Synchronizing` and `Live` compare snapshots with their moving Head timestamp.
-A terminal `Stale` publication stops advancing, so snapshot age becomes fixed;
-an eligible entry remains usable, while a queried obsolete entry is removed
-and rebuilt from the final coherent Head. Publication replacement releases the
+A terminal `Stale` publication stops advancing, so snapshot age and the
+ordinary-history boundary become fixed; an eligible entry remains usable,
+while a queried obsolete entry is removed and rebuilt from the final coherent
+Head. Publication replacement releases the
 complete tier cache with the containing publication under the
 publication-lifetime contract.
 

@@ -1614,6 +1614,16 @@ that entry's own tier removes it atomically and joins or installs exactly one
 selected-tier job. An eligible hit starts no refresh. Failure gives all
 on-demand waiters the same typed error, removes the job, and permits retry.
 
+While a `Synchronizing` publication remains below the 90-second age boundary,
+advance it far enough for ordinary level-scoped history pruning to move
+`oldest_available_revision` beyond a completed tier's cursor without advancing
+the replay floor. With no matching completed delta source, require the next
+exact-tier request to remove that snapshot, reject its matching ETag rather
+than return `304`, and construct a newer snapshot whose cursor remains
+replayable. Also pause a tier candidate during detached encoding, move the
+ordinary-history boundary beyond its cursor, and require the still-pending job
+to discard that candidate and complete from one newer shared capture.
+
 Pause a demand-built Head-tier job during detached encoding and advance Head
 across the completion-time age boundary. A candidate completing at age 89,999
 milliseconds is installed and delivered. At age 90,000 it is neither inserted
@@ -1623,8 +1633,12 @@ one shared eligible result. Advancing Head after an eligible candidate's
 admission must not revoke that installed entry or its already waiting
 responses. Repeat the obsolete-candidate case for the publication's first
 tier-20 request. For a terminal `Stale` publication, verify that age remains
-fixed, an eligible entry remains reusable, and querying an obsolete entry
-removes and rebuilds it from the final Head.
+fixed, an eligible entry remains reusable, and querying an age- or ordinary-
+history-obsolete entry removes and rebuilds it from the final Head. Starting
+from the obsolete tier cursor, require `StartPruned` fresh-view recovery to
+receive that rebuilt snapshot and then reach Head without selecting the old
+tier again, both when the publication remains `Synchronizing` and after it
+becomes `Stale`.
 
 For canonical Head deltas, verify at most one publication-owned job per source.
 Concurrent requests join it even when they selected different targets. A

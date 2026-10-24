@@ -238,6 +238,7 @@ delivery, and request waiting never hold it. The private capture values are:
 struct GraphViewCapture {
     publication_id: u64,
     replay_floor_revision: u64,
+    oldest_available_revision: u64,
     view: GraphView,
 }
 
@@ -266,13 +267,14 @@ supplied by ApiService's
 The slot owner defines acquisition and replacement behavior.
 
 A Head snapshot-cache job or Head-backed window holds one core read lock while
-it captures an owned `Frozen` graph view and the history-owned replay floor.
-For a cache operation, the request also performs its short nonblocking cache
-lookup or exact-slot job election before releasing that core read lock. The
-lock order is always core read lock followed by cache-state synchronization;
-no cache-state guard may acquire the core. This makes a pre-floor capture
-either visible to the later floor invalidation or impossible after that
-invalidation, without retaining either guard for extraction or encoding. A
+it captures an owned `Frozen` graph view, the history-owned replay floor, and
+`oldest_available_revision`. For a cache operation, the request also performs
+its short nonblocking cache lookup or exact-slot job election before releasing
+that core read lock. The lock order is always core read lock followed by cache-
+state synchronization; no cache-state guard may acquire the core. This makes a
+pre-floor capture either visible to the later floor invalidation or impossible
+after that invalidation, without retaining either guard for extraction or
+encoding, and gives Head eligibility one coherent ordinary-history boundary. A
 window performs its complete extraction against that same Frozen view. A level
 lookup similarly captures the revision and every requested complete level
 under one core read lock; an unavailable level produces no partial capture.
