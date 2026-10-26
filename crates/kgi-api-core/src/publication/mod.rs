@@ -519,8 +519,8 @@ mod tests {
     use super::*;
     use crate::{
         cache::{
-            CacheAccess, CacheBuildError, CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot, DeltaCacheLookup,
-            GraphCache, HeadEligibilityBoundary,
+            CacheAccess, CacheBuildError, CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot, DeltaBuildContext,
+            DeltaCacheLookup, GraphCache, HeadEligibilityBoundary,
         },
         client::{DeltaCompletionResult, DeltaScheduleAction, SseMailbox, SseMessage},
         codec::{
@@ -610,13 +610,13 @@ mod tests {
         builder: F,
     ) -> CacheAccess<CachedDelta>
     where
-        F: FnOnce(tokio_util::sync::CancellationToken) -> Fut + Send + 'static,
+        F: FnOnce(DeltaBuildContext) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Arc<CachedDelta>, CacheBuildError>> + Send + 'static,
     {
         match cache.lookup_delta(source_revision, target_revision, 0) {
             DeltaCacheLookup::Completed(value) => CacheAccess::Completed(value),
             DeltaCacheLookup::Running(job) => CacheAccess::Job(job),
-            DeltaCacheLookup::ConstructionRequired => cache.elect_delta(jobs, source_revision, 0, target_revision, builder),
+            DeltaCacheLookup::ConstructionRequired => cache.elect_delta(jobs, source_revision, 0, target_revision, false, builder),
         }
     }
 

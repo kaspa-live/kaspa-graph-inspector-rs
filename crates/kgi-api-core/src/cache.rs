@@ -55,6 +55,17 @@ impl CachedDelta {
         self.to_revision_id >= target_revision || self.size_limited
     }
 
+    fn reclassified_size_limited(&self) -> Arc<Self> {
+        assert!(!self.size_limited, "only an ordinary completed delta requires size-limited reclassification");
+        Arc::new(Self {
+            from_revision_id: self.from_revision_id,
+            to_revision_id: self.to_revision_id,
+            size_limited: true,
+            uncompressed_json_bytes: self.uncompressed_json_bytes,
+            gzip_body: self.gzip_body.clone(),
+        })
+    }
+
     /// Returns the complete uncompressed JSON byte count.
     pub(crate) const fn uncompressed_json_bytes(&self) -> u64 {
         self.uncompressed_json_bytes
@@ -268,17 +279,23 @@ impl GraphCache {
         source_revision: u64,
         first_revision_timestamp_ms: u64,
         target_revision: u64,
+        size_limited: bool,
         builder: F,
     ) -> CacheAccess<CachedDelta>
     where
-        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        F: FnOnce(DeltaBuildContext) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Arc<CachedDelta>, CacheBuildError>> + Send + 'static,
     {
-        let (access, builder_job) =
-            self.lock_state().deltas.elect(source_revision, first_revision_timestamp_ms, target_revision, jobs.new_job_cancellation());
+        let (access, builder_job) = self.lock_state().deltas.elect(
+            source_revision,
+            first_revision_timestamp_ms,
+            target_revision,
+            size_limited,
+            jobs.new_job_cancellation(),
+        );
 
         if let Some(job) = builder_job {
-            self.spawn_delta_builder(jobs, source_revision, job, builder);
+            self.spawn_delta_builder(jobs, source_revision, target_revision, size_limited, job, builder);
         }
         access
     }
@@ -322,21 +339,31 @@ impl GraphCache {
         self: &Arc<Self>,
         jobs: &CacheJobTracker,
         source_revision: u64,
+        target_revision: u64,
+        size_limited: bool,
         job: Arc<CacheJob<CachedDelta>>,
         builder: F,
     ) where
-        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        F: FnOnce(DeltaBuildContext) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Arc<CachedDelta>, CacheBuildError>> + Send + 'static,
     {
         let cache = Arc::downgrade(self);
         let task_job = job.clone();
         let spawned = jobs.spawn(move |cancellation| async move {
             let job_cancellation = task_job.cancellation.clone();
+            let context = DeltaBuildContext {
+                cache: cache.clone(),
+                source_revision,
+                target_revision,
+                size_limited,
+                job: task_job.clone(),
+                cancellation: job_cancellation,
+            };
             let result = tokio::select! {
                 biased;
                 () = cancellation.cancelled() => Err(CacheBuildError::Cancelled),
                 () = task_job.work_cancelled() => Err(CacheBuildError::Cancelled),
-                result = builder(job_cancellation) => result,
+                result = builder(context) => result,
             };
             finish_delta_job(&cache, source_revision, &task_job, result);
         });
@@ -495,9 +522,19 @@ impl DeltaCache {
         source_revision: u64,
         first_revision_timestamp_ms: u64,
         target_revision: u64,
+        size_limited: bool,
         cancellation: CancellationToken,
     ) -> (CacheAccess<CachedDelta>, Option<Arc<CacheJob<CachedDelta>>>) {
         if let Some(slot) = self.slots_by_source.get_mut(&source_revision) {
+            if size_limited
+                && let Some(completed) = &slot.completed
+                && completed.to_revision_id() == target_revision
+                && !completed.is_size_limited()
+            {
+                let reclassified = completed.reclassified_size_limited();
+                slot.completed = Some(reclassified.clone());
+                return (CacheAccess::Completed(reclassified), None);
+            }
             if let Some(completed) = &slot.completed
                 && completed.is_adequate_for(target_revision)
             {
@@ -508,7 +545,7 @@ impl DeltaCache {
             }
 
             let job = Arc::new(CacheJob::pending(cancellation));
-            slot.running = Some(RunningDeltaJob { target_revision, job: job.clone() });
+            slot.running = Some(RunningDeltaJob { target_revision, size_limited, job: job.clone() });
             return (CacheAccess::Job(job.clone()), Some(job));
         }
 
@@ -517,9 +554,8 @@ impl DeltaCache {
             source_revision,
             DeltaCacheSlot {
                 first_revision_timestamp_ms,
-                size_ceiling_revision: None,
                 completed: None,
-                running: Some(RunningDeltaJob { target_revision, job: job.clone() }),
+                running: Some(RunningDeltaJob { target_revision, size_limited, job: job.clone() }),
             },
         );
         (CacheAccess::Job(job.clone()), Some(job))
@@ -536,6 +572,11 @@ impl DeltaCache {
                     Some(value.to_revision_id()),
                     slot.running.as_ref().map(|running| running.target_revision),
                     "a completed delta reaches its elected target"
+                );
+                assert_eq!(
+                    Some(value.is_size_limited()),
+                    slot.running.as_ref().map(|running| running.size_limited),
+                    "a completed delta preserves its elected size classification"
                 );
                 if slot.completed.as_ref().is_none_or(|completed| value.to_revision_id() > completed.to_revision_id()) {
                     slot.completed = Some(value.clone());
@@ -594,14 +635,41 @@ impl DeltaCache {
 
 struct DeltaCacheSlot {
     first_revision_timestamp_ms: u64,
-    size_ceiling_revision: Option<u64>,
     completed: Option<Arc<CachedDelta>>,
     running: Option<RunningDeltaJob>,
 }
 
 struct RunningDeltaJob {
     target_revision: u64,
+    size_limited: bool,
     job: Arc<CacheJob<CachedDelta>>,
+}
+
+/// Exact source-job capability supplied to one elected delta builder.
+pub(crate) struct DeltaBuildContext {
+    cache: Weak<GraphCache>,
+    source_revision: u64,
+    target_revision: u64,
+    size_limited: bool,
+    job: Arc<CacheJob<CachedDelta>>,
+    cancellation: CancellationToken,
+}
+
+impl DeltaBuildContext {
+    /// Returns the cancellation token for detached construction work.
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    /// Returns the fitting target fixed before this job's election.
+    pub(crate) const fn target_revision(&self) -> u64 {
+        self.target_revision
+    }
+
+    /// Returns the immutable size classification fixed before election.
+    pub(crate) const fn is_size_limited(&self) -> bool {
+        self.size_limited
+    }
 }
 
 #[derive(Default)]
@@ -806,8 +874,8 @@ mod tests {
     use crate::codec::HeadEtagInput;
 
     use super::{
-        CacheAccess, CacheBuildError, CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot, DeltaCache, DeltaCacheLookup,
-        DeltaCacheSlot, EncodingSchedulerError, GraphCache, HeadEligibilityBoundary, RunningDeltaJob,
+        CacheAccess, CacheBuildError, CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot, DeltaBuildContext, DeltaCache,
+        DeltaCacheLookup, DeltaCacheSlot, EncodingSchedulerError, GraphCache, HeadEligibilityBoundary, RunningDeltaJob,
     };
 
     fn cached_delta(source: u64, target: u64) -> Arc<CachedDelta> {
@@ -842,21 +910,15 @@ mod tests {
         let source_revision = value.source_revision_id();
         cache.lock_state().deltas.slots_by_source.insert(
             source_revision,
-            DeltaCacheSlot {
-                first_revision_timestamp_ms: source_revision + 1,
-                size_ceiling_revision: None,
-                completed: Some(value),
-                running: None,
-            },
+            DeltaCacheSlot { first_revision_timestamp_ms: source_revision + 1, completed: Some(value), running: None },
         );
     }
 
     fn running_delta_slot(source_revision: u64, target_revision: u64, job: Arc<super::CacheJob<CachedDelta>>) -> DeltaCacheSlot {
         DeltaCacheSlot {
             first_revision_timestamp_ms: source_revision + 1,
-            size_ceiling_revision: None,
             completed: None,
-            running: Some(RunningDeltaJob { target_revision, job }),
+            running: Some(RunningDeltaJob { target_revision, size_limited: false, job }),
         }
     }
 
@@ -872,14 +934,14 @@ mod tests {
         builder: F,
     ) -> CacheAccess<CachedDelta>
     where
-        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        F: FnOnce(DeltaBuildContext) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Arc<CachedDelta>, CacheBuildError>> + Send + 'static,
     {
         match cache.lookup_delta(source_revision, target_revision, 1_000) {
             DeltaCacheLookup::Completed(value) => CacheAccess::Completed(value),
             DeltaCacheLookup::Running(job) => CacheAccess::Job(job),
             DeltaCacheLookup::ConstructionRequired => {
-                cache.elect_delta(jobs, source_revision, source_revision + 1, target_revision, builder)
+                cache.elect_delta(jobs, source_revision, source_revision + 1, target_revision, false, builder)
             }
         }
     }
@@ -914,7 +976,6 @@ mod tests {
                 source_revision,
                 DeltaCacheSlot {
                     first_revision_timestamp_ms,
-                    size_ceiling_revision: None,
                     completed: Some(cached_delta(source_revision, source_revision + 1)),
                     running: None,
                 },
@@ -932,15 +993,9 @@ mod tests {
     #[should_panic(expected = "a delta source timestamp does not postdate its publication Head")]
     fn delta_age_pruning_rejects_a_source_timestamp_from_the_future() {
         let mut cache = DeltaCache::default();
-        cache.slots_by_source.insert(
-            10,
-            DeltaCacheSlot {
-                first_revision_timestamp_ms: 11,
-                size_ceiling_revision: None,
-                completed: Some(cached_delta(10, 11)),
-                running: None,
-            },
-        );
+        cache
+            .slots_by_source
+            .insert(10, DeltaCacheSlot { first_revision_timestamp_ms: 11, completed: Some(cached_delta(10, 11)), running: None });
 
         cache.prune_expired(10);
     }
@@ -952,7 +1007,7 @@ mod tests {
         let started = Arc::new(Notify::new());
         let started_builder = started.clone();
         let (release_tx, release_rx) = oneshot::channel();
-        let running = job(cache.elect_delta(&jobs, 3, 0, 4, move |_| async move {
+        let running = job(cache.elect_delta(&jobs, 3, 0, 4, false, move |_| async move {
             started_builder.notify_one();
             release_rx.await.expect("expired delta builder is released");
             Ok(cached_delta(3, 4))
@@ -1129,12 +1184,12 @@ mod tests {
         assert!(matches!(cache.lookup_delta(7, 11, 1_000), DeltaCacheLookup::ConstructionRequired));
 
         let completed = cache
-            .elect_delta(&jobs, 7, 8, 11, |_| async { Ok(cached_delta(7, 11)) })
+            .elect_delta(&jobs, 7, 8, 11, false, |_| async { Ok(cached_delta(7, 11)) })
             .resolve(CancellationToken::new())
             .await
             .expect("competing construction completes");
 
-        match cache.elect_delta(&jobs, 7, 8, 11, |_| async { panic!("the redundant capture cannot become a builder") }) {
+        match cache.elect_delta(&jobs, 7, 8, 11, false, |_| async { panic!("the redundant capture cannot become a builder") }) {
             CacheAccess::Completed(value) => assert!(Arc::ptr_eq(&value, &completed)),
             CacheAccess::Job(_) => panic!("the second election observes the adequate completion"),
         }
@@ -1196,6 +1251,119 @@ mod tests {
         seed_delta(&cache, value.clone());
 
         assert!(matches!(cache.lookup_delta(7, u64::MAX, 1_000), DeltaCacheLookup::Completed(hit) if Arc::ptr_eq(&hit, &value)));
+    }
+
+    #[tokio::test]
+    async fn second_election_installs_only_the_preclassified_fitting_target() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        let started = Arc::new(Notify::new());
+        let started_builder = started.clone();
+        let (release_tx, release_rx) = oneshot::channel();
+        let running = job(cache.elect_delta(&jobs, 7, 8, 13, true, move |context| async move {
+            assert!(!context.cancellation().is_cancelled());
+            assert_eq!(context.target_revision(), 13);
+            assert!(context.is_size_limited());
+            started_builder.notify_one();
+            release_rx.await.expect("fixed-target builder is released");
+            Ok(Arc::new(CachedDelta::new(7, 13, true, 23, Bytes::from_static(b"gzip"))))
+        }));
+        started.notified().await;
+
+        {
+            let state = cache.lock_state();
+            let slot = state.deltas.slots_by_source.get(&7).expect("fitting source remains cached");
+            assert_eq!(slot.running.as_ref().map(|job| job.target_revision), Some(13));
+            assert_eq!(slot.running.as_ref().map(|job| job.size_limited), Some(true));
+            assert!(slot.running.as_ref().is_some_and(|candidate| Arc::ptr_eq(&candidate.job, &running)));
+        }
+        let joined = job(delta(&cache, &jobs, 7, 31, |_| async { panic!("waiters join the fixed-target job") }));
+        assert!(Arc::ptr_eq(&joined, &running));
+
+        release_tx.send(()).expect("fixed-target builder release is observed");
+        let completed = joined.wait(CancellationToken::new()).await.expect("fixed-target job completes");
+        assert_eq!(completed.to_revision_id(), 13);
+        assert!(completed.is_size_limited());
+        jobs.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_fitting_job_retains_no_size_evidence() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        let failed = job(cache.elect_delta(&jobs, 7, 8, 15, true, |context| async move {
+            assert_eq!(context.target_revision(), 15);
+            assert!(context.is_size_limited());
+            Err(CacheBuildError::Encoding(EncodingSchedulerError::BlockingExecutorFailed))
+        }));
+        assert_eq!(
+            failed.wait(CancellationToken::new()).await,
+            Err(CacheWaitError::Build(CacheBuildError::Encoding(EncodingSchedulerError::BlockingExecutorFailed)))
+        );
+
+        assert!(matches!(cache.lookup_delta(7, 19, 1_000), DeltaCacheLookup::ConstructionRequired));
+
+        let retry = job(cache.elect_delta(&jobs, 7, 8, 15, true, |_| async {
+            Ok(Arc::new(CachedDelta::new(7, 15, true, 23, Bytes::from_static(b"gzip"))))
+        }));
+        assert!(!Arc::ptr_eq(&failed, &retry));
+        assert_eq!(retry.wait(CancellationToken::new()).await.expect("retry repeats fitting construction").to_revision_id(), 15);
+        jobs.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn existing_fitting_completion_is_reclassified_without_reencoding() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        let body = Bytes::from(vec![1, 2, 3, 4]);
+        let builder_body = body.clone();
+        let previous =
+            delta(&cache, &jobs, 7, 11, move |_| async move { Ok(Arc::new(CachedDelta::new(7, 11, false, 23, builder_body))) })
+                .resolve(CancellationToken::new())
+                .await
+                .expect("ordinary fallback is cached");
+
+        let reclassified =
+            match cache.elect_delta(&jobs, 7, 8, 11, true, |_| async { panic!("reclassification performs no encoding") }) {
+                CacheAccess::Completed(value) => value,
+                CacheAccess::Job(_) => panic!("the exact fitting completion is reclassified immediately"),
+            };
+
+        assert!(reclassified.is_size_limited());
+        assert_eq!(reclassified.to_revision_id(), 11);
+        assert_eq!(reclassified.gzip_body().as_ptr(), previous.gzip_body().as_ptr());
+        assert!(matches!(
+            cache.lookup_delta(7, u64::MAX, 1_000),
+            DeltaCacheLookup::Completed(value) if Arc::ptr_eq(&value, &reclassified)
+        ));
+        jobs.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn joined_fixed_target_job_is_reclassified_on_waiter_reentry() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        let body = Bytes::from(vec![1, 2, 3, 4]);
+        let builder_body = body.clone();
+        let (release_tx, release_rx) = oneshot::channel();
+        let ordinary = job(cache.elect_delta(&jobs, 7, 8, 11, false, move |_| async move {
+            release_rx.await.expect("ordinary builder is released");
+            Ok(Arc::new(CachedDelta::new(7, 11, false, 23, builder_body)))
+        }));
+
+        let joined = job(cache.elect_delta(&jobs, 7, 8, 11, true, |_| async { panic!("the fitting request joins current work") }));
+        assert!(Arc::ptr_eq(&ordinary, &joined));
+        release_tx.send(()).expect("ordinary builder release is observed");
+        let completed = joined.wait(CancellationToken::new()).await.expect("joined fixed-target job completes");
+        assert!(!completed.is_size_limited());
+
+        let reclassified = match cache.elect_delta(&jobs, 7, 8, 11, true, |_| async { panic!("re-entry reuses encoded bytes") }) {
+            CacheAccess::Completed(value) => value,
+            CacheAccess::Job(_) => panic!("completed fitting bytes are reclassified"),
+        };
+        assert!(reclassified.is_size_limited());
+        assert_eq!(reclassified.gzip_body().as_ptr(), completed.gzip_body().as_ptr());
+        jobs.shutdown().await;
     }
 
     #[tokio::test]
