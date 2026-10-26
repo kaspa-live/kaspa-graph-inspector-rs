@@ -388,7 +388,7 @@ choice:
 ```rust
 struct GraphCacheState {
     deltas: DeltaCache,
-    head_slots: HashMap<u32, CacheSlot<CachedHeadSnapshot>>,
+    head_slots: HashMap<u32, HeadCacheSlot>,
 }
 
 struct DeltaCache {
@@ -407,9 +407,9 @@ struct RunningDeltaJob {
     job: Arc<CacheJob<CachedDelta>>,
 }
 
-struct CacheSlot<T> {
-    completed: Option<Arc<T>>,
-    running: Option<Arc<CacheJob<T>>>,
+struct HeadCacheSlot {
+    completed: Option<Arc<CachedHeadSnapshot>>,
+    running: Option<Arc<CacheJob<CachedHeadSnapshot>>>,
 }
 
 enum CacheJobState<T> {
