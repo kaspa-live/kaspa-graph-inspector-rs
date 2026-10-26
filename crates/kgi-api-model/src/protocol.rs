@@ -6,20 +6,14 @@ use kgi_model::lifecycle::{NodeServiceStatus, ProcessingStatus, StorageServiceSt
 
 use crate::{graph::Level, history::GraphHistoryEntryList};
 
-/// Maximum number of Head levels a cached delta target may trail its publication.
-pub const MAX_CACHE_LEVEL_DISTANCE: u32 = 500;
+/// Exact ordered depth tiers retained by the publication-local Head cache.
+pub const CACHED_HEAD_WINDOW_DEPTHS: [u32; 6] = [20, 50, 100, 150, 200, 250];
 
-/// Maximum number of Head levels a heated delta destination may trail its publication.
-pub const HOT_DESTINATION_LEVEL_DISTANCE: u32 = 250;
+/// Maximum age of a cached Head snapshot in publication-local milliseconds.
+pub const CACHED_HEAD_SNAPSHOT_MAX_AGE_MS: u64 = 90_000;
 
-/// Depth interval from which the finite Head snapshot cache tiers are derived.
-pub const CACHED_HEAD_WINDOW_DEPTH_STEP: u32 = 50;
-
-/// Head-level distance at which a selected cached snapshot triggers refresh.
-pub const CACHED_WINDOW_REFRESH_LEVEL_DISTANCE: u32 = 40;
-
-/// Head-level distance at which a cached snapshot becomes ineligible.
-pub const CACHED_WINDOW_MAX_LEVEL_DISTANCE: u32 = 100;
+/// Maximum age of a source-keyed canonical delta in publication-local milliseconds.
+pub const DELTA_CACHE_MAX_AGE_MS: u64 = 300_000;
 
 /// Reason a request must abandon its current graph lineage or source cursor.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

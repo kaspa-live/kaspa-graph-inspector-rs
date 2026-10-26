@@ -407,7 +407,6 @@ impl GraphPublication {
         }
         self.clients.advance_head(applied.target_revision);
         drop(mutation);
-        self.cache.prune_deltas(applied.head_high_level);
         Ok(Some(applied.target_revision))
     }
 
@@ -446,7 +445,6 @@ impl OriginalUpdate<'_> {
 
 struct AppliedLineageUpdate {
     target_revision: u64,
-    head_high_level: u32,
     replay_floor_advance: Option<u64>,
 }
 
@@ -475,7 +473,7 @@ impl AppliedLineageUpdate {
         let replay_floor_advance = (replayability == GraphHistoryReplayability::ReplayBarrier).then_some(target_revision);
         history.append(delta, estimated_raw_bytes, replayability).expect("a successful Head update extends its matching history");
         history.prune(view.low_level());
-        Ok(Some(Self { target_revision, head_high_level: view.high_level(), replay_floor_advance }))
+        Ok(Some(Self { target_revision, replay_floor_advance }))
     }
 }
 
@@ -791,23 +789,15 @@ mod tests {
         let cache = publication.cache();
         let jobs = CacheJobTracker::new();
 
-        let CacheAccess::Job(initial_delta) = cache.delta(
-            &jobs,
-            0,
-            |_| async { Ok(Arc::new(CachedDelta::new(0, 1, 1, 4, Bytes::from_static(b"old-delta")))) },
-            || async { 1 },
-        ) else {
+        let CacheAccess::Job(initial_delta) =
+            cache.delta(&jobs, 0, |_| async { Ok(Arc::new(CachedDelta::new(0, 1, false, 4, Bytes::from_static(b"old-delta")))) })
+        else {
             panic!("fixture delta installs one cache job");
         };
         initial_delta.wait(tokio_util::sync::CancellationToken::new()).await.expect("fixture delta completes");
 
         let head_access = cache
-            .head(
-                &jobs,
-                50,
-                |_, _| async { std::future::pending::<Result<Arc<CachedHeadSnapshot>, CacheBuildError>>().await },
-                || async { 1 },
-            )
+            .head(&jobs, 50, |_, _| async { std::future::pending::<Result<Arc<CachedHeadSnapshot>, CacheBuildError>>().await })
             .await;
 
         let mailbox = Arc::new(SseMailbox::new());
@@ -834,12 +824,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!capture.is_finished(), "the new core remains hidden before replay-floor invalidation");
         assert!(matches!(
-            cache.delta(
-                &jobs,
-                0,
-                |_| async { panic!("the pre-floor completed value still exists before invalidation") },
-                || async { 1 }
-            ),
+            cache.delta(&jobs, 0, |_| async { panic!("the pre-floor completed value still exists before invalidation") },),
             CacheAccess::Completed(_)
         ));
 
@@ -856,7 +841,7 @@ mod tests {
             head_access.resolve(tokio_util::sync::CancellationToken::new()).await,
             Err(CacheWaitError::InvalidatedByReplayFloor { replay_floor_revision: 1 })
         );
-        assert!(matches!(cache.delta(&jobs, 0, |_| async { Err(CacheBuildError::Cancelled) }, || async { 2 }), CacheAccess::Job(_)));
+        assert!(matches!(cache.delta(&jobs, 0, |_| async { Err(CacheBuildError::Cancelled) }), CacheAccess::Job(_)));
 
         jobs.shutdown().await;
     }
@@ -866,7 +851,7 @@ mod tests {
         let (mut publication, hook) = publication_with_atomic_mutation_hook(2);
         Arc::get_mut(&mut publication).expect("fixture publication is not yet shared").delta_estimate_test_override =
             Some(estimate::SOFT_DELTA_ESTIMATED_BYTES);
-        let old_delta = Arc::new(CachedDelta::new(0, 1, 1, 4, Bytes::from_static(b"delta")));
+        let old_delta = Arc::new(CachedDelta::new(0, 1, false, 4, Bytes::from_static(b"delta")));
         let old_head = cached_head_candidate(publication.publication_id(), 0);
 
         let update_publication = publication.clone();
@@ -887,7 +872,7 @@ mod tests {
             ReplayFloorAdmission::Rejected { replay_floor_revision: 1 }
         ));
 
-        let floor_delta = Arc::new(CachedDelta::new(1, 2, 2, 4, Bytes::from_static(b"floor-delta")));
+        let floor_delta = Arc::new(CachedDelta::new(1, 2, false, 4, Bytes::from_static(b"floor-delta")));
         assert!(matches!(publication.admit_cached_delta_replay_floor(floor_delta).await, ReplayFloorAdmission::Admitted(_)));
         let floor_head = cached_head_candidate(publication.publication_id(), 1);
         assert!(matches!(publication.admit_cached_head_replay_floor(floor_head).await, ReplayFloorAdmission::Admitted(_)));
@@ -899,7 +884,7 @@ mod tests {
             GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view_with_depth(2), GraphHistory::new())
                 .expect("matching candidate");
         publication.delta_estimate_test_override = Some(estimate::SOFT_DELTA_ESTIMATED_BYTES);
-        let delta = Arc::new(CachedDelta::new(0, 1, 1, 4, Bytes::from_static(b"delta")));
+        let delta = Arc::new(CachedDelta::new(0, 1, false, 4, Bytes::from_static(b"delta")));
         let admitted_delta = publication.admit_cached_delta_replay_floor(delta.clone()).await;
 
         let hook = Arc::new(ReplayFloorAdmissionTestHook::new());
@@ -982,24 +967,18 @@ mod tests {
 
         let cache = publication.cache();
         let jobs = CacheJobTracker::new();
-        let CacheAccess::Job(initial) = cache.delta(
-            &jobs,
-            0,
-            |_| async { Ok(Arc::new(CachedDelta::new(0, 1, 2, 4, Bytes::from_static(b"gzip")))) },
-            || async { 2 },
-        ) else {
+        let CacheAccess::Job(initial) =
+            cache.delta(&jobs, 0, |_| async { Ok(Arc::new(CachedDelta::new(0, 1, false, 4, Bytes::from_static(b"gzip")))) })
+        else {
             panic!("the first source access starts a job");
         };
         initial.wait(tokio_util::sync::CancellationToken::new()).await.expect("fixture cache entry completes");
-        assert!(matches!(
-            cache.delta(&jobs, 0, |_| async { panic!("retained source must hit") }, || async { 2 }),
-            CacheAccess::Completed(_)
-        ));
+        assert!(matches!(cache.delta(&jobs, 0, |_| async { panic!("retained source must hit") }), CacheAccess::Completed(_)));
 
         assert_eq!(publication.apply_block_committed(&committed_block(3)).await.expect("block update"), Some(2));
         assert_eq!(publication.apply_block_committed(&committed_block(4)).await.expect("block update"), Some(3));
 
-        match cache.delta(&jobs, 0, |_| async { panic!("source-history pruning does not prune a completed delta") }, || async { 4 }) {
+        match cache.delta(&jobs, 0, |_| async { panic!("source-history pruning does not prune a completed delta") }) {
             CacheAccess::Completed(hit) => assert_eq!(hit.to_revision_id(), 1),
             CacheAccess::Job(_) => panic!("the completed source remains cached until target-level pruning"),
         }
