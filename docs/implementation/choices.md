@@ -913,11 +913,12 @@ the still-running blocking owners.
 
 ### Cache kernel placement and task tracking
 
-Place the publication-local response cache, typed cached values, generic slot
-and job primitives, and shared waiter transport in the private
-`kgi_api_core::cache` module. `GraphPublication` creates and durably owns its
-cache `Arc`; orchestration tasks retain only a weak cache reference and their
-exact running job. A small service-level `CacheJobTracker` combines the
+Place the publication-local response cache, typed cached values, specialized
+Head and Delta cache domains, the generic job primitive, and shared waiter
+transport in the private `kgi_api_core::cache` module. `GraphPublication`
+creates and durably owns its cache `Arc`; orchestration tasks retain only a
+weak cache reference and their exact running job. A small service-level
+`CacheJobTracker` combines the
 `TaskTracker` required by the ApiService contract with the cache-job
 cancellation root that the later service lifecycle will own.
 

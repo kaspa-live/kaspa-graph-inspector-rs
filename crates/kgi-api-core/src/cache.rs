@@ -50,6 +50,11 @@ impl CachedDelta {
         self.size_limited
     }
 
+    /// Returns whether this response satisfies a request for `target_revision`.
+    pub(crate) const fn is_adequate_for(&self, target_revision: u64) -> bool {
+        self.to_revision_id >= target_revision || self.size_limited
+    }
+
     /// Returns the complete uncompressed JSON byte count.
     pub(crate) const fn uncompressed_json_bytes(&self) -> u64 {
         self.uncompressed_json_bytes
@@ -247,8 +252,13 @@ impl GraphCache {
     }
 
     /// Prunes expired sources and inspects one exact delta source without history work.
-    pub(crate) fn lookup_delta(&self, source_revision: u64, head_revision_timestamp_ms: u64) -> DeltaCacheLookup {
-        self.lock_state().deltas.lookup(source_revision, head_revision_timestamp_ms)
+    pub(crate) fn lookup_delta(
+        &self,
+        source_revision: u64,
+        target_revision: u64,
+        head_revision_timestamp_ms: u64,
+    ) -> DeltaCacheLookup {
+        self.lock_state().deltas.lookup(source_revision, target_revision, head_revision_timestamp_ms)
     }
 
     /// Re-evaluates one captured delta source and elects at most one builder.
@@ -464,17 +474,19 @@ impl DeltaCache {
         expired.into_values().filter_map(|slot| slot.running.map(|running| running.job)).collect()
     }
 
-    fn lookup(&mut self, source_revision: u64, head_revision_timestamp_ms: u64) -> DeltaCacheLookup {
+    fn lookup(&mut self, source_revision: u64, target_revision: u64, head_revision_timestamp_ms: u64) -> DeltaCacheLookup {
         self.prune_expired(head_revision_timestamp_ms);
         let Some(slot) = self.slots_by_source.get(&source_revision) else {
             return DeltaCacheLookup::ConstructionRequired;
         };
-        if let Some(completed) = &slot.completed {
+        if let Some(completed) = &slot.completed
+            && completed.is_adequate_for(target_revision)
+        {
             DeltaCacheLookup::Completed(completed.clone())
         } else if let Some(running) = &slot.running {
             DeltaCacheLookup::Running(running.job.clone())
         } else {
-            panic!("a retained delta cache slot contains a completed value or running job")
+            DeltaCacheLookup::ConstructionRequired
         }
     }
 
@@ -485,14 +497,19 @@ impl DeltaCache {
         target_revision: u64,
         cancellation: CancellationToken,
     ) -> (CacheAccess<CachedDelta>, Option<Arc<CacheJob<CachedDelta>>>) {
-        if let Some(slot) = self.slots_by_source.get(&source_revision) {
-            if let Some(completed) = &slot.completed {
+        if let Some(slot) = self.slots_by_source.get_mut(&source_revision) {
+            if let Some(completed) = &slot.completed
+                && completed.is_adequate_for(target_revision)
+            {
                 return (CacheAccess::Completed(completed.clone()), None);
             }
             if let Some(running) = &slot.running {
                 return (CacheAccess::Job(running.job.clone()), None);
             }
-            panic!("a retained delta cache slot contains a completed value or running job");
+
+            let job = Arc::new(CacheJob::pending(cancellation));
+            slot.running = Some(RunningDeltaJob { target_revision, job: job.clone() });
+            return (CacheAccess::Job(job.clone()), Some(job));
         }
 
         let job = Arc::new(CacheJob::pending(cancellation));
@@ -520,7 +537,9 @@ impl DeltaCache {
                     slot.running.as_ref().map(|running| running.target_revision),
                     "a completed delta reaches its elected target"
                 );
-                slot.completed = Some(value.clone());
+                if slot.completed.as_ref().is_none_or(|completed| value.to_revision_id() > completed.to_revision_id()) {
+                    slot.completed = Some(value.clone());
+                }
             }
             slot.running = None;
             remove_slot = slot.completed.is_none();
@@ -856,7 +875,7 @@ mod tests {
         F: FnOnce(CancellationToken) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Arc<CachedDelta>, CacheBuildError>> + Send + 'static,
     {
-        match cache.lookup_delta(source_revision, 1_000) {
+        match cache.lookup_delta(source_revision, target_revision, 1_000) {
             DeltaCacheLookup::Completed(value) => CacheAccess::Completed(value),
             DeltaCacheLookup::Running(job) => CacheAccess::Job(job),
             DeltaCacheLookup::ConstructionRequired => {
@@ -940,7 +959,7 @@ mod tests {
         }));
         started.notified().await;
 
-        assert!(matches!(cache.lookup_delta(3, DELTA_CACHE_MAX_AGE_MS), DeltaCacheLookup::ConstructionRequired));
+        assert!(matches!(cache.lookup_delta(3, 4, DELTA_CACHE_MAX_AGE_MS), DeltaCacheLookup::ConstructionRequired));
         assert!(!running.cancellation.is_cancelled(), "age pruning detaches rather than cancelling the running job");
 
         release_tx.send(()).expect("expired delta builder release is observed");
@@ -948,7 +967,7 @@ mod tests {
             running.wait(CancellationToken::new()).await.expect("the admitted waiter receives the detached result").to_revision_id(),
             4
         );
-        assert!(matches!(cache.lookup_delta(3, DELTA_CACHE_MAX_AGE_MS), DeltaCacheLookup::ConstructionRequired));
+        assert!(matches!(cache.lookup_delta(3, 4, DELTA_CACHE_MAX_AGE_MS), DeltaCacheLookup::ConstructionRequired));
         jobs.shutdown().await;
     }
 
@@ -1104,6 +1123,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn second_delta_election_discards_a_redundant_capture_after_an_adequate_completion() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        assert!(matches!(cache.lookup_delta(7, 11, 1_000), DeltaCacheLookup::ConstructionRequired));
+
+        let completed = cache
+            .elect_delta(&jobs, 7, 8, 11, |_| async { Ok(cached_delta(7, 11)) })
+            .resolve(CancellationToken::new())
+            .await
+            .expect("competing construction completes");
+
+        match cache.elect_delta(&jobs, 7, 8, 11, |_| async { panic!("the redundant capture cannot become a builder") }) {
+            CacheAccess::Completed(value) => assert!(Arc::ptr_eq(&value, &completed)),
+            CacheAccess::Job(_) => panic!("the second election observes the adequate completion"),
+        }
+        jobs.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn farther_waiter_joins_the_current_job_then_reenters_for_enlargement() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        let (release_tx, release_rx) = oneshot::channel();
+        let shorter = job(delta(&cache, &jobs, 7, 11, move |_| async move {
+            release_rx.await.expect("shorter construction is released");
+            Ok(cached_delta(7, 11))
+        }));
+
+        let farther_waiter = job(delta(&cache, &jobs, 7, 19, |_| async { panic!("the farther waiter joins current work") }));
+        assert!(Arc::ptr_eq(&shorter, &farther_waiter));
+        release_tx.send(()).expect("shorter construction release is observed");
+        assert_eq!(farther_waiter.wait(CancellationToken::new()).await.expect("joined work completes").to_revision_id(), 11);
+
+        let enlargement = job(delta(&cache, &jobs, 7, 19, |_| async { Ok(cached_delta(7, 19)) }));
+        assert!(!Arc::ptr_eq(&shorter, &enlargement));
+        assert_eq!(enlargement.wait(CancellationToken::new()).await.expect("re-elected enlargement completes").to_revision_id(), 19);
+        jobs.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_enlargement_preserves_the_previous_completed_value() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        let completed = delta(&cache, &jobs, 7, 11, |_| async { Ok(cached_delta(7, 11)) })
+            .resolve(CancellationToken::new())
+            .await
+            .expect("initial construction completes");
+
+        let failed = job(delta(&cache, &jobs, 7, 19, |_| async {
+            Err(CacheBuildError::Encoding(EncodingSchedulerError::BlockingExecutorFailed))
+        }));
+        assert_eq!(
+            failed.wait(CancellationToken::new()).await,
+            Err(CacheWaitError::Build(CacheBuildError::Encoding(EncodingSchedulerError::BlockingExecutorFailed)))
+        );
+
+        match delta(&cache, &jobs, 7, 11, |_| async { panic!("the preserved completion remains available") }) {
+            CacheAccess::Completed(value) => assert!(Arc::ptr_eq(&value, &completed)),
+            CacheAccess::Job(_) => panic!("ordinary enlargement failure preserves the completed value"),
+        }
+        let retry = job(delta(&cache, &jobs, 7, 19, |_| async { Ok(cached_delta(7, 19)) }));
+        assert!(!Arc::ptr_eq(&failed, &retry));
+        retry.wait(CancellationToken::new()).await.expect("enlargement can be retried");
+        jobs.shutdown().await;
+    }
+
+    #[test]
+    fn size_limited_delta_is_adequate_for_every_farther_target() {
+        let cache = GraphCache::new();
+        let value = Arc::new(CachedDelta::new(7, 11, true, 23, Bytes::from_static(b"gzip")));
+        seed_delta(&cache, value.clone());
+
+        assert!(matches!(cache.lookup_delta(7, u64::MAX, 1_000), DeltaCacheLookup::Completed(hit) if Arc::ptr_eq(&hit, &value)));
+    }
+
+    #[tokio::test]
     async fn failure_removes_the_exact_running_job_before_notifying_waiters() {
         let cache = Arc::new(GraphCache::new());
         let jobs = CacheJobTracker::new();
@@ -1232,22 +1327,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_delta_remains_immutable_at_its_exact_source_key() {
+    async fn inadequate_completed_delta_is_preserved_while_one_enlargement_runs() {
         let cache = Arc::new(GraphCache::new());
         let jobs = CacheJobTracker::new();
         let first = job(delta(&cache, &jobs, 7, 11, |_| async { Ok(cached_delta(7, 11)) }));
         let completed = first.wait(CancellationToken::new()).await.expect("initial build completes");
 
-        match delta(&cache, &jobs, 7, 19, |_| async { Ok(cached_delta(7, 19)) }) {
+        let (release_tx, release_rx) = oneshot::channel();
+        let enlargement = job(delta(&cache, &jobs, 7, 19, move |_| async move {
+            release_rx.await.expect("enlargement is released");
+            Ok(cached_delta(7, 19))
+        }));
+
+        match delta(&cache, &jobs, 7, 11, |_| async { panic!("the shorter request reuses the preserved completion") }) {
             CacheAccess::Completed(hit) => {
                 assert!(Arc::ptr_eq(&hit, &completed));
-                assert_eq!(hit.to_revision_id(), 11, "Head advancement cannot promote a source-keyed entry");
+                assert_eq!(hit.to_revision_id(), 11);
             }
-            CacheAccess::Job(_) => panic!("the exact source reuses its immutable value"),
+            CacheAccess::Job(_) => panic!("the completed value remains adequate for the shorter request"),
         }
 
-        let distinct = job(delta(&cache, &jobs, 8, 19, |_| async { Ok(cached_delta(8, 19)) }));
-        assert_eq!(distinct.wait(CancellationToken::new()).await.expect("distinct source builds independently").to_revision_id(), 19);
+        let joined = job(delta(&cache, &jobs, 7, 23, |_| async { panic!("one source has at most one running job") }));
+        assert!(Arc::ptr_eq(&enlargement, &joined));
+
+        release_tx.send(()).expect("enlargement release is observed");
+        let enlarged = enlargement.wait(CancellationToken::new()).await.expect("enlargement completes");
+        assert_eq!(enlarged.to_revision_id(), 19);
+        match delta(&cache, &jobs, 7, 19, |_| async { panic!("the enlarged completion is reused") }) {
+            CacheAccess::Completed(hit) => assert!(Arc::ptr_eq(&hit, &enlarged)),
+            CacheAccess::Job(_) => panic!("the enlarged completion is adequate"),
+        }
         jobs.shutdown().await;
     }
 

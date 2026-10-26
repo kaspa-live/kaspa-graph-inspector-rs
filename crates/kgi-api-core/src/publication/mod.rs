@@ -613,7 +613,7 @@ mod tests {
         F: FnOnce(tokio_util::sync::CancellationToken) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Arc<CachedDelta>, CacheBuildError>> + Send + 'static,
     {
-        match cache.lookup_delta(source_revision, 0) {
+        match cache.lookup_delta(source_revision, target_revision, 0) {
             DeltaCacheLookup::Completed(value) => CacheAccess::Completed(value),
             DeltaCacheLookup::Running(job) => CacheAccess::Job(job),
             DeltaCacheLookup::ConstructionRequired => cache.elect_delta(jobs, source_revision, 0, target_revision, builder),
