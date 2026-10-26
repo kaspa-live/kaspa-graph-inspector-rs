@@ -1646,14 +1646,15 @@ waiter needing a farther target re-enters after successful completion, starts
 or joins the serialized enlargement, and never receives the inadequate shorter
 body. Ordinary failure gives that job's waiters the same request-local error
 and preserves the preceding completed value.
-Pause one caller after its initial source miss and immutable history capture but
-before its second cache election. Let another caller install and complete that
-source job. When the result is adequate for the paused caller's captured
-target, require the second election to return the same completed value without
-another job or encoding. When it is inadequate, require the second election to
-preserve it and install only the one required enlargement job. In both cases,
-the paused caller releases its redundant captured entries unless it becomes
-the enlargement builder.
+Pause one caller after its initial source miss, immutable history capture, and
+pre-election sizing but before its second cache election. Let another caller
+install and complete that source job. When the result is adequate for the
+paused caller's fitting target, require the second election to return or
+reclassify the same completed value without another job or encoding. When it is
+inadequate, require the second election to preserve it and install only the one
+required fixed-target enlargement job. In both cases, the paused caller
+releases its redundant captured entries unless it becomes the enlargement
+builder.
 Wrap one cached batch body with different valid request-specific publication
 and coherent Head revision/timestamp headers without serializing, compressing,
 or decompressing it. Verify that `CachedDelta` retains its boundaries,
@@ -1670,16 +1671,28 @@ farther enlargement without receiving the shorter body. Preserve the previous
 completed value throughout enlargement and replace it only after successful
 farther completion. A response already committed to delivery remains valid.
 
-Make one target cross the soft estimate and, separately, the hard uncompressed
-limit. The soft crossing lowers the exclusive source ceiling and requires the
-same pending source job to descend to each next-lower target without exposing
-an intermediate public error or detaching its waiters. The injected hard-limit
-crossing below the soft estimate logs the estimator-invariant violation, must
-not lower the ceiling, and still publishes the complete cached result. Repeat
-ordinary soft descent until a fitting result is marked `size_limited`.
-When the selected lower boundary already exists as the completed value, reuse
-its bytes and promote it without encoding. Serialization, gzip, cancellation,
-and unrelated job failures must establish no ceiling.
+Make one request-selected target cross the soft estimate and, separately, the
+hard uncompressed limit. Before the second cache election, require estimate
+descent to determine the farthest fitting target and its `size_limited`
+classification. The one slot transition must install only the fitting fixed-
+target job; no job or terminal result may exist for an excluded target. The
+same source and request-selected target must produce an identical fitting
+target and classification for concurrent callers; treat disagreement as an
+internal invariant failure rather than reconciling the observations. Allow
+different request-selected targets to produce different fitting results. The
+injected hard-limit crossing below the soft estimate logs the estimator-
+invariant violation, does not change the classification, and still publishes
+the complete cached result. When the fitting lower boundary already exists as
+the completed value, reuse its bytes and reclassify it without encoding.
+Serialization, gzip, cancellation, and unrelated job failures must persist no
+size evidence.
+Pause a non-size-limited job at the eventual fitting target, then let a farther
+request discover that the target is size-limited. Require that request to join
+the unchanged job and, after completion, reclassify the same encoded bytes on
+re-entry without changing the running target or encoding again.
+After a fitting job fails or is cancelled, require the slot to retain no size
+evidence. A retry must repeat deterministic estimation before installing only
+the fitting target.
 
 For query-time pruning, populate sparse source revisions with nondecreasing and
 equal timestamps in one ordered cache. At cache ages 299,999 and 300,000
@@ -2114,11 +2127,12 @@ restoring a cache slot.
 
 Exercise `DeltaCache` as one source-revision-ordered value under the enclosing
 cache critical section. Exact lookup, running-job election, completed
-replacement, serialized enlargement, monotonic size-ceiling reduction,
-expired-prefix pruning, and history-floor invalidation must preserve one
-coherent slot map without storing an independent floor. Prove that equal
-first-revision timestamps do not break prefix pruning and that no
-destination-heat or target-level side index remains.
+replacement, serialized enlargement, completed-value reclassification,
+expired-prefix pruning, and history-floor invalidation must
+preserve one coherent slot map without storing an independent floor. Prove
+that equal first-revision timestamps do not break prefix pruning, no excluded
+target job can be installed, and no destination-heat or target-level side
+index remains.
 
 Verify all cache orchestration tasks are registered in the ApiService task
 tracker. Include every demand-triggered tier-keyed Head snapshot job in the

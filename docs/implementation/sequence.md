@@ -103,7 +103,7 @@ level.
 | 13. Publication runtime | First adapt the existing graph-update ingress and processing producer to the Catchup-triggered publication contract, then implement the session-bound `PublicationRuntime`: AwaitingCatchup handling, Catchup-triggered database seeding, staging, dual-cut alignment, immediate installation, gap reconstruction, projection-failure reconstruction, quiescent receiver closure, and its completed shutdown barrier. | Focused ingress and processor tests for the Catchup gate and marker-ownership refactor, followed by deterministic runtime state-machine tests for every construction state, both alignment cuts, idle-source waits, overflow and gap cuts, sticky Live, installation supersession, database failure classes, worker failure, and cancellation with no surviving task. |
 | 14. ApiService lifecycle and publication installation | Implement ApiService's event path, runtime generation fence, reset/current-publication slots, publication installation, cancellation roots, status aggregation, and terminal service barrier. This PR integrates increments 8–13 but adds no Axum router. | Control-level tests for Resync/Rebuild reset, predecessor overlap and join, superseded installation, publication replacement, database-read reopening, unexpected worker failure, shutdown from every runtime state, task/resource release, and idempotence. |
 | 15. Atomic history and replay-floor foundation | Adapt retained history to atomic one-revision entries, cumulative byte estimates, replayability classification, and the history-owned replay floor. Integrate publication-time classification and the synchronized cache invalidation plus final-admission ordering required when that floor advances. Add no logical Head or delta request operation. | Graph-model and publication-kernel tests for atomic append and range budgeting, cumulative overflow, append-time replay barriers, monotonic floor advancement, cache invalidation, detached-job completion races, and both orders of final admission versus floor advancement. |
-| 16. Response-cache and encoding kernels | Adapt the Increment 10 cache and encoding infrastructure without adding logical request outcomes: exact configured Head-tier slots, source-ordered `DeltaCache`, removal of destination heat and target-level indexes, query-driven age-pruning primitives, source-serialized jobs, monotonic size ceilings, and canonical-delta encoding that logs and accepts an invariant-threshold overrun. | Kernel tests for exact-tier operations, ordered-prefix pruning with equal timestamps, source single-flight and enlargement, in-job soft-estimate descent, cache invalidation, estimator conservatism and estimate-versus-actual measurements, diagnostic overrun acceptance, weak insertion, cancellation, and shutdown. |
+| 16. Response-cache and encoding kernels | Adapt the Increment 10 cache and encoding infrastructure without adding logical request outcomes: exact configured Head-tier slots, source-ordered `DeltaCache`, removal of destination heat and target-level indexes, query-driven age-pruning primitives, source-serialized fixed-target jobs, pre-election fitting-target classification, and canonical-delta encoding that logs and accepts an invariant-threshold overrun. | Kernel tests for exact-tier operations, ordered-prefix pruning with equal timestamps, source single-flight and enlargement, pre-election sizing inputs, completed-value reclassification, cache invalidation, estimator conservatism and estimate-versus-actual measurements, diagnostic overrun acceptance, weak insertion, cancellation, and shutdown. |
 | 17. In-memory Head snapshot and level operations | Implement logical Head snapshot construction and retained Head-level lookup over one captured publication. Apply exact-tier selection, 90-second publication-time eligibility, completion-time recapture, weak ETags, replay-floor admission, and all-or-nothing level lookup. Keep canonical delta selection, transport parsing, and Axum response delivery out of this PR. | Operation tests for every target depth and selected tier, eligible hits, on-demand construction, obsolete removal and recapture, no larger-tier reuse, ETags and `304`, replay-floor races, Stale snapshots, all-or-nothing levels, publication mismatch, and request-local failures. |
 | 18. Canonical delta operation | Implement the complete logical canonical-delta operation: dyadic target selection, atomic-history budgeting, five-minute source-age policy, source-job joining and enlargement, soft-estimate descent, cached batch construction, typed outcomes, continuation, and SSE registration completion and rearming. Store one mutable ApiService-wide active interval initialized from `INITIAL_ADAPTIVE_DELTA_INTERVAL = 4`; every decision reads its current value, while production performs no later update until the adaptive controller is settled. Keep transport parsing and Axum response delivery out of this PR. | Operation tests for every dyadic boundary and active interval, cache hits and age pruning, serialized enlargement, size-limited reuse, Complete/Prefix/UpToDate/fresh-view outcomes, Stale catch-up, HTTP-only continuation, registration disappearance, rearming races, and upward/downward interval changes without rescheduling existing registrations. |
 | 19. Anchored windows, status, and API admission | Implement Head-first anchored-window resolution with database fallback, detached historical projections, status composition, the independent Head/historical/status admission lanes, database-read permits and timeouts, and request-owned resource accounting. | Tests for all anchors and misses, immutable-source selection, DB/gate races, detached-resource lifetime, status independence, lane saturation, query timeout, and no partial graph. |
@@ -154,12 +154,15 @@ Execute increment 16 as these ordered points:
    for one source, preserve an inadequate completed value during enlargement,
    join the current source job regardless of its target, and require a farther
    waiter to re-enter after completion.
-5. Add source-job target and size-ceiling transitions. Preserve the same
-   pending job and waiters while a builder records successively lower exclusive
-   ceilings and caller-supplied fallback targets; promote an already completed
-   fallback by sharing its encoded bytes, and replace the completed value only
-   with a successful farther result. The dyadic target-selection algorithm
-   remains in increment 18.
+5. Add fixed source-job targets and pre-election sizing inputs. The second
+   cache operation accepts a caller-supplied fitting target and its
+   `size_limited` classification, and installs only that target in one critical
+   section. Remove every separate ceiling field, excluded-target election
+   result, and in-job descent or target transition. Reclassify an already
+   completed fitting value by sharing its encoded bytes, retain no size evidence
+   after job failure or cancellation, and replace the completed value only with
+   a successful farther result. The dyadic sizing algorithm remains in
+   increment 18.
 6. Add the scheduler-owned canonical-delta encoding mode. Keep capped
    serialization unchanged for non-delta graph bodies, while delta encoding
    returns its complete observed JSON size and deterministic gzip body even
@@ -169,11 +172,13 @@ Execute increment 16 as these ordered points:
    widths.
 7. Replace superseded cache tests with focused kernel and controlled-race
    coverage for the exact tier set, ordered-prefix pruning, both cache-election
-   passes, source serialization and enlargement, monotonic ceilings, fallback
-   promotion, weak insertion, replay-floor invalidation, detached completion,
-   estimator measurements, diagnostic-overrun acceptance, cancellation, and
-   terminal joining. Update non-normative implementation records, run the full
-   Rust validation suite, and keep the PR limited to this kernel adaptation.
+   passes, source serialization and enlargement, fitting-target installation,
+   completed-value reclassification, absence of retained size evidence after
+   failure, weak insertion,
+   replay-floor invalidation, detached completion, estimator measurements,
+   diagnostic-overrun acceptance, cancellation, and terminal joining. Update
+   non-normative implementation records, run the full Rust validation suite,
+   and keep the PR limited to this kernel adaptation.
 
 This increment adds no logical Head snapshot, Head-level, canonical-delta,
 anchored-window, or status result; no active-interval or dyadic-target policy;

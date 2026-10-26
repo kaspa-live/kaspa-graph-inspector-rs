@@ -287,11 +287,15 @@ core read lock, derives the protocol target from those captured values, then
 performs the protocol-required query-driven cache pruning and exact-source
 cache decision before consulting history. A protocol-adequate completed value
 or a running job is retained without a history lookup. Only a decision that
-requires construction asks that same history for a range ending at the
-captured revision, then performs a second source-slot cache election before
-releasing the lock. That election completely re-evaluates the source slot
-under the [ApiService-owned cache contract](api-service.md#cache-and-encoding-jobs);
-the history capture is retained only when this caller becomes the builder.
+requires construction captures the history range ending at the request-
+selected target. While retaining the core read lock and no cache-state guard,
+the caller performs the
+[protocol-owned pre-election target sizing](api-protocol.md#canonical-head-delta-responses--settled)
+over that immutable range. It then performs a second source-slot cache election
+before releasing the core lock. That election completely re-evaluates the
+source slot and applies the supplied sizing result under the
+[ApiService-owned cache contract](api-service.md#cache-and-encoding-jobs); the
+history capture is retained only when this caller becomes the builder.
 The revision and timestamp form the coherent Head pair carried in the
 protocol-owned response headers. At that capture instant, history has the same
 current revision. When needed, the immutable range capture remains bounded by
@@ -300,9 +304,11 @@ recapturing the view. Ordinary history pruning therefore cannot make an
 otherwise valid completed cache hit unusable.
 
 Construction-side history range capture clones the selected immutable
-`Arc<GraphHistoryEntry>` values under the core read lock. Budgeting,
-response-wide dictionary construction, JSON serialization, and gzip compression
-then proceed without the lock. Later history pruning cannot invalidate those
+`Arc<GraphHistoryEntry>` values under the core read lock. The protocol-owned
+pre-election sizing is a bounded, nonawaiting operation over those entries and
+completes before the second cache election. Response-wide
+dictionary construction, JSON serialization, and gzip compression then
+proceed without the core lock. Later history pruning cannot invalidate those
 captured entries. Replay-floor invalidation detaches their cache jobs before
 releasing the mutation barrier, so a pre-floor capture cannot become a newly
 admitted public cache result afterward.

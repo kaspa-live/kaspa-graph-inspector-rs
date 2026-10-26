@@ -322,9 +322,10 @@ cache invalidation, and the final-admission seam used by later logical graph
 operations.
 Increment 16 adapts both cache kernels and the encoder: it removes destination
 heat and target-level indexes, makes source entries enlargeable through one
-serialized job, adds monotonic size ceilings and query-driven age pruning, and
-permits a soft-admitted canonical delta to log an unexpected invariant-
-threshold overrun while still completing gzip and cache construction. The
+serialized fixed-target job, adds pre-election sizing, completed-value
+reclassification, and query-driven age pruning, and permits a soft-admitted
+canonical delta to log an unexpected invariant-threshold overrun while still
+completing gzip and cache construction. The
 enforced non-delta response limit remains unchanged.
 Increment 17 implements logical Head snapshot and retained-level operations.
 Increment 18 implements the canonical delta operation, including atomic

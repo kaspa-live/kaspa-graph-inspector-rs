@@ -922,6 +922,18 @@ weak cache reference and their exact running job. A small service-level
 `TaskTracker` required by the ApiService contract with the cache-job
 cancellation root that the later service lifecycle will own.
 
+Supply an elected delta builder with a private `DeltaBuildContext` containing
+its cancellation token, exact source and job identity, and a weak cache
+reference. Target sizing occurs before election, so this context carries only
+the already proven fitting target and its immutable `size_limited`
+classification; it never changes the job target. The second cache operation
+accepts that fitting target and classification, then installs the job under
+the same short cache critical section. If an exact fitting completion already
+exists, it shares the encoded bytes while reclassifying the cached value as
+size-limited. The representation has no separate persisted ceiling,
+excluded-target election result, or in-job descent. A failed or cancelled job
+retains no implementation-owned size evidence.
+
 Use Tokio `watch` for one retained pending-or-terminal job state. This lets
 independent request cancellation detach one receiver, preserves the terminal
 result after every current receiver has gone, and avoids a separate waiter
