@@ -388,7 +388,11 @@ choice:
 ```rust
 struct GraphCacheState {
     deltas: DeltaCache,
-    head_slots: HashMap<u32, HeadCacheSlot>,
+    heads: HeadCache,
+}
+
+struct HeadCache {
+    slots_by_depth: HashMap<u32, HeadCacheSlot>,
 }
 
 struct DeltaCache {
@@ -470,9 +474,10 @@ path. Every job holds only detached immutable inputs during JSON serialization
 and gzip and no
 publication-core or cache-state guard.
 
-`DeltaCache` is a nested value accessed only within the enclosing
-`GraphCache` state critical section. It is not another synchronization or
-lifecycle owner and stores no copy of the history-owned replay floor.
+`HeadCache` and `DeltaCache` are nested values accessed only within the
+enclosing `GraphCache` state critical section. Neither is another
+synchronization or lifecycle owner. `DeltaCache` stores no copy of the
+history-owned replay floor.
 `slots_by_source` supplies exact lookup, source-keyed single-flight ownership,
 replacement, and query-driven prefix pruning in one index. Every slot records
 the first selected revision timestamp before either a completed value or
