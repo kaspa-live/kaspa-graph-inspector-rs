@@ -517,7 +517,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        cache::{CacheAccess, CacheBuildError, CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot},
+        cache::{
+            CacheAccess, CacheBuildError, CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot, HeadEligibilityBoundary,
+        },
         client::{DeltaCompletionResult, DeltaScheduleAction, SseMailbox, SseMessage},
         codec::{
             HeadEtagInput,
@@ -796,9 +798,9 @@ mod tests {
         };
         initial_delta.wait(tokio_util::sync::CancellationToken::new()).await.expect("fixture delta completes");
 
-        let head_access = cache
-            .head(&jobs, 50, |_, _| async { std::future::pending::<Result<Arc<CachedHeadSnapshot>, CacheBuildError>>().await })
-            .await;
+        let head_access = cache.head_tier(&jobs, 50, HeadEligibilityBoundary::new(0, 0, 0), |_| async {
+            std::future::pending::<Result<Arc<CachedHeadSnapshot>, CacheBuildError>>().await
+        });
 
         let mailbox = Arc::new(SseMailbox::new());
         let identifier = publication
