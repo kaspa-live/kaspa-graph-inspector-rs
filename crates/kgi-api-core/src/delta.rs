@@ -49,12 +49,11 @@ impl Default for ActiveDeltaInterval {
 pub(crate) struct DeltaRevisionRange {
     source_revision: u64,
     target_revision: u64,
-    size_limited: bool,
 }
 
 impl DeltaRevisionRange {
     const fn selected(source_revision: u64, target_revision: u64) -> Self {
-        Self { source_revision, target_revision, size_limited: false }
+        Self { source_revision, target_revision }
     }
 
     /// Returns the request's fixed source revision.
@@ -65,11 +64,6 @@ impl DeltaRevisionRange {
     /// Returns the selected atomic target boundary.
     pub(crate) const fn target_revision(self) -> u64 {
         self.target_revision
-    }
-
-    /// Returns whether estimate descent shortened the request-selected target.
-    pub(crate) const fn is_size_limited(self) -> bool {
-        self.size_limited
     }
 }
 
@@ -140,22 +134,28 @@ impl DeltaTargetLadder {
         DeltaTargetSelection::WaitForWakeup { wake_at_revision_id }
     }
 
-    /// Walks backward from the selected target and returns the farthest range
-    /// admitted by `fits`.
+    /// Returns the nearest future boundary for a cursor and active interval.
+    pub(crate) fn next_eligible_boundary_from(source_revision: u64, active_interval: u64) -> u64 {
+        assert!(ADAPTIVE_DELTA_INTERVALS.contains(&active_interval), "the active delta interval is validated before selection");
+        let targets = Self::target_boundaries(source_revision);
+        let successor = targets[0];
+        targets
+            .iter()
+            .copied()
+            .filter(|&target| target == successor || target - source_revision >= active_interval)
+            .min()
+            .expect("the ordinary successor is always an eligible boundary")
+    }
+
+    /// Iterates the selected target and its permitted size-descent boundaries.
     ///
     /// An existing non-size-limited cache target is already encoded reusable
     /// coverage, so it is the lower bound: selecting it permits byte-sharing
     /// reclassification, while selecting a shorter target would discard
-    /// available progress. `None` means no candidate at or beyond that bound
-    /// fits. Selection happens before cache-job election, so an admitted range
-    /// can be built directly in one fixed job.
-    pub(crate) fn farthest_fitting(
-        &self,
-        selected: DeltaRevisionRange,
-        mut fits: impl FnMut(DeltaRevisionRange) -> bool,
-    ) -> Option<DeltaRevisionRange> {
+    /// available progress. Targets are yielded farthest to nearest so the
+    /// history can accept the first one whose additive estimate fits.
+    pub(crate) fn fitting_targets(&self, selected: DeltaRevisionRange) -> impl Iterator<Item = u64> + '_ {
         assert_eq!(selected.source_revision, self.source_revision, "a fitting target belongs to this source ladder");
-        assert!(!selected.size_limited, "size descent starts from the request-selected target");
         let selected_index = self
             .targets
             .iter()
@@ -170,12 +170,6 @@ impl DeltaTargetLadder {
             .iter()
             .copied()
             .take_while(|target| self.current_target.is_none_or(|current| *target >= current))
-            .map(|target_revision| DeltaRevisionRange {
-                source_revision: self.source_revision,
-                target_revision,
-                size_limited: target_revision != selected.target_revision,
-            })
-            .find(|candidate| fits(*candidate))
     }
 
     /// Returns this source's complete descending target ladder.
@@ -304,34 +298,17 @@ mod tests {
     }
 
     #[test]
-    fn size_descent_returns_the_farthest_fitting_fixed_range() {
+    fn size_descent_yields_farthest_to_nearest_boundaries() {
         let ladder = DeltaTargetLadder::new(32, 64, None, 4);
         let selected = range(ladder.select(GraphPublicationState::Live));
-        let mut inspected = Vec::new();
-        let fitting = ladder
-            .farthest_fitting(selected, |candidate| {
-                inspected.push(candidate.target_revision());
-                candidate.target_revision() <= 40
-            })
-            .expect("one descending target fits");
-
-        assert_eq!(inspected, [64, 48, 40]);
-        assert_eq!(fitting.source_revision(), 32);
-        assert_eq!(fitting.target_revision(), 40);
-        assert!(fitting.is_size_limited());
+        assert_eq!(ladder.fitting_targets(selected).collect::<Vec<_>>(), [64, 48, 40, 36, 34, 33]);
     }
 
     #[test]
     fn existing_target_bounds_descent_and_can_be_reclassified() {
         let ladder = DeltaTargetLadder::new(32, 64, Some(48), 4);
         let selected = range(ladder.select(GraphPublicationState::Live));
-        let fitting = ladder
-            .farthest_fitting(selected, |candidate| candidate.target_revision() <= 48)
-            .expect("the existing target fits exactly");
-        assert_eq!(fitting.target_revision(), 48);
-        assert!(fitting.is_size_limited());
-
-        assert!(ladder.farthest_fitting(selected, |candidate| candidate.target_revision() < 48).is_none());
+        assert_eq!(ladder.fitting_targets(selected).collect::<Vec<_>>(), [64, 48]);
     }
 
     #[test]

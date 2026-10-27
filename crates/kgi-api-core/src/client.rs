@@ -375,6 +375,11 @@ impl SseClientRegistry {
         self.lock_state().clients.remove(&identifier.key()).is_some()
     }
 
+    /// Validates that one publication-local registration remains live.
+    pub(crate) fn validate(&self, identifier: ClientIdentifier) -> bool {
+        self.complete_delta(identifier, DeltaScheduleAction::ValidateOnly) == DeltaCompletionResult::Accepted
+    }
+
     /// Publishes one required lifecycle observation to every live registration.
     pub(crate) fn publish_state(&self, publication_state: GraphPublicationState, revision: u64) {
         let mut cancellations = Vec::new();

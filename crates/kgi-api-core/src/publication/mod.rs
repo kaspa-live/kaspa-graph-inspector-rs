@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Instant};
 use kgi_api_model::{
     delta::GraphDelta,
     graph::{GraphView, GraphViewExtractError, LevelExtent, TrackingPolicy},
-    history::{GraphHistory, GraphHistoryRange, GraphHistoryRangeError, GraphHistoryReplayability},
+    history::{GraphHistory, GraphHistoryEntryList, GraphHistoryRangeError, GraphHistoryReplayability},
     protocol::{HeadLevelLookupOutcome, HeadLevelValue},
 };
 use kgi_model::graph_update::{BlockCommitted, VspcCommitted};
@@ -18,16 +18,21 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     cache::{
-        CacheAccess, CacheBuildError, CacheJobTracker, CachedDelta, CachedHeadSnapshot, GraphCache, HeadCacheLookup,
-        HeadEligibilityBoundary,
+        CacheAccess, CacheBuildError, CacheJobTracker, CachedDelta, CachedHeadSnapshot, DeltaBuildContext, GraphCache,
+        HeadCacheLookup, HeadEligibilityBoundary,
     },
     client::SseClientRegistry,
-    codec::{HeadEtag, HeadEtagInput, graph::HeadSnapshotResponseDto},
+    codec::{HeadEtag, HeadEtagInput, delta::GraphDeltaBatchDto, graph::HeadSnapshotResponseDto},
+    delta::{DeltaRevisionRange, DeltaTargetLadder},
     encoding::scheduler::EncodingScheduler,
 };
 
 pub(crate) use self::error::PublicationProjectionError;
+pub(crate) use self::estimate::SOFT_DELTA_ESTIMATED_BYTES;
 use self::estimate::{classify_replayability, estimate_raw_delta_bytes};
+
+#[cfg(test)]
+use kgi_api_model::history::GraphHistoryRange;
 
 /// Externally meaningful lifecycle state of one graph publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,6 +202,37 @@ pub(crate) enum ReplayFloorAdmission<T> {
         /// Floor observed while holding the publication core read lock.
         replay_floor_revision: u64,
     },
+}
+
+/// Result of the history-backed second delta-cache election.
+pub(crate) enum DeltaHistoryElection {
+    /// The source's first replay unit has crossed the cache recreation horizon.
+    SourceExpired,
+    /// A fitting completed value or fixed-target job was selected.
+    Access(CacheAccess<CachedDelta>),
+}
+
+/// Immutable inputs to one history-backed delta-cache election.
+pub(crate) struct DeltaHistoryRequest {
+    source_revision: u64,
+    head: GraphDeltaTargetCapture,
+    selected: DeltaRevisionRange,
+    current_target: Option<u64>,
+    active_interval: u64,
+}
+
+impl DeltaHistoryRequest {
+    /// Groups the protocol selection retained through history capture and the
+    /// second cache election.
+    pub(crate) const fn new(
+        source_revision: u64,
+        head: GraphDeltaTargetCapture,
+        selected: DeltaRevisionRange,
+        current_target: Option<u64>,
+        active_interval: u64,
+    ) -> Self {
+        Self { source_revision, head, selected, current_target, active_interval }
+    }
 }
 
 /// One publication-local graph lineage and its synchronization boundary.
@@ -481,7 +517,55 @@ impl GraphPublication {
         }
     }
 
-    /// Captures immutable retained history through a previously sampled target.
+    /// Captures, sizes, and elects history-backed delta construction while the
+    /// publication capture remains linearized.
+    pub(crate) async fn elect_history_delta(
+        self: &Arc<Self>,
+        jobs: &CacheJobTracker,
+        scheduler: &EncodingScheduler,
+        request: DeltaHistoryRequest,
+    ) -> Result<DeltaHistoryElection, GraphHistoryRangeError> {
+        let DeltaHistoryRequest { source_revision, head, selected, current_target, active_interval } = request;
+        assert_eq!(head.publication_id, self.publication_id, "delta target belongs to this publication");
+        assert_eq!(selected.source_revision(), source_revision, "the selected delta range belongs to the requested source");
+        assert!(selected.target_revision() <= head.revision, "the selected delta target does not exceed its captured Head");
+
+        let core = self.core.read().await;
+        let ladder = DeltaTargetLadder::new(source_revision, head.revision, current_target, active_interval);
+        let fitting = core
+            .history
+            .fitting_range(source_revision, ladder.fitting_targets(selected), |estimated_raw_bytes| {
+                estimated_raw_bytes < SOFT_DELTA_ESTIMATED_BYTES
+            })?
+            .expect("a retained replayable atomic boundary fits the delta soft limit");
+        let first_revision_timestamp_ms =
+            fitting.entries().first().expect("a forward fitting history range is nonempty").delta().revision_timestamp_ms();
+        let age_ms = head
+            .revision_timestamp_ms
+            .checked_sub(first_revision_timestamp_ms)
+            .expect("a selected delta source does not postdate its captured Head");
+        if age_ms >= kgi_api_model::protocol::DELTA_CACHE_MAX_AGE_MS {
+            return Ok(DeltaHistoryElection::SourceExpired);
+        }
+
+        let target_revision = fitting.target_revision();
+        let estimated_raw_bytes = fitting.estimated_raw_bytes();
+        let size_limited = fitting.was_shortened();
+        let fitting_entries = fitting.into_entries();
+
+        let scheduler = scheduler.clone();
+        let access = self.cache.elect_delta(
+            jobs,
+            source_revision,
+            first_revision_timestamp_ms,
+            target_revision,
+            size_limited,
+            move |context| async move { Self::build_delta(fitting_entries, estimated_raw_bytes, scheduler, context).await },
+        );
+        Ok(DeltaHistoryElection::Access(access))
+    }
+
+    #[cfg(test)]
     pub(crate) async fn capture_history_range(
         &self,
         from_revision_id: u64,
@@ -652,6 +736,36 @@ impl GraphPublication {
         }
     }
 
+    async fn build_delta(
+        entries: GraphHistoryEntryList,
+        estimated_raw_bytes: u64,
+        scheduler: EncodingScheduler,
+        context: DeltaBuildContext,
+    ) -> Result<Arc<CachedDelta>, CacheBuildError> {
+        let response = GraphDeltaBatchDto::from_entries(&entries);
+        let encoded = scheduler
+            .encode_delta_priority(
+                response,
+                estimated_raw_bytes,
+                |overrun| {
+                    log::error!(
+                        "canonical delta estimator invariant violated: estimated={} observed={}",
+                        overrun.estimated_raw_bytes(),
+                        overrun.observed_uncompressed_json_bytes()
+                    );
+                },
+                context.cancellation().clone(),
+            )
+            .await?;
+        Ok(Arc::new(CachedDelta::new(
+            entries.first().expect("a delta job retains a nonempty range").delta().from_revision_id(),
+            context.target_revision(),
+            context.is_size_limited(),
+            encoded.uncompressed_json_bytes(),
+            encoded.into_gzip_body(),
+        )))
+    }
+
     async fn capture_head_tier(&self, depth: u32) -> GraphViewCapture {
         let core = self.core.read().await;
         core.capture_head_tier(self.publication_id, depth)
@@ -765,6 +879,7 @@ mod tests {
             HeadEtagInput,
             sse::{PublicationStateDto, PublicationWakeupDto},
         },
+        delta::DeltaTargetSelection,
     };
 
     fn head_view() -> GraphView {
@@ -858,7 +973,9 @@ mod tests {
         match cache.lookup_delta(source_revision, target_revision, 0) {
             DeltaCacheLookup::Completed(value) => CacheAccess::Completed(value),
             DeltaCacheLookup::Running(job) => CacheAccess::Job(job),
-            DeltaCacheLookup::ConstructionRequired => cache.elect_delta(jobs, source_revision, 0, target_revision, false, builder),
+            DeltaCacheLookup::ConstructionRequired { .. } => {
+                cache.elect_delta(jobs, source_revision, 0, target_revision, false, builder)
+            }
         }
     }
 
@@ -1161,6 +1278,55 @@ mod tests {
             assert_eq!(view.oldest_available_revision(), expected_replay_floor);
             assert_eq!(target.replay_floor_revision(), expected_replay_floor);
         }
+    }
+
+    #[tokio::test]
+    async fn fitting_history_reclassifies_the_existing_target_as_size_limited() {
+        let mut publication = GraphPublication::new(
+            GraphPublicationState::Synchronizing,
+            Instant::now(),
+            head_view_with_depth(250),
+            GraphHistory::new(),
+        )
+        .expect("matching candidate");
+        publication.delta_estimate_test_override = Some(SOFT_DELTA_ESTIMATED_BYTES / 3);
+        let publication = Arc::new(publication);
+        for byte in 2..=5 {
+            assert_eq!(
+                publication.apply_block_committed(&committed_block(byte)).await.expect("block update"),
+                Some(u64::from(byte - 1))
+            );
+        }
+        let head = publication.capture_delta_target().await;
+        assert_eq!(head.revision(), 4);
+
+        let jobs = CacheJobTracker::new();
+        let scheduler = EncodingScheduler::production();
+        let CacheAccess::Job(initial) = publication.cache.elect_delta(&jobs, 0, 0, 2, false, |_| async {
+            Ok(Arc::new(CachedDelta::new(0, 2, false, 4, Bytes::from_static(b"existing"))))
+        }) else {
+            panic!("fixture installs the existing non-size-limited target")
+        };
+        let existing = initial.wait(tokio_util::sync::CancellationToken::new()).await.expect("fixture target completes");
+        assert!(!existing.is_size_limited());
+
+        let selected = match DeltaTargetLadder::new(0, head.revision(), None, 4).select(head.state()) {
+            DeltaTargetSelection::Range(selected) => selected,
+            DeltaTargetSelection::WaitForWakeup { .. } => panic!("revision four is an available ladder boundary"),
+        };
+        let election = publication
+            .elect_history_delta(&jobs, &scheduler, DeltaHistoryRequest::new(0, head, selected, Some(2), 4))
+            .await
+            .expect("history range remains retained");
+        let DeltaHistoryElection::Access(CacheAccess::Completed(reclassified)) = election else {
+            panic!("size descent reclassifies the existing target without a new job")
+        };
+        assert_eq!(reclassified.to_revision_id(), 2);
+        assert!(reclassified.is_size_limited());
+        assert_eq!(reclassified.gzip_body(), existing.gzip_body());
+
+        jobs.shutdown().await;
+        scheduler.shutdown().await.expect("scheduler shuts down");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

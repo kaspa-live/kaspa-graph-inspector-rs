@@ -5,8 +5,9 @@ use std::{
 
 use kgi_api_ingress::channel::GraphUpdateReceiver;
 use kgi_api_model::{
+    history::GraphHistoryRangeError,
     projection::MAX_WINDOW_DEPTH,
-    protocol::{CACHED_HEAD_WINDOW_DEPTHS, FreshViewReason, HeadLevelLookupOutcome, SystemStatus},
+    protocol::{CACHED_HEAD_WINDOW_DEPTHS, DeltaContinuation, FreshViewReason, HeadLevelLookupOutcome, SystemStatus},
 };
 use kgi_model::lifecycle::{NodeServiceStatus, ProcessingStatus, RecoveryMode, StorageServiceStatus, SupervisorStatus};
 use kgi_storage::generation::ValidatedApiDbClient;
@@ -18,16 +19,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
-    cache::{CacheJobTracker, CacheWaitError, CachedHeadSnapshot},
+    cache::{CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot, DeltaCacheLookup},
+    client::{ClientIdentifier, DeltaCompletionResult, DeltaScheduleAction},
     codec::{HeadEtag, graph::HeadLevelLookupResponseDto},
-    delta::ActiveDeltaInterval,
+    delta::{ActiveDeltaInterval, DeltaTargetLadder, DeltaTargetSelection},
     encoding::{
         EncodedGraphBody,
         scheduler::{EncodingScheduler, EncodingSchedulerError},
     },
     error::ApiServiceError,
     publication::{
-        GraphPublication, HeadTierSelection, ReplayFloorAdmission,
+        DeltaHistoryElection, DeltaHistoryRequest, GraphDeltaTargetCapture, GraphPublication, GraphPublicationState,
+        HeadTierSelection, ReplayFloorAdmission,
         runtime::{PublicationInstallOutcome, PublicationInstaller, PublicationRuntime},
     },
 };
@@ -99,6 +102,56 @@ pub(crate) enum HeadLevelLookupResponse {
         publication: Option<Arc<GraphPublication>>,
         /// Reason the caller must abandon its existing graph lineage.
         reason: FreshViewReason,
+    },
+}
+
+/// Body selection for one successful logical canonical-delta operation.
+#[allow(dead_code, reason = "HTTP response mapping is introduced by the transport increment")]
+pub(crate) enum CanonicalDeltaSuccess {
+    /// The request cursor already equals the captured Head.
+    UpToDate,
+    /// No eligible target has reached the captured advancing Head.
+    WaitForWakeup,
+    /// The cached body reaches the captured Head.
+    Complete(Arc<CachedDelta>),
+    /// The cached body ends at an earlier complete atomic boundary.
+    Prefix(Arc<CachedDelta>),
+}
+
+/// Logical result of one canonical-delta operation before HTTP mapping.
+#[allow(dead_code, reason = "HTTP response mapping is introduced by the transport increment")]
+pub(crate) enum CanonicalDeltaResponse {
+    /// The supplied publication does not address the retained current lineage.
+    FreshViewRequired {
+        /// Current publication when one exists.
+        publication: Option<Arc<GraphPublication>>,
+        /// Exact lineage or cursor recovery reason.
+        reason: FreshViewReason,
+    },
+    /// The supplied source revision is later than the coherently captured Head.
+    InvalidFutureCursor {
+        /// Exact publication retained for response finalization.
+        publication: Arc<GraphPublication>,
+    },
+    /// The supplied publication-local client registration is absent.
+    ClientRegistrationRequired {
+        /// Exact publication retained for response finalization.
+        publication: Arc<GraphPublication>,
+    },
+    /// One successful empty or body-bearing result and its response metadata.
+    Success {
+        /// Exact publication retained for response finalization and delivery.
+        publication: Arc<GraphPublication>,
+        /// Coherent Head metadata against which this request was selected.
+        head: GraphDeltaTargetCapture,
+        /// Empty or cached body selection.
+        outcome: CanonicalDeltaSuccess,
+        /// Required client action after consuming this result.
+        continuation: DeltaContinuation,
+        /// Wake boundary carried only by a wakeup continuation.
+        wake_at_revision_id: Option<u64>,
+        /// Polling delay carried only by HTTP-only Head or wakeup results.
+        retry_after_ms: Option<u64>,
     },
 }
 
@@ -473,6 +526,202 @@ impl ApiService {
         self.status.current()
     }
 
+    /// Selects, constructs, and completes one logical canonical-delta request.
+    #[allow(dead_code, reason = "the logical operation is consumed by the later HTTP transport increment")]
+    pub(crate) async fn canonical_delta(
+        &self,
+        requested_publication_id: u64,
+        from_revision_id: u64,
+        client: Option<ClientIdentifier>,
+        cancellation: CancellationToken,
+    ) -> Result<CanonicalDeltaResponse, CacheWaitError> {
+        if cancellation.is_cancelled() {
+            return Err(CacheWaitError::Cancelled);
+        }
+        let Some(publication) = self.current_publication() else {
+            return Ok(CanonicalDeltaResponse::FreshViewRequired { publication: None, reason: FreshViewReason::PublicationMismatch });
+        };
+        if publication.publication_id() != requested_publication_id {
+            return Ok(CanonicalDeltaResponse::FreshViewRequired {
+                publication: Some(publication),
+                reason: FreshViewReason::PublicationMismatch,
+            });
+        }
+
+        let head = publication.capture_delta_target().await;
+        if from_revision_id > head.revision() {
+            return Ok(CanonicalDeltaResponse::InvalidFutureCursor { publication });
+        }
+        if client.is_some_and(|identifier| !publication.client_registry().validate(identifier)) {
+            return Ok(CanonicalDeltaResponse::ClientRegistrationRequired { publication });
+        }
+
+        let active_interval = self.active_delta_interval.current();
+        let cache = publication.cache();
+        cache.prune_deltas(head.revision_timestamp_ms());
+        if from_revision_id == head.revision() {
+            return Ok(self.complete_delta_success(
+                publication,
+                head,
+                CanonicalDeltaSuccess::UpToDate,
+                from_revision_id,
+                client,
+                active_interval,
+            ));
+        }
+        if from_revision_id < head.replay_floor_revision() {
+            return Ok(CanonicalDeltaResponse::FreshViewRequired {
+                publication: Some(publication),
+                reason: FreshViewReason::DeltaReplayBarrier,
+            });
+        }
+
+        let selected = match DeltaTargetLadder::new(from_revision_id, head.revision(), None, active_interval).select(head.state()) {
+            DeltaTargetSelection::WaitForWakeup { .. } => {
+                return Ok(self.complete_delta_success(
+                    publication,
+                    head,
+                    CanonicalDeltaSuccess::WaitForWakeup,
+                    from_revision_id,
+                    client,
+                    active_interval,
+                ));
+            }
+            DeltaTargetSelection::Range(selected) => selected,
+        };
+
+        loop {
+            let access = match cache.lookup_delta(from_revision_id, selected.target_revision(), head.revision_timestamp_ms()) {
+                DeltaCacheLookup::Completed(candidate) => {
+                    return Ok(self
+                        .complete_cached_delta(publication, head, selected.target_revision(), candidate, client, active_interval)
+                        .await);
+                }
+                DeltaCacheLookup::Running(job) => crate::cache::CacheAccess::Job(job),
+                DeltaCacheLookup::ConstructionRequired { current_target } => {
+                    match publication
+                        .elect_history_delta(
+                            &self.cache_jobs,
+                            &self.encoding.scheduler,
+                            DeltaHistoryRequest::new(from_revision_id, head, selected, current_target, active_interval),
+                        )
+                        .await
+                    {
+                        Ok(DeltaHistoryElection::SourceExpired) => {
+                            return Ok(CanonicalDeltaResponse::FreshViewRequired {
+                                publication: Some(publication),
+                                reason: FreshViewReason::DeltaSourceExpired,
+                            });
+                        }
+                        Ok(DeltaHistoryElection::Access(access)) => access,
+                        Err(error) => {
+                            return Ok(CanonicalDeltaResponse::FreshViewRequired {
+                                publication: Some(publication),
+                                reason: delta_history_error_reason(error),
+                            });
+                        }
+                    }
+                }
+            };
+
+            let candidate = match access.resolve(cancellation.clone()).await {
+                Ok(candidate) => candidate,
+                Err(CacheWaitError::InvalidatedByReplayFloor { .. }) => {
+                    return Ok(CanonicalDeltaResponse::FreshViewRequired {
+                        publication: Some(publication),
+                        reason: FreshViewReason::DeltaReplayBarrier,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            if candidate.is_adequate_for(selected.target_revision()) {
+                return Ok(self
+                    .complete_cached_delta(publication, head, selected.target_revision(), candidate, client, active_interval)
+                    .await);
+            }
+        }
+    }
+
+    async fn complete_cached_delta(
+        &self,
+        publication: Arc<GraphPublication>,
+        head: GraphDeltaTargetCapture,
+        requested_target: u64,
+        candidate: Arc<CachedDelta>,
+        client: Option<ClientIdentifier>,
+        active_interval: u64,
+    ) -> CanonicalDeltaResponse {
+        assert!(candidate.is_adequate_for(requested_target), "a delivered cached delta is adequate for the selected target");
+        let candidate = match publication.admit_cached_delta_replay_floor(candidate).await {
+            ReplayFloorAdmission::Admitted(candidate) => candidate,
+            ReplayFloorAdmission::Rejected { .. } => {
+                return CanonicalDeltaResponse::FreshViewRequired {
+                    publication: Some(publication),
+                    reason: FreshViewReason::DeltaReplayBarrier,
+                };
+            }
+        };
+        let returned_revision = candidate.to_revision_id();
+        let outcome = if returned_revision >= head.revision() {
+            CanonicalDeltaSuccess::Complete(candidate)
+        } else {
+            CanonicalDeltaSuccess::Prefix(candidate)
+        };
+        self.complete_delta_success(publication, head, outcome, returned_revision, client, active_interval)
+    }
+
+    fn complete_delta_success(
+        &self,
+        publication: Arc<GraphPublication>,
+        head: GraphDeltaTargetCapture,
+        outcome: CanonicalDeltaSuccess,
+        returned_revision: u64,
+        client: Option<ClientIdentifier>,
+        active_interval: u64,
+    ) -> CanonicalDeltaResponse {
+        assert!(returned_revision <= head.revision(), "a canonical delta does not pass its captured Head");
+        let next_boundary = DeltaTargetLadder::next_eligible_boundary_from(returned_revision, active_interval);
+        let continuation = if returned_revision == head.revision() {
+            DeltaContinuation::ReachedHead
+        } else if head.state() == GraphPublicationState::Stale || next_boundary <= head.revision() {
+            DeltaContinuation::ContinueImmediately
+        } else {
+            DeltaContinuation::WaitForWakeup
+        };
+
+        if let Some(identifier) = client {
+            let action = if head.state() == GraphPublicationState::Stale && returned_revision == head.revision() {
+                DeltaScheduleAction::ValidateOnly
+            } else {
+                DeltaScheduleAction::Replace {
+                    wake_at_revision_id: next_boundary,
+                    wake_sent: continuation == DeltaContinuation::ContinueImmediately,
+                }
+            };
+            if publication.client_registry().complete_delta(identifier, action) == DeltaCompletionResult::RegistrationMissing {
+                return CanonicalDeltaResponse::ClientRegistrationRequired { publication };
+            }
+        }
+
+        let wake_at_revision_id = (continuation == DeltaContinuation::WaitForWakeup).then_some(next_boundary);
+        let retry_after_ms = if client.is_some() || continuation == DeltaContinuation::ContinueImmediately {
+            None
+        } else if head.state() == GraphPublicationState::Stale && returned_revision == head.revision() {
+            Some(1_000)
+        } else {
+            Some(
+                next_boundary
+                    .checked_sub(head.revision())
+                    .expect("a Head or wakeup retry boundary follows the captured Head")
+                    .max(1)
+                    .checked_mul(75)
+                    .expect("canonical delta retry delay fits u64"),
+            )
+        };
+
+        CanonicalDeltaResponse::Success { publication, head, outcome, continuation, wake_at_revision_id, retry_after_ms }
+    }
+
     /// Selects one coherent in-memory Head snapshot or its conditional result.
     #[allow(dead_code, reason = "the logical operation is consumed by the later HTTP transport increment")]
     pub(crate) async fn head_snapshot(
@@ -555,6 +804,17 @@ impl ApiService {
     }
 }
 
+fn delta_history_error_reason(error: GraphHistoryRangeError) -> FreshViewReason {
+    match error {
+        GraphHistoryRangeError::StartPruned { .. } => FreshViewReason::StartPruned,
+        GraphHistoryRangeError::StartBeforeReplayFloor { .. } => FreshViewReason::DeltaReplayBarrier,
+        GraphHistoryRangeError::StartUnavailable { .. } => FreshViewReason::StartUnavailable,
+        GraphHistoryRangeError::BackwardTarget { .. } => {
+            panic!("a validated forward canonical-delta request cannot select a backward history range")
+        }
+    }
+}
+
 #[allow(dead_code, reason = "called by the logical Head operation before its HTTP consumer exists")]
 fn selected_head_depth(target_depth: u32) -> u32 {
     assert!((1..=MAX_WINDOW_DEPTH).contains(&target_depth), "Head target depth is validated before logical selection");
@@ -609,9 +869,9 @@ mod tests {
     use url::Url;
 
     use super::{
-        ApiDbGenerationMessage, ApiRuntimeSlot, ApiService, ApiServiceEvent, ApiStatusInputs, FreshViewReason,
-        HeadLevelLookupResponse, HeadSnapshotCondition, HeadSnapshotOutcome, OwnedPublicationRuntime, PublicationInstallState,
-        RuntimePublicationInstaller, selected_head_depth,
+        ApiDbGenerationMessage, ApiRuntimeSlot, ApiService, ApiServiceEvent, ApiStatusInputs, CanonicalDeltaResponse,
+        CanonicalDeltaSuccess, FreshViewReason, HeadLevelLookupResponse, HeadSnapshotCondition, HeadSnapshotOutcome,
+        OwnedPublicationRuntime, PublicationInstallState, RuntimePublicationInstaller, selected_head_depth,
     };
     use crate::{
         api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
@@ -786,6 +1046,21 @@ mod tests {
 
     fn publication_with_levels(origin: Instant) -> Arc<GraphPublication> {
         Arc::new(publication_value_with_levels(origin))
+    }
+
+    fn delta_publication(origin: Instant) -> Arc<GraphPublication> {
+        let view = GraphView::from_database_projection(
+            250,
+            LevelExtent::new(1, 2).expect("valid extent"),
+            TrackingPolicy::Head,
+            BTreeMap::from([(1, Level { size: 1, daa_score: None }), (2, Level { size: 2, daa_score: Some(20) })]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        Arc::new(
+            GraphPublication::new(GraphPublicationState::Synchronizing, origin, view, GraphHistory::new())
+                .expect("coherent delta publication"),
+        )
     }
 
     fn replay_barrier_publication(origin: Instant) -> Arc<GraphPublication> {
@@ -1202,7 +1477,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conditional_head_request_joins_a_job_present_at_first_lookup() {
         let (service, _events) = service();
-        let publication = publication_with_levels(Instant::now());
+        let publication = delta_publication(Instant::now());
         service.current_publication.send_replace(Some(publication.clone()));
         let candidate =
             cached_head_snapshot(publication.publication_id(), 0, 0, LevelExtent::new(1, 2).expect("valid initial extent"));
@@ -1606,6 +1881,70 @@ mod tests {
         let (_producer, receiver) = graph_update_channel();
         service.reset(receiver, RecoveryMode::Resync).await.expect("runtime reset succeeds");
         assert_eq!(service.active_delta_interval.current(), 32);
+
+        service.shutdown().await.expect("service shuts down");
+    }
+
+    #[tokio::test]
+    async fn canonical_delta_constructs_reuses_and_completes_one_head_range() {
+        let (service, _events) = service();
+        let publication = publication_with_levels(Instant::now());
+        service.current_publication.send_replace(Some(publication.clone()));
+        for id in 3..=6 {
+            assert_eq!(
+                publication.apply_block_committed(&block_update(id, 2, 1)).await.expect("Head update succeeds"),
+                Some(u64::from(id - 2))
+            );
+        }
+        let head = publication.capture_delta_target().await;
+        assert_eq!(publication.capture_view().await.view().low_level(), 1);
+        publication.capture_history_range(0, head).await.expect("source zero remains retained");
+
+        let first = service
+            .canonical_delta(publication.publication_id(), 0, None, CancellationToken::new())
+            .await
+            .expect("delta construction succeeds");
+        let (first_delta, continuation, wake_at_revision_id, retry_after_ms) = match first {
+            CanonicalDeltaResponse::Success {
+                outcome: CanonicalDeltaSuccess::Complete(first_delta),
+                continuation,
+                wake_at_revision_id,
+                retry_after_ms,
+                ..
+            } => (first_delta, continuation, wake_at_revision_id, retry_after_ms),
+            CanonicalDeltaResponse::FreshViewRequired { reason, .. } => panic!("unexpected fresh-view reason: {reason:?}"),
+            CanonicalDeltaResponse::InvalidFutureCursor { .. } => panic!("source is not future"),
+            CanonicalDeltaResponse::ClientRegistrationRequired { .. } => panic!("HTTP-only request has no registration"),
+            CanonicalDeltaResponse::Success { outcome: CanonicalDeltaSuccess::UpToDate, .. } => panic!("source is not current"),
+            CanonicalDeltaResponse::Success { outcome: CanonicalDeltaSuccess::WaitForWakeup, .. } => {
+                panic!("the four-revision boundary is available")
+            }
+            CanonicalDeltaResponse::Success { outcome: CanonicalDeltaSuccess::Prefix(_), .. } => {
+                panic!("the four-revision range is not shortened")
+            }
+        };
+        assert_eq!(first_delta.source_revision_id(), 0);
+        assert_eq!(first_delta.to_revision_id(), 4);
+        assert!(!first_delta.is_size_limited());
+        assert_eq!(continuation, kgi_api_model::protocol::DeltaContinuation::ReachedHead);
+        assert_eq!(wake_at_revision_id, None);
+        assert_eq!(retry_after_ms, Some(300));
+        assert_eq!(decode_gzip(first_delta.gzip_body())["deltas"].as_array().expect("delta list").len(), 4);
+
+        let second = service
+            .canonical_delta(publication.publication_id(), 0, None, CancellationToken::new())
+            .await
+            .expect("cached delta lookup succeeds");
+        let CanonicalDeltaResponse::Success { outcome: CanonicalDeltaSuccess::Complete(second_delta), .. } = second else {
+            panic!("the cached four-revision range still reaches Head")
+        };
+        assert!(Arc::ptr_eq(&first_delta, &second_delta));
+
+        let current = service
+            .canonical_delta(publication.publication_id(), 4, None, CancellationToken::new())
+            .await
+            .expect("current cursor succeeds");
+        assert!(matches!(current, CanonicalDeltaResponse::Success { outcome: CanonicalDeltaSuccess::UpToDate, .. }));
 
         service.shutdown().await.expect("service shuts down");
     }
