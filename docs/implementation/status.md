@@ -462,3 +462,28 @@ increment 18; HTTP parsing, admission, headers, and delivery remain in later
 increments. Completion validation passed workspace formatting, Cargo check,
 582/582 Nextest tests including Docker PostgreSQL integration, Cargo doctests,
 Clippy with warnings denied, and `git diff --check`.
+
+Implementation increment 18 is implemented: `ApiService` now owns one mutable
+process-wide active delta interval and the complete logical canonical-delta
+operation. Requests validate publication, cursor, and optional registration in
+order; capture one coherent Head; prune and query the source-keyed cache;
+select dyadic targets; enforce the history replay floor and five-minute source
+horizon; size retained atomic history before the second election; serialize
+source construction and enlargement; and retain final replay-floor admission.
+Successful results distinguish complete, prefix, up-to-date, and wakeup
+outcomes, derive request-specific continuation and HTTP-only retry metadata,
+and atomically validate or rearm SSE registrations. Size descent installs only
+its fitting fixed target, persists `size_limited` only on successful
+completion, reuses or reclassifies existing bytes, and never treats Head- or
+state-limited shortening as size evidence. Production initializes the active
+interval to four and performs no adaptive update while the controller remains
+open architecture work. Focused verification covers every ladder and interval,
+history fitting without redundant capture, validation precedence, cache hits,
+short-job joining and enlargement, size-limited reuse and reclassification,
+the exact source-age boundary, Synchronizing/Live waits, terminal Stale
+catch-up, registration disappearance, Head/rearm ordering, and both interval-
+change directions without rewriting existing schedules. Anchored windows,
+public admission, HTTP/SSE transport, and the adaptive controller remain in
+later increments. Completion validation passed workspace formatting, Cargo
+check, 605/605 Nextest tests including Docker PostgreSQL integration, Cargo
+doctests, Clippy with warnings denied, and `git diff --check`.

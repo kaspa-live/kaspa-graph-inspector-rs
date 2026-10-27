@@ -840,10 +840,11 @@ mod tests {
     use kaspa_consensus_core::network::{NetworkId, NetworkType};
     use kgi_api_ingress::channel::{GraphUpdateOfferOutcome, GraphUpdateProducerError, GraphUpdateReceiver, graph_update_channel};
     use kgi_api_model::{
+        delta::GraphDelta,
         graph::{GraphView, Level, LevelExtent, TrackingPolicy},
-        history::GraphHistory,
+        history::{GraphHistory, GraphHistoryReplayability},
         projection::{GraphViewSeed, GraphWindowResolution},
-        protocol::INITIAL_ADAPTIVE_DELTA_INTERVAL,
+        protocol::{DELTA_CACHE_MAX_AGE_MS, DeltaContinuation, INITIAL_ADAPTIVE_DELTA_INTERVAL},
     };
     use kgi_model::{
         block::{BlockColor, BlockCoordinate, BlockHash, CompactId},
@@ -875,13 +876,18 @@ mod tests {
     };
     use crate::{
         api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
-        cache::{CacheAccess, CacheBuildError, CacheWaitError, CachedHeadSnapshot, HeadCacheLookup, HeadEligibilityBoundary},
-        client::{SseMailbox, SseMessage},
-        codec::{HeadEtagInput, sse::PublicationStateDto},
+        cache::{
+            CacheAccess, CacheBuildError, CacheWaitError, CachedDelta, CachedHeadSnapshot, HeadCacheLookup, HeadEligibilityBoundary,
+        },
+        client::{ClientIdentifier, SseMailbox, SseMessage},
+        codec::{
+            HeadEtagInput,
+            sse::{PublicationStateDto, PublicationWakeupDto},
+        },
         encoding::scheduler::{EncodingSchedulerError, MAX_GRAPH_ENCODING_JOBS},
         error::ApiServiceError,
         publication::{
-            GraphPublication, GraphPublicationState,
+            GraphPublication, GraphPublicationState, SOFT_DELTA_ESTIMATED_BYTES,
             runtime::{
                 PublicationInstallOutcome, PublicationInstaller, PublicationRuntime, PublicationRuntimePhase, PublicationSeedDatabase,
             },
@@ -1061,6 +1067,58 @@ mod tests {
             GraphPublication::new(GraphPublicationState::Synchronizing, origin, view, GraphHistory::new())
                 .expect("coherent delta publication"),
         )
+    }
+
+    fn synthetic_delta_publication(state: GraphPublicationState, entries: &[(u64, u64)]) -> Arc<GraphPublication> {
+        let mut view = GraphView::from_database_projection(
+            250,
+            LevelExtent::new(1, 2).expect("valid extent"),
+            TrackingPolicy::Head,
+            BTreeMap::from([(1, Level { size: 1, daa_score: None }), (2, Level { size: 2, daa_score: Some(20) })]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let mut history = GraphHistory::new();
+        for (index, &(revision_timestamp_ms, estimated_raw_bytes)) in entries.iter().enumerate() {
+            let from_revision_id = u64::try_from(index).expect("fixture revision fits u64");
+            let delta = GraphDelta::new(
+                from_revision_id,
+                from_revision_id + 1,
+                revision_timestamp_ms,
+                2,
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .expect("valid empty fixture delta");
+            view.apply_delta(&delta).expect("fixture Head accepts the delta");
+            history
+                .append(delta, estimated_raw_bytes, GraphHistoryReplayability::Replayable)
+                .expect("fixture history accepts the delta");
+        }
+        let final_timestamp_ms = entries.last().map_or(0, |entry| entry.0);
+        let origin = Instant::now()
+            .checked_sub(Duration::from_millis(final_timestamp_ms))
+            .expect("fixture publication origin is representable");
+        Arc::new(GraphPublication::new(state, origin, view, history).expect("coherent synthetic publication"))
+    }
+
+    async fn register_delta_client(
+        publication: &Arc<GraphPublication>,
+        client_revision_id: u64,
+    ) -> (ClientIdentifier, Arc<SseMailbox>, CancellationToken) {
+        let mailbox = Arc::new(SseMailbox::new());
+        let disconnect = CancellationToken::new();
+        let identifier = publication
+            .client_registry()
+            .register(client_revision_id, &mailbox, disconnect.clone())
+            .expect("fixture registration succeeds");
+        for _ in 0..3 {
+            mailbox.recv().await.expect("initial registration message");
+        }
+        (identifier, mailbox, disconnect)
     }
 
     fn replay_barrier_publication(origin: Instant) -> Arc<GraphPublication> {
@@ -1945,6 +2003,419 @@ mod tests {
             .await
             .expect("current cursor succeeds");
         assert!(matches!(current, CanonicalDeltaResponse::Success { outcome: CanonicalDeltaSuccess::UpToDate, .. }));
+
+        service.shutdown().await.expect("service shuts down");
+    }
+
+    #[tokio::test]
+    async fn canonical_delta_applies_lineage_cursor_and_registration_precedence() {
+        let (service, _events) = service();
+        let unavailable = service.canonical_delta(7, 0, None, CancellationToken::new()).await.expect("logical outcome");
+        assert!(matches!(
+            unavailable,
+            CanonicalDeltaResponse::FreshViewRequired { publication: None, reason: FreshViewReason::PublicationMismatch }
+        ));
+
+        let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &[(1, 1)]);
+        service.current_publication.send_replace(Some(publication.clone()));
+        let mismatched = service
+            .canonical_delta(publication.publication_id().wrapping_add(1), 0, None, CancellationToken::new())
+            .await
+            .expect("logical outcome");
+        assert!(matches!(
+            mismatched,
+            CanonicalDeltaResponse::FreshViewRequired {
+                publication: Some(current),
+                reason: FreshViewReason::PublicationMismatch,
+            } if Arc::ptr_eq(&current, &publication)
+        ));
+
+        assert!(matches!(
+            service
+                .canonical_delta(publication.publication_id(), 2, None, CancellationToken::new())
+                .await
+                .expect("logical outcome"),
+            CanonicalDeltaResponse::InvalidFutureCursor { publication: current } if Arc::ptr_eq(&current, &publication)
+        ));
+
+        let (identifier, _mailbox, _disconnect) = register_delta_client(&publication, 0).await;
+        assert!(publication.client_registry().remove(identifier));
+        assert!(matches!(
+            service
+                .canonical_delta(publication.publication_id(), 0, Some(identifier), CancellationToken::new())
+                .await
+                .expect("logical outcome"),
+            CanonicalDeltaResponse::ClientRegistrationRequired { publication: current } if Arc::ptr_eq(&current, &publication)
+        ));
+
+        service.shutdown().await.expect("service shuts down");
+    }
+
+    #[tokio::test]
+    async fn advancing_states_wait_at_the_active_interval_while_stale_reaches_its_final_head() {
+        let (service, _events) = service();
+        assert!(service.active_delta_interval.try_update(16));
+        let entries = (1..=40).map(|revision| (revision, 1)).collect::<Vec<_>>();
+        let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
+        service.current_publication.send_replace(Some(publication.clone()));
+
+        for expected_state in [GraphPublicationState::Synchronizing, GraphPublicationState::Live] {
+            if expected_state == GraphPublicationState::Live {
+                publication.transition_live().await;
+            }
+            let response = service
+                .canonical_delta(publication.publication_id(), 32, None, CancellationToken::new())
+                .await
+                .expect("logical outcome");
+            let CanonicalDeltaResponse::Success {
+                head,
+                outcome: CanonicalDeltaSuccess::WaitForWakeup,
+                continuation: DeltaContinuation::WaitForWakeup,
+                wake_at_revision_id: Some(48),
+                retry_after_ms: Some(600),
+                ..
+            } = response
+            else {
+                panic!("advancing publication waits for the active-interval boundary")
+            };
+            assert_eq!(head.state(), expected_state);
+        }
+
+        assert!(publication.transition_stale().await);
+        let response = service
+            .canonical_delta(publication.publication_id(), 32, None, CancellationToken::new())
+            .await
+            .expect("Stale catch-up succeeds");
+        let CanonicalDeltaResponse::Success {
+            head,
+            outcome: CanonicalDeltaSuccess::Complete(delta),
+            continuation: DeltaContinuation::ReachedHead,
+            wake_at_revision_id: None,
+            retry_after_ms: Some(1_000),
+            ..
+        } = response
+        else {
+            panic!("Stale publication reaches its fixed final Head")
+        };
+        assert_eq!(head.state(), GraphPublicationState::Stale);
+        assert_eq!(delta.to_revision_id(), 40);
+        assert!(!delta.is_size_limited(), "state-limited shortening remains enlargeable");
+
+        service.shutdown().await.expect("service shuts down");
+    }
+
+    #[tokio::test]
+    async fn size_descent_is_cached_once_and_reused_as_a_prefix() {
+        let (service, _events) = service();
+        let estimate = SOFT_DELTA_ESTIMATED_BYTES / 3;
+        let publication = synthetic_delta_publication(
+            GraphPublicationState::Synchronizing,
+            &[(1, estimate), (2, estimate), (3, estimate), (4, estimate)],
+        );
+        service.current_publication.send_replace(Some(publication.clone()));
+
+        let first = service
+            .canonical_delta(publication.publication_id(), 0, None, CancellationToken::new())
+            .await
+            .expect("size-limited construction succeeds");
+        let CanonicalDeltaResponse::Success {
+            outcome: CanonicalDeltaSuccess::Prefix(first),
+            continuation: DeltaContinuation::WaitForWakeup,
+            wake_at_revision_id: Some(8),
+            retry_after_ms: Some(300),
+            ..
+        } = first
+        else {
+            panic!("soft-estimate descent returns one prefix")
+        };
+        assert_eq!(first.to_revision_id(), 2);
+        assert!(first.is_size_limited());
+
+        let second = service
+            .canonical_delta(publication.publication_id(), 0, None, CancellationToken::new())
+            .await
+            .expect("size-limited reuse succeeds");
+        let CanonicalDeltaResponse::Success { outcome: CanonicalDeltaSuccess::Prefix(second), .. } = second else {
+            panic!("the retained size-limited result remains a prefix")
+        };
+        assert!(Arc::ptr_eq(&first, &second));
+
+        service.shutdown().await.expect("service shuts down");
+    }
+
+    #[tokio::test]
+    async fn absent_source_at_the_exact_cache_age_boundary_is_not_recreated() {
+        let (service, _events) = service();
+        let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &[(0, 1), (DELTA_CACHE_MAX_AGE_MS, 1)]);
+        assert!(publication.transition_stale().await);
+        service.current_publication.send_replace(Some(publication.clone()));
+
+        assert!(matches!(
+            service
+                .canonical_delta(publication.publication_id(), 0, None, CancellationToken::new())
+                .await
+                .expect("logical outcome"),
+            CanonicalDeltaResponse::FreshViewRequired {
+                publication: Some(current),
+                reason: FreshViewReason::DeltaSourceExpired,
+            } if Arc::ptr_eq(&current, &publication)
+        ));
+
+        service.shutdown().await.expect("service shuts down");
+    }
+
+    #[tokio::test]
+    async fn active_interval_changes_do_not_reschedule_existing_registrations() {
+        {
+            let (service, _events) = service();
+            assert!(service.active_delta_interval.try_update(8));
+            let entries = (1..=39).map(|revision| (revision, 1)).collect::<Vec<_>>();
+            let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
+            service.current_publication.send_replace(Some(publication.clone()));
+            let (identifier, mailbox, _disconnect) = register_delta_client(&publication, 32).await;
+
+            let first = service
+                .canonical_delta(publication.publication_id(), 32, Some(identifier), CancellationToken::new())
+                .await
+                .expect("logical outcome");
+            assert!(matches!(
+                first,
+                CanonicalDeltaResponse::Success {
+                    outcome: CanonicalDeltaSuccess::WaitForWakeup,
+                    continuation: DeltaContinuation::WaitForWakeup,
+                    wake_at_revision_id: Some(40),
+                    retry_after_ms: None,
+                    ..
+                }
+            ));
+
+            assert!(service.active_delta_interval.try_update(16));
+            assert_eq!(publication.apply_block_committed(&block_update(200, 2, 1)).await.expect("Head update"), Some(40));
+            assert_eq!(
+                mailbox.recv().await,
+                Some(SseMessage::PublicationWakeup(PublicationWakeupDto::new(publication.publication_id(), 40)))
+            );
+
+            let second = service
+                .canonical_delta(publication.publication_id(), 32, Some(identifier), CancellationToken::new())
+                .await
+                .expect("logical outcome");
+            assert!(matches!(
+                second,
+                CanonicalDeltaResponse::Success {
+                    outcome: CanonicalDeltaSuccess::WaitForWakeup,
+                    continuation: DeltaContinuation::WaitForWakeup,
+                    wake_at_revision_id: Some(48),
+                    retry_after_ms: None,
+                    ..
+                }
+            ));
+            for id in 201..=208 {
+                publication.apply_block_committed(&block_update(id, 2, 1)).await.expect("Head update");
+            }
+            assert_eq!(
+                mailbox.recv().await,
+                Some(SseMessage::PublicationWakeup(PublicationWakeupDto::new(publication.publication_id(), 48)))
+            );
+
+            service.shutdown().await.expect("service shuts down");
+        }
+
+        let (service, _events) = service();
+        assert!(service.active_delta_interval.try_update(16));
+        let entries = (1..=40).map(|revision| (revision, 1)).collect::<Vec<_>>();
+        let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
+        service.current_publication.send_replace(Some(publication.clone()));
+        let (identifier, mailbox, _disconnect) = register_delta_client(&publication, 32).await;
+        assert!(matches!(
+            service
+                .canonical_delta(publication.publication_id(), 32, Some(identifier), CancellationToken::new())
+                .await
+                .expect("logical outcome"),
+            CanonicalDeltaResponse::Success { outcome: CanonicalDeltaSuccess::WaitForWakeup, wake_at_revision_id: Some(48), .. }
+        ));
+
+        assert!(service.active_delta_interval.try_update(8));
+        assert!(
+            timeout(Duration::from_millis(20), mailbox.recv()).await.is_err(),
+            "decreasing the interval does not replace the existing later schedule"
+        );
+        for id in 200..=207 {
+            publication.apply_block_committed(&block_update(id, 2, 1)).await.expect("Head update");
+        }
+        assert_eq!(
+            mailbox.recv().await,
+            Some(SseMessage::PublicationWakeup(PublicationWakeupDto::new(publication.publication_id(), 48)))
+        );
+        let response = service
+            .canonical_delta(publication.publication_id(), 32, Some(identifier), CancellationToken::new())
+            .await
+            .expect("logical outcome");
+        assert!(matches!(
+            response,
+            CanonicalDeltaResponse::Success {
+                outcome: CanonicalDeltaSuccess::Complete(_),
+                continuation: DeltaContinuation::ReachedHead,
+                ..
+            }
+        ));
+
+        service.shutdown().await.expect("service shuts down");
+    }
+
+    #[tokio::test]
+    async fn registration_disappearance_after_cache_join_replaces_the_selected_success() {
+        let (service, _events) = service();
+        let entries = (1..=4).map(|revision| (revision, 1)).collect::<Vec<_>>();
+        let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
+        service.current_publication.send_replace(Some(publication.clone()));
+        let (identifier, _mailbox, _disconnect) = register_delta_client(&publication, 0).await;
+
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let builder_started = started.clone();
+        let builder_release = release.clone();
+        let CacheAccess::Job(job) = publication.cache().elect_delta(&service.cache_jobs, 0, 1, 4, false, move |_| async move {
+            builder_started.add_permits(1);
+            builder_release.acquire().await.expect("controlled builder remains open").forget();
+            Ok(Arc::new(CachedDelta::new(0, 4, false, 4, bytes::Bytes::from_static(b"delta"))))
+        }) else {
+            panic!("fixture installs one controlled job")
+        };
+        started.acquire().await.expect("controlled job starts").forget();
+        let baseline_references = Arc::strong_count(&job);
+
+        let request_service = service.clone();
+        let request_publication_id = publication.publication_id();
+        let request = tokio::spawn(async move {
+            request_service.canonical_delta(request_publication_id, 0, Some(identifier), CancellationToken::new()).await
+        });
+        timeout(TEST_TIMEOUT, async {
+            while Arc::strong_count(&job) == baseline_references {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request joins the controlled cache job");
+        assert!(publication.client_registry().remove(identifier));
+        release.add_permits(1);
+
+        assert!(matches!(
+            request.await.expect("request task completes").expect("logical outcome"),
+            CanonicalDeltaResponse::ClientRegistrationRequired { publication: current } if Arc::ptr_eq(&current, &publication)
+        ));
+
+        service.shutdown().await.expect("service shuts down");
+    }
+
+    #[tokio::test]
+    async fn head_advancement_during_cache_join_rearms_one_current_wakeup() {
+        let (service, _events) = service();
+        let entries = (1..=4).map(|revision| (revision, 1)).collect::<Vec<_>>();
+        let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
+        service.current_publication.send_replace(Some(publication.clone()));
+        let (identifier, mailbox, _disconnect) = register_delta_client(&publication, 0).await;
+
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let builder_started = started.clone();
+        let builder_release = release.clone();
+        let CacheAccess::Job(job) = publication.cache().elect_delta(&service.cache_jobs, 0, 1, 4, false, move |_| async move {
+            builder_started.add_permits(1);
+            builder_release.acquire().await.expect("controlled builder remains open").forget();
+            Ok(Arc::new(CachedDelta::new(0, 4, false, 4, bytes::Bytes::from_static(b"delta"))))
+        }) else {
+            panic!("fixture installs one controlled job")
+        };
+        started.acquire().await.expect("controlled job starts").forget();
+        let baseline_references = Arc::strong_count(&job);
+
+        let request_service = service.clone();
+        let request_publication_id = publication.publication_id();
+        let request = tokio::spawn(async move {
+            request_service.canonical_delta(request_publication_id, 0, Some(identifier), CancellationToken::new()).await
+        });
+        timeout(TEST_TIMEOUT, async {
+            while Arc::strong_count(&job) == baseline_references {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request joins the controlled cache job");
+        for id in 200..=203 {
+            publication.apply_block_committed(&block_update(id, 2, 1)).await.expect("Head update");
+        }
+        release.add_permits(1);
+
+        assert!(matches!(
+            request.await.expect("request task completes").expect("logical outcome"),
+            CanonicalDeltaResponse::Success {
+                outcome: CanonicalDeltaSuccess::Complete(_),
+                continuation: DeltaContinuation::ReachedHead,
+                ..
+            }
+        ));
+        assert_eq!(
+            mailbox.recv().await,
+            Some(SseMessage::PublicationWakeup(PublicationWakeupDto::new(publication.publication_id(), 8)))
+        );
+        mailbox.close();
+        assert_eq!(mailbox.recv().await, None, "completion replaces the queued old wakeup instead of duplicating it");
+
+        service.shutdown().await.expect("service shuts down");
+    }
+
+    #[tokio::test]
+    async fn farther_request_joins_a_short_job_then_returns_only_the_enlargement() {
+        let (service, _events) = service();
+        let entries = (1..=64).map(|revision| (revision, 1)).collect::<Vec<_>>();
+        let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
+        service.current_publication.send_replace(Some(publication.clone()));
+
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let builder_started = started.clone();
+        let builder_release = release.clone();
+        let CacheAccess::Job(short_job) =
+            publication.cache().elect_delta(&service.cache_jobs, 32, 33, 48, false, move |_| async move {
+                builder_started.add_permits(1);
+                builder_release.acquire().await.expect("controlled builder remains open").forget();
+                Ok(Arc::new(CachedDelta::new(32, 48, false, 4, bytes::Bytes::from_static(b"short"))))
+            })
+        else {
+            panic!("fixture installs one controlled short job")
+        };
+        started.acquire().await.expect("controlled job starts").forget();
+        let baseline_references = Arc::strong_count(&short_job);
+
+        let request_service = service.clone();
+        let request_publication_id = publication.publication_id();
+        let request =
+            tokio::spawn(
+                async move { request_service.canonical_delta(request_publication_id, 32, None, CancellationToken::new()).await },
+            );
+        timeout(TEST_TIMEOUT, async {
+            while Arc::strong_count(&short_job) == baseline_references {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the farther request joins the short job");
+        release.add_permits(1);
+
+        let response = request.await.expect("request task completes").expect("logical outcome");
+        let CanonicalDeltaResponse::Success {
+            outcome: CanonicalDeltaSuccess::Complete(enlarged),
+            continuation: DeltaContinuation::ReachedHead,
+            ..
+        } = response
+        else {
+            panic!("the farther request returns only its adequate enlargement")
+        };
+        assert_eq!(enlarged.source_revision_id(), 32);
+        assert_eq!(enlarged.to_revision_id(), 64);
+        assert!(!enlarged.is_size_limited());
+        assert_eq!(short_job.wait(CancellationToken::new()).await.expect("short job result remains observable").to_revision_id(), 48);
 
         service.shutdown().await.expect("service shuts down");
     }
