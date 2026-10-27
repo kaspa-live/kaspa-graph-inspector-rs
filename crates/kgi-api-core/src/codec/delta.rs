@@ -107,6 +107,82 @@ impl GraphDeltaBatchDto {
 }
 
 #[cfg(test)]
+/// Maximum serialized contribution for every additive estimator category.
+pub(crate) struct EstimatorWireContributionBytes {
+    pub entry_and_batch_framing: usize,
+    pub additional_entry_framing: usize,
+    pub distinct_hash: usize,
+    pub block_upsert: usize,
+    pub block_relationship: usize,
+    pub edge_upsert: usize,
+    pub level_installation: usize,
+    pub level_removal: usize,
+    pub membership_mutation: usize,
+    pub color_mutation: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn maximum_estimator_wire_contribution_bytes() -> EstimatorWireContributionBytes {
+    const MAXIMUM_ADMITTED_HASH_REF: HashRef = 99_999;
+
+    fn maximum_entry() -> GraphDeltaEntryDto {
+        GraphDeltaEntryDto {
+            from_revision_id: u64::MAX.into(),
+            to_revision_id: u64::MAX.into(),
+            revision_timestamp_ms: u64::MAX.into(),
+            head_level: u32::MAX,
+            block_upserts: Vec::new(),
+            edge_upserts: Vec::new(),
+            level_mutations: Vec::new(),
+            is_in_vspc_mutations: Vec::new(),
+            color_mutations: Vec::new(),
+        }
+    }
+
+    fn item_bytes(value: &impl Serialize) -> usize {
+        serde_json::to_vec(value).expect("maximum-width estimator fixture serializes").len() + 1
+    }
+
+    let entry_and_batch_framing = serde_json::to_vec(&GraphDeltaBatchDto { hashes: Vec::new(), deltas: vec![maximum_entry()] })
+        .expect("maximum-width entry framing serializes")
+        .len();
+    let two_entry_batch_framing =
+        serde_json::to_vec(&GraphDeltaBatchDto { hashes: Vec::new(), deltas: vec![maximum_entry(), maximum_entry()] })
+            .expect("maximum-width multi-entry framing serializes")
+            .len();
+    let additional_entry_framing = two_entry_batch_framing
+        .checked_sub(entry_and_batch_framing)
+        .expect("adding a maximum-width entry increases serialized framing");
+    let distinct_hash = item_bytes(&BlockHashDto::from(kgi_model::block::BlockHash::from_bytes([u8::MAX; 32])));
+    let block_upsert = item_bytes(&GraphBlockDto::maximum_width_for_estimator(MAXIMUM_ADMITTED_HASH_REF));
+    let block_relationship = item_bytes(&MAXIMUM_ADMITTED_HASH_REF);
+    let edge_upsert = item_bytes(&GraphEdgeDto::maximum_width_for_estimator(MAXIMUM_ADMITTED_HASH_REF));
+    let level_installation = item_bytes(&LevelMutationDto {
+        level: u32::MAX,
+        value: Some(LevelValueDto { size: kgi_model::block::MAX_LEVEL_SIZE, daa_score: Some(kgi_model::block::MAX_DAA_SCORE.into()) }),
+    });
+    let level_removal = item_bytes(&LevelMutationDto { level: u32::MAX, value: None });
+    let membership_mutation = item_bytes(&FieldMutationDto { hash: MAXIMUM_ADMITTED_HASH_REF, value: false });
+    let color_mutation = item_bytes(&FieldMutationDto {
+        hash: MAXIMUM_ADMITTED_HASH_REF,
+        value: BlockColorDto::from(kgi_model::block::BlockColor::Red),
+    });
+
+    EstimatorWireContributionBytes {
+        entry_and_batch_framing,
+        additional_entry_framing,
+        distinct_hash,
+        block_upsert,
+        block_relationship,
+        edge_upsert,
+        level_installation,
+        level_removal,
+        membership_mutation,
+        color_mutation,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         collections::{BTreeMap, HashMap},

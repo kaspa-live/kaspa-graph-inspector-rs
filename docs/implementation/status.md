@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 24 October 2026.
+Updated 27 October 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -313,26 +313,6 @@ Completion validation passed workspace formatting, Cargo check, 436/436
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.
 
-The implemented Increment 10 Head-cache selection, delta target selection,
-destination heat, immutable source slots, and level-based pruning predate the
-current [protocol cache contract](../architecture/api-protocol.md#publication-scoped-head-response-cache--settled).
-Increment 15 has replaced the former composed history with atomic entries,
-absolute cumulative estimates, append-time replay barriers, synchronized
-cache invalidation, and the final-admission seam used by later logical graph
-operations.
-Increment 16 adapts both cache kernels and the encoder: it removes destination
-heat and target-level indexes, makes source entries enlargeable through one
-serialized job, adds monotonic size ceilings and query-driven age pruning, and
-permits a soft-admitted canonical delta to log an unexpected invariant-
-threshold overrun while still completing gzip and cache construction. The
-enforced non-delta response limit remains unchanged.
-Increment 17 implements logical Head snapshot and retained-level operations.
-Increment 18 implements the canonical delta operation, including atomic
-dyadic targets, continuation, and registration completion. It stores one
-mutable ApiService-wide active interval initialized to 4; every decision reads
-the current value, but production does not update it until the controller in
-the open architecture register is settled.
-
 Implementation increment 11 is implemented: each `GraphPublication` now owns
 its publication-local SSE client registry and each connection owns one bounded,
 ordered mailbox. The registry provides atomic initial and replacement batches,
@@ -437,3 +417,24 @@ increments recorded in
 Completion validation passed workspace formatting, Cargo check, 553/553
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.
+
+Implementation increment 16 is implemented: the publication-local response
+cache now uses only the exact configured Head tiers and one source-ordered
+`DeltaCache`. Query-driven age pruning removes an expired source prefix;
+replay-floor invalidation remains synchronized across both cache domains.
+Source-keyed delta work is serialized through fixed-target jobs selected only
+after pre-election sizing. Successful farther results replace older completed
+values, fitting completed bytes can be reclassified without encoding, and
+failed or cancelled work retains no separate size evidence. The encoding
+scheduler now owns a canonical-delta mode that measures the complete JSON,
+reports one estimator overrun before gzip, and still returns the complete
+compressed body; non-delta graph encoding retains its enforced hard limit.
+Focused tests cover exact-tier access, ordered prefix pruning, both delta
+elections, source serialization and enlargement, fixed-target installation,
+reclassification, weak insertion, replay-floor and completion races,
+estimator bounds, diagnostic overrun, cancellation, and terminal joining.
+Logical Head and level operations remain in increment 17, while canonical
+delta selection, continuation, and registration completion remain in
+increment 18. Completion validation passed workspace formatting, Cargo check,
+565/565 Nextest tests including Docker PostgreSQL integration, Cargo doctests,
+Clippy with warnings denied, and `git diff --check`.

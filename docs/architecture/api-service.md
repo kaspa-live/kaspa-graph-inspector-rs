@@ -388,7 +388,11 @@ choice:
 ```rust
 struct GraphCacheState {
     deltas: DeltaCache,
-    head_slots: HashMap<u32, CacheSlot<CachedHeadSnapshot>>,
+    heads: HeadCache,
+}
+
+struct HeadCache {
+    slots_by_depth: HashMap<u32, HeadCacheSlot>,
 }
 
 struct DeltaCache {
@@ -397,19 +401,19 @@ struct DeltaCache {
 
 struct DeltaCacheSlot {
     first_revision_timestamp_ms: u64,
-    size_ceiling_revision: Option<u64>,
     completed: Option<Arc<CachedDelta>>,
     running: Option<RunningDeltaJob>,
 }
 
 struct RunningDeltaJob {
     target_revision: u64,
+    size_limited: bool,
     job: Arc<CacheJob<CachedDelta>>,
 }
 
-struct CacheSlot<T> {
-    completed: Option<Arc<T>>,
-    running: Option<Arc<CacheJob<T>>>,
+struct HeadCacheSlot {
+    completed: Option<Arc<CachedHeadSnapshot>>,
+    running: Option<Arc<CacheJob<CachedHeadSnapshot>>>,
 }
 
 enum CacheJobState<T> {
@@ -442,26 +446,31 @@ source lookup. It returns an adequate completed value, joins the existing
 running job, or reports that construction may be required. The first two
 outcomes consult no history. Only the construction-required outcome captures
 the atomic history range and first revision timestamp needed for the source-
-keyed slot, then performs a second cache operation. Concurrent callers may
-duplicate that immutable capture, so the second operation completely
-re-evaluates the source slot against this request's captured target. It returns
-an adequate completed value, joins a running job, installs an enlargement job
-while preserving an inadequate completed value, or installs the new job in an
-otherwise empty slot. Only either installation elects this caller as builder
-and retains its captured entries; returning or joining discards that redundant
+keyed slot. With no cache-state guard, it obtains the protocol-owned fitting
+target and `size_limited` classification, then performs a second cache
+operation.
+Concurrent callers may duplicate that immutable capture and sizing work, so
+the second operation completely re-evaluates the source slot. In one critical
+section it returns an adequate completed value, reclassifies an already
+completed fitting value by sharing its encoded bytes, joins a running job,
+installs a fixed-target enlargement job while preserving an inadequate
+completed value, or installs the fixed-target job in an otherwise empty slot.
+Only job installation elects this caller as builder and retains its captured
+entries; returning, reclassification, or joining discards that redundant
 capture. This prevents a miss burst from duplicating expensive encoding work
-without placing an incompletely timestamped slot in the ordered cache. The
+without placing an incompletely timestamped slot or a job for an excluded
+target in the ordered cache. The
 [publication-owned capture linearization](api-publication.md#publication-synchronization-and-request-capture--settled)
 encloses this cache operation. A request needing a farther target joins the
 current job and re-evaluates after it completes. Once elected, the builder
-performs the soft estimate and any encoding outside the cache critical section.
-The builder spawns one tracked orchestration task with a child of
+performs encoding outside the cache critical section. The builder spawns one
+tracked orchestration task with a child of
 `ApiCancellation::cache_jobs`.
 
 A source-keyed delta job captures its immutable atomic history-entry Arcs and
-current dyadic candidate target. Each individual encoding attempt keeps that
-target fixed; size evidence may make the same pending job descend before its
-next attempt. A Head snapshot tier job captures one immutable Frozen
+its already proven fitting target. That target and its `size_limited`
+classification remain fixed for the job's lifetime; the job never performs
+target descent. A Head snapshot tier job captures one immutable Frozen
 extraction.
 Head-tier job creation follows the request-driven policy owned by the
 [protocol cache contract](api-protocol.md#publication-scoped-head-response-cache--settled).
@@ -470,9 +479,10 @@ path. Every job holds only detached immutable inputs during JSON serialization
 and gzip and no
 publication-core or cache-state guard.
 
-`DeltaCache` is a nested value accessed only within the enclosing
-`GraphCache` state critical section. It is not another synchronization or
-lifecycle owner and stores no copy of the history-owned replay floor.
+`HeadCache` and `DeltaCache` are nested values accessed only within the
+enclosing `GraphCache` state critical section. Neither is another
+synchronization or lifecycle owner. `DeltaCache` stores no copy of the
+history-owned replay floor.
 `slots_by_source` supplies exact lookup, source-keyed single-flight ownership,
 replacement, and query-driven prefix pruning in one index. Every slot records
 the first selected revision timestamp before either a completed value or
@@ -490,13 +500,14 @@ atomically replaces the completed value only when the candidate reaches
 farther. On ordinary failure it removes the matching running job and preserves
 the preceding completed value.
 
-`size_ceiling_revision` is the exclusive candidate target known to reach the
-soft estimate bound. The running job lowers that ceiling under the cache
-critical section, updates its recorded target to the next lower protocol
-target, and continues while remaining `Pending`. Its waiters stay subscribed
-to the same job. If the next lower completed value already exists, the job
-installs an equivalent `size_limited` cached value sharing its encoded bytes
-rather than starting another encoding.
+The second cache operation installs only the protocol-selected fitting target
+and its immutable `size_limited` classification. No job is installed for an
+excluded target. When the exact fitting completed value already exists,
+reclassification marks shared completed bytes `size_limited` without encoding
+them again. An ordinary failure or cancellation removes only the matching job
+and leaves no separate size evidence in the source slot. The
+[protocol owner](api-protocol.md#canonical-head-delta-responses--settled)
+defines the later request's sizing behavior.
 
 At the beginning of a delta query, the caller supplies the protocol-captured
 Head timestamp. `DeltaCache` removes its expired source prefix before lookup.
@@ -563,8 +574,8 @@ can no longer be upgraded, the job skips insertion but still completes its
 existing receivers.
 
 Cache-state synchronization protects only map and prefix-pruning operations,
-replay-floor invalidation, size-ceiling advancement, and pointer identity
-checks. No guard may
+replay-floor invalidation, completed-value reclassification, job election, and
+pointer identity checks. No guard may
 cross an `.await`, extraction, history capture, size estimation,
 serialization, compression, response delivery, or waiter suspension. The
 custom slots are required because
@@ -1012,7 +1023,8 @@ V2 exposes these operational measurements:
   removal, tier-job joins, construction duration, construction failure, and
   completion-time obsolete-candidate retries;
 - delta cache hits, joins, builds, enlargements, cache age and prefix pruning,
-  serialized source jobs, size-ceiling reductions and in-job descent,
+  serialized source jobs, pre-election target descent, completed-value
+  reclassification,
   dyadic target and delivered spans, active interval, per-client revision
   wakeups, requests per catch-up, size-limited short-prefix frequency,
   replay-floor advances, invalidated delta and Head-tier jobs, estimated versus

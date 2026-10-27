@@ -87,8 +87,8 @@ do not enlarge the PR silently. Any future regrouping requires updating this
 sequence first.
 
 The former broad Step 6 is now increments 6–20, former Step 7 is increments
-21–25, and former Step 8 is increments 26–30. Increments 6–14 are complete;
-the active production work is increment 15, without an additional nesting
+21–25, and former Step 8 is increments 26–30. Increments 6–15 are complete;
+the active production work is increment 16, without an additional nesting
 level.
 
 | Increment / PR | Isolated production scope | Completion evidence |
@@ -103,7 +103,7 @@ level.
 | 13. Publication runtime | First adapt the existing graph-update ingress and processing producer to the Catchup-triggered publication contract, then implement the session-bound `PublicationRuntime`: AwaitingCatchup handling, Catchup-triggered database seeding, staging, dual-cut alignment, immediate installation, gap reconstruction, projection-failure reconstruction, quiescent receiver closure, and its completed shutdown barrier. | Focused ingress and processor tests for the Catchup gate and marker-ownership refactor, followed by deterministic runtime state-machine tests for every construction state, both alignment cuts, idle-source waits, overflow and gap cuts, sticky Live, installation supersession, database failure classes, worker failure, and cancellation with no surviving task. |
 | 14. ApiService lifecycle and publication installation | Implement ApiService's event path, runtime generation fence, reset/current-publication slots, publication installation, cancellation roots, status aggregation, and terminal service barrier. This PR integrates increments 8–13 but adds no Axum router. | Control-level tests for Resync/Rebuild reset, predecessor overlap and join, superseded installation, publication replacement, database-read reopening, unexpected worker failure, shutdown from every runtime state, task/resource release, and idempotence. |
 | 15. Atomic history and replay-floor foundation | Adapt retained history to atomic one-revision entries, cumulative byte estimates, replayability classification, and the history-owned replay floor. Integrate publication-time classification and the synchronized cache invalidation plus final-admission ordering required when that floor advances. Add no logical Head or delta request operation. | Graph-model and publication-kernel tests for atomic append and range budgeting, cumulative overflow, append-time replay barriers, monotonic floor advancement, cache invalidation, detached-job completion races, and both orders of final admission versus floor advancement. |
-| 16. Response-cache and encoding kernels | Adapt the Increment 10 cache and encoding infrastructure without adding logical request outcomes: exact configured Head-tier slots, source-ordered `DeltaCache`, removal of destination heat and target-level indexes, query-driven age-pruning primitives, source-serialized jobs, monotonic size ceilings, and canonical-delta encoding that logs and accepts an invariant-threshold overrun. | Kernel tests for exact-tier operations, ordered-prefix pruning with equal timestamps, source single-flight and enlargement, in-job soft-estimate descent, cache invalidation, estimator conservatism and estimate-versus-actual measurements, diagnostic overrun acceptance, weak insertion, cancellation, and shutdown. |
+| 16. Response-cache and encoding kernels | Adapt the Increment 10 cache and encoding infrastructure without adding logical request outcomes: exact configured Head-tier slots, source-ordered `DeltaCache`, removal of destination heat and target-level indexes, query-driven age-pruning primitives, source-serialized fixed-target jobs, pre-election fitting-target classification, and canonical-delta encoding that logs and accepts an invariant-threshold overrun. | Kernel tests for exact-tier operations, ordered-prefix pruning with equal timestamps, source single-flight and enlargement, pre-election sizing inputs, completed-value reclassification, cache invalidation, estimator conservatism and estimate-versus-actual measurements, diagnostic overrun acceptance, weak insertion, cancellation, and shutdown. |
 | 17. In-memory Head snapshot and level operations | Implement logical Head snapshot construction and retained Head-level lookup over one captured publication. Apply exact-tier selection, 90-second publication-time eligibility, completion-time recapture, weak ETags, replay-floor admission, and all-or-nothing level lookup. Keep canonical delta selection, transport parsing, and Axum response delivery out of this PR. | Operation tests for every target depth and selected tier, eligible hits, on-demand construction, obsolete removal and recapture, no larger-tier reuse, ETags and `304`, replay-floor races, Stale snapshots, all-or-nothing levels, publication mismatch, and request-local failures. |
 | 18. Canonical delta operation | Implement the complete logical canonical-delta operation: dyadic target selection, atomic-history budgeting, five-minute source-age policy, source-job joining and enlargement, soft-estimate descent, cached batch construction, typed outcomes, continuation, and SSE registration completion and rearming. Store one mutable ApiService-wide active interval initialized from `INITIAL_ADAPTIVE_DELTA_INTERVAL = 4`; every decision reads its current value, while production performs no later update until the adaptive controller is settled. Keep transport parsing and Axum response delivery out of this PR. | Operation tests for every dyadic boundary and active interval, cache hits and age pruning, serialized enlargement, size-limited reuse, Complete/Prefix/UpToDate/fresh-view outcomes, Stale catch-up, HTTP-only continuation, registration disappearance, rearming races, and upward/downward interval changes without rescheduling existing registrations. |
 | 19. Anchored windows, status, and API admission | Implement Head-first anchored-window resolution with database fallback, detached historical projections, status composition, the independent Head/historical/status admission lanes, database-read permits and timeouts, and request-owned resource accounting. | Tests for all anchors and misses, immutable-source selection, DB/gate races, detached-resource lifetime, status independence, lane saturation, query timeout, and no partial graph. |
@@ -119,73 +119,72 @@ level.
 | 29. Deployment and release artifacts | Complete the conventional and Docker layouts, runtime log directories, systemd and Compose examples, static-asset cache behavior, and atomic `xtask` bundle/container construction against the composed binary and Web build. | Reproducible bundle and image checks, matching binary/assets and provenance, missing-root failure, unprivileged/read-only deployment, writable logs, direct signal delivery, and atomic failure cleanup. |
 | 30. Full-stack acceptance | Add only the remaining cross-component fixtures and acceptance coverage needed to prove the focused verification contract across node RPC, PostgreSQL, recovery, API/Web, packaging, logging, and resource isolation; update implementation status with the final evidence. | Full Rust, PostgreSQL, Vitest, deterministic and complete-stack Playwright, parity, packaging, shutdown, and load/isolation suites pass from a clean checkout. |
 
-### Active increment 15: atomic history and replay-floor foundation
+### Active increment 16: response-cache and encoding kernels
 
-Increment 15 is exactly one reviewable PR. It adapts the graph-model and
-publication kernel to the settled atomic-history and replay-barrier contracts,
-then establishes the ordering seam through which a replay-floor advance
-invalidates publication-local cache work and fences final response admission.
-The focused [graph model](../architecture/api-graph.md),
-[publication](../architecture/api-publication.md),
-[protocol](../architecture/api-protocol.md), and
-[ApiService](../architecture/api-service.md) documents remain the sole owners
-of those contracts; this plan records only their implementation sequence.
+Increment 16 is exactly one reviewable PR. It adapts the existing cache and
+encoding foundation to the settled response-cache representation and job
+lifecycle without implementing a logical public request operation. The focused
+[protocol](../architecture/api-protocol.md),
+[ApiService](../architecture/api-service.md),
+[publication](../architecture/api-publication.md), and
+[verification](../architecture/verification.md) documents remain the sole
+owners of those contracts; this plan records only their implementation order.
 
-Execute increment 15 as these ordered points:
+Execute increment 16 as these ordered points:
 
-1. Adapt `GraphHistory` and its public model values to the atomic-entry
-   contract. Add the replayability input, replay-floor state and accessor,
-   `NonAtomicDelta`, and `StartBeforeReplayFloor`, preserving the documented
-   validation precedence and the panic-on-cumulative-overflow invariant. Update
-   exports and focused constructors without introducing protocol or cache
-   dependencies into `kgi-api-model`.
-2. Implement replayable append, replay-barrier append, ordinary level pruning,
-   oldest-available and replay-floor boundaries, and exact atomic range
-   selection. Preserve absolute cumulative estimates across both forms of
-   prefix removal and expose immutable entry lists suitable for later response
-   budgeting. Replace the former aggregate-entry tests with boundary-focused
-   tests for one-revision continuity, error precedence, exact target selection,
-   future targets, pruning, replay barriers, and maximum cumulative values.
-3. Add the publication-owned replayability classification at the original
-   update boundary using the existing canonical estimator and the
-   protocol-owned soft threshold. Keep view application, timestamping,
-   estimation, classification, history append, and ordinary pruning inside the
-   existing atomic mutation; add the replay floor and oldest available revision
-   to the documented coherent captures. An update classified as a replay
-   barrier must never enter retained history or start encoding work.
-4. Add the narrow replay-floor invalidation operation to the existing
-   publication-local graph cache and cache-job state machine. Under one cache
-   critical section, detach the architecture-selected delta and Head entries
-   and make affected pending jobs terminal before returning their handles;
-   perform cancellation only after leaving that section. Preserve exact
-   slot/job identity so either invalidation or ordinary completion wins the
-   documented two-order race without repopulating an invalidated slot.
-5. Integrate that invalidation into the original-update tail. When history
-   reports a floor advance, invoke the synchronous bounded cache operation
-   before publishing the new core, then release the core lock, cancel detached
-   work without awaiting it, advance the SSE client registry, and finally
-   release mutation ownership. Add deterministic interleavings proving that no
-   new pre-floor capture can escape the mutation boundary.
-6. Implement the publication-owned final replay-floor-admission primitive for
-   immutable cached delta and Head candidates. It must compare and record
-   admission while briefly holding the core read side and hold no cache guard;
-   later operation increments will call this primitive immediately before
-   response commitment. Verify both possible orders between admission and a
-   concurrent floor advance, including a completed job removed after winning
-   its race with invalidation.
-7. Complete focused model, publication, cache-job, and concurrency coverage for
-   replay-floor monotonicity, detached range handles, invalidated waiters,
-   cancellation, completion races, and resource release. Record only genuine
-   implementation choices and the increment status, run the full Rust
-   validation suite, and keep the PR limited to this foundation.
+1. Align the private cached response values and protocol constants with their
+   current owners. Give `CachedDelta` its complete kernel representation,
+   replace the derived Head-depth sequence with the exact configured tier set,
+   and remove superseded level-distance, refresh, destination-heat, and
+   target-level-index constants and accessors. Keep public outcome selection
+   outside this increment.
+2. Reduce Head caching to exact-tier slot primitives. Preserve one completed
+   value and one pending job per configured tier, but remove larger-tier reuse,
+   demand refresh, and level-distance eligibility from the kernel. Retain exact
+   job identity, weak insertion, replay-floor invalidation, and tracked task
+   completion so increment 17 can supply the request-owned eligibility inputs.
+3. Replace the delta side indexes with the source-ordered `DeltaCache` and its
+   source-slot state. Add bounded prefix age pruning using the supplied
+   publication-local Head timestamp, preserve equal-timestamp ordering, and
+   keep replay-floor invalidation on the same cache mutex. Removing an expired
+   slot must detach rather than await or resurrect its running job.
+4. Implement the two cache-election primitives used by a later canonical-delta
+   operation: initial prune-and-lookup without history, followed after an
+   immutable capture by complete source-slot re-evaluation. Serialize all work
+   for one source, preserve an inadequate completed value during enlargement,
+   join the current source job regardless of its target, and require a farther
+   waiter to re-enter after completion.
+5. Add fixed source-job targets and pre-election sizing inputs. The second
+   cache operation accepts a caller-supplied fitting target and its
+   `size_limited` classification, and installs only that target in one critical
+   section. Remove every separate ceiling field, excluded-target election
+   result, and in-job descent or target transition. Reclassify an already
+   completed fitting value by sharing its encoded bytes, retain no size evidence
+   after job failure or cancellation, and replace the completed value only with
+   a successful farther result. The dyadic sizing algorithm remains in
+   increment 18.
+6. Add the scheduler-owned canonical-delta encoding mode. Keep capped
+   serialization unchanged for non-delta graph bodies, while delta encoding
+   returns its complete observed JSON size and deterministic gzip body even
+   after crossing the diagnostic threshold. Expose one construction-level
+   estimator-overrun observation, preserve cancellation and shutdown tracking,
+   and verify the recorded estimator weights against reachable maximum wire
+   widths.
+7. Replace superseded cache tests with focused kernel and controlled-race
+   coverage for the exact tier set, ordered-prefix pruning, both cache-election
+   passes, source serialization and enlargement, fitting-target installation,
+   completed-value reclassification, absence of retained size evidence after
+   failure, weak insertion,
+   replay-floor invalidation, detached completion, estimator measurements,
+   diagnostic-overrun acceptance, cancellation, and terminal joining. Update
+   non-normative implementation records, run the full Rust validation suite,
+   and keep the PR limited to this kernel adaptation.
 
-This increment adds no logical Head, level, canonical-delta, anchored-window,
-or status operation; no HTTP admission lane, Axum route, or SSE transport; and
-no adaptive-interval controller. It does not perform the broader response-cache
-redesign assigned to increment 16: exact Head-tier policy, source-ordered
-`DeltaCache`, query-driven age pruning, source-job enlargement, size ceilings,
-and canonical response encoding remain out of scope. Increments 17 and 18 own
-the first consumers of the capture and final-admission primitives.
+This increment adds no logical Head snapshot, Head-level, canonical-delta,
+anchored-window, or status result; no active-interval or dyadic-target policy;
+no HTTP admission lane, Axum route, or SSE transport; and no adaptive
+controller. Increment 17 owns the first Head-tier consumer, while increment 18
+owns canonical-delta selection, source-age outcomes, and public continuation.
 
 ## Cross-increment ordering
 

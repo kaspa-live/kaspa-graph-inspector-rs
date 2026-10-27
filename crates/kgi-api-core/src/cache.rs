@@ -7,13 +7,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use kgi_api_model::{
-    projection::MAX_WINDOW_DEPTH,
-    protocol::{
-        CACHED_HEAD_WINDOW_DEPTH_STEP, CACHED_WINDOW_MAX_LEVEL_DISTANCE, CACHED_WINDOW_REFRESH_LEVEL_DISTANCE,
-        HOT_DESTINATION_LEVEL_DISTANCE, MAX_CACHE_LEVEL_DISTANCE,
-    },
-};
+use kgi_api_model::protocol::{CACHED_HEAD_SNAPSHOT_MAX_AGE_MS, CACHED_HEAD_WINDOW_DEPTHS, DELTA_CACHE_MAX_AGE_MS};
 use tokio::sync::watch;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -24,7 +18,7 @@ use crate::{codec::HeadEtagInput, encoding::scheduler::EncodingSchedulerError};
 pub(crate) struct CachedDelta {
     from_revision_id: u64,
     to_revision_id: u64,
-    head_level: u32,
+    size_limited: bool,
     uncompressed_json_bytes: u64,
     gzip_body: Bytes,
 }
@@ -34,11 +28,11 @@ impl CachedDelta {
     pub(crate) const fn new(
         from_revision_id: u64,
         to_revision_id: u64,
-        head_level: u32,
+        size_limited: bool,
         uncompressed_json_bytes: u64,
         gzip_body: Bytes,
     ) -> Self {
-        Self { from_revision_id, to_revision_id, head_level, uncompressed_json_bytes, gzip_body }
+        Self { from_revision_id, to_revision_id, size_limited, uncompressed_json_bytes, gzip_body }
     }
 
     /// Returns the exact source revision represented by this entry.
@@ -51,9 +45,25 @@ impl CachedDelta {
         self.to_revision_id
     }
 
-    /// Returns the last entry's target Head level.
-    pub(crate) const fn head_level(&self) -> u32 {
-        self.head_level
+    /// Returns whether soft-size descent selected this cached target.
+    pub(crate) const fn is_size_limited(&self) -> bool {
+        self.size_limited
+    }
+
+    /// Returns whether this response satisfies a request for `target_revision`.
+    pub(crate) const fn is_adequate_for(&self, target_revision: u64) -> bool {
+        self.to_revision_id >= target_revision || self.size_limited
+    }
+
+    fn reclassified_size_limited(&self) -> Arc<Self> {
+        assert!(!self.size_limited, "only an ordinary completed delta requires size-limited reclassification");
+        Arc::new(Self {
+            from_revision_id: self.from_revision_id,
+            to_revision_id: self.to_revision_id,
+            size_limited: true,
+            uncompressed_json_bytes: self.uncompressed_json_bytes,
+            gzip_body: self.gzip_body.clone(),
+        })
     }
 
     /// Returns the complete uncompressed JSON byte count.
@@ -137,6 +147,32 @@ impl CachedHeadSnapshot {
     }
 }
 
+/// One coherent publication boundary for cached Head-snapshot eligibility.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HeadEligibilityBoundary {
+    head_revision_timestamp_ms: u64,
+    replay_floor_revision: u64,
+    oldest_available_revision: u64,
+}
+
+impl HeadEligibilityBoundary {
+    /// Constructs the eligibility boundary captured from one publication core.
+    pub(crate) const fn new(head_revision_timestamp_ms: u64, replay_floor_revision: u64, oldest_available_revision: u64) -> Self {
+        Self { head_revision_timestamp_ms, replay_floor_revision, oldest_available_revision }
+    }
+
+    /// Returns whether one cached snapshot remains eligible at this boundary.
+    pub(crate) fn admits(self, snapshot: &CachedHeadSnapshot) -> bool {
+        let age_ms = self
+            .head_revision_timestamp_ms
+            .checked_sub(snapshot.revision_timestamp_ms())
+            .expect("a cached Head snapshot does not postdate its publication Head");
+        snapshot.revision() >= self.replay_floor_revision
+            && snapshot.revision() >= self.oldest_available_revision
+            && age_ms < CACHED_HEAD_SNAPSHOT_MAX_AGE_MS
+    }
+}
+
 /// Shared failure produced by one cache construction job.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum CacheBuildError {
@@ -215,7 +251,7 @@ impl CacheJobTracker {
     }
 }
 
-/// Publication-local completed responses, shared jobs, and destination heat.
+/// Publication-local completed responses and shared construction jobs.
 pub(crate) struct GraphCache {
     state: Mutex<GraphCacheState>,
 }
@@ -226,76 +262,63 @@ impl GraphCache {
         Self { state: Mutex::new(GraphCacheState::default()) }
     }
 
-    /// Reuses or starts the single immutable delta response for one exact source revision.
-    ///
-    /// The elected builder samples the then-current Head only after construction
-    /// so an aged result can complete its waiters without entering the cache.
-    pub(crate) fn delta<F, Fut, H, HeadFut>(
+    /// Prunes expired sources and inspects one exact delta source without history work.
+    pub(crate) fn lookup_delta(
+        &self,
+        source_revision: u64,
+        target_revision: u64,
+        head_revision_timestamp_ms: u64,
+    ) -> DeltaCacheLookup {
+        self.lock_state().deltas.lookup(source_revision, target_revision, head_revision_timestamp_ms)
+    }
+
+    /// Re-evaluates one captured delta source and elects at most one builder.
+    pub(crate) fn elect_delta<F, Fut>(
         self: &Arc<Self>,
         jobs: &CacheJobTracker,
         source_revision: u64,
+        first_revision_timestamp_ms: u64,
+        target_revision: u64,
+        size_limited: bool,
         builder: F,
-        current_head_high_level: H,
     ) -> CacheAccess<CachedDelta>
     where
-        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        F: FnOnce(DeltaBuildContext) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Arc<CachedDelta>, CacheBuildError>> + Send + 'static,
-        H: FnOnce() -> HeadFut + Send + 'static,
-        HeadFut: Future<Output = u32> + Send + 'static,
     {
-        let (access, builder_job) = self.lock_state().deltas.access(source_revision, jobs.new_job_cancellation());
+        let (access, builder_job) = self.lock_state().deltas.elect(
+            source_revision,
+            first_revision_timestamp_ms,
+            target_revision,
+            size_limited,
+            jobs.new_job_cancellation(),
+        );
 
         if let Some(job) = builder_job {
-            self.spawn_delta_builder(jobs, source_revision, job, builder, current_head_high_level);
+            self.spawn_delta_builder(jobs, source_revision, target_revision, size_limited, job, builder);
         }
         access
     }
 
-    /// Selects or starts the cache work for one valid requested Head depth.
-    ///
-    /// The current Head is sampled before the cache critical section. The
-    /// returned access retains the request's selected tier even when a larger
-    /// completed value or running job supplies the response.
-    pub(crate) async fn head<'a, F, Fut, H, HeadFut>(
+    /// Reuses or starts cache work for one exact configured Head tier.
+    pub(crate) fn head_tier<F, Fut>(
         self: &Arc<Self>,
-        jobs: &'a CacheJobTracker,
-        target_depth: u32,
+        jobs: &CacheJobTracker,
+        depth: u32,
+        boundary: HeadEligibilityBoundary,
         builder: F,
-        current_head_high_level: H,
-    ) -> HeadCacheAccess<'a, F, H>
+    ) -> CacheAccess<CachedHeadSnapshot>
     where
-        F: Fn(u32, CancellationToken) -> Fut + Clone + Send + Sync + 'static,
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Arc<CachedHeadSnapshot>, CacheBuildError>> + Send + 'static,
-        H: Fn() -> HeadFut + Clone + Send + Sync + 'static,
-        HeadFut: Future<Output = u32> + Send + 'static,
     {
-        let selected_depth = selected_head_depth(target_depth);
-        let head_high_level = current_head_high_level().await;
-        let selection = self.lock_state().select_head(selected_depth, head_high_level, jobs.new_job_cancellation());
+        assert!(CACHED_HEAD_WINDOW_DEPTHS.contains(&depth), "a Head cache key is one configured tier");
+        let (access, builder_job) = self.lock_state().heads.access(depth, boundary, jobs.new_job_cancellation());
 
-        if let Some(job) = &selection.builder_job {
-            self.spawn_head_builder(jobs, selected_depth, job.clone(), builder.clone(), current_head_high_level.clone());
+        if let Some(job) = builder_job {
+            self.spawn_head_builder(jobs, depth, job, builder);
         }
-
-        HeadCacheAccess {
-            cache: self.clone(),
-            jobs,
-            selected_depth,
-            response_depth: selection.response_depth,
-            access: selection.access,
-            builder,
-            current_head_high_level,
-        }
-    }
-
-    /// Records one successfully delivered canonical delta at its actual destination.
-    pub(crate) fn record_delta_delivery(&self, destination_revision: u64, destination_head_level: u32) {
-        self.lock_state().deltas.record_delivery(destination_revision, destination_head_level);
-    }
-
-    /// Prunes complete delta and destination-heat buckets behind their structural bounds.
-    pub(crate) fn prune_deltas(&self, head_high_level: u32) {
-        self.lock_state().deltas.prune(head_high_level);
+        access
     }
 
     /// Detaches entries invalidated by a newer replay floor and terminalizes
@@ -312,18 +335,52 @@ impl GraphCache {
         invalidation
     }
 
-    fn spawn_delta_builder<F, Fut, H, HeadFut>(
+    fn spawn_delta_builder<F, Fut>(
         self: &Arc<Self>,
         jobs: &CacheJobTracker,
         source_revision: u64,
+        target_revision: u64,
+        size_limited: bool,
         job: Arc<CacheJob<CachedDelta>>,
         builder: F,
-        current_head_high_level: H,
+    ) where
+        F: FnOnce(DeltaBuildContext) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Arc<CachedDelta>, CacheBuildError>> + Send + 'static,
+    {
+        let cache = Arc::downgrade(self);
+        let task_job = job.clone();
+        let spawned = jobs.spawn(move |cancellation| async move {
+            let job_cancellation = task_job.cancellation.clone();
+            let context = DeltaBuildContext {
+                cache: cache.clone(),
+                source_revision,
+                target_revision,
+                size_limited,
+                job: task_job.clone(),
+                cancellation: job_cancellation,
+            };
+            let result = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(CacheBuildError::Cancelled),
+                () = task_job.work_cancelled() => Err(CacheBuildError::Cancelled),
+                result = builder(context) => result,
+            };
+            finish_delta_job(&cache, source_revision, &task_job, result);
+        });
+        if !spawned {
+            finish_delta_job(&Arc::downgrade(self), source_revision, &job, Err(CacheBuildError::Cancelled));
+        }
+    }
+
+    fn spawn_head_builder<F, Fut>(
+        self: &Arc<Self>,
+        jobs: &CacheJobTracker,
+        depth: u32,
+        job: Arc<CacheJob<CachedHeadSnapshot>>,
+        builder: F,
     ) where
         F: FnOnce(CancellationToken) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<Arc<CachedDelta>, CacheBuildError>> + Send + 'static,
-        H: FnOnce() -> HeadFut + Send + 'static,
-        HeadFut: Future<Output = u32> + Send + 'static,
+        Fut: Future<Output = Result<Arc<CachedHeadSnapshot>, CacheBuildError>> + Send + 'static,
     {
         let cache = Arc::downgrade(self);
         let task_job = job.clone();
@@ -335,82 +392,14 @@ impl GraphCache {
                 () = task_job.work_cancelled() => Err(CacheBuildError::Cancelled),
                 result = async {
                     let value = builder(job_cancellation).await?;
-                    let head_high_level = current_head_high_level().await;
-                    Ok((value, head_high_level))
+                    assert_eq!(value.depth(), depth, "a Head-tier builder returns its selected depth");
+                    Ok(value)
                 } => result,
             };
-            finish_delta_job(&cache, source_revision, &task_job, result);
-        });
-        if !spawned {
-            finish_delta_job(&Arc::downgrade(self), source_revision, &job, Err(CacheBuildError::Cancelled));
-        }
-    }
-
-    fn spawn_head_builder<F, Fut, H, HeadFut>(
-        self: &Arc<Self>,
-        jobs: &CacheJobTracker,
-        depth: u32,
-        job: Arc<CacheJob<CachedHeadSnapshot>>,
-        builder: F,
-        current_head_high_level: H,
-    ) where
-        F: Fn(u32, CancellationToken) -> Fut + Clone + Send + Sync + 'static,
-        Fut: Future<Output = Result<Arc<CachedHeadSnapshot>, CacheBuildError>> + Send + 'static,
-        H: Fn() -> HeadFut + Clone + Send + Sync + 'static,
-        HeadFut: Future<Output = u32> + Send + 'static,
-    {
-        let cache = Arc::downgrade(self);
-        let task_job = job.clone();
-        let spawned = jobs.spawn(move |cancellation| async move {
-            let job_cancellation = task_job.cancellation.clone();
-            loop {
-                let attempt = tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => Err(CacheBuildError::Cancelled),
-                    () = task_job.work_cancelled() => Err(CacheBuildError::Cancelled),
-                    result = async {
-                        let value = builder(depth, job_cancellation.clone()).await?;
-                        assert_eq!(value.depth(), depth, "a Head-tier builder returns its selected depth");
-                        let head_high_level = current_head_high_level().await;
-                        Ok((value, head_high_level))
-                    } => result,
-                };
-
-                match attempt {
-                    Ok((value, head_high_level))
-                        if head_snapshot_eligibility(&value, head_high_level) == HeadSnapshotEligibility::Ineligible =>
-                    {
-                        continue;
-                    }
-                    result => {
-                        finish_head_job(&cache, depth, &task_job, result);
-                        break;
-                    }
-                }
-            }
+            finish_head_job(&cache, depth, &task_job, result);
         });
         if !spawned {
             finish_head_job(&Arc::downgrade(self), depth, &job, Err(CacheBuildError::Cancelled));
-        }
-    }
-
-    fn ensure_head_refresh<F, Fut, H, HeadFut>(
-        self: &Arc<Self>,
-        jobs: &CacheJobTracker,
-        selected_depth: u32,
-        value: &Arc<CachedHeadSnapshot>,
-        head_high_level: u32,
-        builder: F,
-        current_head_high_level: H,
-    ) where
-        F: Fn(u32, CancellationToken) -> Fut + Clone + Send + Sync + 'static,
-        Fut: Future<Output = Result<Arc<CachedHeadSnapshot>, CacheBuildError>> + Send + 'static,
-        H: Fn() -> HeadFut + Clone + Send + Sync + 'static,
-        HeadFut: Future<Output = u32> + Send + 'static,
-    {
-        let builder_job = self.lock_state().ensure_head_refresh(selected_depth, value, head_high_level, jobs.new_job_cancellation());
-        if let Some(job) = builder_job {
-            self.spawn_head_builder(jobs, selected_depth, job, builder, current_head_high_level);
         }
     }
 
@@ -422,109 +411,72 @@ impl GraphCache {
 #[derive(Default)]
 struct GraphCacheState {
     deltas: DeltaCache,
-    head_slots: HashMap<u32, CacheSlot<CachedHeadSnapshot>>,
+    heads: HeadCache,
 }
 
 impl GraphCacheState {
     fn detach_before_replay_floor(&mut self, replay_floor_revision: u64) -> ReplayFloorInvalidation {
         let delta_jobs = self.deltas.detach_before_replay_floor(replay_floor_revision);
-        let mut head_jobs = Vec::new();
+        let head_jobs = self.heads.detach_before_replay_floor(replay_floor_revision);
 
-        self.head_slots.retain(|_, slot| {
+        ReplayFloorInvalidation { delta_jobs, head_jobs }
+    }
+}
+
+#[derive(Default)]
+struct HeadCache {
+    slots_by_depth: HashMap<u32, HeadCacheSlot>,
+}
+
+impl HeadCache {
+    fn detach_before_replay_floor(&mut self, replay_floor_revision: u64) -> Vec<Arc<CacheJob<CachedHeadSnapshot>>> {
+        let mut jobs = Vec::new();
+
+        self.slots_by_depth.retain(|_, slot| {
             if slot.completed.as_ref().is_some_and(|value| value.revision() < replay_floor_revision) {
                 slot.completed = None;
             }
             if let Some(job) = slot.running.take() {
-                head_jobs.push(job);
+                jobs.push(job);
             }
             slot.completed.is_some()
         });
 
-        ReplayFloorInvalidation { delta_jobs, head_jobs }
+        jobs
     }
 
-    fn select_head(&mut self, selected_depth: u32, head_high_level: u32, cancellation: CancellationToken) -> HeadSelection {
-        if let Some(completed) = self
-            .head_slots
-            .get(&selected_depth)
-            .and_then(|slot| slot.completed.as_ref())
-            .filter(|value| head_snapshot_eligibility(value, head_high_level) != HeadSnapshotEligibility::Ineligible)
-            .cloned()
-        {
-            let builder_job = (head_snapshot_eligibility(&completed, head_high_level) == HeadSnapshotEligibility::Refresh)
-                .then(|| self.install_head_job(selected_depth, cancellation.clone()))
-                .flatten();
-            return HeadSelection { response_depth: selected_depth, access: CacheAccess::Completed(completed), builder_job };
-        }
-
-        for depth in head_tiers().filter(|&depth| depth > selected_depth) {
-            if let Some(completed) = self
-                .head_slots
-                .get(&depth)
-                .and_then(|slot| slot.completed.as_ref())
-                .filter(|value| head_snapshot_eligibility(value, head_high_level) != HeadSnapshotEligibility::Ineligible)
-                .cloned()
-            {
-                return HeadSelection {
-                    response_depth: depth,
-                    access: CacheAccess::Completed(completed),
-                    builder_job: self.install_head_job(selected_depth, cancellation.clone()),
-                };
-            }
-        }
-
-        if let Some(running) = self.head_slots.get(&selected_depth).and_then(|slot| slot.running.clone()) {
-            return HeadSelection { response_depth: selected_depth, access: CacheAccess::Job(running), builder_job: None };
-        }
-
-        for depth in head_tiers().filter(|&depth| depth > selected_depth) {
-            if let Some(running) = self.head_slots.get(&depth).and_then(|slot| slot.running.clone()) {
-                return HeadSelection { response_depth: depth, access: CacheAccess::Job(running), builder_job: None };
-            }
-        }
-
-        let job = self.install_head_job(selected_depth, cancellation).expect("a selected tier without running work installs one job");
-        HeadSelection { response_depth: selected_depth, access: CacheAccess::Job(job.clone()), builder_job: Some(job) }
-    }
-
-    fn ensure_head_refresh(
+    fn access(
         &mut self,
-        selected_depth: u32,
-        value: &Arc<CachedHeadSnapshot>,
-        head_high_level: u32,
+        depth: u32,
+        boundary: HeadEligibilityBoundary,
         cancellation: CancellationToken,
-    ) -> Option<Arc<CacheJob<CachedHeadSnapshot>>> {
-        if head_snapshot_eligibility(value, head_high_level) == HeadSnapshotEligibility::Fresh {
-            return None;
+    ) -> (CacheAccess<CachedHeadSnapshot>, Option<Arc<CacheJob<CachedHeadSnapshot>>>) {
+        let slot = self.slots_by_depth.entry(depth).or_default();
+        if let Some(completed) = &slot.completed {
+            if boundary.admits(completed) {
+                return (CacheAccess::Completed(completed.clone()), None);
+            }
+            slot.completed = None;
         }
-        let slot = self.head_slots.get(&selected_depth)?;
-        if !slot.completed.as_ref().is_some_and(|completed| Arc::ptr_eq(completed, value)) {
-            return None;
-        }
-        self.install_head_job(selected_depth, cancellation)
-    }
-
-    fn install_head_job(&mut self, depth: u32, cancellation: CancellationToken) -> Option<Arc<CacheJob<CachedHeadSnapshot>>> {
-        let slot = self.head_slots.entry(depth).or_default();
-        if slot.running.is_some() {
-            return None;
+        if let Some(running) = &slot.running {
+            return (CacheAccess::Job(running.clone()), None);
         }
         let job = Arc::new(CacheJob::pending(cancellation));
         slot.running = Some(job.clone());
-        Some(job)
+        (CacheAccess::Job(job.clone()), Some(job))
     }
 
-    fn finish_head(
+    fn finish(
         &mut self,
         depth: u32,
         job: &Arc<CacheJob<CachedHeadSnapshot>>,
-        result: &Result<(Arc<CachedHeadSnapshot>, u32), CacheBuildError>,
+        result: &Result<Arc<CachedHeadSnapshot>, CacheBuildError>,
     ) {
         let mut remove_slot = false;
-        if let Some(slot) = self.head_slots.get_mut(&depth)
+        if let Some(slot) = self.slots_by_depth.get_mut(&depth)
             && slot.running.as_ref().is_some_and(|running| Arc::ptr_eq(running, job))
         {
-            if let Ok((value, _)) = result {
+            if let Ok(value) = result {
                 assert_eq!(value.depth(), depth, "a completed Head snapshot remains keyed by its derived tier");
                 slot.completed = Some(value.clone());
             }
@@ -532,75 +484,102 @@ impl GraphCacheState {
             remove_slot = slot.completed.is_none();
         }
         if remove_slot {
-            self.head_slots.remove(&depth);
+            self.slots_by_depth.remove(&depth);
         }
     }
-}
-
-struct HeadSelection {
-    response_depth: u32,
-    access: CacheAccess<CachedHeadSnapshot>,
-    builder_job: Option<Arc<CacheJob<CachedHeadSnapshot>>>,
 }
 
 #[derive(Default)]
 struct DeltaCache {
-    slots_by_source: HashMap<u64, CacheSlot<CachedDelta>>,
-    sources_by_head_level: BTreeMap<u32, Vec<u64>>,
-    destination_heat: DestinationHeat,
+    slots_by_source: BTreeMap<u64, DeltaCacheSlot>,
 }
 
 impl DeltaCache {
     fn detach_before_replay_floor(&mut self, replay_floor_revision: u64) -> Vec<Arc<CacheJob<CachedDelta>>> {
-        let mut jobs = Vec::new();
-        self.slots_by_source.retain(|source_revision, slot| {
-            if *source_revision >= replay_floor_revision {
-                return true;
-            }
-            if let Some(job) = slot.running.take() {
-                jobs.push(job);
-            }
-            false
-        });
-        self.sources_by_head_level.retain(|_, source_revisions| {
-            source_revisions.retain(|source_revision| *source_revision >= replay_floor_revision);
-            !source_revisions.is_empty()
-        });
-        jobs
+        let retained = self.slots_by_source.split_off(&replay_floor_revision);
+        let expired = std::mem::replace(&mut self.slots_by_source, retained);
+        expired.into_values().filter_map(|slot| slot.running.map(|running| running.job)).collect()
     }
 
-    fn access(
-        &mut self,
-        source_revision: u64,
-        cancellation: CancellationToken,
-    ) -> (CacheAccess<CachedDelta>, Option<Arc<CacheJob<CachedDelta>>>) {
-        let slot = self.slots_by_source.entry(source_revision).or_default();
-        if let Some(completed) = &slot.completed {
-            (CacheAccess::Completed(completed.clone()), None)
+    fn lookup(&mut self, source_revision: u64, target_revision: u64, head_revision_timestamp_ms: u64) -> DeltaCacheLookup {
+        self.prune_expired(head_revision_timestamp_ms);
+        let Some(slot) = self.slots_by_source.get(&source_revision) else {
+            return DeltaCacheLookup::ConstructionRequired;
+        };
+        if let Some(completed) = &slot.completed
+            && completed.is_adequate_for(target_revision)
+        {
+            DeltaCacheLookup::Completed(completed.clone())
         } else if let Some(running) = &slot.running {
-            (CacheAccess::Job(running.clone()), None)
+            DeltaCacheLookup::Running(running.job.clone())
         } else {
-            let job = Arc::new(CacheJob::pending(cancellation));
-            slot.running = Some(job.clone());
-            (CacheAccess::Job(job.clone()), Some(job))
+            DeltaCacheLookup::ConstructionRequired
         }
     }
 
-    fn finish(
+    fn elect(
         &mut self,
         source_revision: u64,
-        job: &Arc<CacheJob<CachedDelta>>,
-        result: &Result<(Arc<CachedDelta>, u32), CacheBuildError>,
-    ) {
+        first_revision_timestamp_ms: u64,
+        target_revision: u64,
+        size_limited: bool,
+        cancellation: CancellationToken,
+    ) -> (CacheAccess<CachedDelta>, Option<Arc<CacheJob<CachedDelta>>>) {
+        if let Some(slot) = self.slots_by_source.get_mut(&source_revision) {
+            if size_limited
+                && let Some(completed) = &slot.completed
+                && completed.to_revision_id() == target_revision
+                && !completed.is_size_limited()
+            {
+                let reclassified = completed.reclassified_size_limited();
+                slot.completed = Some(reclassified.clone());
+                return (CacheAccess::Completed(reclassified), None);
+            }
+            if let Some(completed) = &slot.completed
+                && completed.is_adequate_for(target_revision)
+            {
+                return (CacheAccess::Completed(completed.clone()), None);
+            }
+            if let Some(running) = &slot.running {
+                return (CacheAccess::Job(running.job.clone()), None);
+            }
+
+            let job = Arc::new(CacheJob::pending(cancellation));
+            slot.running = Some(RunningDeltaJob { target_revision, size_limited, job: job.clone() });
+            return (CacheAccess::Job(job.clone()), Some(job));
+        }
+
+        let job = Arc::new(CacheJob::pending(cancellation));
+        self.slots_by_source.insert(
+            source_revision,
+            DeltaCacheSlot {
+                first_revision_timestamp_ms,
+                completed: None,
+                running: Some(RunningDeltaJob { target_revision, size_limited, job: job.clone() }),
+            },
+        );
+        (CacheAccess::Job(job.clone()), Some(job))
+    }
+
+    fn finish(&mut self, source_revision: u64, job: &Arc<CacheJob<CachedDelta>>, result: &Result<Arc<CachedDelta>, CacheBuildError>) {
         let mut remove_slot = false;
         if let Some(slot) = self.slots_by_source.get_mut(&source_revision)
-            && slot.running.as_ref().is_some_and(|running| Arc::ptr_eq(running, job))
+            && slot.running.as_ref().is_some_and(|running| Arc::ptr_eq(&running.job, job))
         {
-            if let Ok((value, head_high_level)) = result {
+            if let Ok(value) = result {
                 assert_eq!(value.source_revision_id(), source_revision, "a completed delta remains keyed by its captured source");
-                if head_high_level.saturating_sub(value.head_level()) <= MAX_CACHE_LEVEL_DISTANCE {
+                assert_eq!(
+                    Some(value.to_revision_id()),
+                    slot.running.as_ref().map(|running| running.target_revision),
+                    "a completed delta reaches its elected target"
+                );
+                assert_eq!(
+                    Some(value.is_size_limited()),
+                    slot.running.as_ref().map(|running| running.size_limited),
+                    "a completed delta preserves its elected size classification"
+                );
+                if slot.completed.as_ref().is_none_or(|completed| value.to_revision_id() > completed.to_revision_id()) {
                     slot.completed = Some(value.clone());
-                    self.sources_by_head_level.entry(value.head_level()).or_default().push(source_revision);
                 }
             }
             slot.running = None;
@@ -611,60 +590,102 @@ impl DeltaCache {
         }
     }
 
-    fn record_delivery(&mut self, destination_revision: u64, destination_head_level: u32) {
-        self.destination_heat.record(destination_revision, destination_head_level);
-    }
+    fn prune_expired(&mut self, head_revision_timestamp_ms: u64) {
+        let Some((&first_source, first_slot)) = self.slots_by_source.first_key_value() else {
+            return;
+        };
+        if !Self::is_expired(first_slot, head_revision_timestamp_ms) {
+            return;
+        }
 
-    fn prune(&mut self, head_high_level: u32) {
-        let retained_head_level = head_high_level.saturating_sub(MAX_CACHE_LEVEL_DISTANCE);
-        let retained = self.sources_by_head_level.split_off(&retained_head_level);
-        let expired = std::mem::replace(&mut self.sources_by_head_level, retained);
-        for source_revisions in expired.into_values() {
-            for source_revision in source_revisions {
-                self.slots_by_source.remove(&source_revision);
+        let (&last_source, last_slot) = self.slots_by_source.last_key_value().expect("a cache with a first slot has a last slot");
+        if Self::is_expired(last_slot, head_revision_timestamp_ms) {
+            self.slots_by_source.clear();
+            return;
+        }
+
+        // Search the numeric source-revision domain. For sparse cache keys,
+        // range(midpoint..) supplies the first actual source at or after the
+        // midpoint. The first delivered revision is source + 1, so stored
+        // timestamps preserve this ordering.
+        let mut expired = first_source;
+        let mut retained = last_source;
+        while retained - expired > 1 {
+            let midpoint = expired + (retained - expired) / 2;
+            let (_, candidate) =
+                self.slots_by_source.range(midpoint..).next().expect("the binary-search midpoint does not exceed the last source");
+            if Self::is_expired(candidate, head_revision_timestamp_ms) {
+                expired = midpoint;
+            } else {
+                retained = midpoint;
             }
         }
-        self.destination_heat.prune(head_high_level);
+
+        let first_retained_source = *self.slots_by_source.range(retained..).next().expect("an unexpired suffix has a first source").0;
+        self.slots_by_source = self.slots_by_source.split_off(&first_retained_source);
+    }
+
+    fn is_expired(slot: &DeltaCacheSlot, head_revision_timestamp_ms: u64) -> bool {
+        head_revision_timestamp_ms
+            .checked_sub(slot.first_revision_timestamp_ms)
+            .expect("a delta source timestamp does not postdate its publication Head")
+            >= DELTA_CACHE_MAX_AGE_MS
+    }
+}
+
+struct DeltaCacheSlot {
+    first_revision_timestamp_ms: u64,
+    completed: Option<Arc<CachedDelta>>,
+    running: Option<RunningDeltaJob>,
+}
+
+struct RunningDeltaJob {
+    target_revision: u64,
+    size_limited: bool,
+    job: Arc<CacheJob<CachedDelta>>,
+}
+
+/// Exact source-job capability supplied to one elected delta builder.
+pub(crate) struct DeltaBuildContext {
+    cache: Weak<GraphCache>,
+    source_revision: u64,
+    target_revision: u64,
+    size_limited: bool,
+    job: Arc<CacheJob<CachedDelta>>,
+    cancellation: CancellationToken,
+}
+
+impl DeltaBuildContext {
+    /// Returns the cancellation token for detached construction work.
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    /// Returns the fitting target fixed before this job's election.
+    pub(crate) const fn target_revision(&self) -> u64 {
+        self.target_revision
+    }
+
+    /// Returns the immutable size classification fixed before election.
+    pub(crate) const fn is_size_limited(&self) -> bool {
+        self.size_limited
     }
 }
 
 #[derive(Default)]
-struct DestinationHeat {
-    counts_by_revision: HashMap<u64, u64>,
-    revisions_by_level: BTreeMap<u32, Vec<u64>>,
+struct HeadCacheSlot {
+    completed: Option<Arc<CachedHeadSnapshot>>,
+    running: Option<Arc<CacheJob<CachedHeadSnapshot>>>,
 }
 
-impl DestinationHeat {
-    fn record(&mut self, destination_revision: u64, destination_head_level: u32) {
-        if let Some(count) = self.counts_by_revision.get_mut(&destination_revision) {
-            *count = count.saturating_add(1);
-        } else {
-            self.counts_by_revision.insert(destination_revision, 1);
-            self.revisions_by_level.entry(destination_head_level).or_default().push(destination_revision);
-        }
-    }
-
-    fn prune(&mut self, head_high_level: u32) {
-        let retained_level = head_high_level.saturating_sub(HOT_DESTINATION_LEVEL_DISTANCE);
-        let retained = self.revisions_by_level.split_off(&retained_level);
-        let expired = std::mem::replace(&mut self.revisions_by_level, retained);
-        for destination_revisions in expired.into_values() {
-            for destination_revision in destination_revisions {
-                self.counts_by_revision.remove(&destination_revision);
-            }
-        }
-    }
-}
-
-struct CacheSlot<T> {
-    completed: Option<Arc<T>>,
-    running: Option<Arc<CacheJob<T>>>,
-}
-
-impl<T> Default for CacheSlot<T> {
-    fn default() -> Self {
-        Self { completed: None, running: None }
-    }
+/// Result of one pruned exact-source delta-cache lookup.
+pub(crate) enum DeltaCacheLookup {
+    /// A completed immutable value is available at this source.
+    Completed(Arc<CachedDelta>),
+    /// Construction for this source is already running.
+    Running(Arc<CacheJob<CachedDelta>>),
+    /// The caller must consult history before the second cache election.
+    ConstructionRequired,
 }
 
 /// Existing value or shared construction job selected by one cache access.
@@ -675,88 +696,13 @@ pub(crate) enum CacheAccess<T> {
     Job(Arc<CacheJob<T>>),
 }
 
-/// Selected Head tier and the completed value or shared job supplying it.
-pub(crate) struct HeadCacheAccess<'a, F, H> {
-    cache: Arc<GraphCache>,
-    jobs: &'a CacheJobTracker,
-    selected_depth: u32,
-    response_depth: u32,
-    access: CacheAccess<CachedHeadSnapshot>,
-    builder: F,
-    current_head_high_level: H,
-}
-
-impl<'a, F, Fut, H, HeadFut> HeadCacheAccess<'a, F, H>
-where
-    F: Fn(u32, CancellationToken) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Result<Arc<CachedHeadSnapshot>, CacheBuildError>> + Send + 'static,
-    H: Fn() -> HeadFut + Clone + Send + Sync + 'static,
-    HeadFut: Future<Output = u32> + Send + 'static,
-{
-    /// Returns the tier derived from the original request depth.
-    pub(crate) const fn selected_depth(&self) -> u32 {
-        self.selected_depth
-    }
-
-    /// Returns the selected or smallest covering tier supplying this access.
-    pub(crate) const fn response_depth(&self) -> u32 {
-        self.response_depth
-    }
-
-    /// Resolves the access and demand-refreshes a selected soft-aged result.
-    pub(crate) async fn resolve(self, cancellation: CancellationToken) -> Result<Arc<CachedHeadSnapshot>, CacheWaitError> {
-        let joined_job = matches!(self.access, CacheAccess::Job(_));
-        let refresh_cancellation = cancellation.clone();
-        let value = match self.access {
-            CacheAccess::Completed(value) => value,
-            CacheAccess::Job(job) => job.wait(cancellation).await?,
-        };
-
-        if joined_job && self.response_depth == self.selected_depth {
-            let head_high_level = tokio::select! {
-                biased;
-                () = refresh_cancellation.cancelled() => return Err(CacheWaitError::Cancelled),
-                head_high_level = (self.current_head_high_level)() => head_high_level,
-            };
-            self.cache.ensure_head_refresh(
-                self.jobs,
-                self.selected_depth,
-                &value,
-                head_high_level,
-                self.builder,
-                self.current_head_high_level,
-            );
+impl<T> CacheAccess<T> {
+    /// Resolves the completed value or shared construction job.
+    pub(crate) async fn resolve(self, cancellation: CancellationToken) -> Result<Arc<T>, CacheWaitError> {
+        match self {
+            Self::Completed(value) => Ok(value),
+            Self::Job(job) => job.wait(cancellation).await,
         }
-        Ok(value)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HeadSnapshotEligibility {
-    Fresh,
-    Refresh,
-    Ineligible,
-}
-
-fn selected_head_depth(target_depth: u32) -> u32 {
-    assert!((1..=MAX_WINDOW_DEPTH).contains(&target_depth), "Head target depth is validated before cache selection");
-    target_depth.div_ceil(CACHED_HEAD_WINDOW_DEPTH_STEP) * CACHED_HEAD_WINDOW_DEPTH_STEP
-}
-
-fn head_tiers() -> impl Iterator<Item = u32> {
-    assert_eq!(MAX_WINDOW_DEPTH % CACHED_HEAD_WINDOW_DEPTH_STEP, 0, "Head cache tiers exactly cover the public depth bound");
-    (CACHED_HEAD_WINDOW_DEPTH_STEP..=MAX_WINDOW_DEPTH).step_by(CACHED_HEAD_WINDOW_DEPTH_STEP as usize)
-}
-
-fn head_snapshot_eligibility(value: &CachedHeadSnapshot, head_high_level: u32) -> HeadSnapshotEligibility {
-    let distance =
-        head_high_level.checked_sub(value.high_level()).expect("a publication Head does not precede one of its captured snapshots");
-    if distance < CACHED_WINDOW_REFRESH_LEVEL_DISTANCE {
-        HeadSnapshotEligibility::Fresh
-    } else if distance < CACHED_WINDOW_MAX_LEVEL_DISTANCE {
-        HeadSnapshotEligibility::Refresh
-    } else {
-        HeadSnapshotEligibility::Ineligible
     }
 }
 
@@ -886,34 +832,33 @@ fn finish_delta_job(
     cache: &Weak<GraphCache>,
     source_revision: u64,
     job: &Arc<CacheJob<CachedDelta>>,
-    result: Result<(Arc<CachedDelta>, u32), CacheBuildError>,
+    result: Result<Arc<CachedDelta>, CacheBuildError>,
 ) {
     if let Some(cache) = cache.upgrade() {
         cache.lock_state().deltas.finish(source_revision, job, &result);
     }
-    job.complete(result.map(|(value, _)| value));
+    job.complete(result);
 }
 
 fn finish_head_job(
     cache: &Weak<GraphCache>,
     depth: u32,
     job: &Arc<CacheJob<CachedHeadSnapshot>>,
-    result: Result<(Arc<CachedHeadSnapshot>, u32), CacheBuildError>,
+    result: Result<Arc<CachedHeadSnapshot>, CacheBuildError>,
 ) {
     if let Some(cache) = cache.upgrade() {
-        cache.lock_state().finish_head(depth, job, &result);
+        cache.lock_state().heads.finish(depth, job, &result);
     }
-    job.complete(result.map(|(value, _)| value));
+    job.complete(result);
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, HashMap},
         future::Future,
         sync::{
             Arc, Barrier,
-            atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -921,7 +866,7 @@ mod tests {
     use bytes::Bytes;
     use kgi_api_model::{
         graph::LevelExtent,
-        protocol::{CACHED_HEAD_WINDOW_DEPTH_STEP, CACHED_WINDOW_MAX_LEVEL_DISTANCE, CACHED_WINDOW_REFRESH_LEVEL_DISTANCE},
+        protocol::{CACHED_HEAD_SNAPSHOT_MAX_AGE_MS, CACHED_HEAD_WINDOW_DEPTHS, DELTA_CACHE_MAX_AGE_MS},
     };
     use tokio::sync::{Notify, oneshot};
     use tokio_util::sync::CancellationToken;
@@ -929,16 +874,12 @@ mod tests {
     use crate::codec::HeadEtagInput;
 
     use super::{
-        CacheAccess, CacheBuildError, CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot, EncodingSchedulerError,
-        GraphCache, HeadSnapshotEligibility, head_snapshot_eligibility, selected_head_depth,
+        CacheAccess, CacheBuildError, CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot, DeltaBuildContext, DeltaCache,
+        DeltaCacheLookup, DeltaCacheSlot, EncodingSchedulerError, GraphCache, HeadEligibilityBoundary, RunningDeltaJob,
     };
 
     fn cached_delta(source: u64, target: u64) -> Arc<CachedDelta> {
-        cached_delta_at(source, target, 17)
-    }
-
-    fn cached_delta_at(source: u64, target: u64, head_level: u32) -> Arc<CachedDelta> {
-        Arc::new(CachedDelta::new(source, target, head_level, 23, Bytes::from_static(b"gzip")))
+        Arc::new(CachedDelta::new(source, target, false, 23, Bytes::from_static(b"gzip")))
     }
 
     fn cached_head(depth: u32, revision: u64, high_level: u32) -> Arc<CachedHeadSnapshot> {
@@ -962,32 +903,50 @@ mod tests {
 
     fn seed_head(cache: &GraphCache, value: Arc<CachedHeadSnapshot>) {
         let depth = value.depth();
-        cache.lock_state().head_slots.entry(depth).or_default().completed = Some(value);
+        cache.lock_state().heads.slots_by_depth.entry(depth).or_default().completed = Some(value);
     }
 
     fn seed_delta(cache: &GraphCache, value: Arc<CachedDelta>) {
         let source_revision = value.source_revision_id();
-        let head_level = value.head_level();
-        let mut state = cache.lock_state();
-        state.deltas.slots_by_source.entry(source_revision).or_default().completed = Some(value);
-        state.deltas.sources_by_head_level.entry(head_level).or_default().push(source_revision);
+        cache.lock_state().deltas.slots_by_source.insert(
+            source_revision,
+            DeltaCacheSlot { first_revision_timestamp_ms: source_revision + 1, completed: Some(value), running: None },
+        );
+    }
+
+    fn running_delta_slot(source_revision: u64, target_revision: u64, job: Arc<super::CacheJob<CachedDelta>>) -> DeltaCacheSlot {
+        DeltaCacheSlot {
+            first_revision_timestamp_ms: source_revision + 1,
+            completed: None,
+            running: Some(RunningDeltaJob { target_revision, size_limited: false, job }),
+        }
+    }
+
+    fn head_boundary() -> HeadEligibilityBoundary {
+        HeadEligibilityBoundary::new(1_000, 0, 0)
     }
 
     fn delta<F, Fut>(
         cache: &Arc<GraphCache>,
         jobs: &CacheJobTracker,
         source_revision: u64,
-        completion_head_high_level: u32,
+        target_revision: u64,
         builder: F,
     ) -> CacheAccess<CachedDelta>
     where
-        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        F: FnOnce(DeltaBuildContext) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Arc<CachedDelta>, CacheBuildError>> + Send + 'static,
     {
-        cache.delta(jobs, source_revision, builder, move || async move { completion_head_high_level })
+        match cache.lookup_delta(source_revision, target_revision, 1_000) {
+            DeltaCacheLookup::Completed(value) => CacheAccess::Completed(value),
+            DeltaCacheLookup::Running(job) => CacheAccess::Job(job),
+            DeltaCacheLookup::ConstructionRequired => {
+                cache.elect_delta(jobs, source_revision, source_revision + 1, target_revision, false, builder)
+            }
+        }
     }
 
-    fn job(access: CacheAccess<CachedDelta>) -> Arc<super::CacheJob<CachedDelta>> {
+    fn job<T>(access: CacheAccess<T>) -> Arc<super::CacheJob<T>> {
         match access {
             CacheAccess::Job(job) => job,
             CacheAccess::Completed(_) => panic!("expected shared cache job"),
@@ -1003,372 +962,188 @@ mod tests {
     }
 
     #[test]
-    fn requested_head_depths_derive_the_five_settled_tiers() {
-        for (target_depth, expected) in [(1, 50), (50, 50), (51, 100), (149, 150), (200, 200), (201, 250), (250, 250)] {
-            assert_eq!(selected_head_depth(target_depth), expected);
-        }
-        assert_eq!(selected_head_depth(CACHED_HEAD_WINDOW_DEPTH_STEP), CACHED_HEAD_WINDOW_DEPTH_STEP);
+    fn response_cache_constants_match_the_configured_bounds() {
+        assert_eq!(CACHED_HEAD_WINDOW_DEPTHS, [20, 50, 100, 150, 200, 250]);
+        assert_eq!(CACHED_HEAD_SNAPSHOT_MAX_AGE_MS, 90_000);
+        assert_eq!(DELTA_CACHE_MAX_AGE_MS, 300_000);
     }
 
     #[test]
-    fn head_selection_uses_the_exact_completed_running_and_covering_order() {
-        let exact_cache = GraphCache::new();
+    fn delta_age_pruning_binary_searches_sparse_sources_and_preserves_the_unexpired_suffix() {
+        let mut cache = DeltaCache::default();
+        for (source_revision, first_revision_timestamp_ms) in [(1, 0), (10, 0), (1_000_000, 1), (u64::MAX - 1, 1)] {
+            cache.slots_by_source.insert(
+                source_revision,
+                DeltaCacheSlot {
+                    first_revision_timestamp_ms,
+                    completed: Some(cached_delta(source_revision, source_revision + 1)),
+                    running: None,
+                },
+            );
+        }
+
+        cache.prune_expired(DELTA_CACHE_MAX_AGE_MS - 1);
+        assert_eq!(cache.slots_by_source.keys().copied().collect::<Vec<_>>(), [1, 10, 1_000_000, u64::MAX - 1]);
+
+        cache.prune_expired(DELTA_CACHE_MAX_AGE_MS);
+        assert_eq!(cache.slots_by_source.keys().copied().collect::<Vec<_>>(), [1_000_000, u64::MAX - 1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a delta source timestamp does not postdate its publication Head")]
+    fn delta_age_pruning_rejects_a_source_timestamp_from_the_future() {
+        let mut cache = DeltaCache::default();
+        cache
+            .slots_by_source
+            .insert(10, DeltaCacheSlot { first_revision_timestamp_ms: 11, completed: Some(cached_delta(10, 11)), running: None });
+
+        cache.prune_expired(10);
+    }
+
+    #[tokio::test]
+    async fn expired_running_delta_detaches_without_cancellation_or_cache_resurrection() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        let started = Arc::new(Notify::new());
+        let started_builder = started.clone();
+        let (release_tx, release_rx) = oneshot::channel();
+        let running = job(cache.elect_delta(&jobs, 3, 0, 4, false, move |_| async move {
+            started_builder.notify_one();
+            release_rx.await.expect("expired delta builder is released");
+            Ok(cached_delta(3, 4))
+        }));
+        started.notified().await;
+
+        assert!(matches!(cache.lookup_delta(3, 4, DELTA_CACHE_MAX_AGE_MS), DeltaCacheLookup::ConstructionRequired));
+        assert!(!running.cancellation.is_cancelled(), "age pruning detaches rather than cancelling the running job");
+
+        release_tx.send(()).expect("expired delta builder release is observed");
+        assert_eq!(
+            running.wait(CancellationToken::new()).await.expect("the admitted waiter receives the detached result").to_revision_id(),
+            4
+        );
+        assert!(matches!(cache.lookup_delta(3, 4, DELTA_CACHE_MAX_AGE_MS), DeltaCacheLookup::ConstructionRequired));
+        jobs.shutdown().await;
+    }
+
+    #[test]
+    fn head_eligibility_boundary_applies_age_and_both_revision_floors() {
+        let snapshot = cached_head(50, 1, 100);
+
+        assert!(HeadEligibilityBoundary::new(90_009, 1, 1).admits(&snapshot));
+        assert!(!HeadEligibilityBoundary::new(90_010, 1, 1).admits(&snapshot));
+        assert!(!HeadEligibilityBoundary::new(10, 2, 1).admits(&snapshot));
+        assert!(!HeadEligibilityBoundary::new(10, 1, 2).admits(&snapshot));
+    }
+
+    #[test]
+    #[should_panic(expected = "a cached Head snapshot does not postdate its publication Head")]
+    fn head_eligibility_rejects_a_snapshot_from_the_future() {
+        let _ = HeadEligibilityBoundary::new(9, 0, 0).admits(&cached_head(50, 1, 100));
+    }
+
+    #[test]
+    fn cached_delta_carries_only_its_canonical_response_identity_and_body() {
+        let body = Bytes::from_static(b"gzip");
+        let value = CachedDelta::new(7, 11, true, 23, body.clone());
+
+        assert_eq!(value.source_revision_id(), 7);
+        assert_eq!(value.to_revision_id(), 11);
+        assert!(value.is_size_limited());
+        assert_eq!(value.uncompressed_json_bytes(), 23);
+        assert_eq!(value.gzip_body(), &body);
+    }
+
+    #[test]
+    fn head_tier_access_uses_only_the_exact_configured_slot() {
+        let cache = GraphCache::new();
         let exact = cached_head(50, 1, 100);
         let larger = cached_head(100, 2, 100);
-        seed_head(&exact_cache, exact.clone());
-        seed_head(&exact_cache, larger);
-        let selection = exact_cache.lock_state().select_head(50, 100, CancellationToken::new());
-        assert_eq!(selection.response_depth, 50);
-        assert!(matches!(selection.access, CacheAccess::Completed(value) if Arc::ptr_eq(&value, &exact)));
-        assert!(selection.builder_job.is_none());
+        seed_head(&cache, exact.clone());
+        seed_head(&cache, larger.clone());
+        let (selection, builder_job) = cache.lock_state().heads.access(50, head_boundary(), CancellationToken::new());
+        assert!(matches!(selection, CacheAccess::Completed(value) if Arc::ptr_eq(&value, &exact)));
+        assert!(builder_job.is_none());
 
-        let completed_cover_cache = GraphCache::new();
-        let completed_cover = cached_head(100, 3, 100);
-        seed_head(&completed_cover_cache, completed_cover.clone());
-        let selection = completed_cover_cache.lock_state().select_head(50, 100, CancellationToken::new());
-        assert_eq!(selection.response_depth, 100);
-        assert!(matches!(selection.access, CacheAccess::Completed(value) if Arc::ptr_eq(&value, &completed_cover)));
-        assert!(selection.builder_job.is_some(), "covering reuse starts the missing selected tier");
-
-        let selected_job_cache = GraphCache::new();
-        let selected_job =
-            selected_job_cache.lock_state().install_head_job(50, CancellationToken::new()).expect("selected job installs");
-        let selected_job_selection = selected_job_cache.lock_state().select_head(50, 100, CancellationToken::new());
-        assert_eq!(selected_job_selection.response_depth, 50);
-        assert!(matches!(selected_job_selection.access, CacheAccess::Job(job) if Arc::ptr_eq(&job, &selected_job)));
-        assert!(selected_job_selection.builder_job.is_none());
-
-        let covering_job_cache = GraphCache::new();
-        let covering_job =
-            covering_job_cache.lock_state().install_head_job(100, CancellationToken::new()).expect("covering job installs");
-        let covering_job_selection = covering_job_cache.lock_state().select_head(50, 100, CancellationToken::new());
-        assert_eq!(covering_job_selection.response_depth, 100);
-        assert!(matches!(covering_job_selection.access, CacheAccess::Job(job) if Arc::ptr_eq(&job, &covering_job)));
-        assert!(covering_job_selection.builder_job.is_none());
-        assert!(!covering_job_cache.lock_state().head_slots.contains_key(&50));
-
-        let empty_cache = GraphCache::new();
-        let new_selection = empty_cache.lock_state().select_head(50, 100, CancellationToken::new());
-        assert_eq!(new_selection.response_depth, 50);
-        assert!(
-            matches!(&new_selection.access, CacheAccess::Job(job) if new_selection.builder_job.as_ref().is_some_and(|builder| Arc::ptr_eq(job, builder)))
-        );
+        cache.lock_state().heads.slots_by_depth.get_mut(&50).expect("exact slot exists").completed = None;
+        let (selection, builder_job) = cache.lock_state().heads.access(50, head_boundary(), CancellationToken::new());
+        assert!(matches!(&selection, CacheAccess::Job(job) if builder_job.as_ref().is_some_and(|builder| Arc::ptr_eq(job, builder))));
+        assert!(cache.lock_state().heads.slots_by_depth.get(&100).is_some_and(|slot| {
+            slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &larger)) && slot.running.is_none()
+        }));
     }
 
     #[test]
-    fn head_snapshot_age_boundaries_are_exact() {
-        let value = cached_head(50, 1, 100);
-        assert_eq!(head_snapshot_eligibility(&value, 139), HeadSnapshotEligibility::Fresh);
-        assert_eq!(head_snapshot_eligibility(&value, 140), HeadSnapshotEligibility::Refresh);
-        assert_eq!(head_snapshot_eligibility(&value, 199), HeadSnapshotEligibility::Refresh);
-        assert_eq!(head_snapshot_eligibility(&value, 200), HeadSnapshotEligibility::Ineligible);
-        assert_eq!(CACHED_WINDOW_REFRESH_LEVEL_DISTANCE, 40);
-        assert_eq!(CACHED_WINDOW_MAX_LEVEL_DISTANCE, 100);
+    fn obsolete_head_completion_is_removed_before_joining_or_installing_exact_work() {
+        let cache = GraphCache::new();
+        let obsolete = cached_head(50, 1, 100);
+        seed_head(&cache, obsolete.clone());
+
+        let (first, builder_job) =
+            cache.lock_state().heads.access(50, HeadEligibilityBoundary::new(1_000, 0, 2), CancellationToken::new());
+        let first = job(first);
+        assert!(builder_job.as_ref().is_some_and(|builder| Arc::ptr_eq(builder, &first)));
+        assert!(cache.lock_state().heads.slots_by_depth.get(&50).is_some_and(|slot| slot.completed.is_none()));
+
+        let (joined, builder_job) = cache.lock_state().heads.access(50, head_boundary(), CancellationToken::new());
+        assert!(matches!(joined, CacheAccess::Job(job) if Arc::ptr_eq(&job, &first)));
+        assert!(builder_job.is_none());
     }
 
     #[tokio::test]
-    async fn soft_aged_selected_hit_serves_old_value_and_refreshes_only_its_tier() {
+    async fn exact_head_tier_misses_share_one_job_without_consulting_a_larger_tier() {
         let cache = Arc::new(GraphCache::new());
         let jobs = CacheJobTracker::new();
-        let old_selected = cached_head(50, 1, 100);
-        let untouched_cover = cached_head(100, 2, 100);
-        seed_head(&cache, old_selected.clone());
-        seed_head(&cache, untouched_cover.clone());
+        let larger = cached_head(100, 1, 100);
+        seed_head(&cache, larger.clone());
+        let (release_tx, release_rx) = oneshot::channel();
 
-        let release = Arc::new(Notify::new());
-        let release_builder = release.clone();
-        let access = cache
-            .head(
-                &jobs,
-                25,
-                move |depth, _| {
-                    let release = release_builder.clone();
-                    async move {
-                        release.notified().await;
-                        Ok(cached_head(depth, 3, 140))
-                    }
-                },
-                || async { 140 },
-            )
-            .await;
-        assert_eq!(access.selected_depth(), 50);
-        assert_eq!(access.response_depth(), 50);
-        assert!(Arc::ptr_eq(
-            &access.resolve(CancellationToken::new()).await.expect("soft-aged completed value remains eligible"),
-            &old_selected
-        ));
-
-        let refresh = cache
-            .lock_state()
-            .head_slots
-            .get(&50)
-            .and_then(|slot| slot.running.clone())
-            .expect("selected soft-aged hit starts one refresh");
-        assert!(cache.lock_state().head_slots.get(&100).is_some_and(|slot| {
-            slot.running.is_none() && slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &untouched_cover))
+        let first = job(cache.head_tier(&jobs, 50, head_boundary(), move |_| async move {
+            release_rx.await.expect("Head builder is released");
+            Ok(cached_head(50, 2, 100))
+        }));
+        let second =
+            job(cache
+                .head_tier(&jobs, 50, head_boundary(), |_| async { panic!("an exact-tier waiter cannot become a second builder") }));
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(cache.lock_state().heads.slots_by_depth.get(&100).is_some_and(|slot| {
+            slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &larger)) && slot.running.is_none()
         }));
 
-        release.notify_one();
-        let refreshed = refresh.wait(CancellationToken::new()).await.expect("refresh succeeds");
-        assert_eq!(refreshed.revision(), 3);
-        assert!(cache.lock_state().head_slots.get(&50).is_some_and(|slot| {
-            slot.running.is_none() && slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &refreshed))
-        }));
-        jobs.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn hard_aged_candidate_retries_inside_one_pending_tier_job() {
-        let cache = Arc::new(GraphCache::new());
-        let jobs = CacheJobTracker::new();
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let attempts_builder = attempts.clone();
-        let access = cache
-            .head(
-                &jobs,
-                CACHED_HEAD_WINDOW_DEPTH_STEP,
-                move |depth, _| {
-                    let attempt = attempts_builder.fetch_add(1, Ordering::SeqCst);
-                    async move {
-                        let (revision, high_level) = if attempt == 0 { (1, 20) } else { (2, 120) };
-                        Ok(cached_head(depth, revision, high_level))
-                    }
-                },
-                || async { 120 },
-            )
-            .await;
-        let shared_job = match &access.access {
-            CacheAccess::Job(job) => job.clone(),
-            CacheAccess::Completed(_) => panic!("the first tier request starts one job"),
-        };
-        let concurrent = cache
-            .head(
-                &jobs,
-                CACHED_HEAD_WINDOW_DEPTH_STEP,
-                |_, _| async { panic!("a concurrent tier waiter cannot build") },
-                || async { 120 },
-            )
-            .await;
-        assert!(matches!(&concurrent.access, CacheAccess::Job(job) if Arc::ptr_eq(job, &shared_job)));
-
-        let completed = access.resolve(CancellationToken::new()).await.expect("newer retry completes every waiter");
-        assert_eq!(completed.revision(), 2);
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert!(Arc::ptr_eq(
-            &concurrent.resolve(CancellationToken::new()).await.expect("concurrent waiter receives the same result"),
-            &completed
+        release_tx.send(()).expect("Head builder release is observed");
+        let completed = first.wait(CancellationToken::new()).await.expect("exact-tier construction completes");
+        assert!(Arc::ptr_eq(&second.wait(CancellationToken::new()).await.expect("joined waiter receives the same value"), &completed));
+        assert!(matches!(
+            cache.head_tier(&jobs, 50, head_boundary(), |_| async { panic!("an eligible exact hit cannot rebuild") }),
+            CacheAccess::Completed(value) if Arc::ptr_eq(&value, &completed)
         ));
         jobs.shutdown().await;
     }
 
     #[tokio::test]
-    async fn hard_aged_completed_value_is_preserved_but_excluded_during_reconstruction() {
+    async fn head_tier_job_retains_only_a_weak_cache_reference() {
         let cache = Arc::new(GraphCache::new());
+        let weak_cache = Arc::downgrade(&cache);
         let jobs = CacheJobTracker::new();
-        let previous = cached_head(50, 1, 100);
-        seed_head(&cache, previous.clone());
-        let release = Arc::new(Notify::new());
-        let release_builder = release.clone();
-
-        let access = cache
-            .head(
-                &jobs,
-                50,
-                move |depth, _| {
-                    let release = release_builder.clone();
-                    async move {
-                        release.notified().await;
-                        Ok(cached_head(depth, 2, 200))
-                    }
-                },
-                || async { 200 },
-            )
-            .await;
-        assert_eq!(access.response_depth(), 50);
-        assert!(matches!(&access.access, CacheAccess::Job(_)), "distance 100 excludes the previous completed value");
-        assert!(cache.lock_state().head_slots.get(&50).is_some_and(|slot| {
-            slot.running.is_some() && slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &previous))
+        let (release_tx, release_rx) = oneshot::channel();
+        let running = job(cache.head_tier(&jobs, 20, head_boundary(), move |_| async move {
+            release_rx.await.expect("detached Head builder is released");
+            Ok(cached_head(20, 1, 20))
         }));
 
-        release.notify_one();
-        let replacement = access.resolve(CancellationToken::new()).await.expect("shared reconstruction completes");
-        assert_eq!(replacement.revision(), 2);
-        assert!(cache.lock_state().head_slots.get(&50).is_some_and(|slot| {
-            slot.running.is_none() && slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &replacement))
-        }));
+        drop(cache);
+        assert!(weak_cache.upgrade().is_none());
+        release_tx.send(()).expect("detached Head builder release is observed");
+        assert_eq!(running.wait(CancellationToken::new()).await.expect("existing waiter completes").revision(), 1);
         jobs.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn selected_soft_aged_job_starts_one_successor_but_covering_use_does_not() {
-        let selected_cache = Arc::new(GraphCache::new());
-        let selected_jobs = CacheJobTracker::new();
-        let selected_attempts = Arc::new(AtomicUsize::new(0));
-        let selected_attempts_builder = selected_attempts.clone();
-        let successor_gate = Arc::new(Notify::new());
-        let successor_builder_gate = successor_gate.clone();
-        let selected = selected_cache
-            .head(
-                &selected_jobs,
-                50,
-                move |depth, _| {
-                    let attempt = selected_attempts_builder.fetch_add(1, Ordering::SeqCst);
-                    let successor_gate = successor_builder_gate.clone();
-                    async move {
-                        if attempt > 0 {
-                            successor_gate.notified().await;
-                        }
-                        Ok(cached_head(depth, u64::try_from(attempt + 1).expect("small attempt"), if attempt == 0 { 60 } else { 100 }))
-                    }
-                },
-                || async { 100 },
-            )
-            .await;
-        let first = selected.resolve(CancellationToken::new()).await.expect("soft-aged selected candidate is delivered");
-        assert_eq!(first.high_level(), 60);
-        tokio::task::yield_now().await;
-        assert_eq!(selected_attempts.load(Ordering::SeqCst), 2, "selected delivery starts one successor refresh");
-        let successor = selected_cache
-            .lock_state()
-            .head_slots
-            .get(&50)
-            .and_then(|slot| slot.running.clone())
-            .expect("successor remains the tier's running job");
-        successor_gate.notify_one();
-        successor.wait(CancellationToken::new()).await.expect("successor completes");
-        selected_jobs.shutdown().await;
-
-        let covering_cache = Arc::new(GraphCache::new());
-        let covering_jobs = CacheJobTracker::new();
-        let covering_attempts = Arc::new(AtomicUsize::new(0));
-        let covering_attempts_builder = covering_attempts.clone();
-        let release = Arc::new(Notify::new());
-        let release_builder = release.clone();
-        let original = covering_cache
-            .head(
-                &covering_jobs,
-                100,
-                move |depth, _| {
-                    covering_attempts_builder.fetch_add(1, Ordering::SeqCst);
-                    let release = release_builder.clone();
-                    async move {
-                        release.notified().await;
-                        Ok(cached_head(depth, 1, 60))
-                    }
-                },
-                || async { 100 },
-            )
-            .await;
-        drop(original);
-        let covering = covering_cache
-            .head(&covering_jobs, 50, |_, _| async { panic!("a covering join cannot create selected-tier work") }, || async { 100 })
-            .await;
-        assert_eq!(covering.selected_depth(), 50);
-        assert_eq!(covering.response_depth(), 100);
-        release.notify_one();
-        covering.resolve(CancellationToken::new()).await.expect("covering job completes");
-        tokio::task::yield_now().await;
-        assert_eq!(covering_attempts.load(Ordering::SeqCst), 1);
-        assert!(covering_cache.lock_state().head_slots.get(&100).is_some_and(|slot| slot.running.is_none()));
-        assert!(!covering_cache.lock_state().head_slots.contains_key(&50));
-        covering_jobs.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn failed_refresh_preserves_previous_value_and_allows_retry() {
+    #[test]
+    #[should_panic(expected = "a Head cache key is one configured tier")]
+    fn unconfigured_head_tier_is_an_internal_invariant_failure() {
         let cache = Arc::new(GraphCache::new());
         let jobs = CacheJobTracker::new();
-        let previous = cached_head(50, 1, 100);
-        seed_head(&cache, previous.clone());
-
-        let fail_gate = Arc::new(Notify::new());
-        let fail_builder_gate = fail_gate.clone();
-
-        let served = cache
-            .head(
-                &jobs,
-                50,
-                move |_, _| {
-                    let fail_gate = fail_builder_gate.clone();
-                    async move {
-                        fail_gate.notified().await;
-                        Err(CacheBuildError::Encoding(EncodingSchedulerError::BlockingExecutorFailed))
-                    }
-                },
-                || async { 140 },
-            )
-            .await;
-        assert!(Arc::ptr_eq(&served.resolve(CancellationToken::new()).await.expect("previous value remains serviceable"), &previous));
-        let failed = cache
-            .lock_state()
-            .head_slots
-            .get(&50)
-            .and_then(|slot| slot.running.clone())
-            .expect("refresh failure is observed through its shared job");
-        fail_gate.notify_one();
-        assert_eq!(
-            failed.wait(CancellationToken::new()).await,
-            Err(CacheWaitError::Build(CacheBuildError::Encoding(EncodingSchedulerError::BlockingExecutorFailed)))
-        );
-        assert!(cache.lock_state().head_slots.get(&50).is_some_and(|slot| {
-            slot.running.is_none() && slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &previous))
-        }));
-
-        let retry_gate = Arc::new(Notify::new());
-        let retry_builder_gate = retry_gate.clone();
-        let retried = cache
-            .head(
-                &jobs,
-                50,
-                move |depth, _| {
-                    let retry_gate = retry_builder_gate.clone();
-                    async move {
-                        retry_gate.notified().await;
-                        Ok(cached_head(depth, 2, 140))
-                    }
-                },
-                || async { 140 },
-            )
-            .await;
-        assert!(Arc::ptr_eq(&retried.resolve(CancellationToken::new()).await.expect("retry still serves previous value"), &previous));
-        let replacement =
-            cache.lock_state().head_slots.get(&50).and_then(|slot| slot.running.clone()).expect("retry installs new refresh work");
-        retry_gate.notify_one();
-        assert_eq!(replacement.wait(CancellationToken::new()).await.expect("retry succeeds").revision(), 2);
-        jobs.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn head_advancement_without_demand_starts_no_refresh() {
-        let cache = Arc::new(GraphCache::new());
-        let jobs = CacheJobTracker::new();
-        let head_high_level = Arc::new(AtomicU32::new(100));
-        let sampled_head = head_high_level.clone();
-        let builds = Arc::new(AtomicUsize::new(0));
-        let builder_builds = builds.clone();
-        cache
-            .head(
-                &jobs,
-                50,
-                move |depth, _| {
-                    builder_builds.fetch_add(1, Ordering::SeqCst);
-                    async move { Ok(cached_head(depth, 1, 100)) }
-                },
-                move || {
-                    let sampled_head = sampled_head.clone();
-                    async move { sampled_head.load(Ordering::SeqCst) }
-                },
-            )
-            .await
-            .resolve(CancellationToken::new())
-            .await
-            .expect("initial demand constructs the tier");
-
-        head_high_level.store(140, Ordering::SeqCst);
-        tokio::task::yield_now().await;
-        assert_eq!(builds.load(Ordering::SeqCst), 1);
-        assert!(cache.lock_state().head_slots.get(&50).is_some_and(|slot| slot.running.is_none()));
-        jobs.shutdown().await;
+        let _ = cache.head_tier(&jobs, 21, head_boundary(), |_| async { Ok(cached_head(21, 1, 21)) });
     }
 
     #[tokio::test]
@@ -1379,12 +1154,12 @@ mod tests {
         let (release_tx, release_rx) = oneshot::channel();
         let builds_for_job = builds.clone();
 
-        let first = job(delta(&cache, &jobs, 7, 17, move |_| async move {
+        let first = job(delta(&cache, &jobs, 7, 11, move |_| async move {
             builds_for_job.fetch_add(1, Ordering::SeqCst);
             release_rx.await.expect("builder is released");
             Ok(cached_delta(7, 11))
         }));
-        let second = job(delta(&cache, &jobs, 7, 17, |_| async { panic!("a joined miss cannot become a second builder") }));
+        let second = job(delta(&cache, &jobs, 7, 11, |_| async { panic!("a joined miss cannot become a second builder") }));
         assert!(Arc::ptr_eq(&first, &second));
 
         let cancelled = CancellationToken::new();
@@ -1394,7 +1169,7 @@ mod tests {
         release_tx.send(()).expect("builder release is observed");
         let completed = second.wait(CancellationToken::new()).await.expect("remaining waiter receives success");
         assert_eq!(builds.load(Ordering::SeqCst), 1);
-        match delta(&cache, &jobs, 7, 17, |_| async { panic!("a completed hit cannot rebuild") }) {
+        match delta(&cache, &jobs, 7, 11, |_| async { panic!("a completed hit cannot rebuild") }) {
             CacheAccess::Completed(hit) => assert!(Arc::ptr_eq(&hit, &completed)),
             CacheAccess::Job(_) => panic!("completed cache entry is reused"),
         }
@@ -1403,10 +1178,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failure_removes_the_exact_running_job_before_notifying_waiters() {
+    async fn second_delta_election_discards_a_redundant_capture_after_an_adequate_completion() {
         let cache = Arc::new(GraphCache::new());
         let jobs = CacheJobTracker::new();
-        let failed = job(delta(&cache, &jobs, 5, 17, |_| async {
+        assert!(matches!(cache.lookup_delta(7, 11, 1_000), DeltaCacheLookup::ConstructionRequired));
+
+        let completed = cache
+            .elect_delta(&jobs, 7, 8, 11, false, |_| async { Ok(cached_delta(7, 11)) })
+            .resolve(CancellationToken::new())
+            .await
+            .expect("competing construction completes");
+
+        match cache.elect_delta(&jobs, 7, 8, 11, false, |_| async { panic!("the redundant capture cannot become a builder") }) {
+            CacheAccess::Completed(value) => assert!(Arc::ptr_eq(&value, &completed)),
+            CacheAccess::Job(_) => panic!("the second election observes the adequate completion"),
+        }
+        jobs.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn farther_waiter_joins_the_current_job_then_reenters_for_enlargement() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        let (release_tx, release_rx) = oneshot::channel();
+        let shorter = job(delta(&cache, &jobs, 7, 11, move |_| async move {
+            release_rx.await.expect("shorter construction is released");
+            Ok(cached_delta(7, 11))
+        }));
+
+        let farther_waiter = job(delta(&cache, &jobs, 7, 19, |_| async { panic!("the farther waiter joins current work") }));
+        assert!(Arc::ptr_eq(&shorter, &farther_waiter));
+        release_tx.send(()).expect("shorter construction release is observed");
+        assert_eq!(farther_waiter.wait(CancellationToken::new()).await.expect("joined work completes").to_revision_id(), 11);
+
+        let enlargement = job(delta(&cache, &jobs, 7, 19, |_| async { Ok(cached_delta(7, 19)) }));
+        assert!(!Arc::ptr_eq(&shorter, &enlargement));
+        assert_eq!(enlargement.wait(CancellationToken::new()).await.expect("re-elected enlargement completes").to_revision_id(), 19);
+        jobs.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_enlargement_preserves_the_previous_completed_value() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        let completed = delta(&cache, &jobs, 7, 11, |_| async { Ok(cached_delta(7, 11)) })
+            .resolve(CancellationToken::new())
+            .await
+            .expect("initial construction completes");
+
+        let failed = job(delta(&cache, &jobs, 7, 19, |_| async {
             Err(CacheBuildError::Encoding(EncodingSchedulerError::BlockingExecutorFailed))
         }));
         assert_eq!(
@@ -1414,7 +1234,151 @@ mod tests {
             Err(CacheWaitError::Build(CacheBuildError::Encoding(EncodingSchedulerError::BlockingExecutorFailed)))
         );
 
-        let replacement = job(delta(&cache, &jobs, 5, 17, |_| async { Ok(cached_delta(5, 8)) }));
+        match delta(&cache, &jobs, 7, 11, |_| async { panic!("the preserved completion remains available") }) {
+            CacheAccess::Completed(value) => assert!(Arc::ptr_eq(&value, &completed)),
+            CacheAccess::Job(_) => panic!("ordinary enlargement failure preserves the completed value"),
+        }
+        let retry = job(delta(&cache, &jobs, 7, 19, |_| async { Ok(cached_delta(7, 19)) }));
+        assert!(!Arc::ptr_eq(&failed, &retry));
+        retry.wait(CancellationToken::new()).await.expect("enlargement can be retried");
+        jobs.shutdown().await;
+    }
+
+    #[test]
+    fn size_limited_delta_is_adequate_for_every_farther_target() {
+        let cache = GraphCache::new();
+        let value = Arc::new(CachedDelta::new(7, 11, true, 23, Bytes::from_static(b"gzip")));
+        seed_delta(&cache, value.clone());
+
+        assert!(matches!(cache.lookup_delta(7, u64::MAX, 1_000), DeltaCacheLookup::Completed(hit) if Arc::ptr_eq(&hit, &value)));
+    }
+
+    #[tokio::test]
+    async fn second_election_installs_only_the_preclassified_fitting_target() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        let started = Arc::new(Notify::new());
+        let started_builder = started.clone();
+        let (release_tx, release_rx) = oneshot::channel();
+        let running = job(cache.elect_delta(&jobs, 7, 8, 13, true, move |context| async move {
+            assert!(!context.cancellation().is_cancelled());
+            assert_eq!(context.target_revision(), 13);
+            assert!(context.is_size_limited());
+            started_builder.notify_one();
+            release_rx.await.expect("fixed-target builder is released");
+            Ok(Arc::new(CachedDelta::new(7, 13, true, 23, Bytes::from_static(b"gzip"))))
+        }));
+        started.notified().await;
+
+        {
+            let state = cache.lock_state();
+            let slot = state.deltas.slots_by_source.get(&7).expect("fitting source remains cached");
+            assert_eq!(slot.running.as_ref().map(|job| job.target_revision), Some(13));
+            assert_eq!(slot.running.as_ref().map(|job| job.size_limited), Some(true));
+            assert!(slot.running.as_ref().is_some_and(|candidate| Arc::ptr_eq(&candidate.job, &running)));
+        }
+        let joined = job(delta(&cache, &jobs, 7, 31, |_| async { panic!("waiters join the fixed-target job") }));
+        assert!(Arc::ptr_eq(&joined, &running));
+
+        release_tx.send(()).expect("fixed-target builder release is observed");
+        let completed = joined.wait(CancellationToken::new()).await.expect("fixed-target job completes");
+        assert_eq!(completed.to_revision_id(), 13);
+        assert!(completed.is_size_limited());
+        jobs.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_fitting_job_retains_no_size_evidence() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        let failed = job(cache.elect_delta(&jobs, 7, 8, 15, true, |context| async move {
+            assert_eq!(context.target_revision(), 15);
+            assert!(context.is_size_limited());
+            Err(CacheBuildError::Encoding(EncodingSchedulerError::BlockingExecutorFailed))
+        }));
+        assert_eq!(
+            failed.wait(CancellationToken::new()).await,
+            Err(CacheWaitError::Build(CacheBuildError::Encoding(EncodingSchedulerError::BlockingExecutorFailed)))
+        );
+
+        assert!(matches!(cache.lookup_delta(7, 19, 1_000), DeltaCacheLookup::ConstructionRequired));
+
+        let retry = job(cache.elect_delta(&jobs, 7, 8, 15, true, |_| async {
+            Ok(Arc::new(CachedDelta::new(7, 15, true, 23, Bytes::from_static(b"gzip"))))
+        }));
+        assert!(!Arc::ptr_eq(&failed, &retry));
+        assert_eq!(retry.wait(CancellationToken::new()).await.expect("retry repeats fitting construction").to_revision_id(), 15);
+        jobs.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn existing_fitting_completion_is_reclassified_without_reencoding() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        let body = Bytes::from(vec![1, 2, 3, 4]);
+        let builder_body = body.clone();
+        let previous =
+            delta(&cache, &jobs, 7, 11, move |_| async move { Ok(Arc::new(CachedDelta::new(7, 11, false, 23, builder_body))) })
+                .resolve(CancellationToken::new())
+                .await
+                .expect("ordinary fallback is cached");
+
+        let reclassified =
+            match cache.elect_delta(&jobs, 7, 8, 11, true, |_| async { panic!("reclassification performs no encoding") }) {
+                CacheAccess::Completed(value) => value,
+                CacheAccess::Job(_) => panic!("the exact fitting completion is reclassified immediately"),
+            };
+
+        assert!(reclassified.is_size_limited());
+        assert_eq!(reclassified.to_revision_id(), 11);
+        assert_eq!(reclassified.gzip_body().as_ptr(), previous.gzip_body().as_ptr());
+        assert!(matches!(
+            cache.lookup_delta(7, u64::MAX, 1_000),
+            DeltaCacheLookup::Completed(value) if Arc::ptr_eq(&value, &reclassified)
+        ));
+        jobs.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn joined_fixed_target_job_is_reclassified_on_waiter_reentry() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        let body = Bytes::from(vec![1, 2, 3, 4]);
+        let builder_body = body.clone();
+        let (release_tx, release_rx) = oneshot::channel();
+        let ordinary = job(cache.elect_delta(&jobs, 7, 8, 11, false, move |_| async move {
+            release_rx.await.expect("ordinary builder is released");
+            Ok(Arc::new(CachedDelta::new(7, 11, false, 23, builder_body)))
+        }));
+
+        let joined = job(cache.elect_delta(&jobs, 7, 8, 11, true, |_| async { panic!("the fitting request joins current work") }));
+        assert!(Arc::ptr_eq(&ordinary, &joined));
+        release_tx.send(()).expect("ordinary builder release is observed");
+        let completed = joined.wait(CancellationToken::new()).await.expect("joined fixed-target job completes");
+        assert!(!completed.is_size_limited());
+
+        let reclassified = match cache.elect_delta(&jobs, 7, 8, 11, true, |_| async { panic!("re-entry reuses encoded bytes") }) {
+            CacheAccess::Completed(value) => value,
+            CacheAccess::Job(_) => panic!("completed fitting bytes are reclassified"),
+        };
+        assert!(reclassified.is_size_limited());
+        assert_eq!(reclassified.gzip_body().as_ptr(), completed.gzip_body().as_ptr());
+        jobs.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failure_removes_the_exact_running_job_before_notifying_waiters() {
+        let cache = Arc::new(GraphCache::new());
+        let jobs = CacheJobTracker::new();
+        let failed = job(delta(&cache, &jobs, 5, 8, |_| async {
+            Err(CacheBuildError::Encoding(EncodingSchedulerError::BlockingExecutorFailed))
+        }));
+        assert_eq!(
+            failed.wait(CancellationToken::new()).await,
+            Err(CacheWaitError::Build(CacheBuildError::Encoding(EncodingSchedulerError::BlockingExecutorFailed)))
+        );
+
+        let replacement = job(delta(&cache, &jobs, 5, 8, |_| async { Ok(cached_delta(5, 8)) }));
         assert!(!Arc::ptr_eq(&failed, &replacement));
         replacement.wait(CancellationToken::new()).await.expect("immediate retry succeeds");
         jobs.shutdown().await;
@@ -1426,7 +1390,7 @@ mod tests {
         let weak_cache = Arc::downgrade(&cache);
         let jobs = CacheJobTracker::new();
         let (release_tx, release_rx) = oneshot::channel();
-        let running = job(delta(&cache, &jobs, 3, 17, move |_| async move {
+        let running = job(delta(&cache, &jobs, 3, 4, move |_| async move {
             release_rx.await.expect("detached builder is released");
             Ok(cached_delta(3, 4))
         }));
@@ -1443,7 +1407,7 @@ mod tests {
         let cache = Arc::new(GraphCache::new());
         let jobs = CacheJobTracker::new();
         let (release_tx, release_rx) = oneshot::channel();
-        let running = job(delta(&cache, &jobs, 13, 17, move |_| async move {
+        let running = job(delta(&cache, &jobs, 13, 21, move |_| async move {
             release_rx.await.expect("builder is released");
             Ok(cached_delta(13, 21))
         }));
@@ -1462,58 +1426,14 @@ mod tests {
         let cache = Arc::new(GraphCache::new());
         let jobs = Arc::new(CacheJobTracker::new());
         let running =
-            job(delta(&cache, &jobs, 34, 17, |_| async { std::future::pending::<Result<Arc<CachedDelta>, CacheBuildError>>().await }));
+            job(delta(&cache, &jobs, 34, 35, |_| async { std::future::pending::<Result<Arc<CachedDelta>, CacheBuildError>>().await }));
 
         jobs.shutdown().await;
         assert_eq!(running.wait(CancellationToken::new()).await, Err(CacheWaitError::Build(CacheBuildError::Cancelled)));
 
-        let rejected = job(delta(&cache, &jobs, 34, 17, |_| async { Ok(cached_delta(34, 35)) }));
+        let rejected = job(delta(&cache, &jobs, 34, 35, |_| async { Ok(cached_delta(34, 35)) }));
         assert!(!Arc::ptr_eq(&running, &rejected));
         assert_eq!(rejected.wait(CancellationToken::new()).await, Err(CacheWaitError::Build(CacheBuildError::Cancelled)));
-    }
-
-    #[tokio::test]
-    async fn tracker_shutdown_cancels_unobserved_head_refresh_preserves_the_old_value_and_rejects_replacement() {
-        let cache = Arc::new(GraphCache::new());
-        let jobs = CacheJobTracker::new();
-        let previous = cached_head(CACHED_HEAD_WINDOW_DEPTH_STEP, 1, 100);
-        seed_head(&cache, previous.clone());
-
-        let access = cache
-            .head(
-                &jobs,
-                CACHED_HEAD_WINDOW_DEPTH_STEP,
-                |_, _| async { std::future::pending::<Result<Arc<CachedHeadSnapshot>, CacheBuildError>>().await },
-                || async { 140 },
-            )
-            .await;
-        assert!(matches!(&access.access, CacheAccess::Completed(value) if Arc::ptr_eq(value, &previous)));
-        drop(access);
-        let running = cache
-            .lock_state()
-            .head_slots
-            .get(&CACHED_HEAD_WINDOW_DEPTH_STEP)
-            .and_then(|slot| slot.running.clone())
-            .expect("demand starts one tracked Head refresh");
-
-        jobs.shutdown().await;
-        assert_eq!(running.wait(CancellationToken::new()).await, Err(CacheWaitError::Build(CacheBuildError::Cancelled)));
-        assert!(cache.lock_state().head_slots.get(&CACHED_HEAD_WINDOW_DEPTH_STEP).is_some_and(|slot| {
-            slot.running.is_none() && slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &previous))
-        }));
-
-        let rejected = cache
-            .head(
-                &jobs,
-                CACHED_HEAD_WINDOW_DEPTH_STEP,
-                |_, _| async { panic!("a closed tracker cannot run new Head work") },
-                || async { 200 },
-            )
-            .await;
-        assert_eq!(rejected.resolve(CancellationToken::new()).await, Err(CacheWaitError::Build(CacheBuildError::Cancelled)));
-        assert!(cache.lock_state().head_slots.get(&CACHED_HEAD_WINDOW_DEPTH_STEP).is_some_and(|slot| {
-            slot.running.is_none() && slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &previous))
-        }));
     }
 
     #[tokio::test]
@@ -1528,13 +1448,13 @@ mod tests {
                 &cache,
                 &jobs,
                 7,
-                17,
-                move |_| async move { Ok(Arc::new(CachedDelta::new(7, 11, 17, 23, builder_delta_body))) },
+                11,
+                move |_| async move { Ok(Arc::new(CachedDelta::new(7, 11, false, 23, builder_delta_body))) },
             ))
             .wait(CancellationToken::new())
             .await
             .expect("delta construction completes");
-        let delta_hit = match delta(&cache, &jobs, 7, 17, |_| async { panic!("a completed delta cannot rebuild") }) {
+        let delta_hit = match delta(&cache, &jobs, 7, 11, |_| async { panic!("a completed delta cannot rebuild") }) {
             CacheAccess::Completed(value) => value,
             CacheAccess::Job(_) => panic!("the completed delta is reused"),
         };
@@ -1545,22 +1465,15 @@ mod tests {
         let head_body = Bytes::from(vec![5, 6, 7, 8]);
         let builder_head_body = head_body.clone();
         let completed_head = cache
-            .head(
-                &jobs,
-                50,
-                move |depth, _| {
-                    let body = builder_head_body.clone();
-                    async move { Ok(cached_head_with_body(depth, 13, 17, body)) }
-                },
-                || async { 17 },
-            )
-            .await
+            .head_tier(&jobs, 50, head_boundary(), move |_| {
+                let body = builder_head_body.clone();
+                async move { Ok(cached_head_with_body(50, 13, 17, body)) }
+            })
             .resolve(CancellationToken::new())
             .await
             .expect("Head construction completes");
         let head_hit = cache
-            .head(&jobs, 50, |_, _| async { panic!("a completed Head tier cannot rebuild") }, || async { 17 })
-            .await
+            .head_tier(&jobs, 50, head_boundary(), |_| async { panic!("a completed Head tier cannot rebuild") })
             .resolve(CancellationToken::new())
             .await
             .expect("Head hit completes");
@@ -1582,126 +1495,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_delta_remains_immutable_at_its_exact_source_key() {
+    async fn inadequate_completed_delta_is_preserved_while_one_enlargement_runs() {
         let cache = Arc::new(GraphCache::new());
         let jobs = CacheJobTracker::new();
-        let first = job(delta(&cache, &jobs, 7, 17, |_| async { Ok(cached_delta(7, 11)) }));
+        let first = job(delta(&cache, &jobs, 7, 11, |_| async { Ok(cached_delta(7, 11)) }));
         let completed = first.wait(CancellationToken::new()).await.expect("initial build completes");
 
-        match delta(&cache, &jobs, 7, 17, |_| async { Ok(cached_delta(7, 19)) }) {
+        let (release_tx, release_rx) = oneshot::channel();
+        let enlargement = job(delta(&cache, &jobs, 7, 19, move |_| async move {
+            release_rx.await.expect("enlargement is released");
+            Ok(cached_delta(7, 19))
+        }));
+
+        match delta(&cache, &jobs, 7, 11, |_| async { panic!("the shorter request reuses the preserved completion") }) {
             CacheAccess::Completed(hit) => {
                 assert!(Arc::ptr_eq(&hit, &completed));
-                assert_eq!(hit.to_revision_id(), 11, "Head advancement cannot promote a source-keyed entry");
+                assert_eq!(hit.to_revision_id(), 11);
             }
-            CacheAccess::Job(_) => panic!("the exact source reuses its immutable value"),
+            CacheAccess::Job(_) => panic!("the completed value remains adequate for the shorter request"),
         }
 
-        let distinct = job(delta(&cache, &jobs, 8, 17, |_| async { Ok(cached_delta(8, 19)) }));
-        assert_eq!(distinct.wait(CancellationToken::new()).await.expect("distinct source builds independently").to_revision_id(), 19);
-        jobs.shutdown().await;
-    }
+        let joined = job(delta(&cache, &jobs, 7, 23, |_| async { panic!("one source has at most one running job") }));
+        assert!(Arc::ptr_eq(&enlargement, &joined));
 
-    #[test]
-    fn destination_heat_counts_saturates_and_prunes_complete_level_buckets() {
-        let cache = GraphCache::new();
-        cache.record_delta_delivery(21, 20);
-        cache.record_delta_delivery(21, 20);
-        cache.record_delta_delivery(34, 20);
-        cache.record_delta_delivery(55, 21);
-        {
-            let state = cache.lock_state();
-            assert_eq!(state.deltas.destination_heat.counts_by_revision.get(&21), Some(&2));
-            assert_eq!(state.deltas.destination_heat.counts_by_revision.get(&34), Some(&1));
-            assert_eq!(state.deltas.destination_heat.revisions_by_level.get(&20), Some(&vec![21, 34]));
-            assert_eq!(state.deltas.destination_heat.revisions_by_level.get(&21), Some(&vec![55]));
+        release_tx.send(()).expect("enlargement release is observed");
+        let enlarged = enlargement.wait(CancellationToken::new()).await.expect("enlargement completes");
+        assert_eq!(enlarged.to_revision_id(), 19);
+        match delta(&cache, &jobs, 7, 19, |_| async { panic!("the enlarged completion is reused") }) {
+            CacheAccess::Completed(hit) => assert!(Arc::ptr_eq(&hit, &enlarged)),
+            CacheAccess::Job(_) => panic!("the enlarged completion is adequate"),
         }
-
-        cache.lock_state().deltas.destination_heat.counts_by_revision.insert(21, u64::MAX);
-        cache.record_delta_delivery(21, 20);
-        assert_eq!(cache.lock_state().deltas.destination_heat.counts_by_revision.get(&21), Some(&u64::MAX));
-
-        cache.prune_deltas(270);
-        assert_eq!(cache.lock_state().deltas.destination_heat.counts_by_revision.len(), 3, "distance 250 remains retained");
-
-        cache.prune_deltas(271);
-        let state = cache.lock_state();
-        assert_eq!(state.deltas.destination_heat.counts_by_revision, HashMap::from([(55, 1)]));
-        assert_eq!(state.deltas.destination_heat.revisions_by_level, BTreeMap::from([(21, vec![55])]));
-    }
-
-    #[tokio::test]
-    async fn head_level_index_prunes_complete_expired_buckets_only() {
-        let cache = Arc::new(GraphCache::new());
-        let jobs = CacheJobTracker::new();
-        for (source, target, head_level) in [(5, 8, 20), (13, 16, 20), (21, 24, 21)] {
-            let completed =
-                job(delta(&cache, &jobs, source, 520, move |_| async move { Ok(cached_delta_at(source, target, head_level)) }));
-            completed.wait(CancellationToken::new()).await.expect("fixture entry completes");
-        }
-
-        cache.prune_deltas(520);
-        {
-            let state = cache.lock_state();
-            assert_eq!(state.deltas.slots_by_source.len(), 3, "distance 500 and younger buckets remain retained");
-            assert_eq!(state.deltas.sources_by_head_level.keys().copied().collect::<Vec<_>>(), [20, 21]);
-        }
-
-        cache.prune_deltas(521);
-        {
-            let state = cache.lock_state();
-            assert_eq!(state.deltas.slots_by_source.keys().copied().collect::<Vec<_>>(), [21]);
-            assert_eq!(state.deltas.sources_by_head_level.keys().copied().collect::<Vec<_>>(), [21]);
-        }
-        jobs.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn completion_serves_but_does_not_index_a_candidate_that_aged_past_the_bound() {
-        let cache = Arc::new(GraphCache::new());
-        let jobs = CacheJobTracker::new();
-        let (release_tx, release_rx) = oneshot::channel();
-        let head_high_level = Arc::new(AtomicU32::new(520));
-        let completion_head = Arc::clone(&head_high_level);
-        let aged = job(cache.delta(
-            &jobs,
-            3,
-            move |_| async move {
-                release_rx.await.expect("builder is released");
-                Ok(cached_delta_at(3, 4, 20))
-            },
-            move || {
-                let completion_head = Arc::clone(&completion_head);
-                async move { completion_head.load(Ordering::SeqCst) }
-            },
-        ));
-
-        head_high_level.store(521, Ordering::SeqCst);
-        release_tx.send(()).expect("builder release is observed");
-        assert_eq!(aged.wait(CancellationToken::new()).await.expect("existing waiter receives successful result").to_revision_id(), 4);
-        {
-            let state = cache.lock_state();
-            assert!(!state.deltas.slots_by_source.contains_key(&3));
-            assert!(!state.deltas.sources_by_head_level.contains_key(&20));
-        }
-
-        let replacement = job(delta(&cache, &jobs, 3, 521, |_| async { Ok(cached_delta_at(3, 7, 521)) }));
-        assert_eq!(replacement.wait(CancellationToken::new()).await.expect("uncached source can retry").to_revision_id(), 7);
         jobs.shutdown().await;
     }
 
     #[tokio::test]
     async fn replay_floor_invalidation_removes_the_exact_cache_set_and_terminalizes_detached_jobs() {
         let cache = GraphCache::new();
-        seed_delta(&cache, cached_delta_at(3, 4, 20));
-        seed_delta(&cache, cached_delta_at(10, 11, 21));
-        seed_delta(&cache, cached_delta_at(12, 13, 22));
+        seed_delta(&cache, cached_delta(3, 4));
+        seed_delta(&cache, cached_delta(10, 11));
+        seed_delta(&cache, cached_delta(12, 13));
 
         let old_delta_job = Arc::new(super::CacheJob::pending(CancellationToken::new()));
         let floor_delta_job = Arc::new(super::CacheJob::pending(CancellationToken::new()));
         {
             let mut state = cache.lock_state();
-            state.deltas.slots_by_source.insert(8, super::CacheSlot { completed: None, running: Some(old_delta_job.clone()) });
-            state.deltas.slots_by_source.insert(10, super::CacheSlot { completed: None, running: Some(floor_delta_job.clone()) });
+            state.deltas.slots_by_source.insert(8, running_delta_slot(8, 9, old_delta_job.clone()));
+            state.deltas.slots_by_source.insert(10, running_delta_slot(10, 11, floor_delta_job.clone()));
         }
 
         let old_head_job = Arc::new(super::CacheJob::pending(CancellationToken::new()));
@@ -1710,27 +1549,28 @@ mod tests {
         {
             let mut state = cache.lock_state();
             state
-                .head_slots
-                .insert(50, super::CacheSlot { completed: Some(cached_head(50, 9, 100)), running: Some(old_head_job.clone()) });
-            state
-                .head_slots
-                .insert(100, super::CacheSlot { completed: Some(cached_head(100, 10, 100)), running: Some(floor_head_job.clone()) });
-            state.head_slots.insert(150, super::CacheSlot { completed: Some(cached_head(150, 11, 100)), running: None });
-            state.head_slots.insert(200, super::CacheSlot { completed: None, running: Some(head_only_job.clone()) });
+                .heads
+                .slots_by_depth
+                .insert(50, super::HeadCacheSlot { completed: Some(cached_head(50, 9, 100)), running: Some(old_head_job.clone()) });
+            state.heads.slots_by_depth.insert(
+                100,
+                super::HeadCacheSlot { completed: Some(cached_head(100, 10, 100)), running: Some(floor_head_job.clone()) },
+            );
+            state.heads.slots_by_depth.insert(150, super::HeadCacheSlot { completed: Some(cached_head(150, 11, 100)), running: None });
+            state.heads.slots_by_depth.insert(200, super::HeadCacheSlot { completed: None, running: Some(head_only_job.clone()) });
         }
 
         let invalidation = cache.invalidate_replay_floor(10);
 
         {
             let state = cache.lock_state();
-            assert_eq!(state.deltas.slots_by_source.keys().copied().collect::<std::collections::HashSet<_>>(), [10, 12].into());
-            assert_eq!(state.deltas.sources_by_head_level, BTreeMap::from([(21, vec![10]), (22, vec![12])]));
-            assert!(!state.head_slots.contains_key(&50));
-            assert!(!state.head_slots.contains_key(&200));
-            assert!(state.head_slots.get(&100).is_some_and(|slot| {
+            assert_eq!(state.deltas.slots_by_source.keys().copied().collect::<Vec<_>>(), [10, 12]);
+            assert!(!state.heads.slots_by_depth.contains_key(&50));
+            assert!(!state.heads.slots_by_depth.contains_key(&200));
+            assert!(state.heads.slots_by_depth.get(&100).is_some_and(|slot| {
                 slot.running.is_none() && slot.completed.as_ref().is_some_and(|value| value.revision() == 10)
             }));
-            assert!(state.head_slots.get(&150).is_some_and(|slot| {
+            assert!(state.heads.slots_by_depth.get(&150).is_some_and(|slot| {
                 slot.running.is_none() && slot.completed.as_ref().is_some_and(|value| value.revision() == 11)
             }));
         }
@@ -1761,7 +1601,7 @@ mod tests {
         let resource = Arc::new(());
         let weak_resource = Arc::downgrade(&resource);
         let builder_resource = resource.clone();
-        let running = job(delta(&cache, &jobs, 3, 20, move |_| async move {
+        let running = job(delta(&cache, &jobs, 3, 4, move |_| async move {
             let _drop_signal = DropSignal(dropped_builder);
             let _resource = builder_resource;
             started_builder.notify_one();
@@ -1793,7 +1633,7 @@ mod tests {
     fn delta_replay_floor_invalidation_wins_before_contending_completion_and_cannot_be_overwritten() {
         let cache = Arc::new(GraphCache::new());
         let job = Arc::new(super::CacheJob::pending(CancellationToken::new()));
-        cache.lock_state().deltas.slots_by_source.insert(3, super::CacheSlot { completed: None, running: Some(job.clone()) });
+        cache.lock_state().deltas.slots_by_source.insert(3, running_delta_slot(3, 4, job.clone()));
 
         let detached = Arc::new(Barrier::new(2));
         let release_invalidator = Arc::new(Barrier::new(2));
@@ -1814,7 +1654,7 @@ mod tests {
         let completion_barrier = completion_started.clone();
         let completion = std::thread::spawn(move || {
             completion_barrier.wait();
-            super::finish_delta_job(&completion_cache, 3, &completion_job, Ok((cached_delta(3, 4), 20)));
+            super::finish_delta_job(&completion_cache, 3, &completion_job, Ok(cached_delta(3, 4)));
         });
         completion_started.wait();
         release_invalidator.wait();
@@ -1833,9 +1673,9 @@ mod tests {
     #[test]
     fn head_replay_floor_invalidation_wins_before_contending_completion_and_cannot_be_overwritten() {
         let cache = Arc::new(GraphCache::new());
-        let depth = CACHED_HEAD_WINDOW_DEPTH_STEP;
+        let depth = CACHED_HEAD_WINDOW_DEPTHS[0];
         let job = Arc::new(super::CacheJob::pending(CancellationToken::new()));
-        cache.lock_state().head_slots.insert(depth, super::CacheSlot { completed: None, running: Some(job.clone()) });
+        cache.lock_state().heads.slots_by_depth.insert(depth, super::HeadCacheSlot { completed: None, running: Some(job.clone()) });
 
         let detached = Arc::new(Barrier::new(2));
         let release_invalidator = Arc::new(Barrier::new(2));
@@ -1856,14 +1696,14 @@ mod tests {
         let completion_barrier = completion_started.clone();
         let completion = std::thread::spawn(move || {
             completion_barrier.wait();
-            super::finish_head_job(&completion_cache, depth, &completion_job, Ok((cached_head(depth, 3, 20), 20)));
+            super::finish_head_job(&completion_cache, depth, &completion_job, Ok(cached_head(depth, 3, 20)));
         });
         completion_started.wait();
         release_invalidator.wait();
 
         let invalidation = invalidator.join().expect("invalidation thread succeeds");
         completion.join().expect("completion thread succeeds");
-        assert!(!cache.lock_state().head_slots.contains_key(&depth));
+        assert!(!cache.lock_state().heads.slots_by_depth.contains_key(&depth));
         assert!(matches!(&*job.state.borrow(), super::CacheJobState::InvalidatedByReplayFloor { replay_floor_revision: 4 }));
 
         job.complete(Err(CacheBuildError::Encoding(EncodingSchedulerError::BlockingExecutorFailed)));
@@ -1876,10 +1716,10 @@ mod tests {
     async fn delta_ordinary_completion_wins_before_replay_floor_invalidation() {
         let cache = Arc::new(GraphCache::new());
         let job = Arc::new(super::CacheJob::pending(CancellationToken::new()));
-        cache.lock_state().deltas.slots_by_source.insert(3, super::CacheSlot { completed: None, running: Some(job.clone()) });
+        cache.lock_state().deltas.slots_by_source.insert(3, running_delta_slot(3, 4, job.clone()));
 
         let completed = cached_delta(3, 4);
-        super::finish_delta_job(&Arc::downgrade(&cache), 3, &job, Ok((completed.clone(), 20)));
+        super::finish_delta_job(&Arc::downgrade(&cache), 3, &job, Ok(completed.clone()));
         assert!(cache.lock_state().deltas.slots_by_source.get(&3).is_some_and(|slot| {
             slot.running.is_none() && slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &completed))
         }));
@@ -1895,20 +1735,20 @@ mod tests {
     #[tokio::test]
     async fn head_ordinary_completion_wins_before_replay_floor_invalidation() {
         let cache = Arc::new(GraphCache::new());
-        let depth = CACHED_HEAD_WINDOW_DEPTH_STEP;
+        let depth = CACHED_HEAD_WINDOW_DEPTHS[0];
         let job = Arc::new(super::CacheJob::pending(CancellationToken::new()));
-        cache.lock_state().head_slots.insert(depth, super::CacheSlot { completed: None, running: Some(job.clone()) });
+        cache.lock_state().heads.slots_by_depth.insert(depth, super::HeadCacheSlot { completed: None, running: Some(job.clone()) });
 
         let completed = cached_head(depth, 3, 20);
-        super::finish_head_job(&Arc::downgrade(&cache), depth, &job, Ok((completed.clone(), 20)));
-        assert!(cache.lock_state().head_slots.get(&depth).is_some_and(|slot| {
+        super::finish_head_job(&Arc::downgrade(&cache), depth, &job, Ok(completed.clone()));
+        assert!(cache.lock_state().heads.slots_by_depth.get(&depth).is_some_and(|slot| {
             slot.running.is_none() && slot.completed.as_ref().is_some_and(|value| Arc::ptr_eq(value, &completed))
         }));
 
         let invalidation = cache.invalidate_replay_floor(4);
         assert!(invalidation.delta_jobs.is_empty());
         assert!(invalidation.head_jobs.is_empty());
-        assert!(!cache.lock_state().head_slots.contains_key(&depth));
+        assert!(!cache.lock_state().heads.slots_by_depth.contains_key(&depth));
         let observed = job.wait(CancellationToken::new()).await.expect("ordinary completion remains terminal");
         assert!(Arc::ptr_eq(&observed, &completed));
     }

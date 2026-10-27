@@ -76,11 +76,13 @@ fn add_weighted(estimate: &mut u64, count: usize, weight: u64) {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
+    use crate::codec::delta::{GraphDeltaBatchDto, maximum_estimator_wire_contribution_bytes};
     use kgi_api_model::{
         delta::{FieldChange, GraphDelta, LevelChange},
         graph::{EdgeId, GraphBlock, GraphEdge, Level},
+        history::{GraphHistory, GraphHistoryRange},
     };
-    use kgi_model::block::{BlockColor, BlockCoordinate};
+    use kgi_model::block::{BlockColor, BlockCoordinate, MAX_DAA_SCORE, MAX_LEVEL_SIZE, MAX_LEVEL_SLOT};
 
     use super::*;
 
@@ -140,5 +142,98 @@ mod tests {
         assert_eq!(classify_replayability(SOFT_DELTA_ESTIMATED_BYTES - 1), GraphHistoryReplayability::Replayable);
         assert_eq!(classify_replayability(SOFT_DELTA_ESTIMATED_BYTES), GraphHistoryReplayability::ReplayBarrier);
         assert_eq!(classify_replayability(SOFT_DELTA_ESTIMATED_BYTES + 1), GraphHistoryReplayability::ReplayBarrier);
+    }
+
+    #[test]
+    fn estimator_bound_covers_reachable_maximum_wire_widths() {
+        let maximum_distinct_hashes_below_soft_limit =
+            (SOFT_DELTA_ESTIMATED_BYTES - 1 - ENTRY_AND_BATCH_FRAMING_BYTES) / DISTINCT_HASH_BYTES;
+        assert!(
+            maximum_distinct_hashes_below_soft_limit <= 99_999,
+            "every admitted dense HashRef fits the representative five-digit width"
+        );
+
+        let wire = maximum_estimator_wire_contribution_bytes();
+        let assert_contribution = |name: &str, actual: usize, estimated: u64| {
+            let bound = usize::try_from(estimated.checked_mul(4).expect("estimator proof bound fits u64"))
+                .expect("estimator proof bound fits usize");
+            assert!(actual <= bound, "{name} needs {actual} bytes but its factor-four estimator bound is {bound}");
+        };
+        // The first framing value includes the outer batch. The incremental
+        // value proves every later entry, so the same bound composes for any
+        // batch length. Global dictionary reuse only reduces bytes relative to
+        // the estimator's per-entry distinct-hash charges.
+        assert_contribution("first entry and batch framing", wire.entry_and_batch_framing, ENTRY_AND_BATCH_FRAMING_BYTES);
+        assert_contribution("additional entry framing", wire.additional_entry_framing, ENTRY_AND_BATCH_FRAMING_BYTES);
+        assert_contribution("distinct hash", wire.distinct_hash, DISTINCT_HASH_BYTES);
+        assert_contribution("block upsert", wire.block_upsert, BLOCK_UPSERT_BYTES);
+        assert_contribution("block relationship", wire.block_relationship, BLOCK_RELATIONSHIP_BYTES);
+        assert_contribution("edge upsert", wire.edge_upsert, EDGE_UPSERT_BYTES);
+        assert_contribution("level installation", wire.level_installation, LEVEL_INSTALLATION_BYTES);
+        assert_contribution("level removal", wire.level_removal, LEVEL_REMOVAL_BYTES);
+        assert_contribution("membership mutation", wire.membership_mutation, MEMBERSHIP_MUTATION_BYTES);
+        assert_contribution("color mutation", wire.color_mutation, COLOR_MUTATION_BYTES);
+
+        let child = hash(1);
+        let parent = hash(2);
+        let blue = hash(3);
+        let red = hash(4);
+        let edge = GraphEdge {
+            id: EdgeId { parent, child },
+            parent_coordinate: BlockCoordinate::new(u32::MAX - 1, MAX_LEVEL_SLOT).expect("maximum parent coordinate"),
+            child_coordinate: BlockCoordinate::new(u32::MAX, MAX_LEVEL_SLOT).expect("maximum child coordinate"),
+        };
+        let block = GraphBlock {
+            hash: child,
+            coordinate: edge.child_coordinate,
+            timestamp: u64::MAX,
+            daa_score: MAX_DAA_SCORE,
+            selected_parent_index: Some(0),
+            direct_parents: Arc::from([parent]),
+            blue_merge_set: Arc::from([blue]),
+            red_merge_set: Arc::from([red]),
+            color: BlockColor::Red,
+            is_in_vspc: true,
+        };
+        let delta = GraphDelta::new(
+            0,
+            1,
+            u64::MAX,
+            u32::MAX,
+            HashMap::from([(child, Some(block))]),
+            HashMap::from([(edge.id, Some(edge))]),
+            vec![
+                LevelChange {
+                    level: u32::MAX,
+                    before: None,
+                    after: Some(Level { size: MAX_LEVEL_SIZE, daa_score: Some(MAX_DAA_SCORE) }),
+                },
+                LevelChange {
+                    level: u32::MAX - 1,
+                    before: Some(Level { size: MAX_LEVEL_SIZE, daa_score: Some(MAX_DAA_SCORE) }),
+                    after: None,
+                },
+            ],
+            HashMap::from([(blue, FieldChange { before: false, after: true })]),
+            HashMap::from([(red, FieldChange { before: BlockColor::Blue, after: BlockColor::Red })]),
+        )
+        .expect("maximum-width wire values form an atomic delta");
+        let estimate = estimate_raw_delta_bytes(&delta);
+        assert!(estimate < SOFT_DELTA_ESTIMATED_BYTES, "the maximum-width fixture is admitted by the estimator");
+
+        let mut history = GraphHistory::new();
+        history.append(delta, estimate, GraphHistoryReplayability::Replayable).expect("maximum-width delta appends to history");
+        let entries = match history.range(0, 1).expect("maximum-width entry is retained") {
+            GraphHistoryRange::Deltas { entries, .. } => entries,
+            GraphHistoryRange::UpToDate { .. } => panic!("the requested range contains one entry"),
+        };
+        let encoded_bytes = GraphDeltaBatchDto::from_entries(&entries).encode().expect("maximum-width delta encodes").len();
+        // History starts at revision zero, so account explicitly for widening
+        // both one-digit lineage boundaries to their reachable u64 maximum.
+        let maximum_width_encoded_bytes =
+            encoded_bytes.checked_add(2 * (u64::MAX.to_string().len() - 1)).expect("test size fits usize");
+        let implementation_bound = estimate.checked_mul(4).expect("test estimate fits u64");
+
+        assert!(u64::try_from(maximum_width_encoded_bytes).expect("encoded length fits u64") <= implementation_bound);
     }
 }

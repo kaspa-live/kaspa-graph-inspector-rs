@@ -1280,39 +1280,53 @@ defines where this classification occurs and its ordering with cache
 invalidation. The [graph owner](api-graph.md#revision-and-history-advancement--settled)
 defines the classification's history effect.
 
-Once an elected builder captures its exact target, that target does not advance
-with Head while the job runs. Preserve the chosen atomic history
+After capturing history and before the second source-slot cache election,
+evaluate additive estimates from the request-selected target down its fixed
+descending ladder. Select the farthest target whose estimate is strictly below
+`SOFT_DELTA_ESTIMATED_BYTES`. A replayable atomic entry is itself below that
+limit, so this descent always finds a fitting target without installing or
+starting a cache job. Supply the fitting target with `size_limited = true` when
+the request-selected target did not fit; otherwise supply the request-selected
+target with `size_limited = false`.
+
+For the same source and request-selected target, immutable atomic history,
+absolute cumulative estimates, and the fixed descending ladder make the
+fitting target and `size_limited` classification deterministic. Concurrent
+callers with those same inputs must derive the identical pair; disagreement is
+an internal invariant failure, and there is no reconciliation or minimum-of-
+observations rule. Callers with different request-selected targets may
+legitimately derive different pairs.
+
+Supply that pair to the
+[ApiService-owned second election](api-service.md#cache-and-encoding-jobs).
+Its semantic outcomes are reuse or reclassification of a completed fitting
+value, joining an existing source job, or installation of the fitting fixed-
+target job. No excluded target is eligible for installation. If the fitting
+completed value already exists with `size_limited = false`, reclassification
+changes only the cached classification and requires no new encoded body. A
+joined shorter job remains fixed; after it completes, the waiter re-enters and
+either reclassifies that fitting value or requests the required fitting
+enlargement. Later requests reuse a `size_limited` value without attempting an
+impossible enlargement. A failed or cancelled job retains no size evidence; a
+later construction attempt repeats the deterministic additive estimation.
+
+Once elected, a builder's fitting target and `size_limited` classification do
+not change with Head or later requests. Preserve its chosen atomic history
 entries as ordered replay units, construct one response-local hash dictionary
 across the complete list, serialize one `GraphDeltaBatchDto`, and measure its
-uncompressed byte length against the hard response limit.
-
-The soft estimate may shorten only along the same descending target ladder.
-When candidate target `X` makes the additive estimate reach
-`SOFT_DELTA_ESTIMATED_BYTES`, that is source-wide size evidence rather than an
-ordinary job failure. The running source job atomically lowers its exclusive
-source-wide size ceiling through `X` and continues at the farthest descending
-target below that ceiling. Its waiters remain attached to the same pending job
-and observe no intermediate public failure. Repeated size evidence can lower
-the ceiling again. It cannot reach an atomic target whose own estimate reaches
-the soft limit because history already made that revision an uncrossable
-replay boundary at append time. If the selected fallback already exists as the
-completed value, the job promotes the same encoded bytes to the size-limited
-result without re-encoding. Otherwise, the first successful fallback becomes
-that result.
-The cache records `size_limited = true`, and later requests reuse it without
-attempting an impossible enlargement. Head- or state-limited shortening
-records `size_limited = false` and remains eligible for later dyadic
-enlargement.
+uncompressed byte length against the hard response limit. Head- or state-
+limited shortening remains `size_limited = false` and eligible for later
+dyadic enlargement.
 
 Every candidate admitted to canonical-delta serialization has an estimate
 strictly below the soft limit. Measuring its final JSON above the hard limit is
 therefore an estimator-invariant violation. Emit an error-level diagnostic
 containing the estimate and observed uncompressed size, then continue to gzip,
-cache, and serve the complete response. The violation does not lower a size
-ceiling, advance the replay floor, select a smaller public result, or become a
-request failure. Serialization, gzip, cancellation, and other non-size
-failures retain their ordinary request-local dispositions and establish no
-ceiling.
+cache, and serve the complete response. The violation does not change the
+`size_limited` classification, advance the replay floor, select a smaller
+public result, or become a request failure. Serialization, gzip, cancellation,
+and other non-size failures retain their ordinary request-local dispositions
+and persist no size evidence.
 
 Every returned entry is complete under the public Head-window contract and
 every batch ends exactly at its selected atomic boundary. Cache construction
@@ -1322,8 +1336,8 @@ diagnostic has been emitted.
 
 For each delivery, return `Complete` when the actual returned right boundary
 reaches or extends through that request's coherently captured Head revision.
-Return `Prefix` when cache-destination selection or soft-estimate descent stops
-at an earlier complete boundary. These are request-specific
+Return `Prefix` when cache-destination selection or pre-election soft-estimate
+descent stops at an earlier complete boundary. These are request-specific
 envelope outcomes rather than fields of the encoded batch. A later request may
 therefore wrap the same cached body differently as Head advances.
 
@@ -1722,11 +1736,12 @@ and re-evaluate after completion when its fixed target is inadequate for their
 captured request. Normal completion installs a farther completed value, and an
 ordinary failure affects only that source job.
 
-Each source slot retains its optional exclusive size ceiling. The first
-linearized soft-estimate exclusion lowers that ceiling. The same pending source
-job descends to the next lower target, retaining its waiters and exact
-cache-slot identity until it completes or fails. No competing construction for
-that source exists to invalidate or cancel.
+Soft-estimate descent occurs over the immutable capture before job election.
+The second election installs only a proven fitting fixed-target job; a job
+never descends or changes its target. A successful `CachedDelta` retains the
+resulting `size_limited` classification as the source slot's only persisted
+size evidence. No competing construction for that source exists to invalidate
+or cancel.
 
 The [publication lifecycle](api-publication.md#publication-state-and-revision--settled)
 owns preservation and release of publication-scoped cache state across Stale
