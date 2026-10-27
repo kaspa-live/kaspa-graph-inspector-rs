@@ -1145,10 +1145,11 @@ INITIAL_ADAPTIVE_DELTA_INTERVAL = 4
 catch-up ladder. ApiService also owns one process-wide active interval `A`
 selected from `ADAPTIVE_DELTA_INTERVALS`. ApiService initializes `A` once to
 `INITIAL_ADAPTIVE_DELTA_INTERVAL` and publication reset or replacement does not
-reset it. The interval governs Live near-Head wakeup and descent; it does not
-replace the fixed four-revision normalization used to enter the catch-up
-ladder. The exact load signals, thresholds, evaluation period, and hysteresis
-that later change `A` remain an
+reset it. The interval governs near-Head wakeup and descent for both advancing
+publication states, `Synchronizing` and `Live`; it does not replace the fixed
+four-revision normalization used to enter the catch-up ladder. The exact load
+signals, thresholds, evaluation period, and hysteresis that later change `A`
+remain an
 [open architecture decision](../decisions/open.md#adaptive-delta-load-controller).
 No implementation may infer those controller mechanics from the allowed values
 alone.
@@ -1180,15 +1181,17 @@ F = 17: 24, 20, 18
 ```
 
 Against captured Head `H`, use the ordinary successor when it is no later than
-`H`. When it is later than `H`, `Synchronizing` and terminal `Stale` select the
-farthest descending target no later than `H`. `Live` considers the successor
-plus only descending targets whose span from `F` is at least the current `A`.
-It selects the farthest eligible target no later than `H`; when none exists it
-returns `WaitForWakeup` at the nearest future eligible target and constructs no
-body. The successor itself remains eligible even when its initial normalization
-or alignment span is below `A`. This lets an arbitrary cursor enter the fixed
-base ladder and lets a cursor aligned to an earlier interval converge to the
-new interval in at most the necessary early ladder wakes.
+`H`. When it is later than `H`, `Synchronizing` and `Live` consider the
+successor plus only descending targets whose span from `F` is at least the
+current `A`. They select the farthest eligible target no later than `H`; when
+none exists they return `WaitForWakeup` at the nearest future eligible target
+and construct no body. The successor itself remains eligible even when its
+initial normalization or alignment span is below `A`. This lets an arbitrary
+cursor enter the fixed base ladder and lets a cursor aligned to an earlier
+interval converge to the new interval in at most the necessary early ladder
+wakes. Terminal `Stale` instead selects the farthest descending target no later
+than its fixed final Head, even when that final span is below `A`, because no
+future revision can satisfy an armed boundary.
 
 After future-cursor rejection and any supplied-client validation, every valid
 delta query, including the equality case, performs the
@@ -1351,9 +1354,10 @@ Every successful delta-to-current response uses the
 The continuation is request-specific response metadata and is not part of the
 encoded delta-batch body. After a response ending at cursor `T` against the
 request's captured Head `H`, let `N(T, A)` be the nearest future revision
-eligible under the same Live target rule used for a request from `T`. This
-includes the ordinary-successor exception that permits fixed-base
-normalization or interval realignment below `A`. Live continuation is:
+eligible under the same advancing-publication target rule used for a request
+from `T`. This includes the ordinary-successor exception that permits
+fixed-base normalization or interval realignment below `A`. `Synchronizing`
+and `Live` continuation is:
 
 ```text
 T == H          => ReachedHead
@@ -1366,8 +1370,9 @@ the familiar comparison of `H - T` with `A`. For example, normalization at
 `T = 17`, `A = 8` has `N(T, A) = 24`; a captured `H = 24` therefore continues
 immediately even though `H - T < A`.
 
-`WaitForWakeup` remains the empty-body Live outcome selected when the request's
-starting cursor has no eligible target at the captured Head. A body-bearing
+`WaitForWakeup` remains the empty-body advancing-publication outcome selected
+when the request's starting cursor has no eligible target at the captured
+Head. A body-bearing
 `Prefix` may also carry `DeltaContinuation::WaitForWakeup` when its returned
 cursor has entered that same near-Head region. This arms the next boundary
 without forcing a second empty HTTP request merely to discover that the client
@@ -1429,13 +1434,15 @@ The HTTP-only client waits at least `N` milliseconds before requesting again.
 The retry header is absent from `continue` responses and from all
 SSE-coordinated responses.
 
-Synchronizing never parks a client for the active revision interval: an
-intermediate response uses `ContinueImmediately`, and ordinary graph wakeups
-remain available. Stale cannot wait for future graph progress; entering Stale
-emits `PublicationState` regardless of the graph wake schedule, intermediate
-responses use `ContinueImmediately`, and reaching the final stalled Head uses
-`ReachedHead` without arming another graph-revision wakeup. The final Stale
-interval may be shorter than the active interval. At that final Head an
+`Synchronizing` and `Live` use the same active-interval target, continuation,
+and wakeup rules. A Synchronizing client can therefore park at the next
+eligible boundary rather than chase every intermediate Head revision; ordinary
+graph advancement eventually satisfies that armed boundary. Stale cannot wait
+for future graph progress; entering Stale emits `PublicationState` regardless
+of the graph wake schedule, intermediate responses use
+`ContinueImmediately`, and reaching the final stalled Head uses `ReachedHead`
+without arming another graph-revision wakeup. The final Stale interval may be
+shorter than the active interval. At that final Head an
 HTTP-only response carries `KGI-Delta-Retry-After-Ms: 1000`; the client polls
 this same delta endpoint until publication replacement produces
 `FreshViewRequired(PublicationMismatch)`, then obtains the replacement Head
@@ -1655,10 +1662,10 @@ Resync or Rebuild.
 
 SSE carries ordered registration, publication-state, and graph-wakeup messages;
 it is not the graph data channel. Each client has a bounded delivery buffer.
-Live history advancement follows the registered active-interval graph-wakeup
-schedule, while `PublicationState` and the replacement sequence bypass it.
-Synchronizing continues to emit ordinary coalesced graph wakeups. Pending
-graph wakeups coalesce to the latest cursor; registration and state messages
+Synchronizing and Live history advancement follow the registered active-
+interval graph-wakeup schedule, while `PublicationState` and the replacement
+sequence bypass it. Pending graph wakeups coalesce to the latest cursor;
+registration and state messages
 retain the ordering required by their owning contract.
 
 The initial three-message sequence, the replacement three-message sequence,

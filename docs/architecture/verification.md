@@ -1560,13 +1560,17 @@ Verify dyadic successor selection from zero, unaligned sources, every power of
 two through the 128-revision cap, and sources divisible by larger powers. Cover
 the exact normalization spans `4..=7`, including `17 -> 24`, followed by
 `24 -> 32 -> 64 -> 128`. For `F = 32`, verify the descending boundaries
-`64, 48, 40, 36, 34, 33`; for `F = 17`, verify `24, 20, 18`. A moving Live
-Head applies the active interval only to descent, while Synchronizing and
-Stale can descend through the final atomic revision. Verify every allowed
-active interval from 1 through 128 and reject any controller output outside
-that set. ApiService must initialize the interval to 4 and retain its current
-value across publication reset and replacement; the open controller decision
-supplies no further executable policy.
+`64, 48, 40, 36, 34, 33`; for `F = 17`, verify `24, 20, 18`. A moving Head in
+either advancing state applies the active interval only to descent. Require
+both Synchronizing and Live to select the same eligible target or future wake
+boundary. For `F = 32`, `H = 40`, and `A = 16`, both states must wait for
+revision 48 and construct no body, while terminal Stale must target its final
+revision 40. Only terminal Stale may descend through its final atomic revision
+below that interval. Verify every allowed active interval from 1 through 128
+and reject any controller output outside that set. ApiService must initialize
+the interval to 4 and retain its current value across publication reset and
+replacement; the open controller decision supplies no further executable
+policy.
 
 Force additive estimates to reach the soft limit at successive dyadic
 boundaries while rebuilding one shared dictionary for each admitted candidate.
@@ -1725,8 +1729,8 @@ from `GraphHistory` while its cache entry remains within the five-minute
 horizon, and require the retained completed hit to succeed without any history
 lookup.
 
-For a Live publication, cover `ReachedHead`, `ContinueImmediately`, and
-`WaitForWakeup`; one wakeup
+For both Synchronizing and Live publications, cover `ReachedHead`,
+`ContinueImmediately`, and `WaitForWakeup`; one wakeup
 at the armed boundary; suppression of further graph wakeups until rearming;
 and `PublicationState` or the replacement sequence bypassing the schedule.
 Verify the canonical
@@ -1827,9 +1831,10 @@ replacement. A state transition emits only `PublicationStateDto`, does not
 replace the ID, and bypasses the graph-wakeup schedule. Entering Stale carries
 the final stalled Head revision. Verify `Last-Event-ID` has no graph-cursor,
 publication, registration, or replay meaning. Cover saturation rather than
-wrap at the maximum revision. Synchronizing never parks for the interval.
-Entering Stale reports state independently of graph-wakeup arming and permits
-descent through the final stalled Head without rearming.
+wrap at the maximum revision. Require Synchronizing to park and rearm at the
+same active-interval boundary as Live. Entering Stale reports state
+independently of graph-wakeup arming and permits descent through the final
+stalled Head without rearming.
 For HTTP-only `head` and `wakeup`, verify the protocol-owned calculated
 `KGI-Delta-Retry-After-Ms` values at representative selected wake boundaries
 and its absence
@@ -1846,9 +1851,10 @@ response stop below the now-current Head, require its immediate continuation
 request, and let the second response converge under the smaller interval. No
 interval change may cancel or duplicate a registration.
 
-Derive Live continuation from the nearest eligible `N(T, A)`, not solely from
-raw revision distance. Cover an aligned cursor where comparison with `A`
-directly selects all three continuations and the normalization exception
+Derive Synchronizing and Live continuation from the nearest eligible `N(T, A)`,
+not solely from raw revision distance. Cover an aligned cursor in both states
+where comparison with `A` directly selects all three continuations and the
+normalization exception
 `T = 17`, `A = 8`, `H = 24`, which must continue immediately. Make a
 body-bearing prefix end in `T < H < N(T, A)` and require it to carry `wakeup`,
 the exact `KGI-Delta-Wake-At-Revision`, and no immediate follow-up request.
