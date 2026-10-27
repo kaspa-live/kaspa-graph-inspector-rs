@@ -485,5 +485,5 @@ catch-up, registration disappearance, Head/rearm ordering, and both interval-
 change directions without rewriting existing schedules. Anchored windows,
 public admission, HTTP/SSE transport, and the adaptive controller remain in
 later increments. Completion validation passed workspace formatting, Cargo
-check, 605/605 Nextest tests including Docker PostgreSQL integration, Cargo
+check, 606/606 Nextest tests including Docker PostgreSQL integration, Cargo
 doctests, Clippy with warnings denied, and `git diff --check`.
