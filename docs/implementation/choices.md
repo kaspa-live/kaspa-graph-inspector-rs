@@ -1153,13 +1153,13 @@ service tracker remains the sole join owner.
 
 ### Final response admission token
 
-Represent the result of final replay-floor admission with one private generic
-`ReplayFloorAdmission<T>` that owns the admitted `Arc<T>`. Type-specific
-`GraphPublication` entry points select the delta source revision or Head
-snapshot revision, then share one comparison while briefly holding only the
-publication-core read lock. This keeps the final candidate alive across the
-check without coupling the publication kernel to later logical-operation
-outcomes or holding a cache guard.
+Represent final Head-snapshot admission with a private generic
+`ReplayFloorAdmission<T>` that owns the admitted `Arc<T>`. Delta admission uses
+a type-specific result that pairs the admitted `Arc<CachedDelta>` with the
+coherently captured delivery Head from the same brief publication-core read
+lock. This keeps each final candidate alive across the check, gives delta
+delivery one linearization point for replayability and response metadata, and
+holds no cache guard.
 
 ## 27 October 2026: in-memory Head snapshot operation
 

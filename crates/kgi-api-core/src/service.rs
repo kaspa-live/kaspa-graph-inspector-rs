@@ -29,8 +29,8 @@ use crate::{
     },
     error::ApiServiceError,
     publication::{
-        CanonicalDeltaReentry, CanonicalDeltaSelection, GraphDeltaTargetCapture, GraphPublication, GraphPublicationState,
-        HeadTierSelection, ReplayFloorAdmission,
+        CanonicalDeltaReentry, CanonicalDeltaSelection, DeltaReplayFloorAdmission, GraphDeltaTargetCapture, GraphPublication,
+        GraphPublicationState, HeadTierSelection, ReplayFloorAdmission,
         runtime::{PublicationInstallOutcome, PublicationInstaller, PublicationRuntime},
     },
 };
@@ -112,7 +112,7 @@ pub(crate) enum CanonicalDeltaSuccess {
     UpToDate,
     /// No eligible target has reached the captured advancing Head.
     WaitForWakeup,
-    /// The cached body reaches the captured Head.
+    /// The cached body reaches the delivery Head.
     Complete(Arc<CachedDelta>),
     /// The cached body ends at an earlier complete atomic boundary.
     Prefix(Arc<CachedDelta>),
@@ -142,7 +142,8 @@ pub(crate) enum CanonicalDeltaResponse {
     Success {
         /// Exact publication retained for response finalization and delivery.
         publication: Arc<GraphPublication>,
-        /// Coherent Head metadata against which this request was selected.
+        /// Coherent Head metadata used by this response. Empty results retain
+        /// the selection Head; body-bearing results carry the delivery Head.
         head: GraphDeltaTargetCapture,
         /// Empty or cached body selection.
         outcome: CanonicalDeltaSuccess,
@@ -599,7 +600,6 @@ impl ApiService {
                 });
             }
         };
-        let head = request.head();
         let requested_target = request.requested_target();
 
         loop {
@@ -614,7 +614,7 @@ impl ApiService {
                 Err(error) => return Err(error),
             };
             if candidate.is_adequate_for(requested_target) {
-                return Ok(self.complete_cached_delta(publication, head, requested_target, candidate, client, active_interval).await);
+                return Ok(self.complete_cached_delta(publication, requested_target, candidate, client, active_interval).await);
             }
             access = match publication.reenter_canonical_delta(&self.cache_jobs, &self.encoding.scheduler, request).await {
                 Ok(CanonicalDeltaReentry::SourceExpired) => {
@@ -637,16 +637,15 @@ impl ApiService {
     async fn complete_cached_delta(
         &self,
         publication: Arc<GraphPublication>,
-        head: GraphDeltaTargetCapture,
         requested_target: u64,
         candidate: Arc<CachedDelta>,
         client: Option<ClientIdentifier>,
         active_interval: u64,
     ) -> CanonicalDeltaResponse {
         assert!(candidate.is_adequate_for(requested_target), "a delivered cached delta is adequate for the selected target");
-        let candidate = match publication.admit_cached_delta_replay_floor(candidate).await {
-            ReplayFloorAdmission::Admitted(candidate) => candidate,
-            ReplayFloorAdmission::Rejected { .. } => {
+        let (candidate, delivery_head) = match publication.admit_cached_delta_replay_floor(candidate).await {
+            DeltaReplayFloorAdmission::Admitted { candidate, delivery_head } => (candidate, delivery_head),
+            DeltaReplayFloorAdmission::Rejected { .. } => {
                 return CanonicalDeltaResponse::FreshViewRequired {
                     publication: Some(publication),
                     reason: FreshViewReason::DeltaReplayBarrier,
@@ -654,12 +653,12 @@ impl ApiService {
             }
         };
         let returned_revision = candidate.to_revision_id();
-        let outcome = if returned_revision >= head.revision() {
+        let outcome = if returned_revision == delivery_head.revision() {
             CanonicalDeltaSuccess::Complete(candidate)
         } else {
             CanonicalDeltaSuccess::Prefix(candidate)
         };
-        self.complete_delta_success(publication, head, outcome, returned_revision, client, active_interval)
+        self.complete_delta_success(publication, delivery_head, outcome, returned_revision, client, active_interval)
     }
 
     fn complete_delta_success(
@@ -671,7 +670,7 @@ impl ApiService {
         client: Option<ClientIdentifier>,
         active_interval: u64,
     ) -> CanonicalDeltaResponse {
-        assert!(returned_revision <= head.revision(), "a canonical delta does not pass its captured Head");
+        assert!(returned_revision <= head.revision(), "a canonical delta does not pass its response Head");
         let next_boundary = DeltaTargetLadder::next_eligible_boundary_from(returned_revision, active_interval);
         let continuation = if returned_revision == head.revision() {
             DeltaContinuation::ReachedHead
@@ -704,7 +703,7 @@ impl ApiService {
             Some(
                 next_boundary
                     .checked_sub(head.revision())
-                    .expect("a Head or wakeup retry boundary follows the captured Head")
+                    .expect("a Head or wakeup retry boundary follows the response Head")
                     .max(1)
                     .checked_mul(75)
                     .expect("canonical delta retry delay fits u64"),
@@ -2326,12 +2325,14 @@ mod tests {
         hook.resume_election();
 
         let earlier = earlier.await.expect("earlier request task completes").expect("earlier logical operation succeeds");
-        let CanonicalDeltaResponse::Success { head: earlier_head, outcome: CanonicalDeltaSuccess::Complete(earlier_delta), .. } =
-            earlier
-        else {
-            panic!("the earlier request completes against its captured Head")
+        let CanonicalDeltaResponse::Success { head: earlier_head, outcome: earlier_outcome, continuation, .. } = earlier else {
+            panic!("the earlier request returns its initially selected body")
         };
-        assert_eq!(earlier_head.revision(), 40);
+        let earlier_delta = match (earlier_head.revision(), earlier_outcome, continuation) {
+            (40, CanonicalDeltaSuccess::Complete(delta), DeltaContinuation::ReachedHead)
+            | (64, CanonicalDeltaSuccess::Prefix(delta), DeltaContinuation::ContinueImmediately) => delta,
+            _ => panic!("delivery metadata reflects the Head observed by final admission"),
+        };
         assert_eq!(earlier_delta.to_revision_id(), 40);
 
         advance.await.expect("later Head advancement completes");
@@ -2349,12 +2350,15 @@ mod tests {
         service.shutdown().await.expect("service shuts down");
     }
 
-    #[tokio::test]
-    async fn cache_job_reentry_preserves_the_request_head_and_target() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cache_job_reentry_reuses_a_farther_completion_with_a_fresh_delivery_head() {
         let (service, _events) = service();
         let entries = (1..=40).map(|revision| (revision, 1)).collect::<Vec<_>>();
-        let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
+        let mut publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
+        let reentry_hook =
+            Arc::get_mut(&mut publication).expect("the fixture publication is not yet shared").pause_before_delta_reentry();
         service.current_publication.send_replace(Some(publication.clone()));
+        let (identifier, mailbox, _disconnect) = register_delta_client(&publication, 32).await;
 
         let started = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
@@ -2374,8 +2378,9 @@ mod tests {
 
         let request_service = service.clone();
         let publication_id = publication.publication_id();
-        let request =
-            tokio::spawn(async move { request_service.canonical_delta(publication_id, 32, None, CancellationToken::new()).await });
+        let earlier = tokio::spawn(async move {
+            request_service.canonical_delta(publication_id, 32, Some(identifier), CancellationToken::new()).await
+        });
         timeout(TEST_TIMEOUT, async {
             while Arc::strong_count(&short_job) == baseline_references {
                 tokio::task::yield_now().await;
@@ -2389,27 +2394,88 @@ mod tests {
         }
         assert_eq!(publication.capture_delta_target().await.revision(), 64);
         release.add_permits(1);
+        reentry_hook.wait_for_core_lock();
 
-        let response = request.await.expect("request task completes").expect("logical outcome");
+        let farther_result =
+            timeout(TEST_TIMEOUT, service.canonical_delta(publication.publication_id(), 32, None, CancellationToken::new())).await;
+        reentry_hook.resume_reentry();
+        let farther =
+            farther_result.expect("the farther request completes while the earlier waiter is paused").expect("logical outcome");
         let CanonicalDeltaResponse::Success {
-            head,
-            outcome: CanonicalDeltaSuccess::Complete(enlarged),
+            head: farther_head,
+            outcome: farther_outcome,
+            continuation: farther_continuation,
+            wake_at_revision_id: farther_wake,
+            retry_after_ms: farther_retry,
+            ..
+        } = farther
+        else {
+            panic!("the farther request installs and returns the revision-64 completion")
+        };
+        let CanonicalDeltaSuccess::Complete(farther_delta) = farther_outcome else {
+            panic!("the farther request reaches delivery Head 64")
+        };
+        assert_eq!(farther_head.revision(), 64);
+        assert_eq!(farther_continuation, DeltaContinuation::ReachedHead);
+        assert_eq!(farther_wake, None);
+        assert_eq!(farther_retry, Some(300));
+        assert_eq!(farther_delta.source_revision_id(), 32);
+        assert_eq!(farther_delta.to_revision_id(), 64);
+
+        let response = timeout(TEST_TIMEOUT, earlier)
+            .await
+            .expect("the earlier request finishes after source-slot reentry")
+            .expect("earlier request task completes")
+            .expect("logical outcome");
+        let CanonicalDeltaResponse::Success {
+            head: delivery_head,
+            outcome: CanonicalDeltaSuccess::Complete(earlier_delta),
             continuation: DeltaContinuation::ReachedHead,
+            wake_at_revision_id: None,
+            retry_after_ms: None,
             ..
         } = response
         else {
-            panic!("the request returns only the enlargement to its captured target")
+            panic!("the earlier request reuses the farther completion against delivery Head 64")
         };
-        assert_eq!(head.revision(), 40);
-        assert_eq!(enlarged.source_revision_id(), 32);
-        assert_eq!(enlarged.to_revision_id(), 40);
+        assert_eq!(delivery_head.revision(), 64);
+        assert_eq!(delivery_head.revision_timestamp_ms(), farther_head.revision_timestamp_ms());
+        assert!(Arc::ptr_eq(&earlier_delta, &farther_delta));
         assert_eq!(short_job.wait(CancellationToken::new()).await.expect("short result remains observable").to_revision_id(), 36);
+
+        publication.apply_block_committed(&block_update(124, 2, 1)).await.expect("Head advances beyond the cached target");
+        let later = service
+            .canonical_delta(publication.publication_id(), 32, None, CancellationToken::new())
+            .await
+            .expect("later logical operation succeeds");
+        let CanonicalDeltaResponse::Success {
+            head: later_head,
+            outcome: CanonicalDeltaSuccess::Prefix(later_delta),
+            continuation: DeltaContinuation::WaitForWakeup,
+            wake_at_revision_id: Some(68),
+            retry_after_ms: Some(225),
+            ..
+        } = later
+        else {
+            panic!("the same cached body becomes a prefix against the newer delivery Head")
+        };
+        assert_eq!(later_head.revision(), 65);
+        assert!(Arc::ptr_eq(&later_delta, &farther_delta));
+        assert!(timeout(Duration::from_millis(20), mailbox.recv()).await.is_err(), "the SSE schedule remains armed for revision 68");
+
+        for id in 125..=127 {
+            publication.apply_block_committed(&block_update(id, 2, 1)).await.expect("Head advances to the armed boundary");
+        }
+        assert_eq!(
+            timeout(TEST_TIMEOUT, mailbox.recv()).await.expect("the armed SSE wakeup is delivered"),
+            Some(SseMessage::PublicationWakeup(PublicationWakeupDto::new(publication.publication_id(), 68)))
+        );
 
         service.shutdown().await.expect("service shuts down");
     }
 
     #[tokio::test]
-    async fn head_advancement_during_cache_join_rearms_one_current_wakeup() {
+    async fn head_advancement_during_cache_join_uses_delivery_head_and_immediate_continuation() {
         let (service, _events) = service();
         let entries = (1..=4).map(|revision| (revision, 1)).collect::<Vec<_>>();
         let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
@@ -2450,17 +2516,20 @@ mod tests {
         assert!(matches!(
             request.await.expect("request task completes").expect("logical outcome"),
             CanonicalDeltaResponse::Success {
-                outcome: CanonicalDeltaSuccess::Complete(_),
-                continuation: DeltaContinuation::ReachedHead,
+                head,
+                outcome: CanonicalDeltaSuccess::Prefix(_),
+                continuation: DeltaContinuation::ContinueImmediately,
+                wake_at_revision_id: None,
+                retry_after_ms: None,
                 ..
-            }
+            } if head.revision() == 8
         ));
-        assert_eq!(
-            mailbox.recv().await,
-            Some(SseMessage::PublicationWakeup(PublicationWakeupDto::new(publication.publication_id(), 8)))
+        assert!(
+            timeout(Duration::from_millis(20), mailbox.recv()).await.is_err(),
+            "immediate continuation replaces the queued Head wakeup"
         );
         mailbox.close();
-        assert_eq!(mailbox.recv().await, None, "completion replaces the queued old wakeup instead of duplicating it");
+        assert_eq!(mailbox.recv().await, None, "completion leaves no duplicate wakeup queued");
 
         service.shutdown().await.expect("service shuts down");
     }

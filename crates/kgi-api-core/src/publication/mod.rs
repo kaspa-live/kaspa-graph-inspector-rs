@@ -215,6 +215,24 @@ pub(crate) enum ReplayFloorAdmission<T> {
     },
 }
 
+/// Result of admitting one cached delta against a coherent delivery Head and
+/// its replay floor.
+pub(crate) enum DeltaReplayFloorAdmission {
+    /// The immutable response may proceed against this delivery Head even if
+    /// the publication advances later.
+    Admitted {
+        /// Exact cached body admitted for delivery.
+        candidate: Arc<CachedDelta>,
+        /// Coherent publication state and Head metadata captured at admission.
+        delivery_head: GraphDeltaTargetCapture,
+    },
+    /// The response source already precedes the inclusive replay floor.
+    Rejected {
+        /// Floor observed while holding the publication core read lock.
+        replay_floor_revision: u64,
+    },
+}
+
 /// Result of one publication-linearized canonical-delta selection.
 pub(crate) enum CanonicalDeltaSelection {
     /// The supplied source is later than the coherently captured Head.
@@ -288,6 +306,8 @@ pub(crate) struct GraphPublication {
     head_second_election_test_hook: Option<std::sync::Arc<HeadSecondElectionTestHook>>,
     #[cfg(test)]
     delta_initial_election_test_hook: Option<std::sync::Arc<DeltaInitialElectionTestHook>>,
+    #[cfg(test)]
+    delta_reentry_test_hook: Option<std::sync::Arc<DeltaReentryTestHook>>,
 }
 
 #[cfg(test)]
@@ -369,6 +389,43 @@ pub(crate) struct DeltaInitialElectionTestHook {
     armed: std::sync::atomic::AtomicBool,
     core_locked: std::sync::Barrier,
     continue_election: std::sync::Barrier,
+}
+
+#[cfg(test)]
+/// Deterministic pause after a delta waiter reacquires the publication core
+/// and before it reenters the source cache slot.
+pub(crate) struct DeltaReentryTestHook {
+    armed: std::sync::atomic::AtomicBool,
+    core_locked: std::sync::Barrier,
+    continue_reentry: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl DeltaReentryTestHook {
+    fn new() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(true),
+            core_locked: std::sync::Barrier::new(2),
+            continue_reentry: std::sync::Barrier::new(2),
+        }
+    }
+
+    fn pause_with_core_lock(&self) {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.core_locked.wait();
+            self.continue_reentry.wait();
+        }
+    }
+
+    /// Waits until the waiter retains the core guard before its cache lookup.
+    pub(crate) fn wait_for_core_lock(&self) {
+        self.core_locked.wait();
+    }
+
+    /// Allows the paused waiter to reenter its source cache slot.
+    pub(crate) fn resume_reentry(&self) {
+        self.continue_reentry.wait();
+    }
 }
 
 #[cfg(test)]
@@ -466,6 +523,8 @@ impl GraphPublication {
             head_second_election_test_hook: None,
             #[cfg(test)]
             delta_initial_election_test_hook: None,
+            #[cfg(test)]
+            delta_reentry_test_hook: None,
         })
     }
 
@@ -514,6 +573,15 @@ impl GraphPublication {
     pub(crate) fn pause_before_delta_initial_election(&mut self) -> std::sync::Arc<DeltaInitialElectionTestHook> {
         let hook = std::sync::Arc::new(DeltaInitialElectionTestHook::new());
         self.delta_initial_election_test_hook = Some(hook.clone());
+        hook
+    }
+
+    /// Installs a test-only pause before a joined delta waiter reenters its
+    /// source cache slot.
+    #[cfg(test)]
+    pub(crate) fn pause_before_delta_reentry(&mut self) -> std::sync::Arc<DeltaReentryTestHook> {
+        let hook = std::sync::Arc::new(DeltaReentryTestHook::new());
+        self.delta_reentry_test_hook = Some(hook.clone());
         hook
     }
 
@@ -667,6 +735,10 @@ impl GraphPublication {
             core.view.current_revision_id() >= head.revision,
             "a publication Head does not retreat behind a retained delta request"
         );
+        #[cfg(test)]
+        if let Some(hook) = &self.delta_reentry_test_hook {
+            hook.pause_with_core_lock();
+        }
         let current_target = match self.cache.lookup_delta(source_revision, selected.target_revision(), head.revision_timestamp_ms) {
             DeltaCacheLookup::Completed(completed) => {
                 return Ok(CanonicalDeltaReentry::Access(CacheAccess::Completed(completed)));
@@ -775,10 +847,22 @@ impl GraphPublication {
         ))
     }
 
-    /// Linearizes one completed cached delta against the current replay floor.
-    pub(crate) async fn admit_cached_delta_replay_floor(&self, candidate: Arc<CachedDelta>) -> ReplayFloorAdmission<CachedDelta> {
+    /// Linearizes one completed cached delta against a coherent delivery Head
+    /// and its current replay floor.
+    pub(crate) async fn admit_cached_delta_replay_floor(&self, candidate: Arc<CachedDelta>) -> DeltaReplayFloorAdmission {
         let source_revision = candidate.source_revision_id();
-        self.admit_replay_floor(source_revision, candidate).await
+        let core = self.core.read().await;
+        #[cfg(test)]
+        if let Some(hook) = &self.replay_floor_admission_test_hook {
+            hook.pause_with_core_lock();
+        }
+        let delivery_head = core.capture_delta_target(self.publication_id);
+        assert!(candidate.to_revision_id() <= delivery_head.revision(), "an admitted cached delta does not pass its delivery Head");
+        if source_revision < delivery_head.replay_floor_revision() {
+            DeltaReplayFloorAdmission::Rejected { replay_floor_revision: delivery_head.replay_floor_revision() }
+        } else {
+            DeltaReplayFloorAdmission::Admitted { candidate, delivery_head }
+        }
     }
 
     /// Linearizes one completed cached Head snapshot against the current replay floor.
@@ -1567,14 +1651,12 @@ mod tests {
 
         hook.resume_core_update();
         assert_eq!(update.await.expect("update task").expect("replay-barrier update"), Some(1));
-        assert!(matches!(admission.await.expect("admission task"), ReplayFloorAdmission::Rejected { replay_floor_revision: 1 }));
+        assert!(matches!(admission.await.expect("admission task"), DeltaReplayFloorAdmission::Rejected { replay_floor_revision: 1 }));
         assert!(matches!(
             publication.admit_cached_head_replay_floor(old_head).await,
             ReplayFloorAdmission::Rejected { replay_floor_revision: 1 }
         ));
 
-        let floor_delta = Arc::new(CachedDelta::new(1, 2, false, 4, Bytes::from_static(b"floor-delta")));
-        assert!(matches!(publication.admit_cached_delta_replay_floor(floor_delta).await, ReplayFloorAdmission::Admitted(_)));
         let floor_head = cached_head_candidate(publication.publication_id(), 1);
         assert!(matches!(publication.admit_cached_head_replay_floor(floor_head).await, ReplayFloorAdmission::Admitted(_)));
     }
@@ -1584,6 +1666,7 @@ mod tests {
         let mut publication =
             GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view_with_depth(2), GraphHistory::new())
                 .expect("matching candidate");
+        assert_eq!(publication.apply_block_committed(&committed_block(2)).await.expect("initial update"), Some(1));
         publication.delta_estimate_test_override = Some(estimate::SOFT_DELTA_ESTIMATED_BYTES);
         let delta = Arc::new(CachedDelta::new(0, 1, false, 4, Bytes::from_static(b"delta")));
         let admitted_delta = publication.admit_cached_delta_replay_floor(delta.clone()).await;
@@ -1591,25 +1674,28 @@ mod tests {
         let hook = Arc::new(ReplayFloorAdmissionTestHook::new());
         publication.replay_floor_admission_test_hook = Some(hook.clone());
         let publication = Arc::new(publication);
-        let head = cached_head_candidate(publication.publication_id(), 0);
+        let head = cached_head_candidate(publication.publication_id(), 1);
         let admission_publication = publication.clone();
         let admission_head = head.clone();
         let admission = tokio::spawn(async move { admission_publication.admit_cached_head_replay_floor(admission_head).await });
         hook.wait_for_core_lock();
 
         let update_publication = publication.clone();
-        let update = tokio::spawn(async move { update_publication.apply_block_committed(&committed_block(2)).await });
+        let update = tokio::spawn(async move { update_publication.apply_block_committed(&committed_block(3)).await });
         tokio::task::yield_now().await;
         assert!(!update.is_finished(), "floor advancement waits for final admission's core read lock");
 
         hook.resume_admission();
         let admitted_head = admission.await.expect("admission task");
-        assert_eq!(update.await.expect("update task").expect("replay-barrier update"), Some(1));
-        assert_eq!(publication.core.read().await.history.replay_floor_revision(), 1);
+        assert_eq!(update.await.expect("update task").expect("replay-barrier update"), Some(2));
+        assert_eq!(publication.core.read().await.history.replay_floor_revision(), 2);
 
         match admitted_delta {
-            ReplayFloorAdmission::Admitted(candidate) => assert!(Arc::ptr_eq(&candidate, &delta)),
-            ReplayFloorAdmission::Rejected { .. } => panic!("delta admission precedes the floor advance"),
+            DeltaReplayFloorAdmission::Admitted { candidate, delivery_head } => {
+                assert!(Arc::ptr_eq(&candidate, &delta));
+                assert_eq!(delivery_head.revision(), 1);
+            }
+            DeltaReplayFloorAdmission::Rejected { .. } => panic!("delta admission precedes the floor advance"),
         }
         match admitted_head {
             ReplayFloorAdmission::Admitted(candidate) => assert!(Arc::ptr_eq(&candidate, &head)),

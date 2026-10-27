@@ -466,10 +466,11 @@ Clippy with warnings denied, and `git diff --check`.
 Implementation increment 18 is implemented: `ApiService` now owns one mutable
 process-wide active delta interval and the complete logical canonical-delta
 operation. Requests validate publication, cursor, and optional registration in
-order; capture one coherent Head; prune and query the source-keyed cache;
-select dyadic targets; enforce the history replay floor and five-minute source
-horizon; size retained atomic history before the second election; serialize
-source construction and enlargement; and retain final replay-floor admission.
+order; capture one coherent selection Head; prune and query the source-keyed
+cache; select dyadic targets; enforce the history replay floor and five-minute
+source horizon; size retained atomic history before the second election;
+serialize source construction and enlargement; and refresh the delivery Head
+during final replay-floor admission without reselecting the fixed target.
 Successful results distinguish complete, prefix, up-to-date, and wakeup
 outcomes, derive request-specific continuation and HTTP-only retry metadata,
 and atomically validate or rearm SSE registrations. Size descent installs only
