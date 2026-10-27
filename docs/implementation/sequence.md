@@ -145,13 +145,14 @@ intermediate abstractions merely to make its commits artificially atomic.
    encoding scheduler, and SSE client registry. This includes request-order
    validation, age pruning, lookup and source-serialized construction or
    enlargement, pre-election target descent, final replay-floor admission,
-   typed results and continuation, and atomic registration completion and
-   rearming.
+   delivery-Head recapture, typed results and continuation, and atomic
+   registration completion and rearming.
 3. Add deterministic operation and race coverage for the dyadic boundaries and
    every active interval; cache hits, joins, enlargement, size limits, age and
    replay-floor changes; publication states and replacement; HTTP-only and SSE
-   completion; registration disappearance; and Head/rearm races. Update the
-   non-normative implementation records and run the full Rust validation suite.
+   completion; registration disappearance; farther-completion delivery; and
+   Head/rearm races. Update the non-normative implementation records and run
+   the full Rust validation suite.
 
 This increment adds no anchored-window or status operation, HTTP/SSE transport,
 public admission lane, database read, or adaptive controller. Controller design

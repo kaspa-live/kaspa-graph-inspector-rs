@@ -537,10 +537,12 @@ KGI-Delta-Continuation: head | continue | wakeup
 ```
 
 `H` and `HT` are one coherent capture of the selected publication's Head
-revision and its publication-local timestamp. They are request-specific and
-stay outside cached bytes, so they may be newer than the final cursor in a
-reused batch. Both use unsigned decimal `u64` text. A client adopts them only
-as a pair.
+revision and its publication-local timestamp. `UpToDate` and
+`WaitForWakeup` use the initial selection capture. A body-bearing response uses
+the delivery capture obtained during its final replay-floor admission. They are
+request-specific and stay outside cached bytes, so they may be newer than the
+final cursor in a reused batch but are never older than it. Both use unsigned
+decimal `u64` text. A client adopts them only as a pair.
 
 Every response whose continuation is `wakeup` additionally carries:
 
@@ -1211,6 +1213,13 @@ result.
 Only a response already committed to HTTP delivery cannot be retroactively
 replaced.
 
+The selected target and sampled active interval remain fixed while a request
+waits for and re-enters source jobs. Publication advancement can nevertheless
+let another request install a completion beyond that selection capture's Head.
+Such a farther value remains adequate. It does not change the waiting
+request's selected target or trigger another enlargement; final replay-floor
+admission supplies the newer delivery Head used by its response envelope.
+
 One source has at most one running construction. A request joins that job
 regardless of its current candidate target. After successful completion, a
 waiter for which
@@ -1342,18 +1351,20 @@ never composes selected entries. Gzip compression and cache insertion occur
 only after the complete batch has been measured and any estimator-invariant
 diagnostic has been emitted.
 
-For each delivery, return `Complete` when the actual returned right boundary
-reaches or extends through that request's coherently captured Head revision.
-Return `Prefix` when cache-destination selection or pre-election soft-estimate
-descent stops at an earlier complete boundary. These are request-specific
-envelope outcomes rather than fields of the encoded batch. A later request may
-therefore wrap the same cached body differently as Head advances.
+For each body-bearing delivery, final replay-floor admission captures one
+coherent delivery Head `(state, H, HT)` from the same publication. Publication
+revision never retreats and every cached target came from that publication, so
+the returned right boundary `T` must satisfy `T <= H`; observing `T > H` after
+this capture is an internal invariant failure. Return `Complete` when `T == H`
+and `Prefix` when `T < H`. These are request-specific envelope outcomes rather
+than fields of the encoded batch. A later request may therefore wrap the same
+cached body differently as Head advances.
 
 Every successful delta-to-current response uses the
 [canonical delta response headers](#canonical-delta-response-dtos--settled).
 The continuation is request-specific response metadata and is not part of the
 encoded delta-batch body. After a response ending at cursor `T` against the
-request's captured Head `H`, let `N(T, A)` be the nearest future revision
+delivery Head `H`, let `N(T, A)` be the nearest future revision
 eligible under the same advancing-publication target rule used for a request
 from `T`. This includes the ordinary-successor exception that permits
 fixed-base normalization or interval realignment below `A`. `Synchronizing`

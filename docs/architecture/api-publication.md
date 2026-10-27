@@ -307,12 +307,15 @@ before releasing the core lock. That election completely re-evaluates the
 source slot and applies the supplied sizing result under the
 [ApiService-owned cache contract](api-service.md#cache-and-encoding-jobs); the
 history capture is retained only when this caller becomes the builder.
-The revision and timestamp form the coherent Head pair carried in the
-protocol-owned response headers. At that capture instant, history has the same
-current revision. When needed, the immutable range capture remains bounded by
-that target and returns its ordinary retained-range outcome without waiting or
-recapturing the view. Ordinary history pruning therefore cannot make an
-otherwise valid completed cache hit unusable.
+The initial revision and timestamp form the coherent selection Head used for
+target selection, cache age, and an immediate empty outcome. At that capture
+instant, history has the same current revision. A body-bearing response later
+receives its protocol-owned header pair from final replay-floor admission; the
+selected target and sampled active interval remain fixed across that refresh.
+When needed, the immutable range capture remains bounded by the selected target
+and returns its ordinary retained-range outcome without waiting or recapturing
+the view. Ordinary history pruning therefore cannot make an otherwise valid
+completed cache hit unusable.
 
 Construction-side history range capture clones the selected immutable
 `Arc<GraphHistoryEntry>` values under the core read lock. The protocol-owned
@@ -327,7 +330,11 @@ admitted public cache result afterward.
 Immediately before replay-floor admission of a completed cached delta or Head
 snapshot, the request briefly reacquires the core read lock, applies the
 protocol-owned final comparison, records the immutable response as
-floor-admitted when eligible, and releases the lock. It holds no cache guard
+floor-admitted when eligible, and releases the lock. For a delta, that same
+critical section captures and returns the current publication state, view
+revision, revision timestamp, Head level, and replay floor as its coherent
+delivery Head. The delivery capture cannot change the request's selected
+target, sampled active interval, or encoded body. It holds no cache guard
 during this check and retains no publication lock for network delivery. The
 core write lock used by replay-floor advancement therefore supplies the exact
 before-or-after ordering required by the protocol; independent completion

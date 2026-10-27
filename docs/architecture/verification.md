@@ -1692,6 +1692,20 @@ farther enlargement without receiving the shorter body. Preserve the previous
 completed value throughout enlargement and replace it only after successful
 farther completion. A response already committed to delivery remains valid.
 
+Pause request A after it captures Head 40 and target 40 while it waits on a
+source-32 job targeting 36. Advance the publication to revision 64, let request
+B install the source-32 completion through revision 64, then resume A's source-
+slot reentry. While the publication remains Synchronizing or Live, require A
+to reuse that farther completion, retain its original selected target and
+active interval, and obtain delivery Head 64 during final replay-floor
+admission. It returns `Complete` with `ReachedHead`, carries Head revision 64
+and its coherent revision-64 timestamp, and never exposes `T > H`. For SSE
+coordination it arms `N(64, A)` without retry metadata; for HTTP-only delivery
+it emits the calculated retry metadata. Repeat with the advancing delivery
+Head beyond 64 and require the same body to become `Prefix` with continuation
+and scheduling derived from that newer Head. No path panics or starts another
+job for target 40.
+
 Make one request-selected target cross the soft estimate and, separately, the
 hard uncompressed limit. Before the second cache election, require estimate
 descent to determine the farthest fitting target and its `size_limited`

@@ -477,6 +477,14 @@ performs encoding outside the cache critical section. The builder spawns one
 tracked orchestration task with a child of
 `ApiCancellation::cache_jobs`.
 
+The request retains its selected target and sampled active interval across
+every join and source-slot reentry. Before wrapping an adequate completed value
+in its request-specific outcome, ApiService invokes the publication-owned final
+replay-floor admission and uses the returned delivery Head for the public Head
+pair, Complete/Prefix classification, continuation, polling metadata, and SSE
+schedule. It never compares a farther completion with the older selection Head
+or starts another enlargement merely to reproduce that older boundary.
+
 A source-keyed delta job captures its immutable atomic history-entry Arcs and
 its already proven fitting target. That target and its `size_limited`
 classification remain fixed for the job's lifetime; the job never performs
