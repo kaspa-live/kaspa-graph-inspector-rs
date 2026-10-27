@@ -452,11 +452,12 @@ Both operations retain the exact selected publication across later state
 change or replacement and preserve request-local cancellation and encoding
 failures. Focused tests cover every target-tier boundary, eligible reuse,
 construction-free exact and wildcard matches, both second-election races,
-first-tier completion-time recapture, replay-floor invalidation and re-entry,
-weak-validator identity, Stale serving, all-or-nothing levels, cache bypass,
-replacement after capture, cancellation, and encoding failure. Canonical
-delta selection and continuation remain in
+matching initial and second-election work, query-time obsolete removal, both
+prospective-admission/replay-floor lock orders, first-tier completion-time
+recapture, replay-floor invalidation and re-entry, weak-validator identity,
+Stale serving, all-or-nothing levels, cache bypass, replacement after capture,
+cancellation, and encoding failure. Canonical delta selection and continuation remain in
 increment 18; HTTP parsing, admission, headers, and delivery remain in later
 increments. Completion validation passed workspace formatting, Cargo check,
-577/577 Nextest tests including Docker PostgreSQL integration, Cargo doctests,
+582/582 Nextest tests including Docker PostgreSQL integration, Cargo doctests,
 Clippy with warnings denied, and `git diff --check`.

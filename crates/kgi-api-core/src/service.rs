@@ -569,7 +569,7 @@ mod tests {
         io::Read,
         sync::{
             Arc, Barrier as StdBarrier, Mutex,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -611,7 +611,7 @@ mod tests {
     };
     use crate::{
         api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
-        cache::{CacheBuildError, CacheWaitError, HeadCacheLookup, HeadEligibilityBoundary},
+        cache::{CacheAccess, CacheBuildError, CacheWaitError, CachedHeadSnapshot, HeadCacheLookup, HeadEligibilityBoundary},
         client::{SseMailbox, SseMessage},
         codec::{HeadEtagInput, sse::PublicationStateDto},
         encoding::scheduler::{EncodingSchedulerError, MAX_GRAPH_ENCODING_JOBS},
@@ -768,7 +768,7 @@ mod tests {
         )
     }
 
-    fn publication_with_levels(origin: Instant) -> Arc<GraphPublication> {
+    fn publication_value_with_levels(origin: Instant) -> GraphPublication {
         let view = GraphView::from_database_projection(
             2,
             LevelExtent::new(1, 2).expect("valid extent"),
@@ -777,16 +777,35 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
         );
-        Arc::new(
-            GraphPublication::new(GraphPublicationState::Synchronizing, origin, view, GraphHistory::new())
-                .expect("coherent publication"),
-        )
+        GraphPublication::new(GraphPublicationState::Synchronizing, origin, view, GraphHistory::new()).expect("coherent publication")
+    }
+
+    fn publication_with_levels(origin: Instant) -> Arc<GraphPublication> {
+        Arc::new(publication_value_with_levels(origin))
     }
 
     fn replay_barrier_publication(origin: Instant) -> Arc<GraphPublication> {
-        let mut publication = publication_with_levels(origin);
-        Arc::get_mut(&mut publication).expect("the fresh fixture has one owner").force_replay_barrier_estimate();
-        publication
+        let mut publication = publication_value_with_levels(origin);
+        publication.force_replay_barrier_estimate();
+        Arc::new(publication)
+    }
+
+    fn cached_head_snapshot(
+        publication_id: u64,
+        revision: u64,
+        revision_timestamp_ms: u64,
+        extent: LevelExtent,
+    ) -> Arc<CachedHeadSnapshot> {
+        Arc::new(CachedHeadSnapshot::new(
+            20,
+            revision,
+            revision_timestamp_ms,
+            extent.low_level(),
+            extent.high_level(),
+            1,
+            HeadEtagInput::new(publication_id, revision, extent).etag(),
+            bytes::Bytes::from_static(b"controlled-head"),
+        ))
     }
 
     fn decode_gzip(body: &bytes::Bytes) -> serde_json::Value {
@@ -1057,6 +1076,274 @@ mod tests {
             service.head_snapshot(1, &nonmatching, CancellationToken::new()).await.expect("a nonmatch is successful"),
             HeadSnapshotOutcome::Complete { .. }
         ));
+
+        service.shutdown().await.expect("service resources shut down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prospective_head_admission_and_replay_floor_advance_observe_both_lock_orders() {
+        {
+            let (service, _events) = service();
+            let mut publication = publication_value_with_levels(Instant::now());
+            publication.force_replay_barrier_estimate();
+            let admission_hook = publication.pause_replay_floor_admission();
+            let publication = Arc::new(publication);
+            service.current_publication.send_replace(Some(publication.clone()));
+            let admitted_etag =
+                HeadEtagInput::new(publication.publication_id(), 0, LevelExtent::new(1, 2).expect("valid initial extent")).etag();
+            let condition = HeadSnapshotCondition::Tags(Arc::from([admitted_etag.clone()]));
+
+            let request_service = service.clone();
+            let request = tokio::spawn(async move { request_service.head_snapshot(1, &condition, CancellationToken::new()).await });
+            admission_hook.wait_for_core_lock();
+
+            let update_publication = publication.clone();
+            let update = tokio::spawn(async move { update_publication.apply_block_committed(&block_update(3, 3, 2)).await });
+            tokio::task::yield_now().await;
+            assert!(!update.is_finished(), "the floor advance waits for prospective admission's core read lock");
+
+            admission_hook.resume_admission();
+            let HeadSnapshotOutcome::NotModified { publication: retained, etag } =
+                request.await.expect("snapshot task completes").expect("prospective admission succeeds")
+            else {
+                panic!("the prospectively admitted representation is not modified")
+            };
+            assert!(Arc::ptr_eq(&retained, &publication));
+            assert_eq!(etag, admitted_etag);
+            assert_eq!(update.await.expect("update task completes").expect("floor-advancing update succeeds"), Some(1));
+            assert_eq!(publication.capture_delta_target().await.replay_floor_revision(), 1);
+            assert!(matches!(
+                publication.cache().lookup_head(20, HeadEligibilityBoundary::new(1, 1, 1)),
+                HeadCacheLookup::ConstructionRequired
+            ));
+            service.shutdown().await.expect("service resources shut down");
+        }
+
+        let (service, _events) = service();
+        let mut publication = publication_value_with_levels(Instant::now());
+        publication.force_replay_barrier_estimate();
+        let mutation_hook = publication.pause_atomic_mutation_after_view_update();
+        let publication = Arc::new(publication);
+        service.current_publication.send_replace(Some(publication.clone()));
+        let current_etag =
+            HeadEtagInput::new(publication.publication_id(), 1, LevelExtent::new(2, 3).expect("valid advanced extent")).etag();
+        let condition = HeadSnapshotCondition::Tags(Arc::from([current_etag.clone()]));
+
+        let update_publication = publication.clone();
+        let update = tokio::spawn(async move { update_publication.apply_block_committed(&block_update(3, 3, 2)).await });
+        mutation_hook.wait_for_view_update();
+        let request_service = service.clone();
+        let request = tokio::spawn(async move { request_service.head_snapshot(1, &condition, CancellationToken::new()).await });
+        tokio::task::yield_now().await;
+        assert!(!request.is_finished(), "prospective capture waits for the floor-advancing core write lock");
+
+        mutation_hook.resume_core_update();
+        assert_eq!(update.await.expect("update task completes").expect("floor-advancing update succeeds"), Some(1));
+        let HeadSnapshotOutcome::NotModified { publication: retained, etag } =
+            request.await.expect("snapshot task completes").expect("post-floor prospective admission succeeds")
+        else {
+            panic!("the identity captured after the floor advance is not modified")
+        };
+        assert!(Arc::ptr_eq(&retained, &publication));
+        assert_eq!(etag, current_etag);
+        assert_eq!(publication.capture_delta_target().await.replay_floor_revision(), 1);
+        assert!(matches!(
+            publication.cache().lookup_head(20, HeadEligibilityBoundary::new(1, 1, 1)),
+            HeadCacheLookup::ConstructionRequired
+        ));
+        service.shutdown().await.expect("service resources shut down");
+    }
+
+    #[tokio::test]
+    async fn matching_prospective_identity_follows_query_time_obsolete_removal() {
+        let (service, _events) = service();
+        let origin = Instant::now().checked_sub(Duration::from_millis(90_000)).expect("valid old publication origin");
+        let publication = publication_with_levels(origin);
+        service.current_publication.send_replace(Some(publication.clone()));
+
+        let HeadSnapshotOutcome::Complete { snapshot: obsolete, .. } = service
+            .head_snapshot(1, &HeadSnapshotCondition::Unconditional, CancellationToken::new())
+            .await
+            .expect("the initial snapshot is constructed")
+        else {
+            panic!("the initial request returns its complete snapshot")
+        };
+        assert_eq!(obsolete.revision(), 0);
+        assert_eq!(publication.apply_block_committed(&block_update(3, 3, 2)).await.expect("Head advances"), Some(1));
+
+        let current_etag =
+            HeadEtagInput::new(publication.publication_id(), 1, LevelExtent::new(2, 3).expect("valid advanced extent")).etag();
+        assert_ne!(obsolete.etag(), &current_etag);
+        let condition = HeadSnapshotCondition::Tags(Arc::from([current_etag.clone()]));
+        let HeadSnapshotOutcome::NotModified { publication: retained, etag } = service
+            .head_snapshot(1, &condition, CancellationToken::new())
+            .await
+            .expect("the current identity is evaluated after obsolete removal")
+        else {
+            panic!("the current prospective identity is not modified")
+        };
+        assert!(Arc::ptr_eq(&retained, &publication));
+        assert_eq!(etag, current_etag);
+        assert!(matches!(
+            publication.cache().lookup_head(20, HeadEligibilityBoundary::new(90_000, 0, 0)),
+            HeadCacheLookup::ConstructionRequired
+        ));
+
+        service.shutdown().await.expect("service resources shut down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conditional_head_request_joins_a_job_present_at_first_lookup() {
+        let (service, _events) = service();
+        let publication = publication_with_levels(Instant::now());
+        service.current_publication.send_replace(Some(publication.clone()));
+        let candidate =
+            cached_head_snapshot(publication.publication_id(), 0, 0, LevelExtent::new(1, 2).expect("valid initial extent"));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let builder_builds = builds.clone();
+        let builder_started = started.clone();
+        let builder_release = release.clone();
+        let access = publication.cache().elect_head(
+            &service.cache_jobs,
+            20,
+            HeadEligibilityBoundary::new(0, 0, 0),
+            || candidate.clone(),
+            move |candidate, _| async move {
+                builder_builds.fetch_add(1, Ordering::SeqCst);
+                builder_started.add_permits(1);
+                builder_release.acquire().await.expect("controlled builder release remains open").forget();
+                Ok(candidate)
+            },
+        );
+        let CacheAccess::Job(installed_job) = access else { panic!("the first caller installs one running job") };
+        started.acquire().await.expect("the controlled builder starts").forget();
+
+        let condition = HeadSnapshotCondition::Tags(Arc::from([candidate.etag().clone()]));
+        let request_service = service.clone();
+        let request = tokio::spawn(async move { request_service.head_snapshot(1, &condition, CancellationToken::new()).await });
+        tokio::task::yield_now().await;
+        assert!(!request.is_finished(), "the conditional request joins the running job");
+        let HeadCacheLookup::Running(joined_job) = publication.cache().lookup_head(20, HeadEligibilityBoundary::new(0, 0, 0)) else {
+            panic!("the exact tier retains its running job")
+        };
+        assert!(Arc::ptr_eq(&joined_job, &installed_job));
+
+        release.add_permits(1);
+        let HeadSnapshotOutcome::NotModified { publication: retained, etag } =
+            request.await.expect("snapshot task completes").expect("the joined completion is admitted")
+        else {
+            panic!("the joined matching completion is not modified")
+        };
+        assert!(Arc::ptr_eq(&retained, &publication));
+        assert_eq!(etag, *candidate.etag());
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        let HeadCacheLookup::Completed(completed) = publication.cache().lookup_head(20, HeadEligibilityBoundary::new(0, 0, 0)) else {
+            panic!("the joined job installs its one completion")
+        };
+        assert!(Arc::ptr_eq(&completed, &candidate));
+
+        service.shutdown().await.expect("service resources shut down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conditional_head_request_uses_a_matching_job_installed_between_elections() {
+        let (service, _events) = service();
+        let mut publication = publication_value_with_levels(Instant::now());
+        let election_hook = publication.pause_before_head_second_election();
+        let publication = Arc::new(publication);
+        assert_eq!(publication.apply_block_committed(&block_update(3, 3, 2)).await.expect("Head advances"), Some(1));
+        service.current_publication.send_replace(Some(publication.clone()));
+        let candidate = cached_head_snapshot(publication.publication_id(), 0, 0, LevelExtent::new(1, 2).expect("valid prior extent"));
+        let condition = HeadSnapshotCondition::Tags(Arc::from([candidate.etag().clone()]));
+
+        let request_service = service.clone();
+        let request = tokio::spawn(async move { request_service.head_snapshot(1, &condition, CancellationToken::new()).await });
+        election_hook.wait_for_prospective_evaluation();
+
+        let builds = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let builder_builds = builds.clone();
+        let builder_started = started.clone();
+        let builder_release = release.clone();
+        let access = publication.cache().elect_head(
+            &service.cache_jobs,
+            20,
+            HeadEligibilityBoundary::new(1, 0, 0),
+            || candidate.clone(),
+            move |candidate, _| async move {
+                builder_builds.fetch_add(1, Ordering::SeqCst);
+                builder_started.add_permits(1);
+                builder_release.acquire().await.expect("controlled builder release remains open").forget();
+                Ok(candidate)
+            },
+        );
+        let CacheAccess::Job(installed_job) = access else { panic!("the competing caller installs one job") };
+        started.acquire().await.expect("the controlled builder starts").forget();
+        election_hook.resume_second_election();
+        tokio::task::yield_now().await;
+        assert!(!request.is_finished(), "the paused request joins the competing job");
+        let HeadCacheLookup::Running(joined_job) = publication.cache().lookup_head(20, HeadEligibilityBoundary::new(1, 0, 0)) else {
+            panic!("the exact tier retains the competing job")
+        };
+        assert!(Arc::ptr_eq(&joined_job, &installed_job));
+
+        release.add_permits(1);
+        let HeadSnapshotOutcome::NotModified { publication: retained, etag } =
+            request.await.expect("snapshot task completes").expect("the second-election job is admitted")
+        else {
+            panic!("the second-election matching job is not modified")
+        };
+        assert!(Arc::ptr_eq(&retained, &publication));
+        assert_eq!(etag, *candidate.etag());
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        let HeadCacheLookup::Completed(completed) = publication.cache().lookup_head(20, HeadEligibilityBoundary::new(1, 0, 0)) else {
+            panic!("the competing job installs its one completion")
+        };
+        assert!(Arc::ptr_eq(&completed, &candidate));
+
+        service.shutdown().await.expect("service resources shut down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conditional_head_request_uses_a_matching_completion_installed_between_elections() {
+        let (service, _events) = service();
+        let mut publication = publication_value_with_levels(Instant::now());
+        let election_hook = publication.pause_before_head_second_election();
+        let publication = Arc::new(publication);
+        assert_eq!(publication.apply_block_committed(&block_update(3, 3, 2)).await.expect("Head advances"), Some(1));
+        service.current_publication.send_replace(Some(publication.clone()));
+        let candidate = cached_head_snapshot(publication.publication_id(), 0, 0, LevelExtent::new(1, 2).expect("valid prior extent"));
+        let condition = HeadSnapshotCondition::Tags(Arc::from([candidate.etag().clone()]));
+
+        let request_service = service.clone();
+        let request = tokio::spawn(async move { request_service.head_snapshot(1, &condition, CancellationToken::new()).await });
+        election_hook.wait_for_prospective_evaluation();
+
+        let access = publication.cache().elect_head(
+            &service.cache_jobs,
+            20,
+            HeadEligibilityBoundary::new(1, 0, 0),
+            || candidate.clone(),
+            |candidate, _| async move { Ok(candidate) },
+        );
+        let completed = access.resolve(CancellationToken::new()).await.expect("the competing completion is installed");
+        assert!(Arc::ptr_eq(&completed, &candidate));
+        election_hook.resume_second_election();
+
+        let HeadSnapshotOutcome::NotModified { publication: retained, etag } =
+            request.await.expect("snapshot task completes").expect("the second-election completion is admitted")
+        else {
+            panic!("the second-election matching completion is not modified")
+        };
+        assert!(Arc::ptr_eq(&retained, &publication));
+        assert_eq!(etag, *candidate.etag());
+        let HeadCacheLookup::Completed(cached) = publication.cache().lookup_head(20, HeadEligibilityBoundary::new(1, 0, 0)) else {
+            panic!("the exact tier retains the competing completion")
+        };
+        assert!(Arc::ptr_eq(&cached, &candidate));
 
         service.shutdown().await.expect("service resources shut down");
     }

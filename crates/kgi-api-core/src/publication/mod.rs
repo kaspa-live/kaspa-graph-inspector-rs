@@ -213,10 +213,13 @@ pub(crate) struct GraphPublication {
     delta_estimate_test_override: Option<u64>,
     #[cfg(test)]
     replay_floor_admission_test_hook: Option<std::sync::Arc<ReplayFloorAdmissionTestHook>>,
+    #[cfg(test)]
+    head_second_election_test_hook: Option<std::sync::Arc<HeadSecondElectionTestHook>>,
 }
 
 #[cfg(test)]
-struct AtomicMutationTestHook {
+/// Deterministic pause inside one atomic publication mutation.
+pub(crate) struct AtomicMutationTestHook {
     armed: std::sync::atomic::AtomicBool,
     view_updated: std::sync::Barrier,
     finish_core_update: std::sync::Barrier,
@@ -239,17 +242,20 @@ impl AtomicMutationTestHook {
         }
     }
 
-    fn wait_for_view_update(&self) {
+    /// Waits until the graph view has changed while the core write lock remains held.
+    pub(crate) fn wait_for_view_update(&self) {
         self.view_updated.wait();
     }
 
-    fn resume_core_update(&self) {
+    /// Allows the paused mutation to finish its core update.
+    pub(crate) fn resume_core_update(&self) {
         self.finish_core_update.wait();
     }
 }
 
 #[cfg(test)]
-struct ReplayFloorAdmissionTestHook {
+/// Deterministic pause while one replay-floor admission holds the core read lock.
+pub(crate) struct ReplayFloorAdmissionTestHook {
     core_locked: std::sync::Barrier,
     finish_admission: std::sync::Barrier,
 }
@@ -265,12 +271,50 @@ impl ReplayFloorAdmissionTestHook {
         self.finish_admission.wait();
     }
 
-    fn wait_for_core_lock(&self) {
+    /// Waits until admission has acquired the publication-core read lock.
+    pub(crate) fn wait_for_core_lock(&self) {
         self.core_locked.wait();
     }
 
-    fn resume_admission(&self) {
+    /// Allows the paused admission to return its result.
+    pub(crate) fn resume_admission(&self) {
         self.finish_admission.wait();
+    }
+}
+
+#[cfg(test)]
+/// Deterministic pause between prospective evaluation and the second Head-cache election.
+pub(crate) struct HeadSecondElectionTestHook {
+    armed: std::sync::atomic::AtomicBool,
+    prospective_evaluated: std::sync::Barrier,
+    continue_election: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl HeadSecondElectionTestHook {
+    fn new() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(true),
+            prospective_evaluated: std::sync::Barrier::new(2),
+            continue_election: std::sync::Barrier::new(2),
+        }
+    }
+
+    fn pause_before_second_election(&self) {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.prospective_evaluated.wait();
+            self.continue_election.wait();
+        }
+    }
+
+    /// Waits until a nonmatching prospective identity has been evaluated.
+    pub(crate) fn wait_for_prospective_evaluation(&self) {
+        self.prospective_evaluated.wait();
+    }
+
+    /// Allows the paused request to perform its second cache election.
+    pub(crate) fn resume_second_election(&self) {
+        self.continue_election.wait();
     }
 }
 
@@ -309,6 +353,8 @@ impl GraphPublication {
             delta_estimate_test_override: None,
             #[cfg(test)]
             replay_floor_admission_test_hook: None,
+            #[cfg(test)]
+            head_second_election_test_hook: None,
         })
     }
 
@@ -326,6 +372,30 @@ impl GraphPublication {
     #[cfg(test)]
     pub(crate) fn force_replay_barrier_estimate(&mut self) {
         self.delta_estimate_test_override = Some(estimate::SOFT_DELTA_ESTIMATED_BYTES);
+    }
+
+    /// Installs a test-only pause after the graph view mutates under the core write lock.
+    #[cfg(test)]
+    pub(crate) fn pause_atomic_mutation_after_view_update(&mut self) -> std::sync::Arc<AtomicMutationTestHook> {
+        let hook = std::sync::Arc::new(AtomicMutationTestHook::new());
+        self.atomic_mutation_test_hook = Some(hook.clone());
+        hook
+    }
+
+    /// Installs a test-only pause while replay-floor admission holds the core read lock.
+    #[cfg(test)]
+    pub(crate) fn pause_replay_floor_admission(&mut self) -> std::sync::Arc<ReplayFloorAdmissionTestHook> {
+        let hook = std::sync::Arc::new(ReplayFloorAdmissionTestHook::new());
+        self.replay_floor_admission_test_hook = Some(hook.clone());
+        hook
+    }
+
+    /// Installs a test-only pause after prospective evaluation and before the second cache election.
+    #[cfg(test)]
+    pub(crate) fn pause_before_head_second_election(&mut self) -> std::sync::Arc<HeadSecondElectionTestHook> {
+        let hook = std::sync::Arc::new(HeadSecondElectionTestHook::new());
+        self.head_second_election_test_hook = Some(hook.clone());
+        hook
     }
 
     /// Returns this publication's client-registration and wake registry.
@@ -442,7 +512,16 @@ impl GraphPublication {
         let extent = core.head_tier_extent(depth);
         let etag = HeadEtagInput::new(self.publication_id, core.view.current_revision_id(), extent).etag();
         if condition_matches(&etag) {
+            #[cfg(test)]
+            if let Some(hook) = &self.replay_floor_admission_test_hook {
+                hook.pause_with_core_lock();
+            }
             return HeadTierSelection::ConditionMatched(etag);
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = &self.head_second_election_test_hook {
+            hook.pause_before_second_election();
         }
 
         let publication = self.clone();
