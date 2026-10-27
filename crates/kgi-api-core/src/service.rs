@@ -4,7 +4,10 @@ use std::{
 };
 
 use kgi_api_ingress::channel::GraphUpdateReceiver;
-use kgi_api_model::protocol::SystemStatus;
+use kgi_api_model::{
+    projection::MAX_WINDOW_DEPTH,
+    protocol::{CACHED_HEAD_WINDOW_DEPTHS, SystemStatus},
+};
 use kgi_model::lifecycle::{NodeServiceStatus, ProcessingStatus, RecoveryMode, StorageServiceStatus, SupervisorStatus};
 use kgi_storage::generation::ValidatedApiDbClient;
 use tokio::{
@@ -15,14 +18,59 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
-    cache::CacheJobTracker,
+    cache::{CacheJobTracker, CacheWaitError, CachedHeadSnapshot},
+    codec::HeadEtag,
     encoding::scheduler::EncodingScheduler,
     error::ApiServiceError,
     publication::{
-        GraphPublication,
+        GraphPublication, HeadTierSelection, ReplayFloorAdmission,
         runtime::{PublicationInstallOutcome, PublicationInstaller, PublicationRuntime},
     },
 };
+
+/// Parsed conditional state for one logical Head snapshot operation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code, reason = "HTTP conditional parsing is introduced by the transport increment")]
+pub(crate) enum HeadSnapshotCondition {
+    /// The caller supplied no current validator.
+    #[default]
+    Unconditional,
+    /// Any current representation satisfies the caller's condition.
+    Any,
+    /// One of these opaque validators must match the current representation.
+    Tags(Arc<[HeadEtag]>),
+}
+
+impl HeadSnapshotCondition {
+    fn matches(&self, etag: &HeadEtag) -> bool {
+        match self {
+            Self::Unconditional => false,
+            Self::Any => true,
+            Self::Tags(tags) => tags.iter().any(|candidate| candidate == etag),
+        }
+    }
+}
+
+/// Logical result of one in-memory Head snapshot operation.
+#[allow(dead_code, reason = "HTTP response delivery is introduced by the transport increment")]
+pub(crate) enum HeadSnapshotOutcome {
+    /// No coherent publication is currently addressable.
+    Unavailable,
+    /// The selected immutable gzip response must be delivered.
+    Complete {
+        /// Exact publication retained for response finalization and delivery.
+        publication: Arc<GraphPublication>,
+        /// Exact eligible cached representation selected by the operation.
+        snapshot: Arc<CachedHeadSnapshot>,
+    },
+    /// The selected representation matches the caller's conditional state.
+    NotModified {
+        /// Exact publication retained for response finalization.
+        publication: Arc<GraphPublication>,
+        /// Exact admitted weak validator matched by the caller's condition.
+        etag: HeadEtag,
+    },
+}
 
 /// Reliable lifecycle event produced by ApiService.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -393,11 +441,60 @@ impl ApiService {
         self.status.current()
     }
 
+    /// Selects one coherent in-memory Head snapshot or its conditional result.
+    #[allow(dead_code, reason = "the logical operation is consumed by the later HTTP transport increment")]
+    pub(crate) async fn head_snapshot(
+        &self,
+        target_depth: u32,
+        condition: &HeadSnapshotCondition,
+        cancellation: CancellationToken,
+    ) -> Result<HeadSnapshotOutcome, CacheWaitError> {
+        let depth = selected_head_depth(target_depth);
+        let Some(publication) = self.current_publication() else {
+            return Ok(HeadSnapshotOutcome::Unavailable);
+        };
+
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(CacheWaitError::Cancelled);
+            }
+            let access =
+                match publication.head_tier(&self.cache_jobs, &self.encoding.scheduler, depth, |etag| condition.matches(etag)).await {
+                    HeadTierSelection::Access(access) => access,
+                    HeadTierSelection::ConditionMatched(etag) => {
+                        return Ok(HeadSnapshotOutcome::NotModified { publication, etag });
+                    }
+                };
+            let candidate = match access.resolve(cancellation.clone()).await {
+                Ok(candidate) => candidate,
+                Err(CacheWaitError::InvalidatedByReplayFloor { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            let candidate = match publication.admit_cached_head_replay_floor(candidate).await {
+                ReplayFloorAdmission::Admitted(candidate) => candidate,
+                ReplayFloorAdmission::Rejected { .. } => continue,
+            };
+            if condition.matches(candidate.etag()) {
+                return Ok(HeadSnapshotOutcome::NotModified { publication, etag: candidate.etag().clone() });
+            }
+            return Ok(HeadSnapshotOutcome::Complete { publication, snapshot: candidate });
+        }
+    }
+
     /// Returns the complete publication current at this instant, when present.
     #[allow(dead_code, reason = "public graph operations are implemented in later API increments")]
     pub(crate) fn current_publication(&self) -> Option<Arc<GraphPublication>> {
         self.current_publication.borrow().clone()
     }
+}
+
+#[allow(dead_code, reason = "called by the logical Head operation before its HTTP consumer exists")]
+fn selected_head_depth(target_depth: u32) -> u32 {
+    assert!((1..=MAX_WINDOW_DEPTH).contains(&target_depth), "Head target depth is validated before logical selection");
+    CACHED_HEAD_WINDOW_DEPTHS
+        .into_iter()
+        .find(|&depth| depth >= target_depth)
+        .expect("the configured Head tiers cover every valid target depth")
 }
 
 #[cfg(test)]
@@ -440,13 +537,13 @@ mod tests {
     use url::Url;
 
     use super::{
-        ApiDbGenerationMessage, ApiRuntimeSlot, ApiService, ApiServiceEvent, ApiStatusInputs, OwnedPublicationRuntime,
-        PublicationInstallState, RuntimePublicationInstaller,
+        ApiDbGenerationMessage, ApiRuntimeSlot, ApiService, ApiServiceEvent, ApiStatusInputs, HeadSnapshotCondition,
+        HeadSnapshotOutcome, OwnedPublicationRuntime, PublicationInstallState, RuntimePublicationInstaller, selected_head_depth,
     };
     use crate::{
         api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
         client::{SseMailbox, SseMessage},
-        codec::sse::PublicationStateDto,
+        codec::{HeadEtagInput, sse::PublicationStateDto},
         error::ApiServiceError,
         publication::{
             GraphPublication, GraphPublicationState,
@@ -700,6 +797,104 @@ mod tests {
         let (_, storage) = watch::channel(StorageServiceStatus { state: StorageServiceStatusState::Connecting });
         let (_, processing) = watch::channel(ProcessingStatus { state: ProcessingState::Idle });
         ApiService::new(supervisor, node, storage, processing)
+    }
+
+    #[test]
+    fn head_target_depth_selects_the_smallest_covering_tier() {
+        for (target_depth, expected_tier) in [
+            (1, 20),
+            (19, 20),
+            (20, 20),
+            (21, 50),
+            (49, 50),
+            (50, 50),
+            (51, 100),
+            (99, 100),
+            (100, 100),
+            (101, 150),
+            (149, 150),
+            (150, 150),
+            (151, 200),
+            (199, 200),
+            (200, 200),
+            (201, 250),
+            (249, 250),
+            (250, 250),
+        ] {
+            assert_eq!(selected_head_depth(target_depth), expected_tier);
+        }
+    }
+
+    #[tokio::test]
+    async fn head_snapshot_reuses_one_exact_tier_and_ignores_state_for_validation() {
+        let (service, _events) = service();
+        assert!(matches!(
+            service
+                .head_snapshot(1, &HeadSnapshotCondition::Unconditional, CancellationToken::new())
+                .await
+                .expect("an absent publication is an ordinary logical outcome"),
+            HeadSnapshotOutcome::Unavailable
+        ));
+
+        let publication = publication();
+        service.current_publication.send_replace(Some(publication.clone()));
+        let prospective_etag =
+            HeadEtagInput::new(publication.publication_id(), 0, LevelExtent::new(1, 1).expect("valid current-tier extent")).etag();
+        let prospective_condition = HeadSnapshotCondition::Tags(Arc::from([prospective_etag.clone()]));
+        let prospective_match = service
+            .head_snapshot(1, &prospective_condition, CancellationToken::new())
+            .await
+            .expect("a prospective current-tier identity is admitted");
+        let HeadSnapshotOutcome::NotModified { publication: retained, etag } = prospective_match else {
+            panic!("a matching prospective identity avoids construction")
+        };
+        assert!(Arc::ptr_eq(&retained, &publication));
+        assert_eq!(etag, prospective_etag);
+
+        let first = service
+            .head_snapshot(1, &HeadSnapshotCondition::Unconditional, CancellationToken::new())
+            .await
+            .expect("the first tier is constructed");
+        let HeadSnapshotOutcome::Complete { publication: retained, snapshot: first } = first else {
+            panic!("an unconditional request receives the complete snapshot")
+        };
+        assert!(Arc::ptr_eq(&retained, &publication));
+        assert_eq!(first.depth(), 20);
+        assert_eq!((first.low_level(), first.high_level()), (1, 1));
+
+        let repeated = service
+            .head_snapshot(20, &HeadSnapshotCondition::Unconditional, CancellationToken::new())
+            .await
+            .expect("the exact completed tier is reusable");
+        let HeadSnapshotOutcome::Complete { snapshot: repeated, .. } = repeated else {
+            panic!("an unconditional request receives the complete snapshot")
+        };
+        assert!(Arc::ptr_eq(&repeated, &first));
+
+        publication.transition_live().await;
+        let condition = HeadSnapshotCondition::Tags(Arc::from([first.etag().clone()]));
+        let matched = service
+            .head_snapshot(1, &condition, CancellationToken::new())
+            .await
+            .expect("a state-only transition preserves snapshot identity");
+        let HeadSnapshotOutcome::NotModified { publication: retained, etag: matched } = matched else {
+            panic!("the unchanged semantic validator matches")
+        };
+        assert!(Arc::ptr_eq(&retained, &publication));
+        assert_eq!(matched, *first.etag());
+
+        let nonmatching = HeadSnapshotCondition::Tags(Arc::from([HeadEtagInput::new(
+            publication.publication_id(),
+            first.revision(),
+            LevelExtent::new(1, 2).expect("valid extent"),
+        )
+        .etag()]));
+        assert!(matches!(
+            service.head_snapshot(1, &nonmatching, CancellationToken::new()).await.expect("a nonmatch is successful"),
+            HeadSnapshotOutcome::Complete { .. }
+        ));
+
+        service.shutdown().await.expect("service resources shut down");
     }
 
     #[tokio::test]

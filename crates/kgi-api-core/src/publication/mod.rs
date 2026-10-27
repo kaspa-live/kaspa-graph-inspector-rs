@@ -16,8 +16,13 @@ use rand::{RngCore, rngs::OsRng};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    cache::{CachedDelta, CachedHeadSnapshot, GraphCache},
+    cache::{
+        CacheAccess, CacheBuildError, CacheJobTracker, CachedDelta, CachedHeadSnapshot, GraphCache, HeadCacheLookup,
+        HeadEligibilityBoundary,
+    },
     client::SseClientRegistry,
+    codec::{HeadEtag, HeadEtagInput, graph::HeadSnapshotResponseDto},
+    encoding::scheduler::EncodingScheduler,
 };
 
 pub(crate) use self::error::PublicationProjectionError;
@@ -34,12 +39,47 @@ pub(crate) enum GraphPublicationState {
     Stale,
 }
 
+/// Exact-tier result selected while one publication-core capture is retained.
+pub(crate) enum HeadTierSelection {
+    /// A completed value or shared construction job must supply the response.
+    Access(CacheAccess<CachedHeadSnapshot>),
+    /// The prospective current-tier identity matched before construction.
+    ConditionMatched(HeadEtag),
+}
+
 /// Atomically observed lifecycle state, canonical Head view, and history.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GraphPublicationCore {
     state: GraphPublicationState,
     view: GraphView,
     history: GraphHistory,
+}
+
+impl GraphPublicationCore {
+    fn head_eligibility_boundary(&self) -> HeadEligibilityBoundary {
+        HeadEligibilityBoundary::new(
+            self.view.current_revision_timestamp_ms(),
+            self.history.replay_floor_revision(),
+            self.history.oldest_available_revision(),
+        )
+    }
+
+    fn head_tier_extent(&self, depth: u32) -> LevelExtent {
+        let high_level = self.view.high_level();
+        let low_level = high_level.saturating_sub(depth - 1).max(self.view.low_level());
+        LevelExtent::new(low_level, high_level).expect("a positive Head tier produces a valid contained extent")
+    }
+
+    fn capture_head_tier(&self, publication_id: u64, depth: u32) -> GraphViewCapture {
+        let extent = self.head_tier_extent(depth);
+        let view = self.view.extract_subview(extent).expect("a selected Head tier is contained in the complete Head");
+        GraphViewCapture {
+            publication_id,
+            replay_floor_revision: self.history.replay_floor_revision(),
+            oldest_available_revision: self.history.oldest_available_revision(),
+            view,
+        }
+    }
 }
 
 /// One detached immutable graph view from a specific publication.
@@ -341,6 +381,41 @@ impl GraphPublication {
         self.core.read().await.history.range(from_revision_id, target.revision)
     }
 
+    /// Selects one exact configured Head tier, admitting a matching identity before construction.
+    pub(crate) async fn head_tier(
+        self: &Arc<Self>,
+        jobs: &CacheJobTracker,
+        scheduler: &EncodingScheduler,
+        depth: u32,
+        condition_matches: impl FnOnce(&HeadEtag) -> bool,
+    ) -> HeadTierSelection {
+        let core = self.core.read().await;
+        let boundary = core.head_eligibility_boundary();
+        match self.cache.lookup_head(depth, boundary) {
+            HeadCacheLookup::Completed(completed) => {
+                return HeadTierSelection::Access(CacheAccess::Completed(completed));
+            }
+            HeadCacheLookup::Running(running) => return HeadTierSelection::Access(CacheAccess::Job(running)),
+            HeadCacheLookup::ConstructionRequired => {}
+        }
+
+        let extent = core.head_tier_extent(depth);
+        let etag = HeadEtagInput::new(self.publication_id, core.view.current_revision_id(), extent).etag();
+        if condition_matches(&etag) {
+            return HeadTierSelection::ConditionMatched(etag);
+        }
+
+        let publication = self.clone();
+        let scheduler = scheduler.clone();
+        HeadTierSelection::Access(self.cache.elect_head(
+            jobs,
+            depth,
+            boundary,
+            || core.capture_head_tier(self.publication_id, depth),
+            move |capture, cancellation| async move { publication.build_head_tier(depth, capture, scheduler, cancellation).await },
+        ))
+    }
+
     /// Linearizes one completed cached delta against the current replay floor.
     pub(crate) async fn admit_cached_delta_replay_floor(&self, candidate: Arc<CachedDelta>) -> ReplayFloorAdmission<CachedDelta> {
         let source_revision = candidate.source_revision_id();
@@ -422,6 +497,50 @@ impl GraphPublication {
         } else {
             ReplayFloorAdmission::Admitted(candidate)
         }
+    }
+
+    async fn build_head_tier(
+        self: Arc<Self>,
+        depth: u32,
+        mut capture: GraphViewCapture,
+        scheduler: EncodingScheduler,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<Arc<CachedHeadSnapshot>, CacheBuildError> {
+        loop {
+            let view = capture.view();
+            let revision = view.current_revision_id();
+            let revision_timestamp_ms = view.current_revision_timestamp_ms();
+            let low_level = view.low_level();
+            let high_level = view.high_level();
+            let response = HeadSnapshotResponseDto::from_capture(&capture);
+            let etag = response.etag_input().etag();
+            let encoded = scheduler.encode_priority(response, cancellation.clone()).await?;
+            let candidate = Arc::new(CachedHeadSnapshot::new(
+                depth,
+                revision,
+                revision_timestamp_ms,
+                low_level,
+                high_level,
+                encoded.uncompressed_json_bytes(),
+                etag,
+                encoded.into_gzip_body(),
+            ));
+
+            if self.head_candidate_is_eligible(&candidate).await {
+                return Ok(candidate);
+            }
+            capture = self.capture_head_tier(depth).await;
+        }
+    }
+
+    async fn capture_head_tier(&self, depth: u32) -> GraphViewCapture {
+        let core = self.core.read().await;
+        core.capture_head_tier(self.publication_id, depth)
+    }
+
+    async fn head_candidate_is_eligible(&self, candidate: &CachedHeadSnapshot) -> bool {
+        let core = self.core.read().await;
+        core.head_eligibility_boundary().admits(candidate)
     }
 
     fn revision_timestamp_ms_at(&self, now: Instant) -> u64 {
@@ -520,7 +639,7 @@ mod tests {
     use crate::{
         cache::{
             CacheAccess, CacheBuildError, CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot, DeltaBuildContext,
-            DeltaCacheLookup, GraphCache, HeadEligibilityBoundary,
+            DeltaCacheLookup, GraphCache, HeadCacheLookup, HeadEligibilityBoundary,
         },
         client::{DeltaCompletionResult, DeltaScheduleAction, SseMailbox, SseMessage},
         codec::{
@@ -597,7 +716,7 @@ mod tests {
             1,
             1,
             4,
-            HeadEtagInput::new(publication_id, revision, extent),
+            HeadEtagInput::new(publication_id, revision, extent).etag(),
             Bytes::from_static(b"head"),
         ))
     }
@@ -663,6 +782,26 @@ mod tests {
                 Some(SseMessage::PublicationWakeup(PublicationWakeupDto::new(publication.publication_id(), 0)))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn matching_prospective_head_identity_leaves_the_exact_tier_vacant() {
+        let publication = Arc::new(
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view(), GraphHistory::new())
+                .expect("coherent publication"),
+        );
+        let cache = publication.cache();
+        let jobs = CacheJobTracker::new();
+        let scheduler = EncodingScheduler::production();
+        let expected =
+            HeadEtagInput::new(publication.publication_id(), 0, LevelExtent::new(1, 1).expect("valid prospective extent")).etag();
+
+        let selection = publication.head_tier(&jobs, &scheduler, 20, |etag| etag == &expected).await;
+        assert!(matches!(selection, HeadTierSelection::ConditionMatched(etag) if etag == expected));
+        assert!(matches!(cache.lookup_head(20, HeadEligibilityBoundary::new(0, 0, 0)), HeadCacheLookup::ConstructionRequired));
+
+        jobs.shutdown().await;
+        scheduler.shutdown().await.expect("scheduler shuts down");
     }
 
     #[tokio::test]
@@ -818,9 +957,13 @@ mod tests {
         };
         initial_delta.wait(tokio_util::sync::CancellationToken::new()).await.expect("fixture delta completes");
 
-        let head_access = cache.head_tier(&jobs, 50, HeadEligibilityBoundary::new(0, 0, 0), |_| async {
-            std::future::pending::<Result<Arc<CachedHeadSnapshot>, CacheBuildError>>().await
-        });
+        let head_access = cache.elect_head(
+            &jobs,
+            50,
+            HeadEligibilityBoundary::new(0, 0, 0),
+            || (),
+            |(), _| async { std::future::pending::<Result<Arc<CachedHeadSnapshot>, CacheBuildError>>().await },
+        );
 
         let mailbox = Arc::new(SseMailbox::new());
         let identifier = publication
