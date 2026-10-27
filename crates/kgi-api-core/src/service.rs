@@ -1156,40 +1156,43 @@ mod tests {
 
     #[tokio::test]
     async fn matching_prospective_identity_follows_query_time_obsolete_removal() {
-        let (service, _events) = service();
-        let origin = Instant::now().checked_sub(Duration::from_millis(90_000)).expect("valid old publication origin");
-        let publication = publication_with_levels(origin);
-        service.current_publication.send_replace(Some(publication.clone()));
+        for wildcard in [false, true] {
+            let (service, _events) = service();
+            let origin = Instant::now().checked_sub(Duration::from_millis(90_000)).expect("valid old publication origin");
+            let publication = publication_with_levels(origin);
+            service.current_publication.send_replace(Some(publication.clone()));
 
-        let HeadSnapshotOutcome::Complete { snapshot: obsolete, .. } = service
-            .head_snapshot(1, &HeadSnapshotCondition::Unconditional, CancellationToken::new())
-            .await
-            .expect("the initial snapshot is constructed")
-        else {
-            panic!("the initial request returns its complete snapshot")
-        };
-        assert_eq!(obsolete.revision(), 0);
-        assert_eq!(publication.apply_block_committed(&block_update(3, 3, 2)).await.expect("Head advances"), Some(1));
+            let HeadSnapshotOutcome::Complete { snapshot: obsolete, .. } = service
+                .head_snapshot(1, &HeadSnapshotCondition::Unconditional, CancellationToken::new())
+                .await
+                .expect("the initial snapshot is constructed")
+            else {
+                panic!("the initial request returns its complete snapshot")
+            };
+            assert_eq!(obsolete.revision(), 0);
+            assert_eq!(publication.apply_block_committed(&block_update(3, 3, 2)).await.expect("Head advances"), Some(1));
 
-        let current_etag =
-            HeadEtagInput::new(publication.publication_id(), 1, LevelExtent::new(2, 3).expect("valid advanced extent")).etag();
-        assert_ne!(obsolete.etag(), &current_etag);
-        let condition = HeadSnapshotCondition::Tags(Arc::from([current_etag.clone()]));
-        let HeadSnapshotOutcome::NotModified { publication: retained, etag } = service
-            .head_snapshot(1, &condition, CancellationToken::new())
-            .await
-            .expect("the current identity is evaluated after obsolete removal")
-        else {
-            panic!("the current prospective identity is not modified")
-        };
-        assert!(Arc::ptr_eq(&retained, &publication));
-        assert_eq!(etag, current_etag);
-        assert!(matches!(
-            publication.cache().lookup_head(20, HeadEligibilityBoundary::new(90_000, 0, 0)),
-            HeadCacheLookup::ConstructionRequired
-        ));
+            let current_etag =
+                HeadEtagInput::new(publication.publication_id(), 1, LevelExtent::new(2, 3).expect("valid advanced extent")).etag();
+            assert_ne!(obsolete.etag(), &current_etag);
+            let condition =
+                if wildcard { HeadSnapshotCondition::Any } else { HeadSnapshotCondition::Tags(Arc::from([current_etag.clone()])) };
+            let HeadSnapshotOutcome::NotModified { publication: retained, etag } = service
+                .head_snapshot(1, &condition, CancellationToken::new())
+                .await
+                .expect("the current identity is evaluated after obsolete removal")
+            else {
+                panic!("the current prospective identity is not modified")
+            };
+            assert!(Arc::ptr_eq(&retained, &publication));
+            assert_eq!(etag, current_etag);
+            assert!(matches!(
+                publication.cache().lookup_head(20, HeadEligibilityBoundary::new(90_000, 0, 0)),
+                HeadCacheLookup::ConstructionRequired
+            ));
 
-        service.shutdown().await.expect("service resources shut down");
+            service.shutdown().await.expect("service resources shut down");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

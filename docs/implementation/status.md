@@ -452,7 +452,8 @@ Both operations retain the exact selected publication across later state
 change or replacement and preserve request-local cancellation and encoding
 failures. Focused tests cover every target-tier boundary, eligible reuse,
 construction-free exact and wildcard matches, both second-election races,
-matching initial and second-election work, query-time obsolete removal, both
+matching initial and second-election work, exact and wildcard query-time
+obsolete removal, both
 prospective-admission/replay-floor lock orders, first-tier completion-time
 recapture, replay-floor invalidation and re-entry, weak-validator identity,
 Stale serving, all-or-nothing levels, cache bypass, replacement after capture,
