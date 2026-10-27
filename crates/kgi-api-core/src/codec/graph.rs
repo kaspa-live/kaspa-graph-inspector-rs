@@ -72,6 +72,22 @@ impl GraphBlockDto {
             is_in_vspc: block.is_in_vspc,
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn maximum_width_for_estimator(reference: HashRef) -> Self {
+        Self {
+            hash: reference,
+            coordinate: BlockCoordinateDto { level: u32::MAX, slot: kgi_model::block::MAX_LEVEL_SLOT },
+            timestamp: u64::MAX.into(),
+            daa_score: kgi_model::block::MAX_DAA_SCORE.into(),
+            selected_parent_index: Some(reference),
+            direct_parents: Vec::new(),
+            blue_merge_set: Vec::new(),
+            red_merge_set: Vec::new(),
+            color: kgi_model::block::BlockColor::Red.into(),
+            is_in_vspc: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -95,6 +111,12 @@ impl GraphEdgeDto {
             parent_coordinate: edge.parent_coordinate.into(),
             child_coordinate: edge.child_coordinate.into(),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn maximum_width_for_estimator(reference: HashRef) -> Self {
+        let coordinate = BlockCoordinateDto { level: u32::MAX, slot: kgi_model::block::MAX_LEVEL_SLOT };
+        Self { id: EdgeIdDto { parent: reference, child: reference }, parent_coordinate: coordinate, child_coordinate: coordinate }
     }
 }
 

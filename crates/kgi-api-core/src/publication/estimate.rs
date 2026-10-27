@@ -76,7 +76,7 @@ fn add_weighted(estimate: &mut u64, count: usize, weight: u64) {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use crate::codec::delta::GraphDeltaBatchDto;
+    use crate::codec::delta::{GraphDeltaBatchDto, maximum_estimator_wire_contribution_bytes};
     use kgi_api_model::{
         delta::{FieldChange, GraphDelta, LevelChange},
         graph::{EdgeId, GraphBlock, GraphEdge, Level},
@@ -152,6 +152,27 @@ mod tests {
             maximum_distinct_hashes_below_soft_limit <= 99_999,
             "every admitted dense HashRef fits the representative five-digit width"
         );
+
+        let wire = maximum_estimator_wire_contribution_bytes();
+        let assert_contribution = |name: &str, actual: usize, estimated: u64| {
+            let bound = usize::try_from(estimated.checked_mul(4).expect("estimator proof bound fits u64"))
+                .expect("estimator proof bound fits usize");
+            assert!(actual <= bound, "{name} needs {actual} bytes but its factor-four estimator bound is {bound}");
+        };
+        // The first framing value includes the outer batch. The incremental
+        // value proves every later entry, so the same bound composes for any
+        // batch length. Global dictionary reuse only reduces bytes relative to
+        // the estimator's per-entry distinct-hash charges.
+        assert_contribution("first entry and batch framing", wire.entry_and_batch_framing, ENTRY_AND_BATCH_FRAMING_BYTES);
+        assert_contribution("additional entry framing", wire.additional_entry_framing, ENTRY_AND_BATCH_FRAMING_BYTES);
+        assert_contribution("distinct hash", wire.distinct_hash, DISTINCT_HASH_BYTES);
+        assert_contribution("block upsert", wire.block_upsert, BLOCK_UPSERT_BYTES);
+        assert_contribution("block relationship", wire.block_relationship, BLOCK_RELATIONSHIP_BYTES);
+        assert_contribution("edge upsert", wire.edge_upsert, EDGE_UPSERT_BYTES);
+        assert_contribution("level installation", wire.level_installation, LEVEL_INSTALLATION_BYTES);
+        assert_contribution("level removal", wire.level_removal, LEVEL_REMOVAL_BYTES);
+        assert_contribution("membership mutation", wire.membership_mutation, MEMBERSHIP_MUTATION_BYTES);
+        assert_contribution("color mutation", wire.color_mutation, COLOR_MUTATION_BYTES);
 
         let child = hash(1);
         let parent = hash(2);
