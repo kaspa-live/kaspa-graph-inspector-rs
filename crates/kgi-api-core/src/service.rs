@@ -875,6 +875,7 @@ mod tests {
             HeadEtagInput,
             sse::{PublicationStateDto, PublicationWakeupDto},
         },
+        delta::DeltaTargetLadder,
         encoding::scheduler::{EncodingSchedulerError, MAX_GRAPH_ENCODING_JOBS},
         error::ApiServiceError,
         publication::{
@@ -2325,15 +2326,39 @@ mod tests {
         hook.resume_election();
 
         let earlier = earlier.await.expect("earlier request task completes").expect("earlier logical operation succeeds");
-        let CanonicalDeltaResponse::Success { head: earlier_head, outcome: earlier_outcome, continuation, .. } = earlier else {
+        let CanonicalDeltaResponse::Success {
+            head: earlier_head,
+            outcome: earlier_outcome,
+            continuation,
+            wake_at_revision_id,
+            retry_after_ms,
+            ..
+        } = earlier
+        else {
             panic!("the earlier request returns its initially selected body")
         };
-        let earlier_delta = match (earlier_head.revision(), earlier_outcome, continuation) {
-            (40, CanonicalDeltaSuccess::Complete(delta), DeltaContinuation::ReachedHead)
-            | (64, CanonicalDeltaSuccess::Prefix(delta), DeltaContinuation::ContinueImmediately) => delta,
-            _ => panic!("delivery metadata reflects the Head observed by final admission"),
+        let delivery_revision = earlier_head.revision();
+        assert!((40..=64).contains(&delivery_revision));
+        let earlier_delta = match earlier_outcome {
+            CanonicalDeltaSuccess::Complete(delta) if delivery_revision == 40 => delta,
+            CanonicalDeltaSuccess::Prefix(delta) if delivery_revision > 40 => delta,
+            _ => panic!("body classification reflects the Head observed by final admission"),
         };
         assert_eq!(earlier_delta.to_revision_id(), 40);
+        let next_boundary = DeltaTargetLadder::next_eligible_boundary_from(40, INITIAL_ADAPTIVE_DELTA_INTERVAL);
+        let expected_continuation = if delivery_revision == 40 {
+            DeltaContinuation::ReachedHead
+        } else if next_boundary <= delivery_revision {
+            DeltaContinuation::ContinueImmediately
+        } else {
+            DeltaContinuation::WaitForWakeup
+        };
+        assert_eq!(continuation, expected_continuation);
+        assert_eq!(wake_at_revision_id, (continuation == DeltaContinuation::WaitForWakeup).then_some(next_boundary));
+        let expected_retry = (continuation != DeltaContinuation::ContinueImmediately).then(|| {
+            next_boundary.checked_sub(delivery_revision).expect("the next retry boundary follows this delivery Head").max(1) * 75
+        });
+        assert_eq!(retry_after_ms, expected_retry);
 
         advance.await.expect("later Head advancement completes");
         let later = service
@@ -2348,6 +2373,68 @@ mod tests {
         assert_eq!(later_delta.to_revision_id(), 64);
 
         service.shutdown().await.expect("service shuts down");
+    }
+
+    #[tokio::test]
+    async fn intermediate_delivery_heads_select_wakeup_and_immediate_continuations() {
+        for (delivery_revision, expected_continuation, expected_wake, expected_retry) in
+            [(41, DeltaContinuation::WaitForWakeup, Some(44), Some(225)), (48, DeltaContinuation::ContinueImmediately, None, None)]
+        {
+            let (service, _events) = service();
+            let entries = (1..=40).map(|revision| (revision, 1)).collect::<Vec<_>>();
+            let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
+            service.current_publication.send_replace(Some(publication.clone()));
+
+            let release = Arc::new(Semaphore::new(0));
+            let builder_release = release.clone();
+            let cached = Arc::new(CachedDelta::new(32, 40, false, 4, bytes::Bytes::from_static(b"controlled")));
+            let builder_cached = cached.clone();
+            let CacheAccess::Job(job) = publication.cache().elect_delta(&service.cache_jobs, 32, 33, 40, false, move |_| async move {
+                builder_release.acquire().await.expect("controlled builder remains open").forget();
+                Ok(builder_cached)
+            }) else {
+                panic!("fixture installs one controlled target-40 job")
+            };
+            let baseline_references = Arc::strong_count(&job);
+
+            let request_service = service.clone();
+            let publication_id = publication.publication_id();
+            let request =
+                tokio::spawn(async move { request_service.canonical_delta(publication_id, 32, None, CancellationToken::new()).await });
+            timeout(TEST_TIMEOUT, async {
+                while Arc::strong_count(&job) == baseline_references {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the request joins the controlled target-40 job");
+
+            for offset in 0..delivery_revision - 40 {
+                let id = 100 + u8::try_from(offset).expect("fixture update count fits u8");
+                publication.apply_block_committed(&block_update(id, 2, 1)).await.expect("Head advances");
+            }
+            release.add_permits(1);
+
+            let response = request.await.expect("request task completes").expect("logical operation succeeds");
+            let CanonicalDeltaResponse::Success {
+                head,
+                outcome: CanonicalDeltaSuccess::Prefix(delta),
+                continuation,
+                wake_at_revision_id,
+                retry_after_ms,
+                ..
+            } = response
+            else {
+                panic!("the target-40 body is a prefix against the controlled delivery Head")
+            };
+            assert_eq!(head.revision(), delivery_revision);
+            assert!(Arc::ptr_eq(&delta, &cached));
+            assert_eq!(continuation, expected_continuation);
+            assert_eq!(wake_at_revision_id, expected_wake);
+            assert_eq!(retry_after_ms, expected_retry);
+
+            service.shutdown().await.expect("service shuts down");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
