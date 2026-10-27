@@ -434,12 +434,22 @@ Key meaning, entry eligibility, exact-tier selection, and checks which must
 precede cache lookup belong to the
 [protocol cache contract](api-protocol.md#publication-scoped-head-response-cache--settled).
 After those checks, one short cache-state critical section applies the required
-slot operation atomically. For a Head request it uses the protocol-selected
-tier key to return its eligible completed entry, physically remove its
-obsolete completed entry, join its running job, or install one `Pending` job
-and designate that caller as its only builder. A missing Head-tier slot is
-therefore installed before its builder performs extraction, serialization, or
-compression.
+slot operation atomically. A Head request first uses the protocol-selected tier
+key to return its eligible completed entry, physically remove its obsolete
+completed entry, join its running job, or report that construction may be
+required. The first two successful selection outcomes start no new work.
+
+On the construction-required outcome, ApiService evaluates the protocol-owned
+condition against the publication's coherently captured current-tier semantic
+identity with no cache-state guard. A match returns the logical not-modified
+outcome directly and performs no second cache operation. A mismatch performs a
+second short exact-tier cache operation while the publication-core read guard
+is retained. That operation completely re-evaluates the slot: it returns an
+eligible completed entry, joins a job installed meanwhile, or installs one
+`Pending` job and designates that caller as its only builder. Only installation
+invokes the synchronous lazy-capture closure and retains the resulting Frozen
+tier. A race between the two elections therefore neither duplicates encoding
+nor lets a request-specific validator terminate shared construction.
 
 For a delta request, the initial cache operation performs pruning and exact-
 source lookup. It returns an adequate completed value, joins the existing

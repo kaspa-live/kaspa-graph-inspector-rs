@@ -1493,6 +1493,23 @@ bytes and ETag, and both `200` and `304` carry the newly sampled
 `KGI-Publication-Id` and newly sampled `KGI-Publication-State`. Verify
 `Cache-Control: no-cache`.
 
+After an exact-tier miss and, separately, after query-time removal of an
+obsolete completed entry, supply the coherently captured current-tier ETag and
+require `304` before job installation, Frozen extraction, serialization,
+compression, or cache insertion. Repeat with `If-None-Match: *`. Hold the
+publication-core read lock at semantic admission while attempting a replay-
+floor advance; require the `304` to admit first and the mutation to follow.
+When the floor advance wins before capture, require the later capture to use
+the resulting current identity. With no competing request, a construction-free
+`304` must leave the exact tier vacant.
+
+For a nonmatching condition after the initial miss, pause before the second
+tier election. Let another caller install a job and, separately, complete the
+tier. Require the paused caller to join or reuse that work and evaluate its
+condition against the selected admitted completion. When a tier job was
+already running at the initial lookup, require the conditional request to join
+it rather than starting an independent semantic probe or construction.
+
 Delta cases cover Frozen and revision compatibility as the only application
 checks, direct target-state installation, Head bound recalculation, fixed-bound
 retention, and equality between sequential application and a directly or

@@ -136,20 +136,23 @@ and must not introduce intermediate abstractions solely to mirror this list.
 
 1. Implement the complete logical Head snapshot operation over one retained
    publication. Integrate exact-tier selection and single flight, coherent
-   Frozen capture, encoding, completion-time eligibility, replay-floor
-   admission, and weak-validator comparison through direct interfaces between
-   the existing publication, cache, codec, and scheduler owners. Record only
-   durable implementation choices that the resulting design actually needs.
+   semantic identity capture and construction-free conditional admission,
+   two-election missing-tier handling, lazy Frozen capture, encoding,
+   completion-time eligibility, replay-floor admission, and weak-validator
+   comparison through direct interfaces between the existing publication,
+   cache, codec, and scheduler owners. Record only durable implementation
+   choices that the resulting design actually needs.
 2. Implement the complete retained Head-level lookup operation. Keep it a
    straightforward all-or-nothing capture and encoding path that bypasses the
    response cache and database while preserving publication identity and
    request-local failure.
 3. Add focused operation and controlled-race coverage for tier selection and
    reuse, obsolete-candidate recapture, replay-floor ordering, state and
-   replacement behavior, weak validators, Stale publications, all-or-nothing
-   levels, cancellation, and request-local failures. Update the non-normative
-   implementation records, run the full Rust validation suite, and keep the PR
-   limited to these two logical in-memory operations.
+   replacement behavior, construction-free `304`, both cache elections, weak
+   validators, Stale publications, all-or-nothing levels, cancellation, and
+   request-local failures. Update the non-normative implementation records,
+   run the full Rust validation suite, and keep the PR limited to these two
+   logical in-memory operations.
 
 This increment adds no canonical-delta selection or continuation, anchored
 window or status operation, HTTP/SSE transport, public admission lane,

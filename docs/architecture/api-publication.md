@@ -266,18 +266,29 @@ supplied by ApiService's
 [current-publication slot](api-service.md#reset-control-and-recovery-effects--settled).
 The slot owner defines acquisition and replacement behavior.
 
-A Head snapshot-cache job or Head-backed window holds one core read lock while
-it captures an owned `Frozen` graph view, the history-owned replay floor, and
-`oldest_available_revision`. For a cache operation, the request also performs
-its short nonblocking cache lookup or exact-slot job election before releasing
-that core read lock. The lock order is always core read lock followed by cache-
-state synchronization; no cache-state guard may acquire the core. This makes a
-pre-floor capture either visible to the later floor invalidation or impossible
-after that invalidation, without retaining either guard for extraction or
-encoding, and gives Head eligibility one coherent ordinary-history boundary. A
-window performs its complete extraction against that same Frozen view. A level
-lookup similarly captures the revision and every requested complete level
-under one core read lock; an unavailable level produces no partial capture.
+A Head snapshot request holds one core read lock while it captures the
+history-owned replay floor, `oldest_available_revision`, and the values needed
+for its current-tier semantic identity. It first performs the short
+nonblocking exact-tier lookup under that guard. An eligible completion or
+running job needs no graph capture. On a construction-required result, the
+request derives the prospective ETag from the current revision and actual
+extent before any Frozen extraction or job installation. A matching
+conditional request records its immutable floor admission under that same core
+read guard and returns without a second cache operation.
+
+For a nonmatching condition, the request performs a second exact-tier election
+before releasing the core read lock. That election completely re-evaluates the
+slot and invokes its synchronous lazy-capture closure only if it installs the
+missing job; the elected builder thereby receives one owned `Frozen` graph
+view and the coherent history boundaries. The lock order is always core read
+lock followed by cache-state synchronization; no cache-state guard may acquire
+the core. This makes a pre-floor capture either visible to the later floor
+invalidation or impossible after that invalidation, without retaining either
+guard for extraction or encoding, and gives Head eligibility one coherent
+ordinary-history boundary. A Head-backed window performs its complete
+extraction against one Frozen view. A level lookup similarly captures the
+revision and every requested complete level under one core read lock; an
+unavailable level produces no partial capture.
 Public publication identity and state headers are finalized separately under the
 [protocol-owned publication-context rule](api-protocol.md#publication-context-response-headers--settled).
 
@@ -320,7 +331,10 @@ floor-admitted when eligible, and releases the lock. It holds no cache guard
 during this check and retains no publication lock for network delivery. The
 core write lock used by replay-floor advancement therefore supplies the exact
 before-or-after ordering required by the protocol; independent completion
-checks remain applicable afterward.
+checks remain applicable afterward. A construction-free matching Head identity
+is instead floor-admitted during its original semantic capture, while that core
+read lock is already held; it has no cached candidate requiring this later
+admission path.
 
 ## Database seed extent and projection — settled
 
