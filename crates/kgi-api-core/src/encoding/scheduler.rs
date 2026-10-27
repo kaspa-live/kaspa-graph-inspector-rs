@@ -11,7 +11,7 @@ use serde::Serialize;
 use tokio::sync::{oneshot, watch};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use super::{EncodedGraphBody, GraphEncodingError, encode_graph};
+use super::{DeltaEstimatorOverrun, EncodedGraphBody, GraphEncodingError, encode_delta_graph, encode_graph};
 
 /// Maximum graph serialization and compression calls active at once.
 pub(crate) const MAX_GRAPH_ENCODING_JOBS: usize = 4;
@@ -93,6 +93,26 @@ impl EncodingScheduler {
         T: Serialize + Send + 'static,
     {
         let admitted = self.inner.submit(JobClass::Priority, Box::new(move || encode_graph(&value)), None)?;
+        admitted.wait(cancellation).await
+    }
+
+    /// Encodes one estimator-admitted canonical delta through the priority lane.
+    pub(crate) async fn encode_delta_priority<T, O>(
+        &self,
+        value: T,
+        estimated_raw_bytes: u64,
+        observe_overrun: O,
+        cancellation: CancellationToken,
+    ) -> Result<EncodedGraphBody, EncodingSchedulerError>
+    where
+        T: Serialize + Send + 'static,
+        O: FnOnce(DeltaEstimatorOverrun) + Send + 'static,
+    {
+        let admitted = self.inner.submit(
+            JobClass::Priority,
+            Box::new(move || encode_delta_graph(&value, estimated_raw_bytes, observe_overrun)),
+            None,
+        )?;
         admitted.wait(cancellation).await
     }
 
@@ -531,6 +551,7 @@ mod tests {
         BlockingExecutor, BlockingExecutorError, BlockingFuture, BlockingJob, EncodingScheduler, EncodingSchedulerError,
         GRAPH_ENCODING_QUEUE_TIMEOUT, MAX_GRAPH_ENCODING_JOBS, MAX_HISTORICAL_ENCODING_JOBS, MAX_QUEUED_GRAPH_ENCODING_JOBS,
     };
+    use crate::encoding::MAX_UNCOMPRESSED_NON_DELTA_GRAPH_RESPONSE_BYTES;
 
     struct ControlledExecutor {
         submitted: mpsc::UnboundedSender<PendingExecution>,
@@ -856,5 +877,57 @@ mod tests {
 
         assert_ne!(*serialization_thread.lock().expect("thread record lock"), Some(caller_thread));
         scheduler.shutdown().await.expect("scheduler shuts down");
+    }
+
+    #[tokio::test]
+    async fn canonical_delta_overrun_is_observed_once_by_the_shared_construction() {
+        let (scheduler, mut submitted) = controlled_scheduler();
+        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+        let value = "a".repeat(MAX_UNCOMPRESSED_NON_DELTA_GRAPH_RESPONSE_BYTES);
+        let delta_scheduler = scheduler.clone();
+        let encoding = tokio::spawn(async move {
+            delta_scheduler
+                .encode_delta_priority(
+                    value,
+                    23,
+                    move |overrun| observed_tx.send(overrun).expect("overrun observer remains installed"),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+
+        next_execution(&mut submitted).await.complete();
+        let encoded = encoding.await.expect("delta task joins").expect("overrun remains successful");
+        let overrun = observed_rx.recv().await.expect("one estimator overrun is observed");
+
+        assert_eq!(overrun.estimated_raw_bytes(), 23);
+        assert_eq!(overrun.observed_uncompressed_json_bytes(), encoded.uncompressed_json_bytes());
+        assert!(observed_rx.try_recv().is_err(), "one shared construction emits one overrun observation");
+        scheduler.shutdown().await.expect("scheduler shuts down");
+    }
+
+    #[tokio::test]
+    async fn cancelled_canonical_delta_remains_tracked_until_blocking_work_finishes() {
+        let (scheduler, mut submitted) = controlled_scheduler();
+        let cancellation = CancellationToken::new();
+        let delta_scheduler = scheduler.clone();
+        let task_cancellation = cancellation.clone();
+        let encoding = tokio::spawn(async move {
+            delta_scheduler
+                .encode_delta_priority("delta", 5, |_| panic!("a small canonical delta does not overrun"), task_cancellation)
+                .await
+        });
+        let execution = next_execution(&mut submitted).await;
+
+        cancellation.cancel();
+        assert_eq!(encoding.await.expect("delta task joins"), Err(EncodingSchedulerError::Cancelled));
+
+        let shutdown_scheduler = scheduler.clone();
+        let shutdown = tokio::spawn(async move { shutdown_scheduler.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished(), "cancelled canonical-delta blocking work remains scheduler-owned");
+
+        execution.complete();
+        shutdown.await.expect("shutdown task joins").expect("scheduler joins cancelled delta work");
     }
 }
