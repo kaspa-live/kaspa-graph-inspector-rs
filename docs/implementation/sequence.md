@@ -87,8 +87,8 @@ do not enlarge the PR silently. Any future regrouping requires updating this
 sequence first.
 
 The former broad Step 6 is now increments 6–20, former Step 7 is increments
-21–25, and former Step 8 is increments 26–30. Increments 6–16 are complete;
-the active production work is increment 17, without an additional nesting
+21–25, and former Step 8 is increments 26–30. Increments 6–17 are complete;
+the active production work is increment 18, without an additional nesting
 level.
 
 | Increment / PR | Isolated production scope | Completion evidence |
@@ -119,10 +119,11 @@ level.
 | 29. Deployment and release artifacts | Complete the conventional and Docker layouts, runtime log directories, systemd and Compose examples, static-asset cache behavior, and atomic `xtask` bundle/container construction against the composed binary and Web build. | Reproducible bundle and image checks, matching binary/assets and provenance, missing-root failure, unprivileged/read-only deployment, writable logs, direct signal delivery, and atomic failure cleanup. |
 | 30. Full-stack acceptance | Add only the remaining cross-component fixtures and acceptance coverage needed to prove the focused verification contract across node RPC, PostgreSQL, recovery, API/Web, packaging, logging, and resource isolation; update implementation status with the final evidence. | Full Rust, PostgreSQL, Vitest, deterministic and complete-stack Playwright, parity, packaging, shutdown, and load/isolation suites pass from a clean checkout. |
 
-### Active increment 17: in-memory Head snapshot and level operations
+### Active increment 18: canonical delta operation
 
-Increment 17 is exactly one reviewable PR. It adds the first logical consumers
-of the response-cache and encoding kernels while remaining below HTTP parsing,
+Increment 18 is exactly one reviewable PR. It completes the logical canonical
+delta operation over the existing publication, history, response-cache,
+encoding, and SSE-registration foundations while remaining below HTTP parsing,
 admission, and delivery. The focused
 [protocol](../architecture/api-protocol.md),
 [ApiService](../architecture/api-service.md),
@@ -130,35 +131,33 @@ admission, and delivery. The focused
 [verification](../architecture/verification.md) documents remain the sole
 owners of those contracts; this plan records only their implementation order.
 
-Execute increment 17 as these ordered points. These are review outcomes rather
-than commit boundaries; implementation should use the smallest coherent design
-and must not introduce intermediate abstractions solely to mirror this list.
+Execute increment 18 as these ordered review outcomes. They are not commit
+boundaries: implement the operation as one coherent path and do not introduce
+intermediate abstractions merely to make its commits artificially atomic.
 
-1. Implement the complete logical Head snapshot operation over one retained
-   publication. Integrate exact-tier selection and single flight, coherent
-   semantic identity capture and construction-free conditional admission,
-   two-election missing-tier handling, lazy Frozen capture, encoding,
-   completion-time eligibility, replay-floor admission, and weak-validator
-   comparison through direct interfaces between the existing publication,
-   cache, codec, and scheduler owners. Record only durable implementation
-   choices that the resulting design actually needs.
-2. Implement the complete retained Head-level lookup operation. Keep it a
-   straightforward all-or-nothing capture and encoding path that bypasses the
-   response cache and database while preserving publication identity and
-   request-local failure.
-3. Add focused operation and controlled-race coverage for tier selection and
-   reuse, obsolete-candidate recapture, replay-floor ordering, state and
-   replacement behavior, construction-free `304`, both cache elections, weak
-   validators, Stale publications, all-or-nothing levels, cancellation, and
-   request-local failures. Update the non-normative implementation records,
-   run the full Rust validation suite, and keep the PR limited to these two
-   logical in-memory operations.
+1. Adapt the protocol values needed by the current canonical-delta contract
+   and implement its pure selection and sizing policy. Add the ApiService-owned
+   active-interval boundary initialized to the settled fixed production value,
+   with test control over every permitted value. Do not implement a load
+   controller.
+2. Implement the complete end-to-end logical operation through direct
+   integration of the retained publication, delta cache, history capture,
+   encoding scheduler, and SSE client registry. This includes request-order
+   validation, age pruning, lookup and source-serialized construction or
+   enlargement, pre-election target descent, final replay-floor admission,
+   typed results and continuation, and atomic registration completion and
+   rearming.
+3. Add deterministic operation and race coverage for the dyadic boundaries and
+   every active interval; cache hits, joins, enlargement, size limits, age and
+   replay-floor changes; publication states and replacement; HTTP-only and SSE
+   completion; registration disappearance; and Head/rearm races. Update the
+   non-normative implementation records and run the full Rust validation suite.
 
-This increment adds no canonical-delta selection or continuation, anchored
-window or status operation, HTTP/SSE transport, public admission lane,
-database read, or adaptive controller. Increment 18 owns canonical-delta
-selection and registration completion; increments 19–20 own the remaining
-logical operations, admission, and transport.
+This increment adds no anchored-window or status operation, HTTP/SSE transport,
+public admission lane, database read, or adaptive controller. Controller design
+and implementation remain outside this PR under the
+[open decision](../decisions/open.md#adaptive-delta-load-controller); increments
+19–20 own the remaining logical operations, admission, and transport.
 
 ## Cross-increment ordering
 
