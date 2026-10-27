@@ -10,6 +10,7 @@ use kgi_api_model::{
     delta::GraphDelta,
     graph::{GraphView, GraphViewExtractError, LevelExtent, TrackingPolicy},
     history::{GraphHistory, GraphHistoryRange, GraphHistoryRangeError, GraphHistoryReplayability},
+    protocol::{HeadLevelLookupOutcome, HeadLevelValue},
 };
 use kgi_model::graph_update::{BlockCommitted, VspcCommitted};
 use rand::{RngCore, rngs::OsRng};
@@ -80,6 +81,17 @@ impl GraphPublicationCore {
             view,
         }
     }
+
+    fn capture_levels(&self, publication_id: u64, requested_levels: &[u32]) -> Result<GraphLevelCapture, u32> {
+        let mut levels = Vec::with_capacity(requested_levels.len());
+        for &level in requested_levels {
+            let Some(&value) = self.view.level(level) else {
+                return Err(level);
+            };
+            levels.push(HeadLevelValue { level, value });
+        }
+        Ok(GraphLevelCapture { publication_id, revision: self.view.current_revision_id(), levels: levels.into() })
+    }
 }
 
 /// One detached immutable graph view from a specific publication.
@@ -115,6 +127,20 @@ impl GraphViewCapture {
     /// Consumes the capture and returns its frozen graph view.
     pub(crate) fn into_view(self) -> GraphView {
         self.view
+    }
+}
+
+/// One all-or-nothing retained-level capture from a specific publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GraphLevelCapture {
+    publication_id: u64,
+    revision: u64,
+    levels: Arc<[HeadLevelValue]>,
+}
+
+impl GraphLevelCapture {
+    fn into_outcome(self) -> HeadLevelLookupOutcome {
+        HeadLevelLookupOutcome::Complete { publication_id: self.publication_id, revision: self.revision, levels: self.levels }
     }
 }
 
@@ -368,6 +394,14 @@ impl GraphPublication {
             revision_timestamp_ms: core.view.current_revision_timestamp_ms(),
             head_level: core.view.high_level(),
             replay_floor_revision: core.history.replay_floor_revision(),
+        }
+    }
+
+    /// Captures every requested retained level, or identifies one unavailable level.
+    pub(crate) async fn capture_levels(&self, requested_levels: &[u32]) -> HeadLevelLookupOutcome {
+        match self.core.read().await.capture_levels(self.publication_id, requested_levels) {
+            Ok(capture) => capture.into_outcome(),
+            Err(requested_level) => HeadLevelLookupOutcome::LevelUnavailable { requested_level },
         }
     }
 

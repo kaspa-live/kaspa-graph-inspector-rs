@@ -6,7 +6,7 @@ use std::{
 use kgi_api_ingress::channel::GraphUpdateReceiver;
 use kgi_api_model::{
     projection::MAX_WINDOW_DEPTH,
-    protocol::{CACHED_HEAD_WINDOW_DEPTHS, SystemStatus},
+    protocol::{CACHED_HEAD_WINDOW_DEPTHS, FreshViewReason, HeadLevelLookupOutcome, SystemStatus},
 };
 use kgi_model::lifecycle::{NodeServiceStatus, ProcessingStatus, RecoveryMode, StorageServiceStatus, SupervisorStatus};
 use kgi_storage::generation::ValidatedApiDbClient;
@@ -19,8 +19,11 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
     cache::{CacheJobTracker, CacheWaitError, CachedHeadSnapshot},
-    codec::HeadEtag,
-    encoding::scheduler::EncodingScheduler,
+    codec::{HeadEtag, graph::HeadLevelLookupResponseDto},
+    encoding::{
+        EncodedGraphBody,
+        scheduler::{EncodingScheduler, EncodingSchedulerError},
+    },
     error::ApiServiceError,
     publication::{
         GraphPublication, HeadTierSelection, ReplayFloorAdmission,
@@ -69,6 +72,32 @@ pub(crate) enum HeadSnapshotOutcome {
         publication: Arc<GraphPublication>,
         /// Exact admitted weak validator matched by the caller's condition.
         etag: HeadEtag,
+    },
+}
+
+/// Logical result of one retained Head-level lookup operation.
+#[allow(dead_code, reason = "HTTP response delivery is introduced by the transport increment")]
+pub(crate) enum HeadLevelLookupResponse {
+    /// Every requested level was captured and encoded for delivery.
+    Complete {
+        /// Exact publication retained for response finalization and delivery.
+        publication: Arc<GraphPublication>,
+        /// Uncached, size-checked gzip representation owned by this request.
+        body: EncodedGraphBody,
+    },
+    /// One requested level was unavailable in the captured Head image.
+    LevelUnavailable {
+        /// Exact publication retained for response finalization.
+        publication: Arc<GraphPublication>,
+        /// Unavailable level that prevents an all-or-nothing response.
+        requested_level: u32,
+    },
+    /// The supplied publication identity no longer addresses the current publication.
+    FreshViewRequired {
+        /// Current coherent publication, when one was available for selection.
+        publication: Option<Arc<GraphPublication>>,
+        /// Reason the caller must abandon its existing graph lineage.
+        reason: FreshViewReason,
     },
 }
 
@@ -481,6 +510,41 @@ impl ApiService {
         }
     }
 
+    /// Captures and encodes complete retained levels from one exact publication.
+    #[allow(dead_code, reason = "the logical operation is consumed by the later HTTP transport increment")]
+    pub(crate) async fn head_levels(
+        &self,
+        requested_publication_id: u64,
+        requested_levels: &[u32],
+        cancellation: CancellationToken,
+    ) -> Result<HeadLevelLookupResponse, EncodingSchedulerError> {
+        if cancellation.is_cancelled() {
+            return Err(EncodingSchedulerError::Cancelled);
+        }
+        let Some(publication) = self.current_publication() else {
+            return Ok(HeadLevelLookupResponse::FreshViewRequired { publication: None, reason: FreshViewReason::PublicationMismatch });
+        };
+        if publication.publication_id() != requested_publication_id {
+            return Ok(HeadLevelLookupResponse::FreshViewRequired {
+                publication: Some(publication),
+                reason: FreshViewReason::PublicationMismatch,
+            });
+        }
+
+        let (publication_id, revision, levels) = match publication.capture_levels(requested_levels).await {
+            HeadLevelLookupOutcome::Complete { publication_id, revision, levels } => (publication_id, revision, levels),
+            HeadLevelLookupOutcome::LevelUnavailable { requested_level } => {
+                return Ok(HeadLevelLookupResponse::LevelUnavailable { publication, requested_level });
+            }
+            HeadLevelLookupOutcome::FreshViewRequired(_) => {
+                unreachable!("an exact publication capture cannot produce a publication mismatch")
+            }
+        };
+        let response = HeadLevelLookupResponseDto::from_complete(publication_id, revision, &levels);
+        let body = self.encoding.scheduler.encode_priority(response, cancellation).await?;
+        Ok(HeadLevelLookupResponse::Complete { publication, body })
+    }
+
     /// Returns the complete publication current at this instant, when present.
     #[allow(dead_code, reason = "public graph operations are implemented in later API increments")]
     pub(crate) fn current_publication(&self) -> Option<Arc<GraphPublication>> {
@@ -499,8 +563,10 @@ fn selected_head_depth(target_depth: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use flate2::read::GzDecoder;
     use std::{
         collections::{BTreeMap, HashMap},
+        io::Read,
         sync::{
             Arc, Barrier as StdBarrier, Mutex,
             atomic::{AtomicBool, Ordering},
@@ -525,6 +591,7 @@ mod tests {
     };
     use kgi_storage::service::{StorageService, StorageServiceEvent};
     use serde::{Serialize, Serializer};
+    use serde_json::json;
     use testcontainers_modules::{
         postgres::Postgres,
         testcontainers::{ImageExt, runners::AsyncRunner},
@@ -537,8 +604,9 @@ mod tests {
     use url::Url;
 
     use super::{
-        ApiDbGenerationMessage, ApiRuntimeSlot, ApiService, ApiServiceEvent, ApiStatusInputs, HeadSnapshotCondition,
-        HeadSnapshotOutcome, OwnedPublicationRuntime, PublicationInstallState, RuntimePublicationInstaller, selected_head_depth,
+        ApiDbGenerationMessage, ApiRuntimeSlot, ApiService, ApiServiceEvent, ApiStatusInputs, FreshViewReason,
+        HeadLevelLookupResponse, HeadSnapshotCondition, HeadSnapshotOutcome, OwnedPublicationRuntime, PublicationInstallState,
+        RuntimePublicationInstaller, selected_head_depth,
     };
     use crate::{
         api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
@@ -652,6 +720,12 @@ mod tests {
             GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), view, GraphHistory::new())
                 .expect("coherent publication"),
         )
+    }
+
+    fn decode_gzip(body: &bytes::Bytes) -> serde_json::Value {
+        let mut decoded = Vec::new();
+        GzDecoder::new(body.as_ref()).read_to_end(&mut decoded).expect("gzip response decodes");
+        serde_json::from_slice(&decoded).expect("response contains JSON")
     }
 
     fn hash(byte: u8) -> BlockHash {
@@ -893,6 +967,69 @@ mod tests {
             service.head_snapshot(1, &nonmatching, CancellationToken::new()).await.expect("a nonmatch is successful"),
             HeadSnapshotOutcome::Complete { .. }
         ));
+
+        service.shutdown().await.expect("service resources shut down");
+    }
+
+    #[tokio::test]
+    async fn head_level_lookup_requires_the_exact_current_publication() {
+        let (service, _events) = service();
+
+        let absent =
+            service.head_levels(7, &[1], CancellationToken::new()).await.expect("an absent publication is a semantic outcome");
+        let HeadLevelLookupResponse::FreshViewRequired { publication: None, reason } = absent else {
+            panic!("an absent publication requires a fresh view without response context")
+        };
+        assert_eq!(reason, FreshViewReason::PublicationMismatch);
+
+        let publication = publication();
+        service.current_publication.send_replace(Some(publication.clone()));
+        let mismatched_publication_id = if publication.publication_id() == 1 { 2 } else { 1 };
+        let mismatch = service
+            .head_levels(mismatched_publication_id, &[1], CancellationToken::new())
+            .await
+            .expect("a publication mismatch is a semantic outcome");
+        let HeadLevelLookupResponse::FreshViewRequired { publication: Some(retained), reason } = mismatch else {
+            panic!("the current publication is retained while reporting a mismatch")
+        };
+        assert!(Arc::ptr_eq(&retained, &publication));
+        assert_eq!(reason, FreshViewReason::PublicationMismatch);
+
+        service.shutdown().await.expect("service resources shut down");
+    }
+
+    #[tokio::test]
+    async fn head_level_lookup_is_all_or_nothing_and_encodes_one_capture() {
+        let (service, _events) = service();
+        let publication = publication();
+        service.current_publication.send_replace(Some(publication.clone()));
+
+        let missing = service
+            .head_levels(publication.publication_id(), &[1, 2], CancellationToken::new())
+            .await
+            .expect("an unavailable level is a semantic outcome");
+        let HeadLevelLookupResponse::LevelUnavailable { publication: retained, requested_level } = missing else {
+            panic!("one unavailable level prevents a partial response")
+        };
+        assert!(Arc::ptr_eq(&retained, &publication));
+        assert_eq!(requested_level, 2);
+
+        let complete = service
+            .head_levels(publication.publication_id(), &[1], CancellationToken::new())
+            .await
+            .expect("retained levels encode successfully");
+        let HeadLevelLookupResponse::Complete { publication: retained, body } = complete else {
+            panic!("every retained level produces one complete response")
+        };
+        assert!(Arc::ptr_eq(&retained, &publication));
+        assert_eq!(
+            decode_gzip(body.gzip_body()),
+            json!({
+                "publication_id": publication.publication_id().to_string(),
+                "revision": "0",
+                "levels": [{ "level": 1, "size": 1, "daa_score": null }]
+            })
+        );
 
         service.shutdown().await.expect("service resources shut down");
     }
