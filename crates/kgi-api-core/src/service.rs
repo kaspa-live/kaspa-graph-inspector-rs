@@ -20,6 +20,7 @@ use crate::{
     api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
     cache::{CacheJobTracker, CacheWaitError, CachedHeadSnapshot},
     codec::{HeadEtag, graph::HeadLevelLookupResponseDto},
+    delta::ActiveDeltaInterval,
     encoding::{
         EncodedGraphBody,
         scheduler::{EncodingScheduler, EncodingSchedulerError},
@@ -329,6 +330,7 @@ pub struct ApiService {
     cancellation: ApiCancellation,
     cache_jobs: CacheJobTracker,
     encoding: OwnedEncodingScheduler,
+    active_delta_interval: ActiveDeltaInterval,
     status: ApiStatusInputs,
 }
 
@@ -364,6 +366,7 @@ impl ApiService {
             },
             cache_jobs: CacheJobTracker::with_cancellation(cache_jobs_cancellation),
             encoding,
+            active_delta_interval: ActiveDeltaInterval::new(),
             status: ApiStatusInputs {
                 kgi_version: env!("CARGO_PKG_VERSION"),
                 supervisor: supervisor_status,
@@ -580,6 +583,7 @@ mod tests {
         graph::{GraphView, Level, LevelExtent, TrackingPolicy},
         history::GraphHistory,
         projection::{GraphViewSeed, GraphWindowResolution},
+        protocol::INITIAL_ADAPTIVE_DELTA_INTERVAL,
     };
     use kgi_model::{
         block::{BlockColor, BlockCoordinate, BlockHash, CompactId},
@@ -1580,6 +1584,7 @@ mod tests {
         assert_eq!(service.publication_install.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).runtime_generation, 0);
         assert!(service.api_db.public_read_client().is_none());
         assert!(service.current_publication().is_none());
+        assert_eq!(service.active_delta_interval.current(), INITIAL_ADAPTIVE_DELTA_INTERVAL);
         assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
         assert!(!events.is_closed());
 
@@ -1591,6 +1596,18 @@ mod tests {
 
         service.encoding.shutdown().await.expect("encoding scheduler shuts down");
         assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn active_delta_interval_survives_publication_runtime_reset() {
+        let (service, _events) = service();
+        assert!(service.active_delta_interval.try_update(32));
+
+        let (_producer, receiver) = graph_update_channel();
+        service.reset(receiver, RecoveryMode::Resync).await.expect("runtime reset succeeds");
+        assert_eq!(service.active_delta_interval.current(), 32);
+
+        service.shutdown().await.expect("service shuts down");
     }
 
     #[tokio::test]

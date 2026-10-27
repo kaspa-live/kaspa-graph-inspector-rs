@@ -15,6 +15,18 @@ pub const CACHED_HEAD_SNAPSHOT_MAX_AGE_MS: u64 = 90_000;
 /// Maximum age of a source-keyed canonical delta in publication-local milliseconds.
 pub const DELTA_CACHE_MAX_AGE_MS: u64 = 300_000;
 
+/// Fixed revision span used to enter the canonical-delta dyadic ladder.
+pub const DELTA_BASE_REVISION_SPAN: u64 = 4;
+
+/// Largest ordinary revision span in the canonical-delta dyadic ladder.
+pub const MAX_DELTA_REVISION_SPAN: u64 = 128;
+
+/// Permitted process-wide canonical-delta intervals.
+pub const ADAPTIVE_DELTA_INTERVALS: [u64; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+
+/// Initial process-wide canonical-delta interval.
+pub const INITIAL_ADAPTIVE_DELTA_INTERVAL: u64 = 4;
+
 /// Reason a request must abandon its current graph lineage or source cursor.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FreshViewReason {
@@ -24,10 +36,10 @@ pub enum FreshViewReason {
     StartPruned,
     /// The requested source revision is not a retained history boundary.
     StartUnavailable,
-    /// The requested delta distance exceeds the supported bound.
-    DeltaDistanceExceeded,
-    /// The first indivisible retained delta exceeds the response budget.
-    FirstStoredDeltaExceedsBudget,
+    /// The source is too old to recreate after its cache entry was pruned.
+    DeltaSourceExpired,
+    /// An uncrossable retained-history barrier follows the source cursor.
+    DeltaReplayBarrier,
 }
 
 /// Semantic result of one canonical Head-delta request.

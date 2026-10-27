@@ -6,6 +6,7 @@ pub(crate) mod api_db;
 pub(crate) mod cache;
 pub(crate) mod client;
 pub(crate) mod codec;
+pub(crate) mod delta;
 pub(crate) mod encoding;
 pub(crate) mod publication;
 

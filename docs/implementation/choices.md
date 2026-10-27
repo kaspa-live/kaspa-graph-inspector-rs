@@ -1200,3 +1200,25 @@ every requested level is present. `ApiService` retains the selected
 `Arc<GraphPublication>` beside the logical result and submits a complete
 `HeadLevelLookupResponseDto` directly to the existing priority encoding lane.
 This needs no operation-specific worker, cache adapter, or database capability.
+
+## 27 October 2026: canonical-delta selection boundary
+
+### Pure dyadic ladder and interval storage
+
+Place source-anchored target selection in a private `DeltaTargetLadder`. The
+value derives its ordered boundaries once from the source revision and retains
+the at-most-eight entries inline in `SmallVec<[u64; 8]>`. It accepts the
+coherently captured Head plus an optional existing cache target, first selects
+the protocol-owned request target or wake boundary, then lets the caller walk
+backward through those same boundaries with a cheap estimate predicate. The
+returned `DeltaRevisionRange` carries the fixed fitting target and whether
+descent made it size-limited. This keeps all sizing before the second cache
+election and lets an elected builder encode its complete fixed range directly
+rather than introducing an in-job descent state machine.
+
+Store the ApiService-wide active interval in a private `AtomicU64`. Each
+logical operation samples the independent scalar once, while validation of a
+prospective replacement is centralized with the stored value. Publication
+runtime reset therefore neither owns nor recreates the interval. The atomic
+does not encode controller policy; that remains with the
+[open decision](../decisions/open.md#adaptive-delta-load-controller).

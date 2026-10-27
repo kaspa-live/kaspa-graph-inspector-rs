@@ -18,6 +18,7 @@ kgi-storage = { path = "../kgi-storage" }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
