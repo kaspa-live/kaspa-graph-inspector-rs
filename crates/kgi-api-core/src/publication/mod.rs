@@ -10,14 +10,20 @@ use kgi_api_model::{
     delta::GraphDelta,
     graph::{GraphView, GraphViewExtractError, LevelExtent, TrackingPolicy},
     history::{GraphHistory, GraphHistoryRange, GraphHistoryRangeError, GraphHistoryReplayability},
+    protocol::{HeadLevelLookupOutcome, HeadLevelValue},
 };
 use kgi_model::graph_update::{BlockCommitted, VspcCommitted};
 use rand::{RngCore, rngs::OsRng};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    cache::{CachedDelta, CachedHeadSnapshot, GraphCache},
+    cache::{
+        CacheAccess, CacheBuildError, CacheJobTracker, CachedDelta, CachedHeadSnapshot, GraphCache, HeadCacheLookup,
+        HeadEligibilityBoundary,
+    },
     client::SseClientRegistry,
+    codec::{HeadEtag, HeadEtagInput, graph::HeadSnapshotResponseDto},
+    encoding::scheduler::EncodingScheduler,
 };
 
 pub(crate) use self::error::PublicationProjectionError;
@@ -34,12 +40,58 @@ pub(crate) enum GraphPublicationState {
     Stale,
 }
 
+/// Exact-tier result selected while one publication-core capture is retained.
+pub(crate) enum HeadTierSelection {
+    /// A completed value or shared construction job must supply the response.
+    Access(CacheAccess<CachedHeadSnapshot>),
+    /// The prospective current-tier identity matched before construction.
+    ConditionMatched(HeadEtag),
+}
+
 /// Atomically observed lifecycle state, canonical Head view, and history.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GraphPublicationCore {
     state: GraphPublicationState,
     view: GraphView,
     history: GraphHistory,
+}
+
+impl GraphPublicationCore {
+    fn head_eligibility_boundary(&self) -> HeadEligibilityBoundary {
+        HeadEligibilityBoundary::new(
+            self.view.current_revision_timestamp_ms(),
+            self.history.replay_floor_revision(),
+            self.history.oldest_available_revision(),
+        )
+    }
+
+    fn head_tier_extent(&self, depth: u32) -> LevelExtent {
+        let high_level = self.view.high_level();
+        let low_level = high_level.saturating_sub(depth - 1).max(self.view.low_level());
+        LevelExtent::new(low_level, high_level).expect("a positive Head tier produces a valid contained extent")
+    }
+
+    fn capture_head_tier(&self, publication_id: u64, depth: u32) -> GraphViewCapture {
+        let extent = self.head_tier_extent(depth);
+        let view = self.view.extract_subview(extent).expect("a selected Head tier is contained in the complete Head");
+        GraphViewCapture {
+            publication_id,
+            replay_floor_revision: self.history.replay_floor_revision(),
+            oldest_available_revision: self.history.oldest_available_revision(),
+            view,
+        }
+    }
+
+    fn capture_levels(&self, publication_id: u64, requested_levels: &[u32]) -> Result<GraphLevelCapture, u32> {
+        let mut levels = Vec::with_capacity(requested_levels.len());
+        for &level in requested_levels {
+            let Some(&value) = self.view.level(level) else {
+                return Err(level);
+            };
+            levels.push(HeadLevelValue { level, value });
+        }
+        Ok(GraphLevelCapture { publication_id, revision: self.view.current_revision_id(), levels: levels.into() })
+    }
 }
 
 /// One detached immutable graph view from a specific publication.
@@ -75,6 +127,20 @@ impl GraphViewCapture {
     /// Consumes the capture and returns its frozen graph view.
     pub(crate) fn into_view(self) -> GraphView {
         self.view
+    }
+}
+
+/// One all-or-nothing retained-level capture from a specific publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GraphLevelCapture {
+    publication_id: u64,
+    revision: u64,
+    levels: Arc<[HeadLevelValue]>,
+}
+
+impl GraphLevelCapture {
+    fn into_outcome(self) -> HeadLevelLookupOutcome {
+        HeadLevelLookupOutcome::Complete { publication_id: self.publication_id, revision: self.revision, levels: self.levels }
     }
 }
 
@@ -147,10 +213,13 @@ pub(crate) struct GraphPublication {
     delta_estimate_test_override: Option<u64>,
     #[cfg(test)]
     replay_floor_admission_test_hook: Option<std::sync::Arc<ReplayFloorAdmissionTestHook>>,
+    #[cfg(test)]
+    head_second_election_test_hook: Option<std::sync::Arc<HeadSecondElectionTestHook>>,
 }
 
 #[cfg(test)]
-struct AtomicMutationTestHook {
+/// Deterministic pause inside one atomic publication mutation.
+pub(crate) struct AtomicMutationTestHook {
     armed: std::sync::atomic::AtomicBool,
     view_updated: std::sync::Barrier,
     finish_core_update: std::sync::Barrier,
@@ -173,17 +242,20 @@ impl AtomicMutationTestHook {
         }
     }
 
-    fn wait_for_view_update(&self) {
+    /// Waits until the graph view has changed while the core write lock remains held.
+    pub(crate) fn wait_for_view_update(&self) {
         self.view_updated.wait();
     }
 
-    fn resume_core_update(&self) {
+    /// Allows the paused mutation to finish its core update.
+    pub(crate) fn resume_core_update(&self) {
         self.finish_core_update.wait();
     }
 }
 
 #[cfg(test)]
-struct ReplayFloorAdmissionTestHook {
+/// Deterministic pause while one replay-floor admission holds the core read lock.
+pub(crate) struct ReplayFloorAdmissionTestHook {
     core_locked: std::sync::Barrier,
     finish_admission: std::sync::Barrier,
 }
@@ -199,12 +271,50 @@ impl ReplayFloorAdmissionTestHook {
         self.finish_admission.wait();
     }
 
-    fn wait_for_core_lock(&self) {
+    /// Waits until admission has acquired the publication-core read lock.
+    pub(crate) fn wait_for_core_lock(&self) {
         self.core_locked.wait();
     }
 
-    fn resume_admission(&self) {
+    /// Allows the paused admission to return its result.
+    pub(crate) fn resume_admission(&self) {
         self.finish_admission.wait();
+    }
+}
+
+#[cfg(test)]
+/// Deterministic pause between prospective evaluation and the second Head-cache election.
+pub(crate) struct HeadSecondElectionTestHook {
+    armed: std::sync::atomic::AtomicBool,
+    prospective_evaluated: std::sync::Barrier,
+    continue_election: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl HeadSecondElectionTestHook {
+    fn new() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(true),
+            prospective_evaluated: std::sync::Barrier::new(2),
+            continue_election: std::sync::Barrier::new(2),
+        }
+    }
+
+    fn pause_before_second_election(&self) {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.prospective_evaluated.wait();
+            self.continue_election.wait();
+        }
+    }
+
+    /// Waits until a nonmatching prospective identity has been evaluated.
+    pub(crate) fn wait_for_prospective_evaluation(&self) {
+        self.prospective_evaluated.wait();
+    }
+
+    /// Allows the paused request to perform its second cache election.
+    pub(crate) fn resume_second_election(&self) {
+        self.continue_election.wait();
     }
 }
 
@@ -243,6 +353,8 @@ impl GraphPublication {
             delta_estimate_test_override: None,
             #[cfg(test)]
             replay_floor_admission_test_hook: None,
+            #[cfg(test)]
+            head_second_election_test_hook: None,
         })
     }
 
@@ -254,6 +366,36 @@ impl GraphPublication {
     /// Returns this publication's response cache.
     pub(crate) fn cache(&self) -> Arc<GraphCache> {
         self.cache.clone()
+    }
+
+    /// Forces every test update to cross the replay-barrier estimate.
+    #[cfg(test)]
+    pub(crate) fn force_replay_barrier_estimate(&mut self) {
+        self.delta_estimate_test_override = Some(estimate::SOFT_DELTA_ESTIMATED_BYTES);
+    }
+
+    /// Installs a test-only pause after the graph view mutates under the core write lock.
+    #[cfg(test)]
+    pub(crate) fn pause_atomic_mutation_after_view_update(&mut self) -> std::sync::Arc<AtomicMutationTestHook> {
+        let hook = std::sync::Arc::new(AtomicMutationTestHook::new());
+        self.atomic_mutation_test_hook = Some(hook.clone());
+        hook
+    }
+
+    /// Installs a test-only pause while replay-floor admission holds the core read lock.
+    #[cfg(test)]
+    pub(crate) fn pause_replay_floor_admission(&mut self) -> std::sync::Arc<ReplayFloorAdmissionTestHook> {
+        let hook = std::sync::Arc::new(ReplayFloorAdmissionTestHook::new());
+        self.replay_floor_admission_test_hook = Some(hook.clone());
+        hook
+    }
+
+    /// Installs a test-only pause after prospective evaluation and before the second cache election.
+    #[cfg(test)]
+    pub(crate) fn pause_before_head_second_election(&mut self) -> std::sync::Arc<HeadSecondElectionTestHook> {
+        let hook = std::sync::Arc::new(HeadSecondElectionTestHook::new());
+        self.head_second_election_test_hook = Some(hook.clone());
+        hook
     }
 
     /// Returns this publication's client-registration and wake registry.
@@ -331,6 +473,14 @@ impl GraphPublication {
         }
     }
 
+    /// Captures every requested retained level, or identifies one unavailable level.
+    pub(crate) async fn capture_levels(&self, requested_levels: &[u32]) -> HeadLevelLookupOutcome {
+        match self.core.read().await.capture_levels(self.publication_id, requested_levels) {
+            Ok(capture) => capture.into_outcome(),
+            Err(requested_level) => HeadLevelLookupOutcome::LevelUnavailable { requested_level },
+        }
+    }
+
     /// Captures immutable retained history through a previously sampled target.
     pub(crate) async fn capture_history_range(
         &self,
@@ -339,6 +489,50 @@ impl GraphPublication {
     ) -> Result<GraphHistoryRange, GraphHistoryRangeError> {
         assert_eq!(target.publication_id, self.publication_id, "delta target belongs to this publication");
         self.core.read().await.history.range(from_revision_id, target.revision)
+    }
+
+    /// Selects one exact configured Head tier, admitting a matching identity before construction.
+    pub(crate) async fn head_tier(
+        self: &Arc<Self>,
+        jobs: &CacheJobTracker,
+        scheduler: &EncodingScheduler,
+        depth: u32,
+        condition_matches: impl FnOnce(&HeadEtag) -> bool,
+    ) -> HeadTierSelection {
+        let core = self.core.read().await;
+        let boundary = core.head_eligibility_boundary();
+        match self.cache.lookup_head(depth, boundary) {
+            HeadCacheLookup::Completed(completed) => {
+                return HeadTierSelection::Access(CacheAccess::Completed(completed));
+            }
+            HeadCacheLookup::Running(running) => return HeadTierSelection::Access(CacheAccess::Job(running)),
+            HeadCacheLookup::ConstructionRequired => {}
+        }
+
+        let extent = core.head_tier_extent(depth);
+        let etag = HeadEtagInput::new(self.publication_id, core.view.current_revision_id(), extent).etag();
+        if condition_matches(&etag) {
+            #[cfg(test)]
+            if let Some(hook) = &self.replay_floor_admission_test_hook {
+                hook.pause_with_core_lock();
+            }
+            return HeadTierSelection::ConditionMatched(etag);
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = &self.head_second_election_test_hook {
+            hook.pause_before_second_election();
+        }
+
+        let publication = self.clone();
+        let scheduler = scheduler.clone();
+        HeadTierSelection::Access(self.cache.elect_head(
+            jobs,
+            depth,
+            boundary,
+            || core.capture_head_tier(self.publication_id, depth),
+            move |capture, cancellation| async move { publication.build_head_tier(depth, capture, scheduler, cancellation).await },
+        ))
     }
 
     /// Linearizes one completed cached delta against the current replay floor.
@@ -422,6 +616,50 @@ impl GraphPublication {
         } else {
             ReplayFloorAdmission::Admitted(candidate)
         }
+    }
+
+    async fn build_head_tier(
+        self: Arc<Self>,
+        depth: u32,
+        mut capture: GraphViewCapture,
+        scheduler: EncodingScheduler,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<Arc<CachedHeadSnapshot>, CacheBuildError> {
+        loop {
+            let view = capture.view();
+            let revision = view.current_revision_id();
+            let revision_timestamp_ms = view.current_revision_timestamp_ms();
+            let low_level = view.low_level();
+            let high_level = view.high_level();
+            let response = HeadSnapshotResponseDto::from_capture(&capture);
+            let etag = response.etag_input().etag();
+            let encoded = scheduler.encode_priority(response, cancellation.clone()).await?;
+            let candidate = Arc::new(CachedHeadSnapshot::new(
+                depth,
+                revision,
+                revision_timestamp_ms,
+                low_level,
+                high_level,
+                encoded.uncompressed_json_bytes(),
+                etag,
+                encoded.into_gzip_body(),
+            ));
+
+            if self.head_candidate_is_eligible(&candidate).await {
+                return Ok(candidate);
+            }
+            capture = self.capture_head_tier(depth).await;
+        }
+    }
+
+    async fn capture_head_tier(&self, depth: u32) -> GraphViewCapture {
+        let core = self.core.read().await;
+        core.capture_head_tier(self.publication_id, depth)
+    }
+
+    async fn head_candidate_is_eligible(&self, candidate: &CachedHeadSnapshot) -> bool {
+        let core = self.core.read().await;
+        core.head_eligibility_boundary().admits(candidate)
     }
 
     fn revision_timestamp_ms_at(&self, now: Instant) -> u64 {
@@ -520,7 +758,7 @@ mod tests {
     use crate::{
         cache::{
             CacheAccess, CacheBuildError, CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot, DeltaBuildContext,
-            DeltaCacheLookup, GraphCache, HeadEligibilityBoundary,
+            DeltaCacheLookup, GraphCache, HeadCacheLookup, HeadEligibilityBoundary,
         },
         client::{DeltaCompletionResult, DeltaScheduleAction, SseMailbox, SseMessage},
         codec::{
@@ -589,15 +827,19 @@ mod tests {
     }
 
     fn cached_head_candidate(publication_id: u64, revision: u64) -> Arc<CachedHeadSnapshot> {
+        cached_head_candidate_at_depth(publication_id, revision, 50)
+    }
+
+    fn cached_head_candidate_at_depth(publication_id: u64, revision: u64, depth: u32) -> Arc<CachedHeadSnapshot> {
         let extent = LevelExtent::new(1, 1).expect("valid cached Head extent");
         Arc::new(CachedHeadSnapshot::new(
-            50,
+            depth,
             revision,
             revision * 10,
             1,
             1,
             4,
-            HeadEtagInput::new(publication_id, revision, extent),
+            HeadEtagInput::new(publication_id, revision, extent).etag(),
             Bytes::from_static(b"head"),
         ))
     }
@@ -663,6 +905,124 @@ mod tests {
                 Some(SseMessage::PublicationWakeup(PublicationWakeupDto::new(publication.publication_id(), 0)))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn matching_prospective_head_identity_leaves_the_exact_tier_vacant() {
+        let publication = Arc::new(
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view(), GraphHistory::new())
+                .expect("coherent publication"),
+        );
+        let cache = publication.cache();
+        let jobs = CacheJobTracker::new();
+        let scheduler = EncodingScheduler::production();
+        let expected =
+            HeadEtagInput::new(publication.publication_id(), 0, LevelExtent::new(1, 1).expect("valid prospective extent")).etag();
+
+        let selection = publication.head_tier(&jobs, &scheduler, 20, |etag| etag == &expected).await;
+        assert!(matches!(selection, HeadTierSelection::ConditionMatched(etag) if etag == expected));
+        assert!(matches!(cache.lookup_head(20, HeadEligibilityBoundary::new(0, 0, 0)), HeadCacheLookup::ConstructionRequired));
+
+        jobs.shutdown().await;
+        scheduler.shutdown().await.expect("scheduler shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_head_election_joins_a_job_installed_after_the_initial_miss() {
+        let publication = Arc::new(
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view(), GraphHistory::new())
+                .expect("coherent publication"),
+        );
+        let cache = publication.cache();
+        let jobs = Arc::new(CacheJobTracker::new());
+        let scheduler = EncodingScheduler::production();
+        let condition_entered = Arc::new(std::sync::Barrier::new(2));
+        let resume_condition = Arc::new(std::sync::Barrier::new(2));
+
+        let request_publication = publication.clone();
+        let request_jobs = jobs.clone();
+        let request_scheduler = scheduler.clone();
+        let request_entered = condition_entered.clone();
+        let request_resume = resume_condition.clone();
+        let request = tokio::spawn(async move {
+            request_publication
+                .head_tier(&request_jobs, &request_scheduler, 20, |_| {
+                    request_entered.wait();
+                    request_resume.wait();
+                    false
+                })
+                .await
+        });
+        condition_entered.wait();
+
+        let competing = match cache.elect_head(
+            &jobs,
+            20,
+            HeadEligibilityBoundary::new(0, 0, 0),
+            || (),
+            |(), _| async { std::future::pending::<Result<Arc<CachedHeadSnapshot>, CacheBuildError>>().await },
+        ) {
+            CacheAccess::Job(job) => job,
+            CacheAccess::Completed(_) => panic!("the competing caller installs a running job"),
+        };
+        resume_condition.wait();
+
+        let HeadTierSelection::Access(CacheAccess::Job(joined)) = request.await.expect("request task completes") else {
+            panic!("the second election joins the competing job")
+        };
+        assert!(Arc::ptr_eq(&joined, &competing));
+
+        jobs.shutdown().await;
+        scheduler.shutdown().await.expect("scheduler shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_head_election_reuses_a_completion_installed_after_the_initial_miss() {
+        let publication = Arc::new(
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view(), GraphHistory::new())
+                .expect("coherent publication"),
+        );
+        let cache = publication.cache();
+        let jobs = Arc::new(CacheJobTracker::new());
+        let scheduler = EncodingScheduler::production();
+        let condition_entered = Arc::new(std::sync::Barrier::new(2));
+        let resume_condition = Arc::new(std::sync::Barrier::new(2));
+
+        let request_publication = publication.clone();
+        let request_jobs = jobs.clone();
+        let request_scheduler = scheduler.clone();
+        let request_entered = condition_entered.clone();
+        let request_resume = resume_condition.clone();
+        let request = tokio::spawn(async move {
+            request_publication
+                .head_tier(&request_jobs, &request_scheduler, 20, |_| {
+                    request_entered.wait();
+                    request_resume.wait();
+                    false
+                })
+                .await
+        });
+        condition_entered.wait();
+
+        let expected = cached_head_candidate_at_depth(publication.publication_id(), 0, 20);
+        let competing = cache.elect_head(
+            &jobs,
+            20,
+            HeadEligibilityBoundary::new(0, 0, 0),
+            || expected.clone(),
+            |candidate, _| async move { Ok(candidate) },
+        );
+        let completed =
+            competing.resolve(tokio_util::sync::CancellationToken::new()).await.expect("competing completion is installed");
+        resume_condition.wait();
+
+        let HeadTierSelection::Access(CacheAccess::Completed(reused)) = request.await.expect("request task completes") else {
+            panic!("the second election reuses the competing completion")
+        };
+        assert!(Arc::ptr_eq(&reused, &completed));
+
+        jobs.shutdown().await;
+        scheduler.shutdown().await.expect("scheduler shuts down");
     }
 
     #[tokio::test]
@@ -818,9 +1178,13 @@ mod tests {
         };
         initial_delta.wait(tokio_util::sync::CancellationToken::new()).await.expect("fixture delta completes");
 
-        let head_access = cache.head_tier(&jobs, 50, HeadEligibilityBoundary::new(0, 0, 0), |_| async {
-            std::future::pending::<Result<Arc<CachedHeadSnapshot>, CacheBuildError>>().await
-        });
+        let head_access = cache.elect_head(
+            &jobs,
+            50,
+            HeadEligibilityBoundary::new(0, 0, 0),
+            || (),
+            |(), _| async { std::future::pending::<Result<Arc<CachedHeadSnapshot>, CacheBuildError>>().await },
+        );
 
         let mailbox = Arc::new(SseMailbox::new());
         let identifier = publication

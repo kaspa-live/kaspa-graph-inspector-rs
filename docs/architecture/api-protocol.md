@@ -1092,8 +1092,13 @@ and `representation_version`. It excludes `target_depth`, selected tier, and
 publication state. The weak validator permits independently serialized
 equivalent snapshots to order unordered collections and assign response-local
 hash references differently. An exact semantic match returns `304 Not
-Modified` with the current publication-context headers; otherwise the endpoint
-returns the complete cached snapshot. Responses use
+Modified` with the matching weak ETag and current publication-context headers;
+otherwise the endpoint returns the complete cached snapshot. A construction-
+required request derives the current tier's semantic identity and evaluates
+the condition before it starts cache construction. A match therefore requires
+no graph extraction, JSON serialization, compression, or completed cache
+entry, and the request neither creates nor waits for a running cache job.
+Responses use
 `Cache-Control: no-cache`, requiring revalidation before reuse.
 
 ## Canonical Head delta responses — settled
@@ -1821,12 +1826,30 @@ byte cap.
 For a valid request, derive its selected depth using the public tier formula.
 The request consults only that exact tier; a completed or running larger tier
 never supplies the response and starts no work for the selected tier. Choose
-work and response reuse in this order:
+work, conditional evaluation, and response reuse in this order:
 
-1. If the selected tier has an eligible completed snapshot, serve it without
-   starting another job.
-2. Otherwise, if a selected-tier job is running, join it.
-3. Otherwise, start and join one selected-tier job.
+1. If the selected tier has an eligible completed snapshot, evaluate the
+   condition against that snapshot and start no job.
+2. Otherwise, if a selected-tier job is running, join it and evaluate the
+   condition against its admitted completion. The conditional request causes
+   no additional construction.
+3. Otherwise, derive the current tier's semantic identity from one coherent
+   publication-core capture. Its revision, actual extent, publication ID, and
+   `representation_version` determine the prospective ETag without extracting
+   or encoding the graph projection. If the condition matches, floor-admit
+   that identity under the same core read lock and return `304 Not Modified`
+   without installing a cache job or entry.
+4. If the prospective identity does not match, perform a second exact-tier
+   cache election. It completely re-evaluates the slot, returning an eligible
+   completion installed meanwhile, joining a job installed meanwhile, or
+   installing one job whose builder captures the Frozen tier. Any returned or
+   joined completion supplies the representation against which the request's
+   condition is finally evaluated.
+
+The construction-free `304` is a request-admitted semantic representation; it
+does not populate the tier cache. A later unconditional or nonmatching request
+constructs the tier normally. `If-None-Match: *` follows the same path and
+matches once the coherent semantic representation has been established.
 
 For a cached snapshot `C` and the publication's current Head `H`, define:
 
@@ -1851,12 +1874,13 @@ query samples the current Head timestamp, replay floor, and ordinary-history
 boundary and examines only its selected tier. If that completed entry has
 reached the maximum age or its cursor precedes `oldest_available_revision`, the
 operation physically removes it before joining or installing the selected-tier
-job and before evaluating `If-None-Match`; an ineligible entry never produces
-`304 Not Modified`. It does not inspect or remove an ineligible entry in any
-other tier. Head advancement, publication installation, and elapsed wall time
-start no scan, removal, refresh, or construction. The fixed tier count and per-
-entry response limit bound completed entries that have not yet been queried
-again.
+job and before evaluating that entry's ETag; an ineligible entry never itself
+produces `304 Not Modified`. After removal, the coherent current-tier semantic
+identity can still produce the construction-free `304` defined above. It does
+not inspect or remove an ineligible entry in any other tier. Head advancement,
+publication installation, and elapsed wall time start no scan, removal,
+refresh, or construction. The fixed tier count and per-entry response limit
+bound completed entries that have not yet been queried again.
 
 After extraction, JSON serialization, size checking, and gzip complete, a tier
 job samples the publication's then-current Head revision timestamp, replay
@@ -1873,6 +1897,10 @@ Once a completed entry or newly encoded candidate passes its request-time or
 completion-time check, ordinary later Head advancement that does not advance
 the replay floor does not revoke that admission, terminal job result, or
 in-flight response, even when it later advances the ordinary-history boundary.
+The same rule applies to a construction-free semantic `304`: admission occurs
+while its capture still holds the publication-core read lock, so a replay-floor
+advance either precedes the capture or follows the admitted response. No later
+eligibility check or encoded candidate is required for that outcome.
 A later request performs a new complete eligibility check. Failure removes the
 selected-tier job and permits a later request to retry; there is no preceding
 entry to preserve as a serve-and-refresh value.

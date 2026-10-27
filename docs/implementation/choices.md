@@ -1160,3 +1160,43 @@ snapshot revision, then share one comparison while briefly holding only the
 publication-core read lock. This keeps the final candidate alive across the
 check without coupling the publication kernel to later logical-operation
 outcomes or holding a cache guard.
+
+## 27 October 2026: in-memory Head snapshot operation
+
+### Cache election and capture boundary
+
+Keep target-depth selection and conditional-result classification in the
+private `ApiService` logical operation. That operation retains one exact
+`Arc<GraphPublication>` for its complete attempt. Implement the
+[protocol-owned conditional and two-election sequence](../architecture/api-protocol.md#publication-scoped-head-response-cache--settled)
+through three private interfaces: `ApiService` supplies the validator
+predicate, `GraphPublication` retains the core guard and derives coherent
+inputs, and `GraphCache` exposes distinct `lookup_head` and `elect_head`
+operations. The lookup represents a vacant tier without inserting a
+placeholder slot. The election accepts a synchronous lazy-capture closure and
+invokes it only for the elected builder. This keeps construction inputs and
+lock ordering visible without adding another worker or synchronization
+domain.
+
+The elected builder owns completion-time recapture in one loop and keeps the
+same cache job installed across obsolete encoded candidates. This uses the
+existing cache job and encoding scheduler directly rather than adding another
+Head-operation worker or synchronization domain.
+
+### Weak Head validator representation
+
+Materialize the private semantic `HeadEtagInput` as one cached `HeadEtag`
+whose opaque text is
+`kgi-head-v{version}-p{publication}-r{revision}-l{low}-h{high}`. HTTP delivery
+will add the weak prefix and quotes to that opaque value. Conditional matching
+and later HTTP formatting share this one private value rather than reparsing
+the opaque text.
+
+### Retained Head-level capture and encoding
+
+Build the private `GraphLevelCapture` directly from the publication core into
+one bounded vector, converting it to the shared immutable slice only after
+every requested level is present. `ApiService` retains the selected
+`Arc<GraphPublication>` beside the logical result and submits a complete
+`HeadLevelLookupResponseDto` directly to the existing priority encoding lane.
+This needs no operation-specific worker, cache adapter, or database capability.
