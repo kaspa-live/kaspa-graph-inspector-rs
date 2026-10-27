@@ -7,10 +7,10 @@ freedom and do not weaken any settled contract.
 
 The [canonical Head-delta protocol](../architecture/api-protocol.md#canonical-head-delta-responses--settled)
 fixes one ApiService-wide active interval, its power-of-two values from 1
-through 128, its initial value of 4, its role in Live near-Head wake and target
-selection, and the requirement that changing it does not reschedule existing
-registrations. The controller that subsequently changes that value remains
-unresolved.
+through 128, its initial value of 4, its role in Synchronizing and Live
+near-Head wake and target selection, and the requirement that changing it does
+not reschedule existing registrations. The controller that subsequently
+changes that value remains unresolved.
 
 Raw delta-request rate alone is insufficient because it combines cheap cache
 hits with expensive construction. Candidate evidence includes:

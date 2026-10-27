@@ -15,9 +15,11 @@ kgi-api-model = { path = "../kgi-api-model" }
 kgi-core = { path = "../kgi-core" }
 kgi-model = { path = "../kgi-model" }
 kgi-storage = { path = "../kgi-storage" }
+log.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

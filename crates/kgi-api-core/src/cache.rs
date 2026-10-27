@@ -272,6 +272,11 @@ impl GraphCache {
         self.lock_state().deltas.lookup(source_revision, target_revision, head_revision_timestamp_ms)
     }
 
+    /// Prunes the expired source prefix without inspecting an exact source.
+    pub(crate) fn prune_deltas(&self, head_revision_timestamp_ms: u64) {
+        self.lock_state().deltas.prune_expired(head_revision_timestamp_ms);
+    }
+
     /// Re-evaluates one captured delta source and elects at most one builder.
     pub(crate) fn elect_delta<F, Fut>(
         self: &Arc<Self>,
@@ -539,7 +544,7 @@ impl DeltaCache {
     fn lookup(&mut self, source_revision: u64, target_revision: u64, head_revision_timestamp_ms: u64) -> DeltaCacheLookup {
         self.prune_expired(head_revision_timestamp_ms);
         let Some(slot) = self.slots_by_source.get(&source_revision) else {
-            return DeltaCacheLookup::ConstructionRequired;
+            return DeltaCacheLookup::ConstructionRequired { current_target: None };
         };
         if let Some(completed) = &slot.completed
             && completed.is_adequate_for(target_revision)
@@ -548,7 +553,9 @@ impl DeltaCache {
         } else if let Some(running) = &slot.running {
             DeltaCacheLookup::Running(running.job.clone())
         } else {
-            DeltaCacheLookup::ConstructionRequired
+            DeltaCacheLookup::ConstructionRequired {
+                current_target: slot.completed.as_ref().map(|completed| completed.to_revision_id()),
+            }
         }
     }
 
@@ -720,7 +727,10 @@ pub(crate) enum DeltaCacheLookup {
     /// Construction for this source is already running.
     Running(Arc<CacheJob<CachedDelta>>),
     /// The caller must consult history before the second cache election.
-    ConstructionRequired,
+    ConstructionRequired {
+        /// Existing reusable coverage which sizing must not shorten.
+        current_target: Option<u64>,
+    },
 }
 
 /// Result of one exact-tier Head-cache lookup without job installation.
@@ -986,7 +996,7 @@ mod tests {
         match cache.lookup_delta(source_revision, target_revision, 1_000) {
             DeltaCacheLookup::Completed(value) => CacheAccess::Completed(value),
             DeltaCacheLookup::Running(job) => CacheAccess::Job(job),
-            DeltaCacheLookup::ConstructionRequired => {
+            DeltaCacheLookup::ConstructionRequired { .. } => {
                 cache.elect_delta(jobs, source_revision, source_revision + 1, target_revision, false, builder)
             }
         }
@@ -1060,7 +1070,7 @@ mod tests {
         }));
         started.notified().await;
 
-        assert!(matches!(cache.lookup_delta(3, 4, DELTA_CACHE_MAX_AGE_MS), DeltaCacheLookup::ConstructionRequired));
+        assert!(matches!(cache.lookup_delta(3, 4, DELTA_CACHE_MAX_AGE_MS), DeltaCacheLookup::ConstructionRequired { .. }));
         assert!(!running.cancellation.is_cancelled(), "age pruning detaches rather than cancelling the running job");
 
         release_tx.send(()).expect("expired delta builder release is observed");
@@ -1068,7 +1078,7 @@ mod tests {
             running.wait(CancellationToken::new()).await.expect("the admitted waiter receives the detached result").to_revision_id(),
             4
         );
-        assert!(matches!(cache.lookup_delta(3, 4, DELTA_CACHE_MAX_AGE_MS), DeltaCacheLookup::ConstructionRequired));
+        assert!(matches!(cache.lookup_delta(3, 4, DELTA_CACHE_MAX_AGE_MS), DeltaCacheLookup::ConstructionRequired { .. }));
         jobs.shutdown().await;
     }
 
@@ -1245,7 +1255,7 @@ mod tests {
     async fn second_delta_election_discards_a_redundant_capture_after_an_adequate_completion() {
         let cache = Arc::new(GraphCache::new());
         let jobs = CacheJobTracker::new();
-        assert!(matches!(cache.lookup_delta(7, 11, 1_000), DeltaCacheLookup::ConstructionRequired));
+        assert!(matches!(cache.lookup_delta(7, 11, 1_000), DeltaCacheLookup::ConstructionRequired { .. }));
 
         let completed = cache
             .elect_delta(&jobs, 7, 8, 11, false, |_| async { Ok(cached_delta(7, 11)) })
@@ -1365,7 +1375,7 @@ mod tests {
             Err(CacheWaitError::Build(CacheBuildError::Encoding(EncodingSchedulerError::BlockingExecutorFailed)))
         );
 
-        assert!(matches!(cache.lookup_delta(7, 19, 1_000), DeltaCacheLookup::ConstructionRequired));
+        assert!(matches!(cache.lookup_delta(7, 19, 1_000), DeltaCacheLookup::ConstructionRequired { .. }));
 
         let retry = job(cache.elect_delta(&jobs, 7, 8, 15, true, |_| async {
             Ok(Arc::new(CachedDelta::new(7, 15, true, 23, Bytes::from_static(b"gzip"))))

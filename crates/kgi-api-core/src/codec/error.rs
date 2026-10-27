@@ -195,8 +195,8 @@ enum FreshViewReasonDto {
     PublicationMismatch,
     StartPruned,
     StartUnavailable,
-    DeltaDistanceExceeded,
-    FirstStoredDeltaExceedsBudget,
+    DeltaSourceExpired,
+    DeltaReplayBarrier,
 }
 
 impl From<FreshViewReason> for FreshViewReasonDto {
@@ -205,8 +205,8 @@ impl From<FreshViewReason> for FreshViewReasonDto {
             FreshViewReason::PublicationMismatch => Self::PublicationMismatch,
             FreshViewReason::StartPruned => Self::StartPruned,
             FreshViewReason::StartUnavailable => Self::StartUnavailable,
-            FreshViewReason::DeltaDistanceExceeded => Self::DeltaDistanceExceeded,
-            FreshViewReason::FirstStoredDeltaExceedsBudget => Self::FirstStoredDeltaExceedsBudget,
+            FreshViewReason::DeltaSourceExpired => Self::DeltaSourceExpired,
+            FreshViewReason::DeltaReplayBarrier => Self::DeltaReplayBarrier,
         }
     }
 }
@@ -288,8 +288,8 @@ mod tests {
             (FreshViewReason::PublicationMismatch, "publication-mismatch"),
             (FreshViewReason::StartPruned, "start-pruned"),
             (FreshViewReason::StartUnavailable, "start-unavailable"),
-            (FreshViewReason::DeltaDistanceExceeded, "delta-distance-exceeded"),
-            (FreshViewReason::FirstStoredDeltaExceedsBudget, "first-stored-delta-exceeds-budget"),
+            (FreshViewReason::DeltaSourceExpired, "delta-source-expired"),
+            (FreshViewReason::DeltaReplayBarrier, "delta-replay-barrier"),
         ];
 
         for (reason, expected) in cases {

@@ -1153,13 +1153,13 @@ service tracker remains the sole join owner.
 
 ### Final response admission token
 
-Represent the result of final replay-floor admission with one private generic
-`ReplayFloorAdmission<T>` that owns the admitted `Arc<T>`. Type-specific
-`GraphPublication` entry points select the delta source revision or Head
-snapshot revision, then share one comparison while briefly holding only the
-publication-core read lock. This keeps the final candidate alive across the
-check without coupling the publication kernel to later logical-operation
-outcomes or holding a cache guard.
+Represent final Head-snapshot admission with a private generic
+`ReplayFloorAdmission<T>` that owns the admitted `Arc<T>`. Delta admission uses
+a type-specific result that pairs the admitted `Arc<CachedDelta>` with the
+coherently captured delivery Head from the same brief publication-core read
+lock. This keeps each final candidate alive across the check, gives delta
+delivery one linearization point for replayability and response metadata, and
+holds no cache guard.
 
 ## 27 October 2026: in-memory Head snapshot operation
 
@@ -1200,3 +1200,25 @@ every requested level is present. `ApiService` retains the selected
 `Arc<GraphPublication>` beside the logical result and submits a complete
 `HeadLevelLookupResponseDto` directly to the existing priority encoding lane.
 This needs no operation-specific worker, cache adapter, or database capability.
+
+## 27 October 2026: canonical-delta selection boundary
+
+### Pure dyadic ladder and interval storage
+
+Place source-anchored target selection in a private `DeltaTargetLadder`. The
+value derives its ordered boundaries once from the source revision and retains
+the at-most-eight entries inline in `SmallVec<[u64; 8]>`. It accepts the
+coherently captured Head plus an optional existing cache target, first selects
+the protocol-owned request target or wake boundary, then lets the caller walk
+backward through those same boundaries with a cheap estimate predicate. The
+returned `DeltaRevisionRange` carries the fixed fitting target and whether
+descent made it size-limited. This keeps all sizing before the second cache
+election and lets an elected builder encode its complete fixed range directly
+rather than introducing an in-job descent state machine.
+
+Store the ApiService-wide active interval in a private `AtomicU64`. Each
+logical operation samples the independent scalar once, while validation of a
+prospective replacement is centralized with the stored value. Publication
+runtime reset therefore neither owns nor recreates the interval. The atomic
+does not encode controller policy; that remains with the
+[open decision](../decisions/open.md#adaptive-delta-load-controller).

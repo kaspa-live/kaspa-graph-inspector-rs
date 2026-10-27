@@ -98,6 +98,52 @@ pub enum GraphHistoryRange {
     },
 }
 
+/// One retained history range selected by a caller-supplied fitting policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphHistoryFittingRange {
+    target_revision: u64,
+    shortened: bool,
+    entries: GraphHistoryEntryList,
+}
+
+impl GraphHistoryFittingRange {
+    /// Returns the accepted atomic right boundary.
+    #[must_use]
+    pub const fn target_revision(&self) -> u64 {
+        self.target_revision
+    }
+
+    /// Returns the additive estimate through the accepted boundary.
+    #[must_use]
+    pub fn estimated_raw_bytes(&self) -> u64 {
+        let first = self.entries.first().expect("a fitting history range is nonempty");
+        let last = self.entries.last().expect("a fitting history range is nonempty");
+        let left_boundary = first
+            .cumulative_estimated_bytes()
+            .checked_sub(first.estimated_raw_bytes())
+            .expect("an entry estimate does not exceed its cumulative boundary");
+        last.cumulative_estimated_bytes().checked_sub(left_boundary).expect("history cumulative estimates do not regress")
+    }
+
+    /// Returns whether fitting shortened the iterator's first target.
+    #[must_use]
+    pub const fn was_shortened(&self) -> bool {
+        self.shortened
+    }
+
+    /// Returns the detached immutable entries through the accepted boundary.
+    #[must_use]
+    pub const fn entries(&self) -> &GraphHistoryEntryList {
+        &self.entries
+    }
+
+    /// Consumes the result and returns its detached immutable entries.
+    #[must_use]
+    pub fn into_entries(self) -> GraphHistoryEntryList {
+        self.entries
+    }
+}
+
 /// Level-scoped retained history for one canonical graph lineage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GraphHistory {
@@ -257,6 +303,85 @@ impl GraphHistory {
             actual_target,
             entries: Arc::from(selected),
         })
+    }
+
+    /// Selects the first fitting target from a farthest-to-nearest iterator.
+    ///
+    /// Candidate estimates are calculated from absolute cumulative boundaries
+    /// without cloning retained entries. The selected entry slice is detached
+    /// only after `fits` accepts a candidate. The first candidate is the
+    /// request-selected target; accepting any later candidate marks the result
+    /// shortened.
+    ///
+    /// # Panics
+    ///
+    /// Panics when candidates after the first are not strictly descending
+    /// retained atomic boundaries inside the first candidate's forward range.
+    pub fn fitting_range(
+        &self,
+        from_revision_id: u64,
+        mut candidate_targets: impl Iterator<Item = u64>,
+        mut fits: impl FnMut(u64) -> bool,
+    ) -> Result<Option<GraphHistoryFittingRange>, GraphHistoryRangeError> {
+        let Some(requested_target) = candidate_targets.next() else {
+            return Ok(None);
+        };
+        if requested_target < from_revision_id {
+            return Err(GraphHistoryRangeError::BackwardTarget { from_revision_id, target_revision_id: requested_target });
+        }
+        if requested_target == from_revision_id {
+            return Ok(None);
+        }
+        if from_revision_id < self.replay_floor_revision {
+            return Err(GraphHistoryRangeError::StartBeforeReplayFloor {
+                requested: from_revision_id,
+                replay_floor_revision: self.replay_floor_revision,
+            });
+        }
+
+        let oldest_available = self.oldest_available_revision();
+        if from_revision_id < oldest_available {
+            return Err(GraphHistoryRangeError::StartPruned { requested: from_revision_id, oldest_available });
+        }
+        if from_revision_id == self.current_revision_id {
+            return Ok(None);
+        }
+        let Some(start_index) = find_boundary_index(&self.entries, from_revision_id, || {}) else {
+            return Err(GraphHistoryRangeError::StartUnavailable { requested: from_revision_id, current: self.current_revision_id });
+        };
+
+        let first = &self.entries[start_index];
+        let left_boundary = first
+            .cumulative_estimated_bytes()
+            .checked_sub(first.estimated_raw_bytes())
+            .expect("an entry estimate does not exceed its cumulative boundary");
+        let mut previous_target = None;
+        for target_revision in std::iter::once(requested_target).chain(candidate_targets) {
+            assert!(
+                from_revision_id < target_revision && target_revision <= requested_target,
+                "fitting targets descend within the selected forward range"
+            );
+            if let Some(previous_target) = previous_target {
+                assert!(target_revision < previous_target, "fitting targets are strictly descending");
+            }
+            previous_target = Some(target_revision);
+            let distance = target_revision - from_revision_id;
+            let end_index = start_index
+                .checked_add(usize::try_from(distance - 1).expect("a retained range length fits usize"))
+                .expect("a retained range index fits usize");
+            let entry = self.entries.get(end_index).expect("a fitting target is retained through the selected boundary");
+            assert_eq!(entry.delta().to_revision_id(), target_revision, "a fitting target is an atomic history boundary");
+            let estimated_raw_bytes =
+                entry.cumulative_estimated_bytes().checked_sub(left_boundary).expect("history cumulative estimates do not regress");
+            if fits(estimated_raw_bytes) {
+                return Ok(Some(GraphHistoryFittingRange {
+                    target_revision,
+                    shortened: target_revision != requested_target,
+                    entries: Arc::from(self.entries.range(start_index..=end_index).cloned().collect::<Vec<_>>()),
+                }));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -633,6 +758,64 @@ mod tests {
         assert_eq!(requested_target, 2);
         assert_eq!(actual_target, 2);
         assert_eq!(entries.iter().map(|entry| entry.delta().to_revision_id()).collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn fitting_range_uses_cumulative_cost_and_detaches_only_the_accepted_slice() {
+        let history = history();
+        let mut inspected = Vec::new();
+
+        let fitting = history
+            .fitting_range(0, [3, 2, 1].into_iter(), |estimated_raw_bytes| {
+                inspected.push((estimated_raw_bytes, history.entries().map(Arc::strong_count).collect::<Vec<_>>()));
+                estimated_raw_bytes < 50
+            })
+            .expect("retained source")
+            .expect("one descending target fits");
+
+        assert_eq!(inspected, [(60, vec![1, 1, 1]), (40, vec![1, 1, 1])]);
+        assert_eq!(fitting.target_revision(), 2);
+        assert_eq!(fitting.estimated_raw_bytes(), 40);
+        assert!(fitting.was_shortened());
+        assert_eq!(fitting.entries().iter().map(|entry| entry.delta().to_revision_id()).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(history.entries().map(Arc::strong_count).collect::<Vec<_>>(), [2, 2, 1]);
+    }
+
+    #[test]
+    fn fitting_range_keeps_the_first_fitting_target_unshortened() {
+        let history = history();
+
+        let fitting = history
+            .fitting_range(1, [3, 2].into_iter(), |estimated_raw_bytes| estimated_raw_bytes < 60)
+            .expect("retained source")
+            .expect("request-selected target fits");
+
+        assert_eq!(fitting.target_revision(), 3);
+        assert_eq!(fitting.estimated_raw_bytes(), 50);
+        assert!(!fitting.was_shortened());
+        assert_eq!(fitting.entries().iter().map(|entry| entry.delta().to_revision_id()).collect::<Vec<_>>(), [2, 3]);
+    }
+
+    #[test]
+    fn fitting_range_can_shorten_to_the_final_permitted_target() {
+        let history = history();
+
+        let fitting = history
+            .fitting_range(0, [3, 2].into_iter(), |estimated_raw_bytes| estimated_raw_bytes <= 40)
+            .expect("retained source")
+            .expect("lower-bound target fits");
+
+        assert_eq!(fitting.target_revision(), 2);
+        assert_eq!(fitting.estimated_raw_bytes(), 40);
+        assert!(fitting.was_shortened());
+    }
+
+    #[test]
+    fn fitting_range_returns_none_without_detaching_when_no_candidate_fits() {
+        let history = history();
+
+        assert_eq!(history.fitting_range(0, [3, 2].into_iter(), |_| false).expect("retained source"), None);
+        assert_eq!(history.entries().map(Arc::strong_count).collect::<Vec<_>>(), [1, 1, 1]);
     }
 
     #[test]

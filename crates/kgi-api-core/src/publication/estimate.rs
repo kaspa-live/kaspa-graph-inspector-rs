@@ -5,7 +5,7 @@ use kgi_api_model::history::GraphHistoryReplayability;
 use kgi_model::block::BlockHash;
 
 /// Soft raw-byte estimate at which an atomic delta becomes a replay barrier.
-pub(super) const SOFT_DELTA_ESTIMATED_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const SOFT_DELTA_ESTIMATED_BYTES: u64 = 4 * 1024 * 1024;
 
 const ENTRY_AND_BATCH_FRAMING_BYTES: u64 = 230;
 const DISTINCT_HASH_BYTES: u64 = 68;
