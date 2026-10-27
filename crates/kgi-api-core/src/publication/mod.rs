@@ -23,7 +23,7 @@ use crate::{
     },
     client::{ClientIdentifier, SseClientRegistry},
     codec::{HeadEtag, HeadEtagInput, delta::GraphDeltaBatchDto, graph::HeadSnapshotResponseDto},
-    delta::{DeltaTargetLadder, DeltaTargetSelection},
+    delta::{DeltaRevisionRange, DeltaTargetLadder, DeltaTargetSelection},
     encoding::scheduler::EncodingScheduler,
 };
 
@@ -231,13 +231,43 @@ pub(crate) enum CanonicalDeltaSelection {
     SourceExpired,
     /// A fitting completed value or fixed-target job was selected.
     Access {
-        /// Head retained through the cache decision.
-        head: GraphDeltaTargetCapture,
-        /// Protocol-selected target which the result must satisfy.
-        requested_target: u64,
+        /// Immutable request capture retained across source-slot reentry.
+        request: CanonicalDeltaRequest,
         /// Completed value or shared construction job elected under the core guard.
         access: CacheAccess<CachedDelta>,
     },
+}
+
+/// Immutable Head, target, and pacing capture for one canonical-delta request.
+#[derive(Clone, Copy)]
+pub(crate) struct CanonicalDeltaRequest {
+    head: GraphDeltaTargetCapture,
+    selected: DeltaRevisionRange,
+    active_interval: u64,
+}
+
+impl CanonicalDeltaRequest {
+    fn new(head: GraphDeltaTargetCapture, selected: DeltaRevisionRange, active_interval: u64) -> Self {
+        Self { head, selected, active_interval }
+    }
+
+    /// Returns the coherent Head captured for this request.
+    pub(crate) const fn head(self) -> GraphDeltaTargetCapture {
+        self.head
+    }
+
+    /// Returns the fixed atomic target selected for this request.
+    pub(crate) const fn requested_target(self) -> u64 {
+        self.selected.target_revision()
+    }
+}
+
+/// Result of reentering one source slot for a request's fixed captured target.
+pub(crate) enum CanonicalDeltaReentry {
+    /// The source's first replay unit has crossed the captured cache horizon.
+    SourceExpired,
+    /// A fitting completed value or fixed-target job was selected.
+    Access(CacheAccess<CachedDelta>),
 }
 
 /// One publication-local graph lineage and its synchronization boundary.
@@ -601,24 +631,62 @@ impl GraphPublication {
             }
             DeltaTargetSelection::Range(selected) => selected,
         };
+        let request = CanonicalDeltaRequest::new(head, selected, active_interval);
         let current_target = match self.cache.lookup_delta(source_revision, selected.target_revision(), head.revision_timestamp_ms) {
             DeltaCacheLookup::Completed(completed) => {
-                return Ok(CanonicalDeltaSelection::Access {
-                    head,
-                    requested_target: selected.target_revision(),
-                    access: CacheAccess::Completed(completed),
-                });
+                return Ok(CanonicalDeltaSelection::Access { request, access: CacheAccess::Completed(completed) });
             }
             DeltaCacheLookup::Running(job) => {
-                return Ok(CanonicalDeltaSelection::Access {
-                    head,
-                    requested_target: selected.target_revision(),
-                    access: CacheAccess::Job(job),
-                });
+                return Ok(CanonicalDeltaSelection::Access { request, access: CacheAccess::Job(job) });
             }
             DeltaCacheLookup::ConstructionRequired { current_target } => current_target,
         };
 
+        match self.elect_canonical_delta_from_history(&core, jobs, scheduler, request, current_target)? {
+            CanonicalDeltaReentry::SourceExpired => Ok(CanonicalDeltaSelection::SourceExpired),
+            CanonicalDeltaReentry::Access(access) => Ok(CanonicalDeltaSelection::Access { request, access }),
+        }
+    }
+
+    /// Reenters one source slot after a joined job proved shorter than the
+    /// request's fixed captured target.
+    pub(crate) async fn reenter_canonical_delta(
+        self: &Arc<Self>,
+        jobs: &CacheJobTracker,
+        scheduler: &EncodingScheduler,
+        request: CanonicalDeltaRequest,
+    ) -> Result<CanonicalDeltaReentry, GraphHistoryRangeError> {
+        let CanonicalDeltaRequest { head, selected, .. } = request;
+        let source_revision = selected.source_revision();
+        assert_eq!(head.publication_id, self.publication_id, "delta target belongs to this publication");
+        assert!(source_revision < selected.target_revision(), "delta reentry retains a forward request target");
+        assert!(selected.target_revision() <= head.revision, "delta reentry target does not exceed its captured Head");
+
+        let core = self.core.read().await;
+        assert!(
+            core.view.current_revision_id() >= head.revision,
+            "a publication Head does not retreat behind a retained delta request"
+        );
+        let current_target = match self.cache.lookup_delta(source_revision, selected.target_revision(), head.revision_timestamp_ms) {
+            DeltaCacheLookup::Completed(completed) => {
+                return Ok(CanonicalDeltaReentry::Access(CacheAccess::Completed(completed)));
+            }
+            DeltaCacheLookup::Running(job) => return Ok(CanonicalDeltaReentry::Access(CacheAccess::Job(job))),
+            DeltaCacheLookup::ConstructionRequired { current_target } => current_target,
+        };
+        self.elect_canonical_delta_from_history(&core, jobs, scheduler, request, current_target)
+    }
+
+    fn elect_canonical_delta_from_history(
+        self: &Arc<Self>,
+        core: &GraphPublicationCore,
+        jobs: &CacheJobTracker,
+        scheduler: &EncodingScheduler,
+        request: CanonicalDeltaRequest,
+        current_target: Option<u64>,
+    ) -> Result<CanonicalDeltaReentry, GraphHistoryRangeError> {
+        let CanonicalDeltaRequest { head, selected, active_interval } = request;
+        let source_revision = selected.source_revision();
         let ladder = DeltaTargetLadder::new(source_revision, head.revision, current_target, active_interval);
         let fitting = core
             .history
@@ -633,7 +701,7 @@ impl GraphPublication {
             .checked_sub(first_revision_timestamp_ms)
             .expect("a selected delta source does not postdate its captured Head");
         if age_ms >= kgi_api_model::protocol::DELTA_CACHE_MAX_AGE_MS {
-            return Ok(CanonicalDeltaSelection::SourceExpired);
+            return Ok(CanonicalDeltaReentry::SourceExpired);
         }
 
         let target_revision = fitting.target_revision();
@@ -650,7 +718,7 @@ impl GraphPublication {
             size_limited,
             move |context| async move { Self::build_delta(fitting_entries, estimated_raw_bytes, scheduler, context).await },
         );
-        Ok(CanonicalDeltaSelection::Access { head, requested_target: selected.target_revision(), access })
+        Ok(CanonicalDeltaReentry::Access(access))
     }
 
     #[cfg(test)]

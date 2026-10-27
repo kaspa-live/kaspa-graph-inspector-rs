@@ -29,8 +29,8 @@ use crate::{
     },
     error::ApiServiceError,
     publication::{
-        CanonicalDeltaSelection, GraphDeltaTargetCapture, GraphPublication, GraphPublicationState, HeadTierSelection,
-        ReplayFloorAdmission,
+        CanonicalDeltaReentry, CanonicalDeltaSelection, GraphDeltaTargetCapture, GraphPublication, GraphPublicationState,
+        HeadTierSelection, ReplayFloorAdmission,
         runtime::{PublicationInstallOutcome, PublicationInstaller, PublicationRuntime},
     },
 };
@@ -549,58 +549,60 @@ impl ApiService {
         }
 
         let active_interval = self.active_delta_interval.current();
-        loop {
-            let (head, requested_target, access) = match publication
-                .select_canonical_delta(&self.cache_jobs, &self.encoding.scheduler, from_revision_id, client, active_interval)
-                .await
-            {
-                Ok(CanonicalDeltaSelection::FutureCursor) => {
-                    return Ok(CanonicalDeltaResponse::InvalidFutureCursor { publication });
-                }
-                Ok(CanonicalDeltaSelection::ClientRegistrationMissing) => {
-                    return Ok(CanonicalDeltaResponse::ClientRegistrationRequired { publication });
-                }
-                Ok(CanonicalDeltaSelection::UpToDate(head)) => {
-                    return Ok(self.complete_delta_success(
-                        publication,
-                        head,
-                        CanonicalDeltaSuccess::UpToDate,
-                        from_revision_id,
-                        client,
-                        active_interval,
-                    ));
-                }
-                Ok(CanonicalDeltaSelection::ReplayBarrier) => {
-                    return Ok(CanonicalDeltaResponse::FreshViewRequired {
-                        publication: Some(publication),
-                        reason: FreshViewReason::DeltaReplayBarrier,
-                    });
-                }
-                Ok(CanonicalDeltaSelection::WaitForWakeup(head)) => {
-                    return Ok(self.complete_delta_success(
-                        publication,
-                        head,
-                        CanonicalDeltaSuccess::WaitForWakeup,
-                        from_revision_id,
-                        client,
-                        active_interval,
-                    ));
-                }
-                Ok(CanonicalDeltaSelection::SourceExpired) => {
-                    return Ok(CanonicalDeltaResponse::FreshViewRequired {
-                        publication: Some(publication),
-                        reason: FreshViewReason::DeltaSourceExpired,
-                    });
-                }
-                Ok(CanonicalDeltaSelection::Access { head, requested_target, access }) => (head, requested_target, access),
-                Err(error) => {
-                    return Ok(CanonicalDeltaResponse::FreshViewRequired {
-                        publication: Some(publication),
-                        reason: delta_history_error_reason(error),
-                    });
-                }
-            };
+        let (request, mut access) = match publication
+            .select_canonical_delta(&self.cache_jobs, &self.encoding.scheduler, from_revision_id, client, active_interval)
+            .await
+        {
+            Ok(CanonicalDeltaSelection::FutureCursor) => {
+                return Ok(CanonicalDeltaResponse::InvalidFutureCursor { publication });
+            }
+            Ok(CanonicalDeltaSelection::ClientRegistrationMissing) => {
+                return Ok(CanonicalDeltaResponse::ClientRegistrationRequired { publication });
+            }
+            Ok(CanonicalDeltaSelection::UpToDate(head)) => {
+                return Ok(self.complete_delta_success(
+                    publication,
+                    head,
+                    CanonicalDeltaSuccess::UpToDate,
+                    from_revision_id,
+                    client,
+                    active_interval,
+                ));
+            }
+            Ok(CanonicalDeltaSelection::ReplayBarrier) => {
+                return Ok(CanonicalDeltaResponse::FreshViewRequired {
+                    publication: Some(publication),
+                    reason: FreshViewReason::DeltaReplayBarrier,
+                });
+            }
+            Ok(CanonicalDeltaSelection::WaitForWakeup(head)) => {
+                return Ok(self.complete_delta_success(
+                    publication,
+                    head,
+                    CanonicalDeltaSuccess::WaitForWakeup,
+                    from_revision_id,
+                    client,
+                    active_interval,
+                ));
+            }
+            Ok(CanonicalDeltaSelection::SourceExpired) => {
+                return Ok(CanonicalDeltaResponse::FreshViewRequired {
+                    publication: Some(publication),
+                    reason: FreshViewReason::DeltaSourceExpired,
+                });
+            }
+            Ok(CanonicalDeltaSelection::Access { request, access }) => (request, access),
+            Err(error) => {
+                return Ok(CanonicalDeltaResponse::FreshViewRequired {
+                    publication: Some(publication),
+                    reason: delta_history_error_reason(error),
+                });
+            }
+        };
+        let head = request.head();
+        let requested_target = request.requested_target();
 
+        loop {
             let candidate = match access.resolve(cancellation.clone()).await {
                 Ok(candidate) => candidate,
                 Err(CacheWaitError::InvalidatedByReplayFloor { .. }) => {
@@ -614,6 +616,21 @@ impl ApiService {
             if candidate.is_adequate_for(requested_target) {
                 return Ok(self.complete_cached_delta(publication, head, requested_target, candidate, client, active_interval).await);
             }
+            access = match publication.reenter_canonical_delta(&self.cache_jobs, &self.encoding.scheduler, request).await {
+                Ok(CanonicalDeltaReentry::SourceExpired) => {
+                    return Ok(CanonicalDeltaResponse::FreshViewRequired {
+                        publication: Some(publication),
+                        reason: FreshViewReason::DeltaSourceExpired,
+                    });
+                }
+                Ok(CanonicalDeltaReentry::Access(access)) => access,
+                Err(error) => {
+                    return Ok(CanonicalDeltaResponse::FreshViewRequired {
+                        publication: Some(publication),
+                        reason: delta_history_error_reason(error),
+                    });
+                }
+            };
         }
     }
 
@@ -2328,6 +2345,65 @@ mod tests {
         };
         assert_eq!(later_head.revision(), 64);
         assert_eq!(later_delta.to_revision_id(), 64);
+
+        service.shutdown().await.expect("service shuts down");
+    }
+
+    #[tokio::test]
+    async fn cache_job_reentry_preserves_the_request_head_and_target() {
+        let (service, _events) = service();
+        let entries = (1..=40).map(|revision| (revision, 1)).collect::<Vec<_>>();
+        let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
+        service.current_publication.send_replace(Some(publication.clone()));
+
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let builder_started = started.clone();
+        let builder_release = release.clone();
+        let CacheAccess::Job(short_job) =
+            publication.cache().elect_delta(&service.cache_jobs, 32, 33, 36, false, move |_| async move {
+                builder_started.add_permits(1);
+                builder_release.acquire().await.expect("controlled builder remains open").forget();
+                Ok(Arc::new(CachedDelta::new(32, 36, false, 4, bytes::Bytes::from_static(b"short"))))
+            })
+        else {
+            panic!("fixture installs one controlled short job")
+        };
+        started.acquire().await.expect("controlled job starts").forget();
+        let baseline_references = Arc::strong_count(&short_job);
+
+        let request_service = service.clone();
+        let publication_id = publication.publication_id();
+        let request =
+            tokio::spawn(async move { request_service.canonical_delta(publication_id, 32, None, CancellationToken::new()).await });
+        timeout(TEST_TIMEOUT, async {
+            while Arc::strong_count(&short_job) == baseline_references {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the revision-40 request joins the short job");
+
+        for id in 100..124 {
+            publication.apply_block_committed(&block_update(id, 2, 1)).await.expect("Head advances while the request waits");
+        }
+        assert_eq!(publication.capture_delta_target().await.revision(), 64);
+        release.add_permits(1);
+
+        let response = request.await.expect("request task completes").expect("logical outcome");
+        let CanonicalDeltaResponse::Success {
+            head,
+            outcome: CanonicalDeltaSuccess::Complete(enlarged),
+            continuation: DeltaContinuation::ReachedHead,
+            ..
+        } = response
+        else {
+            panic!("the request returns only the enlargement to its captured target")
+        };
+        assert_eq!(head.revision(), 40);
+        assert_eq!(enlarged.source_revision_id(), 32);
+        assert_eq!(enlarged.to_revision_id(), 40);
+        assert_eq!(short_job.wait(CancellationToken::new()).await.expect("short result remains observable").to_revision_id(), 36);
 
         service.shutdown().await.expect("service shuts down");
     }
