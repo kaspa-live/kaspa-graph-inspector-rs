@@ -87,8 +87,8 @@ do not enlarge the PR silently. Any future regrouping requires updating this
 sequence first.
 
 The former broad Step 6 is now increments 6–20, former Step 7 is increments
-21–25, and former Step 8 is increments 26–30. Increments 6–15 are complete;
-the active production work is increment 16, without an additional nesting
+21–25, and former Step 8 is increments 26–30. Increments 6–16 are complete;
+the active production work is increment 17, without an additional nesting
 level.
 
 | Increment / PR | Isolated production scope | Completion evidence |
@@ -119,72 +119,43 @@ level.
 | 29. Deployment and release artifacts | Complete the conventional and Docker layouts, runtime log directories, systemd and Compose examples, static-asset cache behavior, and atomic `xtask` bundle/container construction against the composed binary and Web build. | Reproducible bundle and image checks, matching binary/assets and provenance, missing-root failure, unprivileged/read-only deployment, writable logs, direct signal delivery, and atomic failure cleanup. |
 | 30. Full-stack acceptance | Add only the remaining cross-component fixtures and acceptance coverage needed to prove the focused verification contract across node RPC, PostgreSQL, recovery, API/Web, packaging, logging, and resource isolation; update implementation status with the final evidence. | Full Rust, PostgreSQL, Vitest, deterministic and complete-stack Playwright, parity, packaging, shutdown, and load/isolation suites pass from a clean checkout. |
 
-### Active increment 16: response-cache and encoding kernels
+### Active increment 17: in-memory Head snapshot and level operations
 
-Increment 16 is exactly one reviewable PR. It adapts the existing cache and
-encoding foundation to the settled response-cache representation and job
-lifecycle without implementing a logical public request operation. The focused
+Increment 17 is exactly one reviewable PR. It adds the first logical consumers
+of the response-cache and encoding kernels while remaining below HTTP parsing,
+admission, and delivery. The focused
 [protocol](../architecture/api-protocol.md),
 [ApiService](../architecture/api-service.md),
 [publication](../architecture/api-publication.md), and
 [verification](../architecture/verification.md) documents remain the sole
 owners of those contracts; this plan records only their implementation order.
 
-Execute increment 16 as these ordered points:
+Execute increment 17 as these ordered points. These are review outcomes rather
+than commit boundaries; implementation should use the smallest coherent design
+and must not introduce intermediate abstractions solely to mirror this list.
 
-1. Align the private cached response values and protocol constants with their
-   current owners. Give `CachedDelta` its complete kernel representation,
-   replace the derived Head-depth sequence with the exact configured tier set,
-   and remove superseded level-distance, refresh, destination-heat, and
-   target-level-index constants and accessors. Keep public outcome selection
-   outside this increment.
-2. Reduce Head caching to exact-tier slot primitives. Preserve one completed
-   value and one pending job per configured tier, but remove larger-tier reuse,
-   demand refresh, and level-distance eligibility from the kernel. Retain exact
-   job identity, weak insertion, replay-floor invalidation, and tracked task
-   completion so increment 17 can supply the request-owned eligibility inputs.
-3. Replace the delta side indexes with the source-ordered `DeltaCache` and its
-   source-slot state. Add bounded prefix age pruning using the supplied
-   publication-local Head timestamp, preserve equal-timestamp ordering, and
-   keep replay-floor invalidation on the same cache mutex. Removing an expired
-   slot must detach rather than await or resurrect its running job.
-4. Implement the two cache-election primitives used by a later canonical-delta
-   operation: initial prune-and-lookup without history, followed after an
-   immutable capture by complete source-slot re-evaluation. Serialize all work
-   for one source, preserve an inadequate completed value during enlargement,
-   join the current source job regardless of its target, and require a farther
-   waiter to re-enter after completion.
-5. Add fixed source-job targets and pre-election sizing inputs. The second
-   cache operation accepts a caller-supplied fitting target and its
-   `size_limited` classification, and installs only that target in one critical
-   section. Remove every separate ceiling field, excluded-target election
-   result, and in-job descent or target transition. Reclassify an already
-   completed fitting value by sharing its encoded bytes, retain no size evidence
-   after job failure or cancellation, and replace the completed value only with
-   a successful farther result. The dyadic sizing algorithm remains in
-   increment 18.
-6. Add the scheduler-owned canonical-delta encoding mode. Keep capped
-   serialization unchanged for non-delta graph bodies, while delta encoding
-   returns its complete observed JSON size and deterministic gzip body even
-   after crossing the diagnostic threshold. Expose one construction-level
-   estimator-overrun observation, preserve cancellation and shutdown tracking,
-   and verify the recorded estimator weights against reachable maximum wire
-   widths.
-7. Replace superseded cache tests with focused kernel and controlled-race
-   coverage for the exact tier set, ordered-prefix pruning, both cache-election
-   passes, source serialization and enlargement, fitting-target installation,
-   completed-value reclassification, absence of retained size evidence after
-   failure, weak insertion,
-   replay-floor invalidation, detached completion, estimator measurements,
-   diagnostic-overrun acceptance, cancellation, and terminal joining. Update
-   non-normative implementation records, run the full Rust validation suite,
-   and keep the PR limited to this kernel adaptation.
+1. Implement the complete logical Head snapshot operation over one retained
+   publication. Integrate exact-tier selection and single flight, coherent
+   Frozen capture, encoding, completion-time eligibility, replay-floor
+   admission, and weak-validator comparison through direct interfaces between
+   the existing publication, cache, codec, and scheduler owners. Record only
+   durable implementation choices that the resulting design actually needs.
+2. Implement the complete retained Head-level lookup operation. Keep it a
+   straightforward all-or-nothing capture and encoding path that bypasses the
+   response cache and database while preserving publication identity and
+   request-local failure.
+3. Add focused operation and controlled-race coverage for tier selection and
+   reuse, obsolete-candidate recapture, replay-floor ordering, state and
+   replacement behavior, weak validators, Stale publications, all-or-nothing
+   levels, cancellation, and request-local failures. Update the non-normative
+   implementation records, run the full Rust validation suite, and keep the PR
+   limited to these two logical in-memory operations.
 
-This increment adds no logical Head snapshot, Head-level, canonical-delta,
-anchored-window, or status result; no active-interval or dyadic-target policy;
-no HTTP admission lane, Axum route, or SSE transport; and no adaptive
-controller. Increment 17 owns the first Head-tier consumer, while increment 18
-owns canonical-delta selection, source-age outcomes, and public continuation.
+This increment adds no canonical-delta selection or continuation, anchored
+window or status operation, HTTP/SSE transport, public admission lane,
+database read, or adaptive controller. Increment 18 owns canonical-delta
+selection and registration completion; increments 19–20 own the remaining
+logical operations, admission, and transport.
 
 ## Cross-increment ordering
 
