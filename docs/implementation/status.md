@@ -438,3 +438,25 @@ delta selection, continuation, and registration completion remain in
 increment 18. Completion validation passed workspace formatting, Cargo check,
 565/565 Nextest tests including Docker PostgreSQL integration, Cargo doctests,
 Clippy with warnings denied, and `git diff --check`.
+
+Implementation increment 17 is implemented: `ApiService` now provides the
+complete logical in-memory Head snapshot and retained Head-level operations.
+Head snapshots select only the smallest configured covering tier, use the
+publication-owned two-election cache path, admit matching prospective weak
+validators without construction, recapture obsolete candidates within the
+same tracked job, and linearize final cached delivery against the replay
+floor. Retained level lookup captures all requested values under one
+publication-core read lock, encodes through the priority scheduler, and keeps
+the result request-owned without entering the response cache or database.
+Both operations retain the exact selected publication across later state
+change or replacement and preserve request-local cancellation and encoding
+failures. Focused tests cover every target-tier boundary, eligible reuse,
+construction-free exact and wildcard matches, both second-election races,
+first-tier completion-time recapture, replay-floor invalidation and re-entry,
+weak-validator identity, Stale serving, all-or-nothing levels, cache bypass,
+replacement after capture, cancellation, and encoding failure. Canonical
+delta selection and continuation remain in
+increment 18; HTTP parsing, admission, headers, and delivery remain in later
+increments. Completion validation passed workspace formatting, Cargo check,
+577/577 Nextest tests including Docker PostgreSQL integration, Cargo doctests,
+Clippy with warnings denied, and `git diff --check`.

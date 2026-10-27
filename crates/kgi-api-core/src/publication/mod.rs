@@ -322,6 +322,12 @@ impl GraphPublication {
         self.cache.clone()
     }
 
+    /// Forces every test update to cross the replay-barrier estimate.
+    #[cfg(test)]
+    pub(crate) fn force_replay_barrier_estimate(&mut self) {
+        self.delta_estimate_test_override = Some(estimate::SOFT_DELTA_ESTIMATED_BYTES);
+    }
+
     /// Returns this publication's client-registration and wake registry.
     pub(crate) const fn client_registry(&self) -> &SseClientRegistry {
         &self.clients
@@ -742,9 +748,13 @@ mod tests {
     }
 
     fn cached_head_candidate(publication_id: u64, revision: u64) -> Arc<CachedHeadSnapshot> {
+        cached_head_candidate_at_depth(publication_id, revision, 50)
+    }
+
+    fn cached_head_candidate_at_depth(publication_id: u64, revision: u64, depth: u32) -> Arc<CachedHeadSnapshot> {
         let extent = LevelExtent::new(1, 1).expect("valid cached Head extent");
         Arc::new(CachedHeadSnapshot::new(
-            50,
+            depth,
             revision,
             revision * 10,
             1,
@@ -833,6 +843,104 @@ mod tests {
         let selection = publication.head_tier(&jobs, &scheduler, 20, |etag| etag == &expected).await;
         assert!(matches!(selection, HeadTierSelection::ConditionMatched(etag) if etag == expected));
         assert!(matches!(cache.lookup_head(20, HeadEligibilityBoundary::new(0, 0, 0)), HeadCacheLookup::ConstructionRequired));
+
+        jobs.shutdown().await;
+        scheduler.shutdown().await.expect("scheduler shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_head_election_joins_a_job_installed_after_the_initial_miss() {
+        let publication = Arc::new(
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view(), GraphHistory::new())
+                .expect("coherent publication"),
+        );
+        let cache = publication.cache();
+        let jobs = Arc::new(CacheJobTracker::new());
+        let scheduler = EncodingScheduler::production();
+        let condition_entered = Arc::new(std::sync::Barrier::new(2));
+        let resume_condition = Arc::new(std::sync::Barrier::new(2));
+
+        let request_publication = publication.clone();
+        let request_jobs = jobs.clone();
+        let request_scheduler = scheduler.clone();
+        let request_entered = condition_entered.clone();
+        let request_resume = resume_condition.clone();
+        let request = tokio::spawn(async move {
+            request_publication
+                .head_tier(&request_jobs, &request_scheduler, 20, |_| {
+                    request_entered.wait();
+                    request_resume.wait();
+                    false
+                })
+                .await
+        });
+        condition_entered.wait();
+
+        let competing = match cache.elect_head(
+            &jobs,
+            20,
+            HeadEligibilityBoundary::new(0, 0, 0),
+            || (),
+            |(), _| async { std::future::pending::<Result<Arc<CachedHeadSnapshot>, CacheBuildError>>().await },
+        ) {
+            CacheAccess::Job(job) => job,
+            CacheAccess::Completed(_) => panic!("the competing caller installs a running job"),
+        };
+        resume_condition.wait();
+
+        let HeadTierSelection::Access(CacheAccess::Job(joined)) = request.await.expect("request task completes") else {
+            panic!("the second election joins the competing job")
+        };
+        assert!(Arc::ptr_eq(&joined, &competing));
+
+        jobs.shutdown().await;
+        scheduler.shutdown().await.expect("scheduler shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_head_election_reuses_a_completion_installed_after_the_initial_miss() {
+        let publication = Arc::new(
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head_view(), GraphHistory::new())
+                .expect("coherent publication"),
+        );
+        let cache = publication.cache();
+        let jobs = Arc::new(CacheJobTracker::new());
+        let scheduler = EncodingScheduler::production();
+        let condition_entered = Arc::new(std::sync::Barrier::new(2));
+        let resume_condition = Arc::new(std::sync::Barrier::new(2));
+
+        let request_publication = publication.clone();
+        let request_jobs = jobs.clone();
+        let request_scheduler = scheduler.clone();
+        let request_entered = condition_entered.clone();
+        let request_resume = resume_condition.clone();
+        let request = tokio::spawn(async move {
+            request_publication
+                .head_tier(&request_jobs, &request_scheduler, 20, |_| {
+                    request_entered.wait();
+                    request_resume.wait();
+                    false
+                })
+                .await
+        });
+        condition_entered.wait();
+
+        let expected = cached_head_candidate_at_depth(publication.publication_id(), 0, 20);
+        let competing = cache.elect_head(
+            &jobs,
+            20,
+            HeadEligibilityBoundary::new(0, 0, 0),
+            || expected.clone(),
+            |candidate, _| async move { Ok(candidate) },
+        );
+        let completed =
+            competing.resolve(tokio_util::sync::CancellationToken::new()).await.expect("competing completion is installed");
+        resume_condition.wait();
+
+        let HeadTierSelection::Access(CacheAccess::Completed(reused)) = request.await.expect("request task completes") else {
+            panic!("the second election reuses the competing completion")
+        };
+        assert!(Arc::ptr_eq(&reused, &completed));
 
         jobs.shutdown().await;
         scheduler.shutdown().await.expect("scheduler shuts down");

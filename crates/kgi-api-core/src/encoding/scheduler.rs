@@ -137,6 +137,12 @@ impl EncodingScheduler {
     pub(crate) fn fail_worker(&self) {
         self.inner.record_failure();
     }
+
+    /// Returns the number of priority jobs waiting to begin blocking work.
+    #[cfg(test)]
+    pub(crate) fn queued_priority_jobs(&self) -> usize {
+        self.inner.lock_state().priority_queue.len()
+    }
 }
 
 /// One historical queue position retained across its database projection phase.

@@ -598,6 +598,7 @@ mod tests {
     };
     use tokio::{
         sync::{Semaphore, mpsc::error::TryRecvError, watch},
+        task::JoinHandle,
         time::timeout,
     };
     use tokio_util::sync::CancellationToken;
@@ -610,8 +611,10 @@ mod tests {
     };
     use crate::{
         api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
+        cache::{CacheBuildError, CacheWaitError, HeadCacheLookup, HeadEligibilityBoundary},
         client::{SseMailbox, SseMessage},
         codec::{HeadEtagInput, sse::PublicationStateDto},
+        encoding::scheduler::{EncodingSchedulerError, MAX_GRAPH_ENCODING_JOBS},
         error::ApiServiceError,
         publication::{
             GraphPublication, GraphPublicationState,
@@ -707,6 +710,49 @@ mod tests {
         }
     }
 
+    async fn occupy_priority_encoding(service: &ApiService) -> (Vec<JoinHandle<()>>, Arc<StdBarrier>) {
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(StdBarrier::new(MAX_GRAPH_ENCODING_JOBS + 1));
+        let mut tasks = Vec::with_capacity(MAX_GRAPH_ENCODING_JOBS);
+        for _ in 0..MAX_GRAPH_ENCODING_JOBS {
+            let scheduler = service.encoding.scheduler.clone();
+            let started = started.clone();
+            let release = release.clone();
+            tasks.push(tokio::spawn(async move {
+                scheduler
+                    .encode_priority(BlockingEncoding { started, release }, CancellationToken::new())
+                    .await
+                    .expect("encoding blocker completes");
+            }));
+        }
+        started
+            .acquire_many(u32::try_from(MAX_GRAPH_ENCODING_JOBS).expect("encoding-job count fits u32"))
+            .await
+            .expect("encoding start signals remain open")
+            .forget();
+        (tasks, release)
+    }
+
+    async fn release_priority_encoding(tasks: Vec<JoinHandle<()>>, release: Arc<StdBarrier>) {
+        release.wait();
+        for task in tasks {
+            task.await.expect("encoding blocker task completes");
+        }
+    }
+
+    async fn wait_for_queued_priority_jobs(service: &ApiService, expected: usize) {
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                if service.encoding.scheduler.queued_priority_jobs() >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("encoding priority queue did not reach {expected} jobs"));
+    }
+
     fn publication() -> Arc<GraphPublication> {
         let view = GraphView::from_database_projection(
             1,
@@ -720,6 +766,27 @@ mod tests {
             GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), view, GraphHistory::new())
                 .expect("coherent publication"),
         )
+    }
+
+    fn publication_with_levels(origin: Instant) -> Arc<GraphPublication> {
+        let view = GraphView::from_database_projection(
+            2,
+            LevelExtent::new(1, 2).expect("valid extent"),
+            TrackingPolicy::Head,
+            BTreeMap::from([(1, Level { size: 1, daa_score: None }), (2, Level { size: 2, daa_score: Some(20) })]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        Arc::new(
+            GraphPublication::new(GraphPublicationState::Synchronizing, origin, view, GraphHistory::new())
+                .expect("coherent publication"),
+        )
+    }
+
+    fn replay_barrier_publication(origin: Instant) -> Arc<GraphPublication> {
+        let mut publication = publication_with_levels(origin);
+        Arc::get_mut(&mut publication).expect("the fresh fixture has one owner").force_replay_barrier_estimate();
+        publication
     }
 
     fn decode_gzip(body: &bytes::Bytes) -> serde_json::Value {
@@ -912,6 +979,18 @@ mod tests {
 
         let publication = publication();
         service.current_publication.send_replace(Some(publication.clone()));
+        let wildcard = service
+            .head_snapshot(21, &HeadSnapshotCondition::Any, CancellationToken::new())
+            .await
+            .expect("a wildcard condition is admitted without construction");
+        assert!(
+            matches!(wildcard, HeadSnapshotOutcome::NotModified { publication: retained, .. } if Arc::ptr_eq(&retained, &publication))
+        );
+        assert!(matches!(
+            publication.cache().lookup_head(50, HeadEligibilityBoundary::new(0, 0, 0)),
+            HeadCacheLookup::ConstructionRequired
+        ));
+
         let prospective_etag =
             HeadEtagInput::new(publication.publication_id(), 0, LevelExtent::new(1, 1).expect("valid current-tier extent")).etag();
         let prospective_condition = HeadSnapshotCondition::Tags(Arc::from([prospective_etag.clone()]));
@@ -957,6 +1036,17 @@ mod tests {
         assert!(Arc::ptr_eq(&retained, &publication));
         assert_eq!(matched, *first.etag());
 
+        assert!(publication.transition_stale().await);
+        let stale = service
+            .head_snapshot(1, &HeadSnapshotCondition::Unconditional, CancellationToken::new())
+            .await
+            .expect("a Stale publication remains addressable");
+        let HeadSnapshotOutcome::Complete { publication: retained, snapshot: stale } = stale else {
+            panic!("the Stale publication serves its retained snapshot")
+        };
+        assert!(Arc::ptr_eq(&retained, &publication));
+        assert!(Arc::ptr_eq(&stale, &first));
+
         let nonmatching = HeadSnapshotCondition::Tags(Arc::from([HeadEtagInput::new(
             publication.publication_id(),
             first.revision(),
@@ -1001,21 +1091,21 @@ mod tests {
     #[tokio::test]
     async fn head_level_lookup_is_all_or_nothing_and_encodes_one_capture() {
         let (service, _events) = service();
-        let publication = publication();
+        let publication = publication_with_levels(Instant::now());
         service.current_publication.send_replace(Some(publication.clone()));
 
         let missing = service
-            .head_levels(publication.publication_id(), &[1, 2], CancellationToken::new())
+            .head_levels(publication.publication_id(), &[2, 3, 1], CancellationToken::new())
             .await
             .expect("an unavailable level is a semantic outcome");
         let HeadLevelLookupResponse::LevelUnavailable { publication: retained, requested_level } = missing else {
             panic!("one unavailable level prevents a partial response")
         };
         assert!(Arc::ptr_eq(&retained, &publication));
-        assert_eq!(requested_level, 2);
+        assert_eq!(requested_level, 3);
 
         let complete = service
-            .head_levels(publication.publication_id(), &[1], CancellationToken::new())
+            .head_levels(publication.publication_id(), &[2, 1], CancellationToken::new())
             .await
             .expect("retained levels encode successfully");
         let HeadLevelLookupResponse::Complete { publication: retained, body } = complete else {
@@ -1027,11 +1117,169 @@ mod tests {
             json!({
                 "publication_id": publication.publication_id().to_string(),
                 "revision": "0",
-                "levels": [{ "level": 1, "size": 1, "daa_score": null }]
+                "levels": [
+                    { "level": 2, "size": 2, "daa_score": "20" },
+                    { "level": 1, "size": 1, "daa_score": null }
+                ]
             })
         );
+        assert!(matches!(
+            publication.cache().lookup_head(20, HeadEligibilityBoundary::new(0, 0, 0)),
+            HeadCacheLookup::ConstructionRequired
+        ));
+
+        assert!(publication.transition_stale().await);
+        assert!(matches!(
+            service
+                .head_levels(publication.publication_id(), &[1], CancellationToken::new())
+                .await
+                .expect("a Stale publication remains addressable"),
+            HeadLevelLookupResponse::Complete { publication: retained, .. } if Arc::ptr_eq(&retained, &publication)
+        ));
 
         service.shutdown().await.expect("service resources shut down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn obsolete_first_tier_candidate_recaptures_within_the_same_job() {
+        let (service, _events) = service();
+        let origin = Instant::now().checked_sub(Duration::from_millis(90_000)).expect("valid old publication origin");
+        let publication = publication_with_levels(origin);
+        service.current_publication.send_replace(Some(publication.clone()));
+        let (blockers, release) = occupy_priority_encoding(&service).await;
+
+        let request_service = service.clone();
+        let request = tokio::spawn(async move {
+            request_service.head_snapshot(1, &HeadSnapshotCondition::Unconditional, CancellationToken::new()).await
+        });
+        wait_for_queued_priority_jobs(&service, 1).await;
+        assert_eq!(
+            publication.apply_block_committed(&block_update(3, 3, 2)).await.expect("Head advances while encoding is queued"),
+            Some(1)
+        );
+
+        release_priority_encoding(blockers, release).await;
+        let HeadSnapshotOutcome::Complete { publication: retained, snapshot } =
+            request.await.expect("snapshot task completes").expect("the obsolete candidate is recaptured")
+        else {
+            panic!("the recaptured first tier produces a complete response")
+        };
+        assert!(Arc::ptr_eq(&retained, &publication));
+        assert_eq!(snapshot.depth(), 20);
+        assert_eq!(snapshot.revision(), 1);
+        assert_eq!((snapshot.low_level(), snapshot.high_level()), (2, 3));
+
+        service.shutdown().await.expect("service resources shut down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_floor_invalidation_reenters_the_exact_head_tier() {
+        let (service, _events) = service();
+        let publication = replay_barrier_publication(Instant::now());
+        service.current_publication.send_replace(Some(publication.clone()));
+        let (blockers, release) = occupy_priority_encoding(&service).await;
+
+        let request_service = service.clone();
+        let request = tokio::spawn(async move {
+            request_service.head_snapshot(1, &HeadSnapshotCondition::Unconditional, CancellationToken::new()).await
+        });
+        wait_for_queued_priority_jobs(&service, 1).await;
+        assert_eq!(publication.apply_block_committed(&block_update(3, 3, 2)).await.expect("replay-barrier update commits"), Some(1));
+
+        release_priority_encoding(blockers, release).await;
+        let HeadSnapshotOutcome::Complete { publication: retained, snapshot } =
+            request.await.expect("snapshot task completes").expect("the invalidated snapshot re-enters its exact tier")
+        else {
+            panic!("the post-floor exact tier produces a complete response")
+        };
+        assert!(Arc::ptr_eq(&retained, &publication));
+        assert_eq!(snapshot.depth(), 20);
+        assert_eq!(snapshot.revision(), 1);
+
+        service.shutdown().await.expect("service resources shut down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn captured_head_operations_survive_publication_replacement() {
+        let (service, _events) = service();
+        let original = publication_with_levels(Instant::now());
+        service.current_publication.send_replace(Some(original.clone()));
+        let (blockers, release) = occupy_priority_encoding(&service).await;
+
+        let snapshot_service = service.clone();
+        let snapshot = tokio::spawn(async move {
+            snapshot_service.head_snapshot(1, &HeadSnapshotCondition::Unconditional, CancellationToken::new()).await
+        });
+        wait_for_queued_priority_jobs(&service, 1).await;
+
+        let level_service = service.clone();
+        let publication_id = original.publication_id();
+        let levels = tokio::spawn(async move { level_service.head_levels(publication_id, &[1, 2], CancellationToken::new()).await });
+        wait_for_queued_priority_jobs(&service, 2).await;
+
+        let replacement = publication();
+        service.current_publication.send_replace(Some(replacement.clone()));
+        timeout(TEST_TIMEOUT, release_priority_encoding(blockers, release))
+            .await
+            .expect("encoding blockers release before the test deadline");
+
+        let HeadSnapshotOutcome::Complete { publication: snapshot_publication, .. } = timeout(TEST_TIMEOUT, snapshot)
+            .await
+            .expect("snapshot completes before the test deadline")
+            .expect("snapshot task completes")
+            .expect("captured snapshot completes after replacement")
+        else {
+            panic!("the retained snapshot operation completes")
+        };
+        let HeadLevelLookupResponse::Complete { publication: level_publication, .. } = timeout(TEST_TIMEOUT, levels)
+            .await
+            .expect("level lookup completes before the test deadline")
+            .expect("level task completes")
+            .expect("captured levels complete after replacement")
+        else {
+            panic!("the retained level operation completes")
+        };
+        assert!(Arc::ptr_eq(&snapshot_publication, &original));
+        assert!(Arc::ptr_eq(&level_publication, &original));
+        assert!(Arc::ptr_eq(&service.current_publication().expect("replacement remains current"), &replacement));
+
+        timeout(TEST_TIMEOUT, service.shutdown())
+            .await
+            .expect("service shutdown completes before the test deadline")
+            .expect("service resources shut down");
+    }
+
+    #[tokio::test]
+    async fn head_operations_preserve_request_local_cancellation_and_encoding_failure() {
+        let (service, _events) = service();
+        let publication = publication_with_levels(Instant::now());
+        service.current_publication.send_replace(Some(publication.clone()));
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+
+        assert!(matches!(
+            service.head_snapshot(1, &HeadSnapshotCondition::Unconditional, cancelled.clone()).await,
+            Err(CacheWaitError::Cancelled)
+        ));
+        assert!(matches!(
+            service.head_levels(publication.publication_id(), &[1], cancelled).await,
+            Err(EncodingSchedulerError::Cancelled)
+        ));
+        assert!(matches!(
+            publication.cache().lookup_head(20, HeadEligibilityBoundary::new(0, 0, 0)),
+            HeadCacheLookup::ConstructionRequired
+        ));
+
+        service.encoding.scheduler.fail_worker();
+        assert!(matches!(
+            service.head_levels(publication.publication_id(), &[1], CancellationToken::new()).await,
+            Err(EncodingSchedulerError::ShuttingDown)
+        ));
+        assert!(matches!(
+            service.head_snapshot(1, &HeadSnapshotCondition::Unconditional, CancellationToken::new()).await,
+            Err(CacheWaitError::Build(CacheBuildError::Encoding(EncodingSchedulerError::ShuttingDown)))
+        ));
+        assert!(service.shutdown().await.is_err());
     }
 
     #[tokio::test]

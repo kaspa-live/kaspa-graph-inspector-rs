@@ -1191,3 +1191,12 @@ whose opaque text is
 will add the weak prefix and quotes to that opaque value. Conditional matching
 and later HTTP formatting share this one private value rather than reparsing
 the opaque text.
+
+### Retained Head-level capture and encoding
+
+Build the private `GraphLevelCapture` directly from the publication core into
+one bounded vector, converting it to the shared immutable slice only after
+every requested level is present. `ApiService` retains the selected
+`Arc<GraphPublication>` beside the logical result and submits a complete
+`HeadLevelLookupResponseDto` directly to the existing priority encoding lane.
+This needs no operation-specific worker, cache adapter, or database capability.
