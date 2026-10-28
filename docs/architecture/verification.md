@@ -2376,6 +2376,21 @@ commitment and releases admission and any request-owned body. A delivery from
 copying the body per waiter; cancelling or timing out one waiter does not
 release the cache-owned allocation.
 
+Exercise the
+[anchored-window lane handoff](api-service.md#resource-isolation-and-saturation--settled)
+with deterministic Head-backed and database-fallback outcomes. A Head-backed
+result must remain independent of saturated historical admission. On fallback,
+verify the Head capacity is released, no historical encoding reservation or
+database access occurs before historical admission, and saturation returns the
+focused public outcome while unrelated Head work remains admissible. After a
+successful handoff, stall database work, detached encoding, and response
+delivery in turn and verify the historical capacity remains charged until the
+request completes. Cancel or begin terminal shutdown between the two lane
+admissions and verify the same request cancellation and completion registration
+remains observable to the shutdown barrier. No interleaving may wait while
+retaining the Head permit, charge both HTTP lanes, resume the Head lane after
+fallback, or produce a partial response.
+
 For encoding work, fill the reservation queue before issuing a historical
 request and verify rejection performs no database access. With a reservation
 held, complete and detach a historical projection while every encoder is busy;

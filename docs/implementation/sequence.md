@@ -159,11 +159,8 @@ such a split.
    ordinary incremental commits rather than a reason to pre-split the initial
    implementation.
 
-Before point 2 assigns the anchored-window request to a concrete lane, the
-ApiService owner must clarify the current gap between the Head-lane endpoint
-list and the historical lane's database-backed-window rule. Implementation
-must not choose whether a Head-backed request retains one lane or transfers
-lanes on fallback.
+Point 2 follows the settled
+[ApiService anchored-window lane handoff](../architecture/api-service.md#resource-isolation-and-saturation--settled).
 
 This increment adds no Axum router, request parsing, HTTP header or error
 mapping, response-body delivery timeout, SSE connection task, or adaptive

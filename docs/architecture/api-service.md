@@ -763,6 +763,9 @@ request-local work; a request-local timeout may cancel the same child without
 affecting another request. Database and other request-local futures observe
 that token where cancellation is applicable. A cache wait observes it only to
 detach that waiter: it never receives or cancels the shared job token.
+An anchored-window request retains this same cancellation and completion
+registration while changing its applicable lane permit only through the
+[source-dependent lane handoff](#resource-isolation-and-saturation--settled).
 
 Axum executes the handler future. For a graph response, the response body
 retains the guard through complete delivery, delivery failure, client
@@ -914,11 +917,34 @@ MAX_SSE_CLIENTS = 1024
 SSE_CLIENT_BUFFER_CAPACITY = 8
 ```
 
-The Head lane admits Head snapshots, canonical deltas, and Head-level lookups.
-The historical lane admits database-backed anchored windows. The independent
-status lane admits only the memory-only status operation. Admission is
-nonblocking; the [API protocol](api-protocol.md#common-http-outcomes--settled)
-owns the public saturation response.
+The Head lane admits Head snapshots, canonical deltas, Head-level lookups, and
+the in-memory Head-resolution phase of every anchored-window request. A
+complete Head-backed anchored window remains charged to that lane through
+encoding and response delivery.
+
+When the immutable Head operation determines that the complete anchored window
+requires database fallback, the Head phase ends before any historical encoding
+reservation or database work begins. The request releases its Head permit and
+immediately attempts nonblocking historical-lane admission. It performs no
+graph, encoding, or database work between those operations, never waits for a
+historical permit while retaining the Head permit, and never holds both lane
+permits. Full historical capacity produces the protocol-owned saturation
+outcome. Admission closure or request cancellation during the handoff follows
+the ordinary unavailable or cancellation path. The request's cancellation and
+completion registration remains continuous, so terminal shutdown continues to
+own and drain it across the handoff.
+
+Once admitted to the historical lane, the request cannot return to the Head
+lane. It reserves historical encoding capacity before database access and
+retains the historical permit through database projection, detached encoding,
+and response delivery. Thus a Head-backed window consumes no historical HTTP
+capacity, while database fallback cannot use the larger Head lane to bypass
+the historical bulkhead.
+
+The independent status lane admits only the memory-only status operation. All
+three HTTP lane admissions are nonblocking; the
+[API protocol](api-protocol.md#common-http-outcomes--settled) owns the public
+saturation response.
 
 Public historical reads may occupy at most six of the eight API pool
 connections. The remaining pool capacity is available to publication
