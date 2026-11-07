@@ -1645,12 +1645,14 @@ enum ApiReadError {
     QueryFailed,
     GenerationLost,
     InconsistentProjection,
+    Cancelled,
 }
 
 impl ValidatedApiDbClient {
     async fn load_graph_view_seed(
         &self,
         request: GraphViewSeedRequest,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<GraphViewSeedOutcome, ApiReadError>;
 }
 ```
@@ -1665,6 +1667,30 @@ stored identities, blocks, parents, merge sets, coordinates, levels, coloring,
 VSPC membership, and construction metadata into the API-owned result. The
 materialized-ID cut is the only compact ID exposed by this operation; no
 database transaction object is exposed to ApiService.
+
+The caller-owned cancellation token covers the complete operation, including
+replacement-gate admission, API-pool connection acquisition, transaction
+startup, projection, and transaction cleanup. `Cancelled` means only that this
+caller-supplied cancellation was selected. Replacement-gate cancellation or
+exact-generation retirement remains `GenerationLost`; caller cancellation
+does not retire an otherwise valid generation.
+
+If caller cancellation is selected before a transaction exists, Storage
+releases every resource already acquired and returns `Cancelled`. If it is
+selected after PostgreSQL work begins, Storage cancels or closes the backend
+and does not return until the transaction and backend activity have ended, the
+connection has been returned or closed, and the replacement-gate lease has
+been released. Ordinary success and failure likewise return only after these
+database resources have been released. Operation completion, caller
+cancellation, and generation loss linearize once; a later observation cannot
+replace the selected terminal result.
+
+Abandoning the method future retains the Storage-owned cancellation-safe drop
+path: it transfers the connection and replacement lease to detached cleanup so
+database replacement cannot overtake PostgreSQL teardown. That fallback
+provides no cleanup-completion observation to the abandoning caller and is not
+a valid implementation of an observed cancellation barrier. This method's
+terminal result is the sole caller-visible cleanup-completion boundary.
 
 Canonical relationship validation belongs to the accepted Storage mutation
 paths, not to this projection read. Rebuild and ordinary materialization
@@ -1712,7 +1738,8 @@ without retiring the independent processing handle. Publication of the
 validated replacement emits
 `StorageServiceEvent::ApiDbPublished`. A result covered by the read-local
 resolution rules above reports `InconsistentProjection`; it never returns a
-partial seed. The
+partial seed. Caller cancellation reports `Cancelled` only after the cleanup
+barrier above and changes no generation state. The
 [publication construction contract](api-publication.md#head-publication-lifecycle-and-stream-alignment--settled)
 owns those errors during Head construction; the
 [API protocol](api-protocol.md#anchored-graph-windows--settled) owns public

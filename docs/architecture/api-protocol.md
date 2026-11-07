@@ -1632,6 +1632,7 @@ successful delta protocol's millisecond `KGI-Delta-Retry-After-Ms` header.
 Unexpected request-local failures before response commitment return `500
 Internal Server Error` with `Cache-Control: no-store`. This includes
 `ApiReadError::QueryFailed`, `ApiReadError::InconsistentProjection`, and
+an API database query timeout, as well as
 serialization or compression failure. Such failures do not stale a graph
 publication or request processing recovery. A failure after HTTP or SSE
 commitment terminates that response or stream rather than attempting a second
@@ -2040,8 +2041,15 @@ Public database-backed `ApiReadError` outcomes are exhaustive:
 | `QueryFailed` | `500 Internal Server Error` | Non-generation-loss |
 | `GenerationLost` | `503 Service Unavailable` with `Retry-After: 1` | Generation-loss |
 | `InconsistentProjection` | `500 Internal Server Error` | Non-generation-loss |
+| `Cancelled` | Initiating caller cancellation or timeout disposition | Non-generation-loss |
 
 No error returns a partial graph or transparently retries the failed request.
+`Cancelled` has no independent public status. Cancellation initiated by an API
+database query timeout returns the request-local `500` above when a response
+can still be committed. Request or shutdown cancellation follows the common
+pre- or post-commitment cancellation behavior. The
+[ApiService resource owner](api-service.md#resource-isolation-and-saturation--settled)
+defines database-phase completion and capacity release.
 The [ApiService binding contract](api-service.md#api-database-generation-binding--settled)
 owns the exact `ApiDbState` transition for each named binding path. Public read
 errors change no publication ID or state, view or history revision, SSE cursor,

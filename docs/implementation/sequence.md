@@ -161,6 +161,10 @@ such a split.
 
 Point 2 follows the settled
 [ApiService anchored-window lane handoff](../architecture/api-service.md#resource-isolation-and-saturation--settled).
+Its database phase also follows the Storage-owned
+[cancellation-complete projection boundary](../architecture/storage.md#api-graph-projection-reads--settled)
+and the
+[ApiService-owned tracked cleanup-waiter contract](../architecture/api-service.md#resource-isolation-and-saturation--settled).
 
 This increment adds no Axum router, request parsing, HTTP header or error
 mapping, response-body delivery timeout, SSE connection task, or adaptive

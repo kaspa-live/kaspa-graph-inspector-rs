@@ -134,6 +134,8 @@ For a public operation, `QueryFailed` and `InconsistentProjection` leave
 outcomes likewise do not enter generation-loss handling. `GenerationLost`
 also changes no snapshot directly: invalidity makes the exact client
 immediately unusable, and the ordered generation message owns its removal.
+`Cancelled` leaves ApiDbState unchanged; its owning request, timeout, or
+publication-runtime path selects the applicable lifecycle disposition.
 
 Generation messages by themselves change no graph publication ID, state, view
 revision, history, or SSE cursor and do not invoke processing Resync or Rebuild.
@@ -948,11 +950,34 @@ saturation response.
 
 Public historical reads may occupy at most six of the eight API pool
 connections. The remaining pool capacity is available to publication
-construction, generation validation, and replacement work. ApiService applies
-the query timeout to the complete database phase. Timeout cancels that phase,
-releases its transaction, permit, and connection, and follows the existing
-request-local internal-failure path; it does not by itself retire the API
-database generation.
+construction, generation validation, and replacement work. This six-read
+allowance is an ApiService-owned public-read permit, distinct from Storage's
+replacement-gate lease and the historical HTTP permit.
+
+ApiService owns each admitted public database phase through a tracked cleanup
+waiter. From its creation, that operation owns the exact API DB client, the
+public-read permit, and its own completion registration in the same HTTP
+shutdown barrier as request guards. The handler awaits its result but does not
+own its lifetime. The operation passes a phase-local cancellation token to
+Storage's
+[`load_graph_view_seed`](storage.md#api-graph-projection-reads--settled). The
+`API_DB_QUERY_TIMEOUT` timer covers the complete database phase, including
+replacement-gate admission and connection acquisition. Timeout, request
+cancellation, or terminal HTTP cancellation records its initiating cause,
+cancels the phase token, and continues awaiting Storage's cleanup-complete
+terminal result instead of dropping the read future.
+
+The requesting handler may detach after cancellation, but the tracked cleanup
+waiter, public-read permit, and database-phase completion registration remain
+owned until Storage reports completion. Only then does ApiService release the
+permit and finish that registration. Terminal shutdown therefore cannot
+complete while one of these cleanup waiters survives. Query timeout follows
+the existing request-local internal-failure path after cleanup and does not by
+itself retire the API database generation. Request and shutdown cancellation
+retain their ordinary
+pre- and post-response-commitment behavior. Storage's detached drop cleanup is
+an abandonment safety net and cannot satisfy this ApiService completion
+barrier.
 
 The four active encoding jobs cover graph JSON serialization and gzip
 compression. Historical work may occupy at most two, preserving capacity for
