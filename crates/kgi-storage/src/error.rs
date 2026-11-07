@@ -23,6 +23,10 @@ pub enum ApiReadError {
     /// The database snapshot could not form one complete coherent projection.
     #[error("API database projection is inconsistent")]
     InconsistentProjection,
+
+    /// The initiating caller cancelled the database read.
+    #[error("API database read was cancelled")]
+    Cancelled,
 }
 
 /// Failure while establishing the database-replacement preconditions.

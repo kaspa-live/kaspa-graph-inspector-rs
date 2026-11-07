@@ -123,12 +123,12 @@ impl Drop for PublicationRuntime {
 /// Database capability required by one publication construction attempt.
 pub(crate) trait PublicationSeedDatabase: ApiDbGeneration {
     /// Loads the complete detached Head seed from this exact generation.
-    fn load_head_seed(&self) -> impl Future<Output = Result<GraphViewSeed, ApiReadError>> + Send;
+    fn load_head_seed(&self, cancellation: CancellationToken) -> impl Future<Output = Result<GraphViewSeed, ApiReadError>> + Send;
 }
 
 impl PublicationSeedDatabase for ValidatedApiDbClient {
-    async fn load_head_seed(&self) -> Result<GraphViewSeed, ApiReadError> {
-        let outcome = self.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await?;
+    async fn load_head_seed(&self, cancellation: CancellationToken) -> Result<GraphViewSeed, ApiReadError> {
+        let outcome = self.load_graph_view_seed(GraphViewSeedRequest::HeadPublication, cancellation).await?;
         let GraphViewSeedOutcome::Loaded(seed) = outcome else { unreachable!("HeadPublication has no anchor-unavailable outcome") };
         Ok(seed)
     }
@@ -286,12 +286,11 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
             }
         };
 
-        let seed = client.load_head_seed();
+        let seed = client.load_head_seed(cancellation.clone());
         tokio::pin!(seed);
         loop {
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Ok(ConstructionOutcome::Cancelled),
                 result = &mut seed => return match result {
                     Ok(seed) => {
                         self.work = PublicationWork::Aligning(Box::new(ConstructionCandidate::from_seed(seed, origin)));
@@ -299,6 +298,7 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
                     }
                     Err(ApiReadError::QueryFailed | ApiReadError::GenerationLost | ApiReadError::InconsistentProjection) =>
                         Ok(ConstructionOutcome::Restart),
+                    Err(ApiReadError::Cancelled) => Ok(ConstructionOutcome::Cancelled),
                 },
                 observation = self.graph_updates.next_observation() => match observation {
                     Some(observation) => match self.handle_observation(observation).await? {
@@ -872,13 +872,17 @@ mod tests {
     }
 
     impl PublicationSeedDatabase for MockSeedDb {
-        async fn load_head_seed(&self) -> Result<GraphViewSeed, ApiReadError> {
+        async fn load_head_seed(&self, cancellation: CancellationToken) -> Result<GraphViewSeed, ApiReadError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.active_attempts.fetch_add(1, Ordering::SeqCst);
             let _attempt = SeedAttemptGuard(&self.active_attempts);
             self.started.add_permits(1);
             if let Some(release) = &self.release {
-                release.acquire().await.expect("seed gate remains open").forget();
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(ApiReadError::Cancelled),
+                    permit = release.acquire() => permit.expect("seed gate remains open").forget(),
+                }
             }
             let result = self.results.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).pop_front().expect("mock seed result");
             if result == Err(ApiReadError::GenerationLost) {
@@ -1047,7 +1051,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_drops_an_in_progress_seed_attempt_without_a_child_task() {
+    async fn shutdown_cancels_and_joins_an_in_progress_seed_attempt_without_a_child_task() {
         let (database, started, _release) = MockSeedDb::gated(Ok(seed(3)));
         let api_db = Arc::new(ApiDbState::new());
         api_db.update(crate::api_db::ApiDbGenerationUpdate::Published(database.clone())).expect("publish database generation");
@@ -1058,7 +1062,7 @@ mod tests {
         assert_eq!(database.active_attempts(), 1);
 
         assert_eq!(runtime.shutdown().await, Ok(()));
-        assert_eq!(database.active_attempts(), 0, "the joined worker dropped its inline seed future");
+        assert_eq!(database.active_attempts(), 0, "the joined worker observed the seed cancellation barrier");
         assert_eq!(runtime.snapshot().phase, PublicationRuntimePhase::Stopped);
     }
 

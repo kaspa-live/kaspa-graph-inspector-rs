@@ -16,6 +16,7 @@ use kgi_model::{
 use sqlx::{Connection, PgConnection, PgPool, Postgres, pool::PoolConnection};
 
 use tokio::sync::{Mutex, RwLock, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     cache::{CachedVspcSink, ProcessingCaches},
@@ -416,8 +417,15 @@ impl ValidatedApiDbClient {
     }
 
     /// Loads one coherent database-backed graph projection and its alignment metadata.
-    pub async fn load_graph_view_seed(&self, request: GraphViewSeedRequest) -> Result<GraphViewSeedOutcome, ApiReadError> {
-        self.run_read_operation(request).await
+    ///
+    /// Caller cancellation returns only after every acquired database resource
+    /// and replacement lease has been released.
+    pub async fn load_graph_view_seed(
+        &self,
+        request: GraphViewSeedRequest,
+        cancellation: CancellationToken,
+    ) -> Result<GraphViewSeedOutcome, ApiReadError> {
+        self.run_read_operation(request, cancellation).await
     }
 
     #[allow(dead_code, reason = "used by the permanent service lifecycle")]
@@ -457,8 +465,16 @@ impl ValidatedApiDbClient {
         }
     }
 
-    async fn run_read_operation(&self, request: GraphViewSeedRequest) -> Result<GraphViewSeedOutcome, ApiReadError> {
-        let mut lease = match self.acquire_read_lease().await {
+    async fn run_read_operation(
+        &self,
+        request: GraphViewSeedRequest,
+        cancellation: CancellationToken,
+    ) -> Result<GraphViewSeedOutcome, ApiReadError> {
+        let mut lease = match tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(ApiReadError::Cancelled),
+            result = self.acquire_read_lease() => result,
+        } {
             Ok(lease) => lease,
             Err(StorageError::GenerationLost) => return self.finish_generation_loss().await,
             Err(_) => return Err(ApiReadError::QueryFailed),
@@ -470,6 +486,10 @@ impl ValidatedApiDbClient {
             tokio::pin!(acquisition);
             tokio::select! {
                 biased;
+                () = cancellation.cancelled() => {
+                    drop(lease);
+                    return Err(ApiReadError::Cancelled);
+                }
                 () = lease.cancelled() => {
                     drop(lease);
                     return self.finish_generation_loss().await;
@@ -496,9 +516,26 @@ impl ValidatedApiDbClient {
         #[cfg(test)]
         session.set_resource_handoff(self.resource_handoff.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take());
 
-        let backend_pid = match sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(session.connection()).await {
-            Ok(backend_pid) => backend_pid,
-            Err(error) => {
+        enum BackendPidCompletion {
+            Finished(Result<i32, sqlx::Error>),
+            Cancelled,
+        }
+        let backend_pid_completion = {
+            let backend_pid_query = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(session.connection());
+            tokio::pin!(backend_pid_query);
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => BackendPidCompletion::Cancelled,
+                result = &mut backend_pid_query => BackendPidCompletion::Finished(result),
+            }
+        };
+        let backend_pid = match backend_pid_completion {
+            BackendPidCompletion::Cancelled => {
+                session.cancel(None).await;
+                return Err(ApiReadError::Cancelled);
+            }
+            BackendPidCompletion::Finished(Ok(backend_pid)) => backend_pid,
+            BackendPidCompletion::Finished(Err(error)) => {
                 session.release().await;
                 return self.finish_read_error(projection::query_error(error)).await;
             }
@@ -515,6 +552,13 @@ impl ValidatedApiDbClient {
             let mut operation = Box::pin(projection::load(connection, self.binding.genesis_hash(), request));
             let completion = tokio::select! {
                 biased;
+                () = cancellation.cancelled() => {
+                    let cancellation = cancel_projection_backend(self.pool(), backend_pid).await;
+                    if cancellation.is_some() {
+                        let _ = (&mut operation).await;
+                    }
+                    Completion::Interrupted { result: ApiReadError::Cancelled, cancellation }
+                }
                 () = lease.cancelled() => {
                     let cancellation = cancel_projection_backend(self.pool(), backend_pid).await;
                     if cancellation.is_some() {
@@ -769,12 +813,14 @@ mod tests {
         runtime::{RetirementTarget, retirement_channel},
     };
     use kaspa_consensus_core::network::{NetworkId, NetworkType};
+    use kgi_api_model::projection::GraphViewSeedRequest;
     use kgi_core::timing::Timing;
     use kgi_model::{
         block::{BlockCoordinate, BlockHash, CompactId},
         lifecycle::PersistenceFault,
     };
     use sqlx::postgres::PgPoolOptions;
+    use tokio_util::sync::CancellationToken;
 
     fn hash(byte: u8) -> BlockHash {
         BlockHash::from_bytes([byte; 32])
@@ -818,6 +864,33 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(client.retire());
         assert!(matches!(waiting.await.expect("retired waiter completes"), Err(StorageError::GenerationLost)));
+        exclusive.open().expect("test restores gate admission");
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_while_waiting_for_replacement_admission_releases_the_operation() {
+        let pool =
+            PgPoolOptions::new().connect_lazy("postgresql://postgres@localhost/kgi").expect("lazy PostgreSQL pool configuration");
+        let (retirement_tx, mut retirements) = retirement_channel();
+        let gate = ApiReplacementGate::new();
+        let client = ValidatedApiDbClient::new(pool, binding(), retirement_tx, gate.clone());
+        let attempt = gate.begin_replacement().expect("replacement closes admission");
+        let exclusive =
+            attempt.acquire_exclusive(&Timing::production()).await.expect("empty active set establishes replacement exclusion");
+        let cancellation = CancellationToken::new();
+
+        let operation_client = client.clone();
+        let operation_cancellation = cancellation.clone();
+        let operation = tokio::spawn(async move {
+            operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication, operation_cancellation).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!operation.is_finished());
+
+        cancellation.cancel();
+        assert_eq!(operation.await.expect("cancelled read completes"), Err(ApiReadError::Cancelled));
+        assert!(client.is_valid());
+        assert!(retirements.try_recv().is_err());
         exclusive.open().expect("test restores gate admission");
     }
 

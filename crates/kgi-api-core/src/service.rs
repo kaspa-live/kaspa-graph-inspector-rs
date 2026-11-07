@@ -907,7 +907,7 @@ mod tests {
     }
 
     impl PublicationSeedDatabase for TestGeneration {
-        async fn load_head_seed(&self) -> Result<GraphViewSeed, ApiReadError> {
+        async fn load_head_seed(&self, _cancellation: CancellationToken) -> Result<GraphViewSeed, ApiReadError> {
             panic!("simulated publication-runtime worker loss")
         }
     }
@@ -949,9 +949,13 @@ mod tests {
     }
 
     impl PublicationSeedDatabase for ControlledSeedGeneration {
-        async fn load_head_seed(&self) -> Result<GraphViewSeed, ApiReadError> {
+        async fn load_head_seed(&self, cancellation: CancellationToken) -> Result<GraphViewSeed, ApiReadError> {
             self.started.add_permits(1);
-            self.release.acquire().await.expect("seed release path remains open").forget();
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(ApiReadError::Cancelled),
+                permit = self.release.acquire() => permit.expect("seed release path remains open").forget(),
+            }
             Ok(self.seed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take().expect("one seed is loaded once"))
         }
     }
