@@ -1222,3 +1222,20 @@ prospective replacement is centralized with the stored value. Publication
 runtime reset therefore neither owns nor recreates the interval. The atomic
 does not encode controller policy; that remains with the
 [open decision](../decisions/open.md#adaptive-delta-load-controller).
+
+## 7 November 2026: anchored-window Head selection
+
+### Shared extent calculation and immutable capture
+
+Place the common anchored-extent calculation on
+`kgi_api_model::projection::GraphWindowResolution`. Storage projection and
+in-memory Head selection call the same associated function, avoiding parallel
+implementations of the protocol-owned boundary shifting while retaining the
+module-qualified shared-value boundary.
+
+Keep in-memory anchor lookup and complete subview extraction inside one private
+`GraphPublicationCore` operation. The enclosing `GraphPublication` method
+holds one core read guard for that complete synchronous operation and returns a
+private `HeadWindowSelection` containing either the detached capture or the
+need for database fallback. This adds no cache entry, worker, or synchronization
+domain and leaves lane handoff and database execution to ApiService.

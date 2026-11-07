@@ -10,6 +10,7 @@ use kgi_api_model::{
     delta::GraphDelta,
     graph::{GraphView, GraphViewExtractError, LevelExtent, TrackingPolicy},
     history::{GraphHistory, GraphHistoryEntryList, GraphHistoryRangeError, GraphHistoryReplayability},
+    projection::{GraphWindowAnchor, GraphWindowResolution, MAX_WINDOW_DEPTH},
     protocol::{HeadLevelLookupOutcome, HeadLevelValue},
 };
 use kgi_model::graph_update::{BlockCommitted, VspcCommitted};
@@ -108,6 +109,63 @@ impl GraphPublicationCore {
         }
         Ok(GraphLevelCapture { publication_id, revision: self.view.current_revision_id(), levels: levels.into() })
     }
+
+    fn select_anchored_window(&self, publication_id: u64, anchor: GraphWindowAnchor, max_depth: u32) -> HeadWindowSelection {
+        assert!(
+            (1..=MAX_WINDOW_DEPTH).contains(&max_depth),
+            "anchored graph-window depth is validated and capped before Head selection"
+        );
+
+        let resolved_level = match anchor {
+            GraphWindowAnchor::Level(level) => self.view.extent().contains_level(level).then_some(level),
+            GraphWindowAnchor::BlockHash(hash) => self.view.block(&hash).map(|block| block.coordinate.level()),
+            GraphWindowAnchor::DaaScore(requested_score) => self
+                .view
+                .levels()
+                .filter(|(level, _)| self.view.extent().contains_level(*level))
+                .filter_map(|(level, value)| value.daa_score.filter(|score| *score <= requested_score).map(|score| (score, level)))
+                .max()
+                .map(|(_, level)| level),
+        };
+        let Some(resolved_level) = resolved_level else {
+            return HeadWindowSelection::RequiresDatabase;
+        };
+
+        let head_high_level = self.view.high_level();
+        let resolution = GraphWindowResolution::around(resolved_level, head_high_level, max_depth);
+        let extent = resolution.extent();
+        if !self.view.extent().contains_extent(extent) {
+            return HeadWindowSelection::RequiresDatabase;
+        }
+
+        let view = self.view.extract_subview(extent).expect("a contained anchored extent extracts from Head");
+        HeadWindowSelection::Complete {
+            capture: Box::new(GraphViewCapture {
+                publication_id,
+                replay_floor_revision: self.history.replay_floor_revision(),
+                oldest_available_revision: self.history.oldest_available_revision(),
+                view,
+            }),
+            resolution,
+            head_high_level,
+        }
+    }
+}
+
+/// Result of resolving one anchored window against an immutable Head image.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HeadWindowSelection {
+    /// Head supplied both the anchor resolution and the complete frozen view.
+    Complete {
+        /// Detached immutable view selected from the publication.
+        capture: Box<GraphViewCapture>,
+        /// Resolved anchor and effective nominal bounds.
+        resolution: GraphWindowResolution,
+        /// High level of the source Head image.
+        head_high_level: u32,
+    },
+    /// Resolution or the complete effective extent requires one database read.
+    RequiresDatabase,
 }
 
 /// One detached immutable graph view from a specific publication.
@@ -647,6 +705,11 @@ impl GraphPublication {
         })
     }
 
+    /// Resolves and captures one complete anchored window from one immutable Head.
+    pub(crate) async fn select_anchored_window(&self, anchor: GraphWindowAnchor, max_depth: u32) -> HeadWindowSelection {
+        self.core.read().await.select_anchored_window(self.publication_id, anchor, max_depth)
+    }
+
     /// Captures one coherent canonical-delta target from the current core.
     pub(crate) async fn capture_delta_target(&self) -> GraphDeltaTargetCapture {
         let core = self.core.read().await;
@@ -1100,11 +1163,12 @@ mod tests {
     use bytes::Bytes;
     use kgi_api_model::{
         delta::GraphDelta,
-        graph::{GraphViewUpdateError, Level, LevelExtent},
+        graph::{EdgeId, GraphBlock, GraphEdge, GraphViewUpdateError, Level, LevelExtent},
         history::{GraphHistoryRange, GraphHistoryRangeError, GraphHistoryReplayability},
+        projection::GraphWindowAnchor,
     };
     use kgi_model::{
-        block::{BlockColor, BlockCoordinate, BlockHash, CompactId},
+        block::{BlockColor, BlockCoordinate, BlockHash, CompactId, MAX_DAA_SCORE},
         graph_update::{BlockCommitted, LevelCommitted, ParentCommitted, VspcCommitted},
     };
 
@@ -1133,6 +1197,65 @@ mod tests {
             BTreeMap::from([(1, Level { size: 1, daa_score: None })]),
             HashMap::new(),
             HashMap::new(),
+        )
+    }
+
+    fn anchored_head_view() -> GraphView {
+        let levels = BTreeMap::from([
+            (2, Level { size: 1, daa_score: Some(15) }),
+            (3, Level { size: 1, daa_score: Some(30) }),
+            (4, Level { size: 1, daa_score: None }),
+            (5, Level { size: 1, daa_score: Some(50) }),
+            (6, Level { size: 1, daa_score: Some(60) }),
+            (7, Level { size: 1, daa_score: Some(70) }),
+            (8, Level { size: 1, daa_score: Some(80) }),
+            (9, Level { size: 1, daa_score: Some(80) }),
+            (10, Level { size: 1, daa_score: Some(100) }),
+        ]);
+        let blocks = HashMap::from([
+            (
+                hash(3),
+                GraphBlock {
+                    hash: hash(3),
+                    coordinate: BlockCoordinate::new(3, 0).expect("positive coordinate"),
+                    timestamp: 30,
+                    daa_score: 30,
+                    selected_parent_index: Some(0),
+                    direct_parents: Arc::from([hash(2)]),
+                    blue_merge_set: Arc::from([]),
+                    red_merge_set: Arc::from([]),
+                    color: BlockColor::Blue,
+                    is_in_vspc: true,
+                },
+            ),
+            (
+                hash(7),
+                GraphBlock {
+                    hash: hash(7),
+                    coordinate: BlockCoordinate::new(7, 0).expect("positive coordinate"),
+                    timestamp: 70,
+                    daa_score: 70,
+                    selected_parent_index: Some(0),
+                    direct_parents: Arc::from([hash(6)]),
+                    blue_merge_set: Arc::from([]),
+                    red_merge_set: Arc::from([]),
+                    color: BlockColor::Blue,
+                    is_in_vspc: true,
+                },
+            ),
+        ]);
+        let edge = GraphEdge {
+            id: EdgeId { parent: hash(2), child: hash(3) },
+            parent_coordinate: BlockCoordinate::new(2, 0).expect("positive parent coordinate"),
+            child_coordinate: BlockCoordinate::new(3, 0).expect("positive child coordinate"),
+        };
+        GraphView::from_database_projection(
+            8,
+            LevelExtent::new(3, 10).expect("valid Head extent"),
+            TrackingPolicy::Head,
+            levels,
+            blocks,
+            HashMap::from([(edge.id, edge)]),
         )
     }
 
@@ -1965,6 +2088,74 @@ mod tests {
             Err(GraphHistoryRangeError::StartPruned { requested: 0, oldest_available: 1 })
         );
         assert_eq!(full.into_view().tracking_policy(), TrackingPolicy::Frozen);
+    }
+
+    #[tokio::test]
+    async fn anchored_head_selection_resolves_every_anchor_from_one_frozen_image() {
+        let publication =
+            GraphPublication::new(GraphPublicationState::Live, Instant::now(), anchored_head_view(), GraphHistory::new())
+                .expect("matching anchored publication");
+
+        for anchor in [GraphWindowAnchor::Level(7), GraphWindowAnchor::BlockHash(hash(7))] {
+            let HeadWindowSelection::Complete { capture, resolution, head_high_level } =
+                publication.select_anchored_window(anchor, 5).await
+            else {
+                panic!("retained anchor and extent resolve from Head");
+            };
+            assert_eq!(resolution, GraphWindowResolution { resolved_level: 7, effective_start_level: 5, effective_end_level: 9 });
+            assert_eq!(head_high_level, 10);
+            assert_eq!(capture.publication_id(), publication.publication_id());
+            assert_eq!(capture.view().extent(), resolution.extent());
+            assert_eq!(capture.view().tracking_policy(), TrackingPolicy::Frozen);
+            assert_eq!(capture.view().current_revision_id(), 0);
+            assert!(capture.view().block(&hash(7)).is_some());
+        }
+
+        let HeadWindowSelection::Complete { capture, resolution, head_high_level } =
+            publication.select_anchored_window(GraphWindowAnchor::DaaScore(80), 3).await
+        else {
+            panic!("retained DAA floor resolves from Head");
+        };
+        assert_eq!(resolution, GraphWindowResolution { resolved_level: 9, effective_start_level: 8, effective_end_level: 10 });
+        assert_eq!(head_high_level, 10);
+        assert_eq!(capture.view().extent(), resolution.extent());
+
+        let HeadWindowSelection::Complete { resolution, .. } =
+            publication.select_anchored_window(GraphWindowAnchor::DaaScore(MAX_DAA_SCORE), 1).await
+        else {
+            panic!("a DAA score beyond current VSPC resolves to its current level");
+        };
+        assert_eq!(resolution.resolved_level, 10);
+    }
+
+    #[tokio::test]
+    async fn anchored_head_selection_falls_back_without_using_partial_or_external_state() {
+        let publication =
+            GraphPublication::new(GraphPublicationState::Live, Instant::now(), anchored_head_view(), GraphHistory::new())
+                .expect("matching anchored publication");
+
+        for (anchor, depth) in [
+            (GraphWindowAnchor::Level(2), 1),
+            (GraphWindowAnchor::Level(11), 1),
+            (GraphWindowAnchor::BlockHash(hash(99)), 1),
+            (GraphWindowAnchor::DaaScore(20), 1),
+            (GraphWindowAnchor::Level(3), 5),
+            (GraphWindowAnchor::BlockHash(hash(3)), 5),
+        ] {
+            assert_eq!(
+                publication.select_anchored_window(anchor, depth).await,
+                HeadWindowSelection::RequiresDatabase,
+                "{anchor:?} requires a complete database-backed operation"
+            );
+        }
+
+        let HeadWindowSelection::Complete { resolution, capture, .. } =
+            publication.select_anchored_window(GraphWindowAnchor::DaaScore(30), 1).await
+        else {
+            panic!("the lowest nominal VSPC level remains resolvable");
+        };
+        assert_eq!(resolution.resolved_level, 3);
+        assert_eq!(capture.view().extent(), LevelExtent::new(3, 3).expect("single-level extent"));
     }
 
     #[tokio::test]

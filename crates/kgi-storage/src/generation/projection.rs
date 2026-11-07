@@ -115,7 +115,7 @@ impl<'connection> GraphProjection<'connection> {
                     return Err(ApiReadError::InconsistentProjection);
                 }
                 Ok(ProjectionScopeOutcome::Resolved(ProjectionScope {
-                    resolution: anchored_resolution(resolved_level, database_head, max_depth),
+                    resolution: GraphWindowResolution::around(resolved_level, database_head, max_depth),
                     max_depth,
                 }))
             }
@@ -495,23 +495,6 @@ fn head_scope(high_level: u32) -> ProjectionScope {
     }
 }
 
-fn anchored_resolution(resolved_level: u32, database_head: u32, max_depth: u32) -> GraphWindowResolution {
-    let levels_above = (max_depth - 1) / 2;
-    let levels_below = (max_depth - 1) - levels_above;
-    let mut low_level = resolved_level.saturating_sub(levels_below).max(1);
-    let mut high_level = resolved_level.saturating_add(levels_above).min(database_head);
-
-    let initial_depth = high_level - low_level + 1;
-    let unused_depth = max_depth - initial_depth;
-    high_level = high_level.saturating_add(unused_depth).min(database_head);
-
-    let shifted_depth = high_level - low_level + 1;
-    let remaining_depth = max_depth - shifted_depth;
-    low_level = low_level.saturating_sub(remaining_depth).max(1);
-
-    GraphWindowResolution { resolved_level, effective_start_level: low_level, effective_end_level: high_level }
-}
-
 const fn anchor_unavailable(anchor: GraphWindowAnchor) -> GraphWindowAnchorUnavailable {
     match anchor {
         GraphWindowAnchor::Level(requested_level) => GraphWindowAnchorUnavailable::LevelNotRetained { requested_level },
@@ -532,7 +515,7 @@ pub(super) fn query_error(error: sqlx::Error) -> ApiReadError {
 mod tests {
     use std::{collections::HashMap, sync::Arc, time::Duration};
 
-    use super::{GraphProjection, ProjectionScope, ProjectionScopeOutcome, anchored_resolution, head_scope};
+    use super::{GraphProjection, ProjectionScope, ProjectionScopeOutcome, head_scope};
     use kaspa_consensus_core::{
         blockhash::ORIGIN,
         network::{NetworkId, NetworkType},
@@ -798,7 +781,7 @@ mod tests {
     }
 
     fn scope(resolved_level: u32, database_head: u32, max_depth: u32) -> ProjectionScope {
-        ProjectionScope { resolution: anchored_resolution(resolved_level, database_head, max_depth), max_depth }
+        ProjectionScope { resolution: GraphWindowResolution::around(resolved_level, database_head, max_depth), max_depth }
     }
 
     #[test]
