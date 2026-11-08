@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     future::Future,
+    pin::Pin,
     sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
@@ -286,11 +287,16 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
             }
         };
 
-        let seed = client.load_head_seed(cancellation.clone());
+        let attempt_cancellation = cancellation.child_token();
+        let seed = client.load_head_seed(attempt_cancellation.clone());
         tokio::pin!(seed);
         loop {
             tokio::select! {
                 biased;
+                _ = cancellation.cancelled() => {
+                    cancel_and_finish_seed_attempt(&attempt_cancellation, seed.as_mut()).await;
+                    return Ok(ConstructionOutcome::Cancelled);
+                }
                 result = &mut seed => return match result {
                     Ok(seed) => {
                         self.work = PublicationWork::Aligning(Box::new(ConstructionCandidate::from_seed(seed, origin)));
@@ -301,11 +307,29 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
                     Err(ApiReadError::Cancelled) => Ok(ConstructionOutcome::Cancelled),
                 },
                 observation = self.graph_updates.next_observation() => match observation {
-                    Some(observation) => match self.handle_observation(observation).await? {
-                        WorkerAction::Continue => {}
-                        WorkerAction::RestartConstruction => return Ok(ConstructionOutcome::Restart),
+                    Some(observation) => match self.handle_observation(observation).await {
+                        Ok(WorkerAction::Continue) => {}
+                        Ok(WorkerAction::RestartConstruction) => {
+                            cancel_and_finish_seed_attempt(&attempt_cancellation, seed.as_mut()).await;
+                            return if cancellation.is_cancelled() {
+                                Ok(ConstructionOutcome::Cancelled)
+                            } else {
+                                Ok(ConstructionOutcome::Restart)
+                            };
+                        }
+                        Err(error) => {
+                            cancel_and_finish_seed_attempt(&attempt_cancellation, seed.as_mut()).await;
+                            return Err(error);
+                        }
                     },
-                    None => return Ok(ConstructionOutcome::Quiescent),
+                    None => {
+                        cancel_and_finish_seed_attempt(&attempt_cancellation, seed.as_mut()).await;
+                        return if cancellation.is_cancelled() {
+                            Ok(ConstructionOutcome::Cancelled)
+                        } else {
+                            Ok(ConstructionOutcome::Quiescent)
+                        };
+                    }
                 }
             }
         }
@@ -477,6 +501,14 @@ impl<G: PublicationSeedDatabase, I: PublicationInstaller> PublicationRuntimeWork
         self.finish().await;
         Ok(())
     }
+}
+
+async fn cancel_and_finish_seed_attempt<F>(cancellation: &CancellationToken, seed: Pin<&mut F>)
+where
+    F: Future<Output = Result<GraphViewSeed, ApiReadError>>,
+{
+    cancellation.cancel();
+    let _ = seed.await;
 }
 
 enum PublicationWork {
@@ -816,6 +848,8 @@ mod tests {
         results: Mutex<VecDeque<Result<GraphViewSeed, ApiReadError>>>,
         started: Arc<Semaphore>,
         release: Option<Arc<Semaphore>>,
+        cleanup_started: Option<Arc<Semaphore>>,
+        cleanup_release: Option<Arc<Semaphore>>,
     }
 
     impl MockSeedDb {
@@ -831,6 +865,8 @@ mod tests {
                 results: Mutex::new(results.into_iter().collect()),
                 started: Arc::new(Semaphore::new(0)),
                 release: None,
+                cleanup_started: None,
+                cleanup_release: None,
             })
         }
 
@@ -844,8 +880,28 @@ mod tests {
                 results: Mutex::new(VecDeque::from([result])),
                 started: started.clone(),
                 release: Some(release.clone()),
+                cleanup_started: None,
+                cleanup_release: None,
             });
             (database, started, release)
+        }
+
+        fn cleanup_gated(results: impl IntoIterator<Item = Result<GraphViewSeed, ApiReadError>>) -> CleanupGatedSeed {
+            let started = Arc::new(Semaphore::new(0));
+            let release = Arc::new(Semaphore::new(0));
+            let cleanup_started = Arc::new(Semaphore::new(0));
+            let cleanup_release = Arc::new(Semaphore::new(0));
+            let database = Arc::new(Self {
+                valid: AtomicBool::new(true),
+                calls: AtomicUsize::new(0),
+                active_attempts: AtomicUsize::new(0),
+                results: Mutex::new(results.into_iter().collect()),
+                started: started.clone(),
+                release: Some(release.clone()),
+                cleanup_started: Some(cleanup_started.clone()),
+                cleanup_release: Some(cleanup_release.clone()),
+            });
+            CleanupGatedSeed { database, started, cleanup_started, cleanup_release }
         }
 
         fn calls(&self) -> usize {
@@ -855,6 +911,13 @@ mod tests {
         fn active_attempts(&self) -> usize {
             self.active_attempts.load(Ordering::SeqCst)
         }
+    }
+
+    struct CleanupGatedSeed {
+        database: Arc<MockSeedDb>,
+        started: Arc<Semaphore>,
+        cleanup_started: Arc<Semaphore>,
+        cleanup_release: Arc<Semaphore>,
     }
 
     struct SeedAttemptGuard<'a>(&'a AtomicUsize);
@@ -873,14 +936,23 @@ mod tests {
 
     impl PublicationSeedDatabase for MockSeedDb {
         async fn load_head_seed(&self, cancellation: CancellationToken) -> Result<GraphViewSeed, ApiReadError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let attempt_index = self.calls.fetch_add(1, Ordering::SeqCst);
             self.active_attempts.fetch_add(1, Ordering::SeqCst);
             let _attempt = SeedAttemptGuard(&self.active_attempts);
             self.started.add_permits(1);
             if let Some(release) = &self.release {
                 tokio::select! {
                     biased;
-                    () = cancellation.cancelled() => return Err(ApiReadError::Cancelled),
+                    () = cancellation.cancelled() => {
+                        if attempt_index == 0
+                            && let (Some(cleanup_started), Some(cleanup_release)) =
+                                (&self.cleanup_started, &self.cleanup_release)
+                        {
+                            cleanup_started.add_permits(1);
+                            cleanup_release.acquire().await.expect("cleanup gate remains open").forget();
+                        }
+                        return Err(ApiReadError::Cancelled);
+                    }
                     permit = release.acquire() => permit.expect("seed gate remains open").forget(),
                 }
             }
@@ -1349,8 +1421,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gap_reconstruction_drops_the_in_progress_seed_before_starting_its_successor() {
-        let (database, started, _release) = MockSeedDb::gated(Ok(seed(16)));
+    async fn gap_reconstruction_joins_seed_cleanup_before_starting_its_successor() {
+        let CleanupGatedSeed { database, started, cleanup_started, cleanup_release } =
+            MockSeedDb::cleanup_gated([Ok(seed(16)), Ok(seed(17))]);
         let api_db = Arc::new(ApiDbState::new());
         api_db.update(crate::api_db::ApiDbGenerationUpdate::Published(database.clone())).expect("publish database generation");
         let (producer, receiver) = graph_update_channel();
@@ -1362,13 +1435,43 @@ mod tests {
             assert_eq!(producer.offer_vspc_committed(vspc_update(byte as u8)), Ok(GraphUpdateOfferOutcome::Enqueued));
         }
         assert_eq!(producer.offer_vspc_committed(vspc_update(0)), Ok(GraphUpdateOfferOutcome::GapReported));
+        cleanup_started.acquire().await.expect("reconstruction cancels the first seed").forget();
+
+        assert_eq!(database.calls(), 1, "the successor cannot start while predecessor cleanup is blocked");
+        assert_eq!(database.active_attempts(), 1, "the cancelled seed remains active through its cleanup barrier");
+        assert_eq!(started.available_permits(), 0);
+
+        cleanup_release.add_permits(1);
         started.acquire().await.expect("replacement seed attempt starts").forget();
 
         assert_eq!(database.calls(), 2);
-        assert_eq!(database.active_attempts(), 1, "the predecessor seed future was dropped before its successor started");
+        assert_eq!(database.active_attempts(), 1, "the predecessor completed before its successor started");
         assert_eq!(runtime.metrics().reconstruction_count, 1);
         assert_eq!(runtime.shutdown().await, Ok(()));
         assert_eq!(database.active_attempts(), 0);
+    }
+
+    #[tokio::test]
+    async fn receiver_closure_joins_seed_cleanup_before_becoming_quiescent() {
+        let CleanupGatedSeed { database, started, cleanup_started, cleanup_release } = MockSeedDb::cleanup_gated([Ok(seed(18))]);
+        let api_db = Arc::new(ApiDbState::new());
+        api_db.update(crate::api_db::ApiDbGenerationUpdate::Published(database.clone())).expect("publish database generation");
+        let (producer, receiver) = graph_update_channel();
+        let runtime = PublicationRuntime::new(receiver, api_db, MockInstaller::installed());
+        producer.publish_catchup().expect("runtime receiver is open");
+        started.acquire().await.expect("seed attempt starts").forget();
+
+        drop(producer);
+        cleanup_started.acquire().await.expect("receiver closure cancels the seed").forget();
+        assert_eq!(runtime.snapshot().phase, PublicationRuntimePhase::Constructing);
+        assert_eq!(database.active_attempts(), 1, "quiescence waits for seed cleanup");
+
+        cleanup_release.add_permits(1);
+        wait_for(&runtime, |snapshot| snapshot.phase == PublicationRuntimePhase::Quiescent).await;
+        assert_eq!(database.calls(), 1, "receiver closure starts no successor attempt");
+        assert_eq!(database.active_attempts(), 0);
+
+        assert_eq!(runtime.shutdown().await, Ok(()));
     }
 
     #[test]
