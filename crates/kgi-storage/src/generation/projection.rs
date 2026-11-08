@@ -115,7 +115,7 @@ impl<'connection> GraphProjection<'connection> {
                     return Err(ApiReadError::InconsistentProjection);
                 }
                 Ok(ProjectionScopeOutcome::Resolved(ProjectionScope {
-                    resolution: anchored_resolution(resolved_level, database_head, max_depth),
+                    resolution: GraphWindowResolution::around(resolved_level, database_head, max_depth),
                     max_depth,
                 }))
             }
@@ -495,23 +495,6 @@ fn head_scope(high_level: u32) -> ProjectionScope {
     }
 }
 
-fn anchored_resolution(resolved_level: u32, database_head: u32, max_depth: u32) -> GraphWindowResolution {
-    let levels_above = (max_depth - 1) / 2;
-    let levels_below = (max_depth - 1) - levels_above;
-    let mut low_level = resolved_level.saturating_sub(levels_below).max(1);
-    let mut high_level = resolved_level.saturating_add(levels_above).min(database_head);
-
-    let initial_depth = high_level - low_level + 1;
-    let unused_depth = max_depth - initial_depth;
-    high_level = high_level.saturating_add(unused_depth).min(database_head);
-
-    let shifted_depth = high_level - low_level + 1;
-    let remaining_depth = max_depth - shifted_depth;
-    low_level = low_level.saturating_sub(remaining_depth).max(1);
-
-    GraphWindowResolution { resolved_level, effective_start_level: low_level, effective_end_level: high_level }
-}
-
 const fn anchor_unavailable(anchor: GraphWindowAnchor) -> GraphWindowAnchorUnavailable {
     match anchor {
         GraphWindowAnchor::Level(requested_level) => GraphWindowAnchorUnavailable::LevelNotRetained { requested_level },
@@ -532,7 +515,7 @@ pub(super) fn query_error(error: sqlx::Error) -> ApiReadError {
 mod tests {
     use std::{collections::HashMap, sync::Arc, time::Duration};
 
-    use super::{GraphProjection, ProjectionScope, ProjectionScopeOutcome, anchored_resolution, head_scope};
+    use super::{GraphProjection, ProjectionScope, ProjectionScopeOutcome, head_scope};
     use kaspa_consensus_core::{
         blockhash::ORIGIN,
         network::{NetworkId, NetworkType},
@@ -555,6 +538,7 @@ mod tests {
         sync::oneshot,
         time::{sleep, timeout},
     };
+    use tokio_util::sync::CancellationToken;
 
     const POSTGRES_PORT: u16 = 5432;
 
@@ -798,7 +782,7 @@ mod tests {
     }
 
     fn scope(resolved_level: u32, database_head: u32, max_depth: u32) -> ProjectionScope {
-        ProjectionScope { resolution: anchored_resolution(resolved_level, database_head, max_depth), max_depth }
+        ProjectionScope { resolution: GraphWindowResolution::around(resolved_level, database_head, max_depth), max_depth }
     }
 
     #[test]
@@ -868,8 +852,10 @@ mod tests {
         let (genesis_hash, head_id) = seed_linear_graph(&fixture.pool, high_level).await;
         let (client, _) = api_client(fixture.pool, genesis_hash);
 
-        let GraphViewSeedOutcome::Loaded(seed) =
-            client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await.expect("maximum-depth Head projection")
+        let GraphViewSeedOutcome::Loaded(seed) = client
+            .load_graph_view_seed(GraphViewSeedRequest::HeadPublication, CancellationToken::new())
+            .await
+            .expect("maximum-depth Head projection")
         else {
             panic!("Head has no miss outcome");
         };
@@ -1001,8 +987,10 @@ mod tests {
         projection.commit().await.expect("projection snapshot commit");
 
         let (successor, _) = api_client(fixture.pool, graph.blocks[0].0);
-        let GraphViewSeedOutcome::Loaded(successor_seed) =
-            successor.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await.expect("successor projection")
+        let GraphViewSeedOutcome::Loaded(successor_seed) = successor
+            .load_graph_view_seed(GraphViewSeedRequest::HeadPublication, CancellationToken::new())
+            .await
+            .expect("successor projection")
         else {
             panic!("Head has no miss outcome");
         };
@@ -1020,7 +1008,10 @@ mod tests {
         let (client, mut retirements) = api_client(pool, blocks.blocks[0].0);
 
         let outcome = client
-            .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 2 })
+            .load_graph_view_seed(
+                GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 2 },
+                CancellationToken::new(),
+            )
             .await
             .expect("complete projection");
         let GraphViewSeedOutcome::Loaded(seed) = outcome else {
@@ -1048,7 +1039,10 @@ mod tests {
         assert_eq!(seed.snapshot_vspc_sink, blocks.blocks[2].0);
 
         let GraphViewSeedOutcome::Loaded(narrow) = client
-            .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 1 })
+            .load_graph_view_seed(
+                GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 1 },
+                CancellationToken::new(),
+            )
             .await
             .expect("narrow projection")
         else {
@@ -1058,8 +1052,10 @@ mod tests {
         assert_eq!(narrow.edges.len(), 3, "two one-endpoint edges and one zero-endpoint edge intersect level two");
         assert_eq!(narrow.levels.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
 
-        let GraphViewSeedOutcome::Loaded(head) =
-            client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await.expect("Head projection")
+        let GraphViewSeedOutcome::Loaded(head) = client
+            .load_graph_view_seed(GraphViewSeedRequest::HeadPublication, CancellationToken::new())
+            .await
+            .expect("Head projection")
         else {
             panic!("Head has no miss outcome");
         };
@@ -1091,7 +1087,7 @@ mod tests {
             ),
         ] {
             let GraphViewSeedOutcome::Loaded(anchored) = client
-                .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor, max_depth })
+                .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor, max_depth }, CancellationToken::new())
                 .await
                 .expect("anchored projection")
             else {
@@ -1109,7 +1105,9 @@ mod tests {
             (GraphWindowAnchor::DaaScore(9), GraphWindowAnchorUnavailable::NoRetainedDaaMatch { requested_score: 9 }),
         ] {
             assert_eq!(
-                client.load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor, max_depth: 2 }).await,
+                client
+                    .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor, max_depth: 2 }, CancellationToken::new())
+                    .await,
                 Ok(GraphViewSeedOutcome::AnchorUnavailable(expected))
             );
         }
@@ -1134,10 +1132,10 @@ mod tests {
         let unknown = hash(88);
         assert_eq!(
             client
-                .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow {
-                    anchor: GraphWindowAnchor::BlockHash(unknown),
-                    max_depth: 1,
-                })
+                .load_graph_view_seed(
+                    GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::BlockHash(unknown), max_depth: 1 },
+                    CancellationToken::new()
+                )
                 .await,
             Ok(GraphViewSeedOutcome::AnchorUnavailable(GraphWindowAnchorUnavailable::BlockNotMaterialized {
                 requested_hash: unknown
@@ -1145,7 +1143,10 @@ mod tests {
         );
         assert_eq!(
             client
-                .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 1 })
+                .load_graph_view_seed(
+                    GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 1 },
+                    CancellationToken::new()
+                )
                 .await,
             Err(crate::error::ApiReadError::InconsistentProjection)
         );
@@ -1161,7 +1162,7 @@ mod tests {
         sqlx::query("DROP TABLE levels").execute(&fixture.pool).await.expect("query-failure fixture");
 
         assert_eq!(
-            client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await,
+            client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication, CancellationToken::new()).await,
             Err(crate::error::ApiReadError::QueryFailed)
         );
         assert!(client.is_valid());
@@ -1178,8 +1179,9 @@ mod tests {
         let client = super::super::ValidatedApiDbClient::new(api_pool, binding(graph.blocks[0].0), retirement_tx, gate.clone());
         let blocker = lock_blocks(&fixture.pool).await;
         let operation_client = client.clone();
-        let operation =
-            tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
+        let operation = tokio::spawn(async move {
+            operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication, CancellationToken::new()).await
+        });
         let pid = blocked_projection_pid(&fixture.pool).await;
 
         let replacement = gate.begin_replacement().expect("replacement closes admission");
@@ -1221,9 +1223,12 @@ mod tests {
             crate::replacement::ApiReplacementGate::new(),
         );
         let blocker = lock_blocks(&fixture.pool).await;
+        let cancellation = CancellationToken::new();
         let operation_client = client.clone();
-        let operation =
-            tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
+        let operation_cancellation = cancellation.clone();
+        let operation = tokio::spawn(async move {
+            operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication, operation_cancellation).await
+        });
         let pid = blocked_projection_pid(&fixture.pool).await;
 
         assert!(client.retire());
@@ -1240,10 +1245,177 @@ mod tests {
         };
         assert!(Arc::ptr_eq(&retired, &client));
         assert!(!operation.is_finished());
+        cancellation.cancel();
         request.complete(Ok(()));
         assert_eq!(operation.await.expect("projection task"), Err(crate::error::ApiReadError::GenerationLost));
 
         blocker.rollback().await.expect("release block-table lock");
+    }
+
+    #[tokio::test]
+    async fn generation_retirement_interrupts_backend_pid_lookup_before_its_barrier() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let gate = crate::replacement::ApiReplacementGate::new();
+        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(api_pool, binding(graph.blocks[0].0), retirement_tx, gate.clone());
+        let (pid_reached_tx, pid_reached_rx) = oneshot::channel();
+        let (_pid_release_tx, pid_release_rx) = oneshot::channel();
+        client.hold_next_backend_pid_completion(pid_reached_tx, pid_release_rx);
+        let operation_client = client.clone();
+        let operation = tokio::spawn(async move {
+            operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication, CancellationToken::new()).await
+        });
+        let pid = pid_reached_rx.await.expect("backend PID query reaches its held completion");
+
+        assert!(client.retire());
+        let request = retirements.recv().await.expect("PID lookup joins the exact-generation retirement barrier");
+        let retired = match request.target() {
+            crate::runtime::RetirementTarget::Api(generation) => generation.upgrade().expect("API generation remains alive"),
+            crate::runtime::RetirementTarget::Processing(_) => panic!("API read requested processing retirement"),
+        };
+        assert!(Arc::ptr_eq(&retired, &client));
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let backend_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+                    .bind(pid)
+                    .fetch_one(&fixture.pool)
+                    .await
+                    .expect("retired PID-lookup backend inspection");
+                if !backend_exists {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the interrupted PID-lookup backend exits before retirement completes");
+
+        let replacement = gate.begin_replacement().expect("replacement closes admission");
+        let exclusive = timeout(Duration::from_secs(1), replacement.acquire_exclusive(&Timing::production()))
+            .await
+            .expect("PID-lookup cleanup releases its replacement lease")
+            .expect("replacement exclusion");
+        assert!(!operation.is_finished(), "the exact-generation retirement barrier remains pending");
+
+        request.complete(Ok(()));
+        assert_eq!(operation.await.expect("projection task"), Err(crate::error::ApiReadError::GenerationLost));
+
+        exclusive.open().expect("test reopens admission");
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_waits_for_blocked_projection_cleanup_without_retiring_the_generation() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let gate = crate::replacement::ApiReplacementGate::new();
+        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(api_pool, binding(graph.blocks[0].0), retirement_tx, gate.clone());
+        let blocker = lock_blocks(&fixture.pool).await;
+        let (cleanup_reached_tx, cleanup_reached_rx) = oneshot::channel();
+        let (cleanup_release_tx, cleanup_release_rx) = oneshot::channel();
+        client.hold_next_resource_handoff(cleanup_reached_tx, cleanup_release_rx);
+        let cancellation = CancellationToken::new();
+        let operation_client = client.clone();
+        let operation_cancellation = cancellation.clone();
+        let operation = tokio::spawn(async move {
+            operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication, operation_cancellation).await
+        });
+        let pid = blocked_projection_pid(&fixture.pool).await;
+
+        cancellation.cancel();
+        assert_eq!(cleanup_reached_rx.await.expect("cleanup receives the database resources and lease"), Some(pid));
+        assert!(!operation.is_finished(), "Cancelled is not returned before database cleanup completes");
+
+        let replacement = gate.begin_replacement().expect("replacement closes admission");
+        let timing = Timing::production();
+        let exclusive = replacement.acquire_exclusive(&timing);
+        tokio::pin!(exclusive);
+        assert!(timeout(Duration::from_millis(50), &mut exclusive).await.is_err(), "cleanup retains the replacement lease");
+
+        cleanup_release_tx.send(()).expect("release observed cleanup");
+        assert_eq!(operation.await.expect("cancelled projection task"), Err(crate::error::ApiReadError::Cancelled));
+        let exclusive = timeout(Duration::from_secs(1), &mut exclusive)
+            .await
+            .expect("cleanup releases database resources promptly")
+            .expect("replacement exclusion");
+        let backend_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+            .bind(pid)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("cancelled backend inspection");
+        assert!(!backend_exists);
+        assert!(client.is_valid());
+        assert!(retirements.try_recv().is_err());
+
+        exclusive.open().expect("test reopens admission");
+        blocker.rollback().await.expect("release block-table lock");
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_while_waiting_for_an_api_connection_releases_its_replacement_lease() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let held_connection = api_pool.acquire().await.expect("occupy the only API connection");
+        let gate = crate::replacement::ApiReplacementGate::new();
+        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(api_pool, binding(graph.blocks[0].0), retirement_tx, gate.clone());
+        let cancellation = CancellationToken::new();
+        let operation_client = client.clone();
+        let operation_cancellation = cancellation.clone();
+        let operation = tokio::spawn(async move {
+            operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication, operation_cancellation).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!operation.is_finished());
+
+        cancellation.cancel();
+        assert_eq!(operation.await.expect("cancelled connection waiter"), Err(crate::error::ApiReadError::Cancelled));
+        let replacement = gate.begin_replacement().expect("replacement closes admission");
+        let exclusive = timeout(Duration::from_secs(1), replacement.acquire_exclusive(&Timing::production()))
+            .await
+            .expect("caller cancellation releases the read lease")
+            .expect("replacement exclusion");
+        assert!(client.is_valid());
+        assert!(retirements.try_recv().is_err());
+
+        exclusive.open().expect("test reopens admission");
+        drop(held_connection);
+    }
+
+    #[tokio::test]
+    async fn ordinary_projection_completion_remains_selected_when_cancellation_arrives_during_release() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(
+            api_pool,
+            binding(graph.blocks[0].0),
+            retirement_tx,
+            crate::replacement::ApiReplacementGate::new(),
+        );
+        let (release_reached_tx, release_reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        client.hold_next_resource_handoff(release_reached_tx, release_rx);
+        let cancellation = CancellationToken::new();
+        let operation_client = client.clone();
+        let operation_cancellation = cancellation.clone();
+        let operation = tokio::spawn(async move {
+            operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication, operation_cancellation).await
+        });
+
+        assert!(release_reached_rx.await.expect("ordinary release receives the database resources").is_some());
+        cancellation.cancel();
+        assert!(!operation.is_finished(), "ordinary completion retains its selected release barrier");
+        release_tx.send(()).expect("release the completed projection resources");
+
+        assert!(matches!(operation.await.expect("projection task"), Ok(GraphViewSeedOutcome::Loaded(_))));
+        assert!(client.is_valid());
+        assert!(retirements.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1256,8 +1428,9 @@ mod tests {
         let client = super::super::ValidatedApiDbClient::new(api_pool, binding(graph.blocks[0].0), retirement_tx, gate.clone());
         let blocker = lock_blocks(&fixture.pool).await;
         let operation_client = client.clone();
-        let operation =
-            tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
+        let operation = tokio::spawn(async move {
+            operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication, CancellationToken::new()).await
+        });
         let pid = blocked_projection_pid(&fixture.pool).await;
 
         operation.abort();
@@ -1293,8 +1466,9 @@ mod tests {
         let (cleanup_release_tx, cleanup_release_rx) = oneshot::channel();
         client.hold_next_resource_handoff(cleanup_reached_tx, cleanup_release_rx);
         let operation_client = client.clone();
-        let operation =
-            tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
+        let operation = tokio::spawn(async move {
+            operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication, CancellationToken::new()).await
+        });
         let pid = blocked_projection_pid(&fixture.pool).await;
 
         let replacement = gate.begin_replacement().expect("replacement closes admission");
@@ -1356,7 +1530,10 @@ mod tests {
         let operation_client = client.clone();
         let operation = tokio::spawn(async move {
             operation_client
-                .load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 1 })
+                .load_graph_view_seed(
+                    GraphViewSeedRequest::AnchoredWindow { anchor: GraphWindowAnchor::Level(2), max_depth: 1 },
+                    CancellationToken::new(),
+                )
                 .await
         });
         let pid = release_reached_rx
@@ -1424,8 +1601,9 @@ mod tests {
         let processing = super::super::ValidatedDbClient::new(processing_pool, generation_binding, retirement_tx);
         let blocker = lock_blocks(&fixture.pool).await;
         let operation_client = api.clone();
-        let operation =
-            tokio::spawn(async move { operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication).await });
+        let operation = tokio::spawn(async move {
+            operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication, CancellationToken::new()).await
+        });
         let pid = blocked_projection_pid(&fixture.pool).await;
         let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
             .bind(pid)

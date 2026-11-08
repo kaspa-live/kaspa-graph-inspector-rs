@@ -1,39 +1,135 @@
 use std::{
     fmt::Display,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use kgi_api_ingress::channel::GraphUpdateReceiver;
 use kgi_api_model::{
+    graph::{GraphView, TrackingPolicy},
     history::GraphHistoryRangeError,
-    projection::MAX_WINDOW_DEPTH,
+    projection::{GraphViewSeedOutcome, GraphViewSeedRequest, GraphWindowAnchor, GraphWindowAnchorUnavailable, MAX_WINDOW_DEPTH},
     protocol::{CACHED_HEAD_WINDOW_DEPTHS, DeltaContinuation, FreshViewReason, HeadLevelLookupOutcome, SystemStatus},
 };
 use kgi_model::lifecycle::{NodeServiceStatus, ProcessingStatus, RecoveryMode, StorageServiceStatus, SupervisorStatus};
-use kgi_storage::generation::ValidatedApiDbClient;
+use kgi_storage::{error::ApiReadError, generation::ValidatedApiDbClient};
 use tokio::{
-    sync::{Mutex as AsyncMutex, mpsc, watch},
+    sync::{Mutex as AsyncMutex, Semaphore, mpsc, watch},
     task::JoinHandle,
+    time::sleep,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
+    admission::{ApiRequestAdmissionError, ApiRequestAdmissions, ApiRequestGuard, ApiRequestLane},
     api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
     cache::{CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot},
     client::{ClientIdentifier, DeltaCompletionResult, DeltaScheduleAction},
-    codec::{HeadEtag, graph::HeadLevelLookupResponseDto},
+    codec::{
+        HeadEtag,
+        graph::{GraphWindowResponseDto, HeadLevelLookupResponseDto},
+    },
     delta::{ActiveDeltaInterval, DeltaTargetLadder},
     encoding::{
         EncodedGraphBody,
-        scheduler::{EncodingScheduler, EncodingSchedulerError},
+        scheduler::{EncodingScheduler, EncodingSchedulerError, HistoricalEncodingReservation},
     },
     error::ApiServiceError,
     publication::{
         CanonicalDeltaReentry, CanonicalDeltaSelection, DeltaReplayFloorAdmission, GraphDeltaTargetCapture, GraphPublication,
-        GraphPublicationState, HeadTierSelection, ReplayFloorAdmission,
+        GraphPublicationState, HeadTierSelection, HeadWindowSelection, ReplayFloorAdmission,
         runtime::{PublicationInstallOutcome, PublicationInstaller, PublicationRuntime},
     },
 };
+
+/// Maximum public historical database phases active at once.
+#[allow(dead_code, reason = "the logical operation is consumed by the transport increment")]
+pub(crate) const MAX_PUBLIC_HISTORICAL_DB_READS: usize = 6;
+/// Complete deadline for one public database projection phase.
+#[allow(dead_code, reason = "the logical operation is consumed by the transport increment")]
+pub(crate) const API_DB_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Logical result of one complete anchored-window operation.
+#[allow(dead_code, reason = "HTTP response mapping is introduced by the transport increment")]
+pub(crate) enum AnchoredWindowResponse {
+    /// No coherent current publication or public database generation was available.
+    Unavailable,
+    /// One immutable Head supplied the complete encoded window.
+    Head {
+        /// Exact publication retained through response delivery.
+        publication: Arc<GraphPublication>,
+        /// Uncached encoded complete graph representation.
+        body: EncodedGraphBody,
+    },
+    /// One detached database snapshot supplied the complete encoded window.
+    Database {
+        /// Exact publication selected before the database fallback.
+        publication: Arc<GraphPublication>,
+        /// Uncached encoded complete graph representation.
+        body: EncodedGraphBody,
+    },
+    /// The database snapshot proved that the requested anchor is unavailable.
+    AnchorUnavailable {
+        /// Exact publication selected before the database fallback.
+        publication: Arc<GraphPublication>,
+        /// Typed retained-anchor miss returned by Storage.
+        unavailable: GraphWindowAnchorUnavailable,
+    },
+}
+
+/// Failure of one admitted anchored-window operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[allow(dead_code, reason = "HTTP response mapping is introduced by the transport increment")]
+pub(crate) enum AnchoredWindowError {
+    /// The Head-to-historical lane handoff could not be admitted.
+    #[error(transparent)]
+    Admission(#[from] ApiRequestAdmissionError),
+    /// The public historical database-read allowance is full.
+    #[error("public historical database reads are saturated")]
+    DatabaseAdmissionSaturated,
+    /// The complete database phase exceeded its deadline.
+    #[error("public historical database read timed out")]
+    DatabaseTimeout,
+    /// Request or terminal service cancellation ended the operation.
+    #[error("anchored-window request was cancelled")]
+    Cancelled,
+    /// Storage returned a typed database-read failure.
+    #[error(transparent)]
+    Database(#[from] ApiReadError),
+    /// Graph encoding admission or execution failed.
+    #[error(transparent)]
+    Encoding(#[from] EncodingSchedulerError),
+    /// The independently owned database cleanup waiter could not be joined.
+    #[error("public historical database waiter failed")]
+    DatabaseWaiterFailed,
+}
+
+/// Admitted cancellation context accepted by logical Head operations.
+pub(crate) trait HeadRequestContext {
+    /// Returns this request's private cancellation token.
+    fn head_cancellation(&self) -> CancellationToken;
+    /// Proves that production callers retained Head-lane admission.
+    fn assert_head_lane(&self);
+}
+
+impl HeadRequestContext for &ApiRequestGuard {
+    fn head_cancellation(&self) -> CancellationToken {
+        self.cancellation()
+    }
+
+    fn assert_head_lane(&self) {
+        assert_eq!(self.lane(), Some(ApiRequestLane::Head), "a Head operation requires Head-lane admission");
+    }
+}
+
+#[cfg(test)]
+impl HeadRequestContext for CancellationToken {
+    fn head_cancellation(&self) -> CancellationToken {
+        self.clone()
+    }
+
+    fn assert_head_lane(&self) {}
+}
 
 /// Parsed conditional state for one logical Head snapshot operation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -362,6 +458,7 @@ struct ApiStatusInputs {
 }
 
 impl ApiStatusInputs {
+    #[allow(dead_code, reason = "the logical status operation is consumed by the transport increment")]
     fn current(&self) -> SystemStatus {
         SystemStatus {
             kgi_version: self.kgi_version.to_owned(),
@@ -382,6 +479,10 @@ pub struct ApiService {
     api_db: Arc<ApiDbState>,
     current_publication: watch::Sender<Option<Arc<GraphPublication>>>,
     cancellation: ApiCancellation,
+    request_admissions: ApiRequestAdmissions,
+    public_historical_reads: Arc<Semaphore>,
+    historical_read_tasks: TaskTracker,
+    database_query_timeout: Duration,
     cache_jobs: CacheJobTracker,
     encoding: OwnedEncodingScheduler,
     active_delta_interval: ActiveDeltaInterval,
@@ -403,6 +504,7 @@ impl ApiService {
     ) -> (Arc<Self>, ApiServiceEventReceiver) {
         let (events, event_rx) = mpsc::unbounded_channel();
         let cache_jobs_cancellation = CancellationToken::new();
+        let http_cancellation = CancellationToken::new();
         let api_db = Arc::new(ApiDbState::new());
         let publication_install = Arc::new(Mutex::new(PublicationInstallState { runtime_generation: 0 }));
         let (current_publication, _) = watch::channel(None);
@@ -414,10 +516,14 @@ impl ApiService {
             api_db,
             current_publication,
             cancellation: ApiCancellation {
-                http: CancellationToken::new(),
+                http: http_cancellation.clone(),
                 sse: CancellationToken::new(),
                 cache_jobs: cache_jobs_cancellation.clone(),
             },
+            request_admissions: ApiRequestAdmissions::new(http_cancellation),
+            public_historical_reads: Arc::new(Semaphore::new(MAX_PUBLIC_HISTORICAL_DB_READS)),
+            historical_read_tasks: TaskTracker::new(),
+            database_query_timeout: API_DB_QUERY_TIMEOUT,
             cache_jobs: CacheJobTracker::with_cancellation(cache_jobs_cancellation),
             encoding,
             active_delta_interval: ActiveDeltaInterval::new(),
@@ -486,6 +592,9 @@ impl ApiService {
             return Ok(());
         }
 
+        self.request_admissions.close();
+        self.public_historical_reads.close();
+        self.historical_read_tasks.close();
         if matches!(*runtime, ApiRuntimeSlot::AwaitReset | ApiRuntimeSlot::Running(_)) {
             let previous = std::mem::replace(&mut *runtime, ApiRuntimeSlot::Stopping(None));
             if let ApiRuntimeSlot::Running(installed) = previous {
@@ -508,6 +617,7 @@ impl ApiService {
 
         self.cancellation.sse.cancel();
         self.cancellation.http.cancel();
+        tokio::join!(self.request_admissions.wait(), self.historical_read_tasks.wait());
 
         let ((), encoding_result) = tokio::join!(biased; self.cache_jobs.shutdown(), self.encoding.shutdown());
         if result.is_ok()
@@ -522,20 +632,110 @@ impl ApiService {
     }
 
     /// Captures the latest independent component observations without waiting for a common revision.
-    #[allow(dead_code, reason = "the public status operation is implemented in increment 16")]
-    pub(crate) fn system_status(&self) -> SystemStatus {
+    #[allow(dead_code, reason = "the logical status operation is consumed by the transport increment")]
+    pub(crate) fn system_status(&self, request: &ApiRequestGuard) -> SystemStatus {
+        assert_eq!(request.lane(), Some(ApiRequestLane::Status), "status capture requires status-lane admission");
         self.status.current()
+    }
+
+    /// Attempts nonblocking admission to the shared Head-operation lane.
+    #[allow(dead_code, reason = "HTTP handlers are introduced by the transport increment")]
+    pub(crate) fn admit_head_request(&self) -> Result<ApiRequestGuard, ApiRequestAdmissionError> {
+        self.request_admissions.admit_head()
+    }
+
+    /// Attempts nonblocking admission to the independent memory-only status lane.
+    #[allow(dead_code, reason = "HTTP handlers are introduced by the transport increment")]
+    pub(crate) fn admit_status_request(&self) -> Result<ApiRequestGuard, ApiRequestAdmissionError> {
+        self.request_admissions.admit_status()
+    }
+
+    /// Resolves and encodes one anchored graph window without combining sources.
+    #[allow(dead_code, reason = "the logical operation is consumed by the transport increment")]
+    pub(crate) async fn anchored_window(
+        &self,
+        request: &ApiRequestGuard,
+        anchor: GraphWindowAnchor,
+        max_depth: u32,
+    ) -> Result<AnchoredWindowResponse, AnchoredWindowError> {
+        assert_eq!(request.lane(), Some(ApiRequestLane::Head), "anchored-window selection begins in the Head lane");
+        if request.cancellation().is_cancelled() {
+            return Err(AnchoredWindowError::Cancelled);
+        }
+        let Some(publication) = self.current_publication() else {
+            return Ok(AnchoredWindowResponse::Unavailable);
+        };
+
+        match publication.select_anchored_window(anchor, max_depth).await {
+            HeadWindowSelection::Complete { capture, resolution, head_high_level } => {
+                let response = GraphWindowResponseDto::from_head(&capture, head_high_level, resolution);
+                let body = self.encoding.scheduler.encode_priority(response, request.cancellation()).await?;
+                Ok(AnchoredWindowResponse::Head { publication, body })
+            }
+            HeadWindowSelection::RequiresDatabase => {
+                self.request_admissions.handoff_to_historical(request)?;
+                self.database_anchored_window(request, publication, anchor, max_depth).await
+            }
+        }
+    }
+
+    #[allow(dead_code, reason = "the logical operation is consumed by the transport increment")]
+    async fn database_anchored_window(
+        &self,
+        request: &ApiRequestGuard,
+        publication: Arc<GraphPublication>,
+        anchor: GraphWindowAnchor,
+        max_depth: u32,
+    ) -> Result<AnchoredWindowResponse, AnchoredWindowError> {
+        assert_eq!(request.lane(), Some(ApiRequestLane::Historical), "database projection requires historical-lane admission");
+        let reservation = self.encoding.scheduler.try_reserve_historical()?;
+        let database_permit = match self.public_historical_reads.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => return Err(AnchoredWindowError::DatabaseAdmissionSaturated),
+            Err(tokio::sync::TryAcquireError::Closed) => return Ok(AnchoredWindowResponse::Unavailable),
+        };
+        let Some(client) = self.api_db.public_read_client() else {
+            return Ok(AnchoredWindowResponse::Unavailable);
+        };
+
+        let cleanup_owner = request.cleanup_owner();
+        let query_timeout = self.database_query_timeout;
+        let waiter = self.historical_read_tasks.spawn(async move {
+            run_historical_projection(cleanup_owner, client, database_permit, reservation, anchor, max_depth, query_timeout).await
+        });
+        let (outcome, reservation) = waiter.await.map_err(|_| AnchoredWindowError::DatabaseWaiterFailed)??;
+        match outcome {
+            GraphViewSeedOutcome::AnchorUnavailable(unavailable) => {
+                Ok(AnchoredWindowResponse::AnchorUnavailable { publication, unavailable })
+            }
+            GraphViewSeedOutcome::Loaded(seed) => {
+                let resolution = seed.resolution;
+                let view = GraphView::from_database_projection(
+                    seed.max_depth,
+                    resolution.extent(),
+                    TrackingPolicy::Fixed,
+                    seed.levels,
+                    seed.blocks,
+                    seed.edges,
+                );
+                let response = GraphWindowResponseDto::from_database(&view, resolution);
+                let body = reservation.encode(response, request.cancellation()).await?;
+                Ok(AnchoredWindowResponse::Database { publication, body })
+            }
+        }
     }
 
     /// Selects, constructs, and completes one logical canonical-delta request.
     #[allow(dead_code, reason = "the logical operation is consumed by the later HTTP transport increment")]
-    pub(crate) async fn canonical_delta(
+    pub(crate) async fn canonical_delta<R: HeadRequestContext>(
         &self,
         requested_publication_id: u64,
         from_revision_id: u64,
         client: Option<ClientIdentifier>,
-        cancellation: CancellationToken,
+        request: R,
     ) -> Result<CanonicalDeltaResponse, CacheWaitError> {
+        request.assert_head_lane();
+        let cancellation = request.head_cancellation();
         if cancellation.is_cancelled() {
             return Err(CacheWaitError::Cancelled);
         }
@@ -715,12 +915,14 @@ impl ApiService {
 
     /// Selects one coherent in-memory Head snapshot or its conditional result.
     #[allow(dead_code, reason = "the logical operation is consumed by the later HTTP transport increment")]
-    pub(crate) async fn head_snapshot(
+    pub(crate) async fn head_snapshot<R: HeadRequestContext>(
         &self,
         target_depth: u32,
         condition: &HeadSnapshotCondition,
-        cancellation: CancellationToken,
+        request: R,
     ) -> Result<HeadSnapshotOutcome, CacheWaitError> {
+        request.assert_head_lane();
+        let cancellation = request.head_cancellation();
         let depth = selected_head_depth(target_depth);
         let Some(publication) = self.current_publication() else {
             return Ok(HeadSnapshotOutcome::Unavailable);
@@ -755,12 +957,14 @@ impl ApiService {
 
     /// Captures and encodes complete retained levels from one exact publication.
     #[allow(dead_code, reason = "the logical operation is consumed by the later HTTP transport increment")]
-    pub(crate) async fn head_levels(
+    pub(crate) async fn head_levels<R: HeadRequestContext>(
         &self,
         requested_publication_id: u64,
         requested_levels: &[u32],
-        cancellation: CancellationToken,
+        request: R,
     ) -> Result<HeadLevelLookupResponse, EncodingSchedulerError> {
+        request.assert_head_lane();
+        let cancellation = request.head_cancellation();
         if cancellation.is_cancelled() {
             return Err(EncodingSchedulerError::Cancelled);
         }
@@ -792,6 +996,50 @@ impl ApiService {
     #[allow(dead_code, reason = "public graph operations are implemented in later API increments")]
     pub(crate) fn current_publication(&self) -> Option<Arc<GraphPublication>> {
         self.current_publication.borrow().clone()
+    }
+}
+
+#[allow(dead_code, reason = "the logical operation is consumed by the transport increment")]
+async fn run_historical_projection(
+    cleanup_owner: ApiRequestGuard,
+    client: Arc<ValidatedApiDbClient>,
+    _database_permit: tokio::sync::OwnedSemaphorePermit,
+    reservation: HistoricalEncodingReservation,
+    anchor: GraphWindowAnchor,
+    max_depth: u32,
+    query_timeout: Duration,
+) -> Result<(GraphViewSeedOutcome, HistoricalEncodingReservation), AnchoredWindowError> {
+    enum Interruption {
+        RequestCancellation,
+        Timeout,
+    }
+
+    let phase_cancellation = CancellationToken::new();
+    let operation =
+        client.load_graph_view_seed(GraphViewSeedRequest::AnchoredWindow { anchor, max_depth }, phase_cancellation.clone());
+    tokio::pin!(operation);
+    let request_cancellation = cleanup_owner.cancellation();
+    let deadline = sleep(query_timeout);
+    tokio::pin!(deadline);
+
+    let interruption = tokio::select! {
+        biased;
+        result = &mut operation => {
+            let outcome = result.map_err(|error| match error {
+                ApiReadError::Cancelled => AnchoredWindowError::Cancelled,
+                error => AnchoredWindowError::Database(error),
+            })?;
+            return Ok((outcome, reservation));
+        }
+        () = request_cancellation.cancelled() => Interruption::RequestCancellation,
+        () = &mut deadline => Interruption::Timeout,
+    };
+
+    phase_cancellation.cancel();
+    let _cleanup_result = operation.await;
+    match interruption {
+        Interruption::RequestCancellation => Err(AnchoredWindowError::Cancelled),
+        Interruption::Timeout => Err(AnchoredWindowError::DatabaseTimeout),
     }
 }
 
@@ -834,11 +1082,11 @@ mod tests {
         delta::GraphDelta,
         graph::{GraphView, Level, LevelExtent, TrackingPolicy},
         history::{GraphHistory, GraphHistoryReplayability},
-        projection::{GraphViewSeed, GraphWindowResolution},
+        projection::{GraphViewSeed, GraphWindowAnchor, GraphWindowAnchorUnavailable, GraphWindowResolution},
         protocol::{DELTA_CACHE_MAX_AGE_MS, DeltaContinuation, INITIAL_ADAPTIVE_DELTA_INTERVAL},
     };
     use kgi_model::{
-        block::{BlockColor, BlockCoordinate, BlockHash, CompactId},
+        block::{BlockColor, BlockCoordinate, BlockHash, CompactId, ValidatedNodeBlock},
         graph_update::{BlockCommitted, LevelCommitted, ParentCommitted, VspcCommitted},
         lifecycle::{
             NodeServiceStatus, NodeServiceStatusState, ProcessingState, ProcessingStatus, RecoveryMode, StorageServiceStatus,
@@ -861,9 +1109,9 @@ mod tests {
     use url::Url;
 
     use super::{
-        ApiDbGenerationMessage, ApiRuntimeSlot, ApiService, ApiServiceEvent, ApiStatusInputs, CanonicalDeltaResponse,
-        CanonicalDeltaSuccess, FreshViewReason, HeadLevelLookupResponse, HeadSnapshotCondition, HeadSnapshotOutcome,
-        OwnedPublicationRuntime, PublicationInstallState, RuntimePublicationInstaller, selected_head_depth,
+        AnchoredWindowResponse, ApiDbGenerationMessage, ApiRuntimeSlot, ApiService, ApiServiceEvent, ApiStatusInputs,
+        CanonicalDeltaResponse, CanonicalDeltaSuccess, FreshViewReason, HeadLevelLookupResponse, HeadSnapshotCondition,
+        HeadSnapshotOutcome, OwnedPublicationRuntime, PublicationInstallState, RuntimePublicationInstaller, selected_head_depth,
     };
     use crate::{
         api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
@@ -907,7 +1155,7 @@ mod tests {
     }
 
     impl PublicationSeedDatabase for TestGeneration {
-        async fn load_head_seed(&self) -> Result<GraphViewSeed, ApiReadError> {
+        async fn load_head_seed(&self, _cancellation: CancellationToken) -> Result<GraphViewSeed, ApiReadError> {
             panic!("simulated publication-runtime worker loss")
         }
     }
@@ -949,9 +1197,13 @@ mod tests {
     }
 
     impl PublicationSeedDatabase for ControlledSeedGeneration {
-        async fn load_head_seed(&self) -> Result<GraphViewSeed, ApiReadError> {
+        async fn load_head_seed(&self, cancellation: CancellationToken) -> Result<GraphViewSeed, ApiReadError> {
             self.started.add_permits(1);
-            self.release.acquire().await.expect("seed release path remains open").forget();
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(ApiReadError::Cancelled),
+                permit = self.release.acquire() => permit.expect("seed release path remains open").forget(),
+            }
             Ok(self.seed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take().expect("one seed is loaded once"))
         }
     }
@@ -1244,12 +1496,14 @@ mod tests {
 
     async fn api_generation_fixture() -> (
         testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+        Url,
         Arc<StorageService>,
         kgi_storage::service::StorageServiceEventReceiver,
+        Arc<kgi_storage::generation::ValidatedDbClient>,
         Arc<kgi_storage::generation::ValidatedApiDbClient>,
     ) {
         let (container, database_url) = postgres_fixture().await;
-        let (storage, mut events) = StorageService::start(database_url);
+        let (storage, mut events) = StorageService::start(database_url.clone());
         let mut status = storage.subscribe_status();
         timeout(TEST_TIMEOUT, async {
             loop {
@@ -1265,15 +1519,80 @@ mod tests {
             .initialize_if_uninitialized(NetworkId::new(NetworkType::Mainnet), hash(1))
             .await
             .expect("database initialization succeeds");
-        match timeout(TEST_TIMEOUT, events.recv()).await.expect("processing publication arrives") {
-            Some(StorageServiceEvent::ProcessingDbPublished(_)) => {}
+        let processing = match timeout(TEST_TIMEOUT, events.recv()).await.expect("processing publication arrives") {
+            Some(StorageServiceEvent::ProcessingDbPublished(processing)) => processing,
             event => panic!("expected processing publication, got {event:?}"),
-        }
+        };
         let api = match timeout(TEST_TIMEOUT, events.recv()).await.expect("API publication arrives") {
             Some(StorageServiceEvent::ApiDbPublished(api)) => api,
             event => panic!("expected API publication, got {event:?}"),
         };
-        (container, storage, events, api)
+        (container, database_url, storage, events, processing, api)
+    }
+
+    async fn rebuild_projection_fixture(
+        processing: &Arc<kgi_storage::generation::ValidatedDbClient>,
+        events: &mut kgi_storage::service::StorageServiceEventReceiver,
+        api: &Arc<kgi_storage::generation::ValidatedApiDbClient>,
+    ) -> Arc<kgi_storage::generation::ValidatedApiDbClient> {
+        processing
+            .rebuild_from_pruning_point(ValidatedNodeBlock {
+                hash: hash(9),
+                selected_parent: hash(5),
+                direct_parents: vec![hash(4), hash(5)],
+                blue_merge_set: vec![hash(3), hash(5)],
+                red_merge_set: vec![hash(2), hash(3)],
+                timestamp: 9,
+                daa_score: 42,
+                blue_score: 43,
+                blue_work: Default::default(),
+            })
+            .await
+            .expect("pruning-point rebuild succeeds");
+        assert!(matches!(
+            timeout(TEST_TIMEOUT, events.recv()).await.expect("API retirement arrives"),
+            Some(StorageServiceEvent::ApiDbRetired(retired)) if Arc::ptr_eq(&retired, api)
+        ));
+        match timeout(TEST_TIMEOUT, events.recv()).await.expect("replacement API publication arrives") {
+            Some(StorageServiceEvent::ApiDbPublished(api)) => api,
+            event => panic!("expected replacement API publication, got {event:?}"),
+        }
+    }
+
+    fn database_fallback_publication() -> Arc<GraphPublication> {
+        let head = GraphView::from_database_projection(
+            1,
+            LevelExtent::new(2, 2).expect("valid Head extent"),
+            TrackingPolicy::Head,
+            BTreeMap::from([(2, Level { size: 0, daa_score: None })]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        Arc::new(
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head, GraphHistory::new())
+                .expect("coherent publication"),
+        )
+    }
+
+    async fn wait_for_blocked_database_lock(pool: &sqlx::PgPool) {
+        for _ in 0..100 {
+            let blocked: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted)")
+                .fetch_one(pool)
+                .await
+                .expect("lock state is readable");
+            if blocked {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("database projection did not reach the controlled table lock");
+    }
+
+    async fn has_blocked_database_lock(pool: &sqlx::PgPool) -> bool {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted)")
+            .fetch_one(pool)
+            .await
+            .expect("lock state is readable")
     }
 
     fn service() -> (std::sync::Arc<ApiService>, super::ApiServiceEventReceiver) {
@@ -1312,6 +1631,221 @@ mod tests {
         ] {
             assert_eq!(selected_head_depth(target_depth), expected_tier);
         }
+    }
+
+    #[tokio::test]
+    async fn anchored_head_window_is_independent_of_historical_lane_saturation() {
+        let (service, _events) = service();
+        let publication = publication_with_levels(Instant::now());
+        service.current_publication.send_replace(Some(publication.clone()));
+
+        let historical: Vec<_> = (0..crate::admission::MAX_HISTORICAL_HTTP_REQUESTS)
+            .map(|_| {
+                let request = service.admit_head_request().expect("Head admission");
+                service.request_admissions.handoff_to_historical(&request).expect("historical admission");
+                request
+            })
+            .collect();
+        let request = service.admit_head_request().expect("Head remains independently available");
+        let outcome = service.anchored_window(&request, GraphWindowAnchor::Level(2), 2).await.expect("Head-backed window succeeds");
+        let AnchoredWindowResponse::Head { publication: selected, body } = outcome else {
+            panic!("the retained Head supplies the complete window")
+        };
+        assert!(Arc::ptr_eq(&selected, &publication));
+        let json = decode_gzip(body.gzip_body());
+        assert_eq!(json["source"]["type"], "head");
+        assert_eq!(json["resolution"]["resolved_level"], 2);
+
+        drop(request);
+        drop(historical);
+        service.shutdown().await.expect("service shuts down");
+    }
+
+    #[tokio::test]
+    async fn status_lane_remains_available_when_graph_lanes_are_full() {
+        let (service, _events) = service();
+        let heads: Vec<_> =
+            (0..crate::admission::MAX_HEAD_HTTP_REQUESTS).map(|_| service.admit_head_request().expect("Head admission")).collect();
+        let status = service.admit_status_request().expect("status has an independent lane");
+        assert_eq!(service.system_status(&status).kgi_version, env!("CARGO_PKG_VERSION"));
+
+        drop(status);
+        drop(heads);
+        service.shutdown().await.expect("service shuts down");
+    }
+
+    #[tokio::test]
+    async fn public_database_saturation_preserves_unrelated_head_work() {
+        let (service, _events) = service();
+        let head = GraphView::from_database_projection(
+            1,
+            LevelExtent::new(2, 2).expect("valid Head extent"),
+            TrackingPolicy::Head,
+            BTreeMap::from([(2, Level { size: 0, daa_score: None })]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let publication = Arc::new(
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head, GraphHistory::new())
+                .expect("coherent publication"),
+        );
+        service.current_publication.send_replace(Some(publication));
+        let database_permits: Vec<_> = (0..super::MAX_PUBLIC_HISTORICAL_DB_READS)
+            .map(|_| service.public_historical_reads.clone().try_acquire_owned().expect("database-read permit"))
+            .collect();
+
+        let fallback = service.admit_head_request().expect("fallback Head admission");
+        assert!(matches!(
+            service.anchored_window(&fallback, GraphWindowAnchor::Level(1), 1).await,
+            Err(super::AnchoredWindowError::DatabaseAdmissionSaturated)
+        ));
+        let head_request = service.admit_head_request().expect("unrelated Head request remains admissible");
+        assert!(matches!(
+            service.anchored_window(&head_request, GraphWindowAnchor::Level(2), 1).await,
+            Ok(AnchoredWindowResponse::Head { .. })
+        ));
+
+        drop(head_request);
+        drop(fallback);
+        drop(database_permits);
+        service.shutdown().await.expect("service shuts down");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_request_and_cleanup_owners() {
+        let (service, _events) = service();
+        let request = service.admit_head_request().expect("request admission");
+        let cleanup = request.cleanup_owner();
+        let shutdown_service = service.clone();
+        let shutdown = tokio::spawn(async move { shutdown_service.shutdown().await });
+        tokio::task::yield_now().await;
+        drop(request);
+        assert!(timeout(Duration::from_millis(20), service.request_admissions.wait()).await.is_err());
+        drop(cleanup);
+        assert_eq!(timeout(TEST_TIMEOUT, shutdown).await.expect("shutdown completes").expect("shutdown task joins"), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn anchored_database_window_uses_one_detached_fixed_projection() {
+        let (_container, _database_url, storage, mut storage_events, processing, api) = api_generation_fixture().await;
+        let api = rebuild_projection_fixture(&processing, &mut storage_events, &api).await;
+
+        let (service, _events) = service();
+        service.update_api_db_generation(ApiDbGenerationMessage::Published(api)).await.expect("API generation is bound");
+        service.current_publication.send_replace(Some(database_fallback_publication()));
+
+        let request = service.admit_head_request().expect("Head admission");
+        let outcome = service
+            .anchored_window(&request, GraphWindowAnchor::BlockHash(hash(9)), 1)
+            .await
+            .expect("database-backed window succeeds");
+        assert_eq!(request.lane(), Some(crate::admission::ApiRequestLane::Historical));
+        let AnchoredWindowResponse::Database { publication: retained, body } = outcome else {
+            panic!("fallback uses the database source")
+        };
+        assert!(Arc::ptr_eq(&retained, &service.current_publication().expect("selected publication remains current")));
+        let json = decode_gzip(body.gzip_body());
+        assert_eq!(json["source"]["type"], "database");
+        assert_eq!(json["resolution"]["resolved_level"], 1);
+
+        let other_historical: Vec<_> = (1..crate::admission::MAX_HISTORICAL_HTTP_REQUESTS)
+            .map(|_| {
+                let admitted = service.admit_head_request().expect("Head admission for historical saturation");
+                service.request_admissions.handoff_to_historical(&admitted).expect("historical admission");
+                admitted
+            })
+            .collect();
+        let rejected = service.admit_head_request().expect("Head permit is released during handoff");
+        assert_eq!(
+            service.request_admissions.handoff_to_historical(&rejected),
+            Err(crate::admission::ApiRequestAdmissionError::Saturated),
+            "the completed response retains historical admission through delivery"
+        );
+        drop(rejected);
+        drop(other_historical);
+
+        for (anchor, expected) in [
+            (GraphWindowAnchor::Level(9), GraphWindowAnchorUnavailable::LevelNotRetained { requested_level: 9 }),
+            (GraphWindowAnchor::BlockHash(hash(99)), GraphWindowAnchorUnavailable::BlockNotMaterialized { requested_hash: hash(99) }),
+            (GraphWindowAnchor::DaaScore(0), GraphWindowAnchorUnavailable::NoRetainedDaaMatch { requested_score: 0 }),
+        ] {
+            let missing = service.admit_head_request().expect("miss Head admission");
+            assert!(matches!(
+                service.anchored_window(&missing, anchor, 1).await,
+                Ok(AnchoredWindowResponse::AnchorUnavailable { unavailable: observed, .. }) if observed == expected
+            ));
+        }
+
+        drop(request);
+        service.shutdown().await.expect("service shuts down");
+        storage.shutdown().await.expect("StorageService fixture shuts down");
+    }
+
+    #[tokio::test]
+    async fn abandoned_database_handler_retains_resources_until_storage_cleanup() {
+        let (_container, database_url, storage, mut storage_events, processing, api) = api_generation_fixture().await;
+        let api = rebuild_projection_fixture(&processing, &mut storage_events, &api).await;
+        let lock_pool = sqlx::PgPool::connect(database_url.as_str()).await.expect("lock-control pool");
+        let mut lock = lock_pool.begin().await.expect("lock-control transaction");
+        sqlx::query("LOCK TABLE levels, blocks, parents, block_identifiers, processing_metadata IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .expect("projection tables are locked");
+
+        let (service, _events) = service();
+        service.update_api_db_generation(ApiDbGenerationMessage::Published(api)).await.expect("API generation is bound");
+        service.current_publication.send_replace(Some(database_fallback_publication()));
+        let request = service.admit_head_request().expect("Head admission");
+        let request_service = service.clone();
+        let operation = tokio::spawn(async move { request_service.anchored_window(&request, GraphWindowAnchor::Level(1), 1).await });
+        wait_for_blocked_database_lock(&lock_pool).await;
+
+        operation.abort();
+        match operation.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("handler task must be aborted"),
+        }
+        let shutdown_service = service.clone();
+        timeout(TEST_TIMEOUT, async move { shutdown_service.shutdown().await })
+            .await
+            .expect("shutdown waits for detached database cleanup")
+            .expect("service shuts down");
+        assert_eq!(service.public_historical_reads.available_permits(), super::MAX_PUBLIC_HISTORICAL_DB_READS);
+        assert!(!has_blocked_database_lock(&lock_pool).await, "the permit returns only after the blocked backend has ended");
+
+        lock.rollback().await.expect("table lock is released");
+        storage.shutdown().await.expect("StorageService fixture shuts down");
+    }
+
+    #[tokio::test]
+    async fn database_timeout_cancels_and_joins_the_storage_operation() {
+        let (_container, database_url, storage, mut storage_events, processing, api) = api_generation_fixture().await;
+        let api = rebuild_projection_fixture(&processing, &mut storage_events, &api).await;
+        let lock_pool = sqlx::PgPool::connect(database_url.as_str()).await.expect("lock-control pool");
+        let mut lock = lock_pool.begin().await.expect("lock-control transaction");
+        sqlx::query("LOCK TABLE levels, blocks, parents, block_identifiers, processing_metadata IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .expect("projection tables are locked");
+
+        let (mut service, _events) = service();
+        Arc::get_mut(&mut service).expect("the fixture owns the only service Arc").database_query_timeout = Duration::from_secs(2);
+        service.update_api_db_generation(ApiDbGenerationMessage::Published(api)).await.expect("API generation is bound");
+        service.current_publication.send_replace(Some(database_fallback_publication()));
+        let request = service.admit_head_request().expect("Head admission");
+        let request_service = service.clone();
+        let operation = tokio::spawn(async move { request_service.anchored_window(&request, GraphWindowAnchor::Level(1), 1).await });
+        wait_for_blocked_database_lock(&lock_pool).await;
+        assert!(matches!(
+            timeout(TEST_TIMEOUT, operation).await.expect("request reaches its database deadline").expect("request task joins"),
+            Err(super::AnchoredWindowError::DatabaseTimeout)
+        ));
+        assert_eq!(service.public_historical_reads.available_permits(), super::MAX_PUBLIC_HISTORICAL_DB_READS);
+        assert!(!has_blocked_database_lock(&lock_pool).await);
+
+        lock.rollback().await.expect("table lock is released");
+        service.shutdown().await.expect("service shuts down");
+        storage.shutdown().await.expect("StorageService fixture shuts down");
     }
 
     #[tokio::test]
@@ -3000,7 +3534,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_database_update_linearizes_on_both_sides_of_service_shutdown() {
-        let (_container, storage, _storage_events, api) = api_generation_fixture().await;
+        let (_container, _database_url, storage, _storage_events, _processing, api) = api_generation_fixture().await;
         let (service, mut events) = service();
         service
             .update_api_db_generation(ApiDbGenerationMessage::Published(api.clone()))
@@ -3152,6 +3686,67 @@ mod tests {
 
         observer_release.add_permits(1);
         assert_eq!(shutdown.await.expect("terminal shutdown task completes"), Ok(()));
+        assert_eq!(successor_producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
+        assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopped));
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_waiting_for_reset_leaves_admission_open() {
+        let (service, mut events) = service();
+        let (predecessor_producer, predecessor_receiver) = graph_update_channel();
+        service.reset(predecessor_receiver, RecoveryMode::Resync).await.expect("predecessor starts");
+
+        let observer_release = Arc::new(Semaphore::new(0));
+        let gated_release = observer_release.clone();
+        let gated_observer = tokio::spawn(async move {
+            gated_release.acquire().await.expect("observer release signal remains open").forget();
+        });
+        let original_observer = {
+            let slot = service.runtime.lock().await;
+            let ApiRuntimeSlot::Running(predecessor) = &*slot else { panic!("predecessor remains current") };
+            predecessor.completion_observer.lock().await.replace(gated_observer)
+        };
+        let original_observer = original_observer.expect("predecessor owns its completion observer");
+        original_observer.abort();
+        assert!(original_observer.await.expect_err("original observer is replaced for the test").is_cancelled());
+
+        let (successor_producer, successor_receiver) = graph_update_channel();
+        let reset_service = service.clone();
+        let reset = tokio::spawn(async move { reset_service.reset(successor_receiver, RecoveryMode::Resync).await });
+        for _ in 0..100 {
+            if predecessor_producer.metrics().receiver_closure_count == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(predecessor_producer.metrics().receiver_closure_count, 1);
+
+        let shutdown_service = service.clone();
+        let shutdown = tokio::spawn(async move { shutdown_service.shutdown().await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!shutdown.is_finished(), "shutdown waits for reset lifecycle ownership");
+        shutdown.abort();
+        assert!(shutdown.await.expect_err("blocked shutdown waiter is cancelled").is_cancelled());
+
+        let head = service.admit_head_request().expect("Head admission remains open");
+        let status = service.admit_status_request().expect("status admission remains open");
+        let database =
+            service.public_historical_reads.clone().try_acquire_owned().expect("historical database admission remains open");
+        assert!(!service.historical_read_tasks.is_closed(), "historical task registration remains open");
+        assert!(!service.cancellation.http.is_cancelled());
+        assert!(!service.cancellation.sse.is_cancelled());
+        assert!(!service.cancellation.cache_jobs.is_cancelled());
+        drop((head, status, database));
+
+        observer_release.add_permits(1);
+        assert_eq!(reset.await.expect("reset task completes"), Ok(()));
+        assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Running(_)));
+        drop(service.admit_head_request().expect("successor remains fully admitting"));
+
+        service.shutdown().await.expect("terminal shutdown succeeds");
         assert_eq!(successor_producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
         assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopped));
         assert_eq!(events.try_recv(), Err(TryRecvError::Empty));

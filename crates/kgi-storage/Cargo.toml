@@ -16,6 +16,7 @@ moka.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 url.workspace = true
 
 [dev-dependencies]

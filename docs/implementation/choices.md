@@ -1222,3 +1222,69 @@ prospective replacement is centralized with the stored value. Publication
 runtime reset therefore neither owns nor recreates the interval. The atomic
 does not encode controller policy; that remains with the
 [open decision](../decisions/open.md#adaptive-delta-load-controller).
+
+## 7 November 2026: anchored-window Head selection
+
+### Shared extent calculation and immutable capture
+
+Place the common anchored-extent calculation on
+`kgi_api_model::projection::GraphWindowResolution`. Storage projection and
+in-memory Head selection call the same associated function, avoiding parallel
+implementations of the protocol-owned boundary shifting while retaining the
+module-qualified shared-value boundary.
+
+Keep in-memory anchor lookup and complete subview extraction inside one private
+`GraphPublicationCore` operation. The enclosing `GraphPublication` method
+holds one core read guard for that complete synchronous operation and returns a
+private `HeadWindowSelection` containing either the detached capture or the
+need for database fallback. This adds no cache entry, worker, or synchronization
+domain and leaves lane handoff and database execution to ApiService.
+
+## 8 November 2026: API request admission and historical projection ownership
+
+### Lane guards and terminal accounting
+
+Implement the independent Head, historical, and status request limits with
+three Tokio semaphores. Track terminal request completion separately with a
+reference-counted latch backed by a Tokio watch value. Each admitted
+`ApiRequestGuard` owns one lane permit, one child HTTP cancellation token, and
+one completion registration through shared inner state. An independently owned
+cleanup clone retains that state without adding another registration or
+cancelling a still-running handler when the clone is dropped. Completion
+tracking therefore remains valid while a failed Head-to-historical handoff
+retains its request guard without a lane permit.
+
+Serialize the short admission-versus-terminal-close boundary with one standard
+mutex protecting an `accepting` flag. Closing admission changes that flag and
+closes all three lane semaphores while holding the same guard used by initial
+admission. Terminal waiting observes the completion count reach zero, so it
+includes both request handlers and any independently retained cleanup ownership
+without deriving request lifetime from lane occupancy or tracking one task per
+memory-only request.
+
+For the anchored-window lane change, keep the current lane and its permit in a
+small mutex inside the shared request state. Remove and drop the Head permit,
+check cancellation, and then attempt nonblocking historical acquisition. A
+failed handoff leaves the request with no lane permit while its cancellation
+and completion ownership remains intact. This is the concrete synchronization
+for the architecture-owned
+[lane handoff](../architecture/api-service.md#resource-isolation-and-saturation--settled),
+not another request state machine.
+
+### Historical database cleanup task
+
+Use a `TaskTracker` for the independently owned public historical database
+phases and a separate six-permit semaphore for their API-pool allowance. Move
+the exact validated client, public-read permit, reserved historical encoder,
+phase-local cancellation token, and request cleanup owner into the tracked
+task before awaiting Storage. The handler retains only the join handle.
+
+Race request cancellation and the database deadline against the same Storage
+future. On either signal, cancel the phase-local token but keep polling that
+future until Storage reports cleanup completion. The tracked task therefore
+remains the sole ordinary owner of the database phase even if its handler is
+abandoned; Storage's drop cleanup remains only the lower-level safety net.
+After a successful detached seed, release the database client and permit before
+submitting the already reserved encoding work. These mechanisms implement the
+focused owners' existing cleanup and resource-lifetime contracts without
+introducing another public error or retry loop.

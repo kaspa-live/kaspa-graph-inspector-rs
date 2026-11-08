@@ -1933,6 +1933,16 @@ block is outside the projected window. Recompute derived level usage from
 edges. Exercise the separate capped API pool and prove its saturation or
 generation loss cannot consume or retire a processing-pool connection.
 
+Exercise caller cancellation of `load_graph_view_seed` while waiting for the
+replacement gate, waiting for an API-pool connection, and running a blocked
+transaction. `Cancelled` must be observed only after every acquired database
+resource and replacement lease has been released and any PostgreSQL backend
+has exited; it must not retire the exact valid API generation. Race caller
+cancellation with ordinary completion and generation loss and require one
+stable terminal result. Separately abandon the future and verify detached
+Storage cleanup still prevents replacement from overtaking the backend, while
+providing no false cleanup-completion observation to the former caller.
+
 Lifecycle cases cover ApiService `AwaitReset`, construction of a fresh private
 runtime in `AwaitingCatchup`, waiting for the first-channel Catchup marker while
 producer-side suppression remains active through processing PreSeal and
@@ -1978,9 +1988,9 @@ transition; an offer ordered after the transition enters the channel instead.
 No second marker is required.
 
 Exercise the runtime's universal intra-session reconstruction primitive from
-`Constructing`, `Aligning`, and `Active`. The first two cancel any seed attempt
-and abandon their candidate; `Active` first becomes terminally Stale. In every
-case,
+`Constructing`, `Aligning`, and `Active`. The first two signal and await cleanup
+of any seed attempt before abandoning their candidate; `Active` first becomes
+terminally Stale. In every case,
 drain through the first observed channel Empty, discard graph mutations,
 preserve sticky Live, capture the newest gap generation, and start a newer
 seed. Updates after the empty frontier must be staged, while a later
@@ -2136,8 +2146,9 @@ Exercise the
 [publication-runtime worker](api-publication.md#publication-runtime--settled)
 as one long-lived worker started by the runtime constructor. During
 construction, make database seeding, graph-update receipt, and cancellation
-win its selection in turn; reconstruction drops an in-progress seed attempt
-without leaving a child task. Runtime shutdown cancels and joins the worker,
+win its selection in turn; reconstruction cancels an in-progress seed attempt,
+awaits its cleanup-complete result, and leaves no child task. Runtime shutdown
+cancels and joins the worker,
 marks an active publication Stale through the ordinary state path, and returns
 the same completed result on repetition. Closing the receiver makes the worker
 quiescent until shutdown without spinning, reconstructing, or changing
@@ -2376,6 +2387,21 @@ commitment and releases admission and any request-owned body. A delivery from
 copying the body per waiter; cancelling or timing out one waiter does not
 release the cache-owned allocation.
 
+Exercise the
+[anchored-window lane handoff](api-service.md#resource-isolation-and-saturation--settled)
+with deterministic Head-backed and database-fallback outcomes. A Head-backed
+result must remain independent of saturated historical admission. On fallback,
+verify the Head capacity is released, no historical encoding reservation or
+database access occurs before historical admission, and saturation returns the
+focused public outcome while unrelated Head work remains admissible. After a
+successful handoff, stall database work, detached encoding, and response
+delivery in turn and verify the historical capacity remains charged until the
+request completes. Cancel or begin terminal shutdown between the two lane
+admissions and verify the same request cancellation and completion registration
+remains observable to the shutdown barrier. No interleaving may wait while
+retaining the Head permit, charge both HTTP lanes, resume the Head lane after
+fallback, or produce a partial response.
+
 For encoding work, fill the reservation queue before issuing a historical
 request and verify rejection performs no database access. With a reservation
 held, complete and detach a historical projection while every encoder is busy;
@@ -2400,8 +2426,24 @@ coherent detached result or clean 503 outcome even when database resources were
 released before response construction completed.
 Saturate public historical reads and prove the pool capacity reserved for
 publication and generation work remains usable. Force the focused-owner query
-timeout and verify transaction, permit, and connection release through the
-request-local internal-failure path without retiring the database generation.
+timeout and verify the Storage cancellation token is signalled without
+dropping its operation future. The tracked cleanup waiter must retain the
+ApiService public-read permit and its database-phase completion registration
+after handler detachment until the transaction and backend have ended, the
+connection and replacement lease are released, and Storage returns
+`Cancelled`. Only then may another public read acquire that permit or terminal
+ApiService shutdown complete. The timeout follows the request-local
+internal-failure path without retiring the database generation. Repeat with
+request cancellation and terminal HTTP cancellation after the handler
+detaches; neither may strand an untracked cleanup task or release public-read
+capacity early.
+
+Cancel a publication seed because of runtime shutdown and because of
+intra-session reconstruction. In both cases the runtime must signal the
+attempt-local token, retain and poll the same Storage future through its
+cleanup-complete `Cancelled` result, and only then complete shutdown or begin
+the successor seed. No detached Storage cleanup may outlive the publication
+runtime barrier.
 
 Go KGI parity fixtures, rusty-kaspa RPC and notification fixtures, PostgreSQL
 integration tests, and browser graph tests accompany the applicable groups

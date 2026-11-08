@@ -127,22 +127,24 @@ impl PublicationRuntime {
 ```
 
 Each runtime starts exactly one long-lived worker as part of construction. The
-worker owns the receiver, phase state, staging buffer, current seed attempt,
-unpublished candidate, gap observation, and Active publication Arc. During
-`Constructing`, it selects between its database-seed future, graph-update
-receiver, and cancellation rather than spawning an untracked seed task.
-Dropping that future cancels an abandoned attempt. Intra-session reconstruction
-remains inside the same worker.
+worker owns the receiver, phase state, staging buffer, current seed attempt and
+its cancellation token, unpublished candidate, gap observation, and Active
+publication Arc. During `Constructing`, it selects between its database-seed
+future, graph-update receiver, and cancellation rather than spawning an
+untracked seed task. Intra-session reconstruction remains inside the same
+worker.
 
 `shutdown()` signals the runtime cancellation token and awaits the worker's
 shared completion result. When the worker observes cancellation, it stops
-consuming and applying graph updates, marks its active publication terminally
-`Stale` if one exists, drops any seed attempt and unpublished candidate,
-releases its receiver and publication Arc, and completes. Every
-potentially indefinite worker wait observes the same cancellation token, and
-no worker child task may survive completion. The behavior is the same for
-session replacement and ApiService shutdown. Repeated calls observe the same
-completed result. The state transition uses the protocol-owned
+consuming and applying graph updates, signals any seed attempt's token, awaits
+that Storage operation's cleanup-complete terminal result, marks its active
+publication terminally `Stale` if one exists, drops the unpublished candidate,
+releases its receiver and publication Arc, and completes. Every potentially
+indefinite worker wait observes the applicable cancellation token, and no
+worker child task or unobserved database cleanup may survive completion. The
+behavior is the same for session replacement and ApiService shutdown. Repeated
+calls observe the same completed result. The state transition uses the
+protocol-owned
 [`PublicationState` delivery](api-protocol.md#publication-wire-observation--settled).
 
 The runtime otherwise terminates only through `shutdown()`. A closed
@@ -531,7 +533,7 @@ database-generation loss, and alignment invariant failure:
 
 ```text
 restart_construction():
-    cancel and abandon the current seed attempt, if any
+    signal and await cleanup of the current seed attempt, if any
     abandon the unpublished candidate, if any
     discard the current staging buffer
     drain the current session channel through the first observed Empty
@@ -551,9 +553,16 @@ ordinary Active reconstruction path.
 
 Each seed attempt first awaits the ApiService-owned `ApiDbState::current()` and
 captures its returned exact client without switching generations within that
-attempt. A `GenerationLost` result invokes `restart_construction()`; the runtime
-does not clear ApiDbState. `QueryFailed` and `InconsistentProjection` invoke the
-same reconstruction primitive while leaving the current client unchanged. A
+attempt. It passes a fresh attempt-local cancellation token to the
+[Storage-owned projection operation](storage.md#api-graph-projection-reads--settled).
+Runtime shutdown or a reconstruction trigger signals that token and continues
+polling the same operation until Storage reports its cleanup-complete terminal
+result; only then may the worker complete or begin the successor attempt. A
+`GenerationLost` result invokes `restart_construction()`; the runtime does not
+clear ApiDbState. `QueryFailed` and `InconsistentProjection` invoke the same
+reconstruction primitive while leaving the current client unchanged. A
+`Cancelled` result follows the already selected runtime-cancellation or
+reconstruction path and does not independently start another reconstruction. A
 `None` result ends the pending construction work without starting another
 attempt. The [database-binding owner](api-service.md#api-database-generation-binding--settled)
 defines when either accessor returns a client or `None`.
