@@ -1253,6 +1253,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generation_retirement_interrupts_backend_pid_lookup_before_its_barrier() {
+        let fixture = fixture().await;
+        let graph = seed_complete_projection_fixture(&fixture.pool).await;
+        let api_pool = PgPoolOptions::new().max_connections(1).connect(&fixture.database_url).await.expect("dedicated API pool");
+        let gate = crate::replacement::ApiReplacementGate::new();
+        let (retirement_tx, mut retirements) = crate::runtime::retirement_channel();
+        let client = super::super::ValidatedApiDbClient::new(api_pool, binding(graph.blocks[0].0), retirement_tx, gate.clone());
+        let (pid_reached_tx, pid_reached_rx) = oneshot::channel();
+        let (_pid_release_tx, pid_release_rx) = oneshot::channel();
+        client.hold_next_backend_pid_completion(pid_reached_tx, pid_release_rx);
+        let operation_client = client.clone();
+        let operation = tokio::spawn(async move {
+            operation_client.load_graph_view_seed(GraphViewSeedRequest::HeadPublication, CancellationToken::new()).await
+        });
+        let pid = pid_reached_rx.await.expect("backend PID query reaches its held completion");
+
+        assert!(client.retire());
+        let request = retirements.recv().await.expect("PID lookup joins the exact-generation retirement barrier");
+        let retired = match request.target() {
+            crate::runtime::RetirementTarget::Api(generation) => generation.upgrade().expect("API generation remains alive"),
+            crate::runtime::RetirementTarget::Processing(_) => panic!("API read requested processing retirement"),
+        };
+        assert!(Arc::ptr_eq(&retired, &client));
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let backend_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+                    .bind(pid)
+                    .fetch_one(&fixture.pool)
+                    .await
+                    .expect("retired PID-lookup backend inspection");
+                if !backend_exists {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the interrupted PID-lookup backend exits before retirement completes");
+
+        let replacement = gate.begin_replacement().expect("replacement closes admission");
+        let exclusive = timeout(Duration::from_secs(1), replacement.acquire_exclusive(&Timing::production()))
+            .await
+            .expect("PID-lookup cleanup releases its replacement lease")
+            .expect("replacement exclusion");
+        assert!(!operation.is_finished(), "the exact-generation retirement barrier remains pending");
+
+        request.complete(Ok(()));
+        assert_eq!(operation.await.expect("projection task"), Err(crate::error::ApiReadError::GenerationLost));
+
+        exclusive.open().expect("test reopens admission");
+    }
+
+    #[tokio::test]
     async fn caller_cancellation_waits_for_blocked_projection_cleanup_without_retiring_the_generation() {
         let fixture = fixture().await;
         let graph = seed_complete_projection_fixture(&fixture.pool).await;

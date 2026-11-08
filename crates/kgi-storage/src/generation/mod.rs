@@ -379,6 +379,8 @@ pub struct ValidatedApiDbClient {
     validity: watch::Sender<bool>,
     #[cfg(test)]
     resource_handoff: StdMutex<Option<ApiReadResourceHandoff>>,
+    #[cfg(test)]
+    backend_pid_handoff: StdMutex<Option<BackendPidHandoff>>,
 }
 
 impl GenerationKind for ValidatedApiDbClient {
@@ -403,6 +405,8 @@ impl ValidatedApiDbClient {
             validity,
             #[cfg(test)]
             resource_handoff: StdMutex::new(None),
+            #[cfg(test)]
+            backend_pid_handoff: StdMutex::new(None),
         })
     }
 
@@ -518,21 +522,35 @@ impl ValidatedApiDbClient {
 
         enum BackendPidCompletion {
             Finished(Result<i32, sqlx::Error>),
-            Cancelled,
+            Interrupted(ApiReadError),
         }
         let backend_pid_completion = {
-            let backend_pid_query = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(session.connection());
+            let (connection, lease) = session.parts();
+            #[cfg(test)]
+            let backend_pid_query = query_backend_pid_with_handoff(
+                connection,
+                self.backend_pid_handoff.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take(),
+            );
+            #[cfg(not(test))]
+            let backend_pid_query = query_backend_pid(connection);
             tokio::pin!(backend_pid_query);
             tokio::select! {
                 biased;
-                () = cancellation.cancelled() => BackendPidCompletion::Cancelled,
+                () = cancellation.cancelled() => BackendPidCompletion::Interrupted(ApiReadError::Cancelled),
+                () = lease.cancelled() => BackendPidCompletion::Interrupted(ApiReadError::GenerationLost),
+                result = validity.changed() => BackendPidCompletion::Interrupted(if result.is_err() {
+                    ApiReadError::QueryFailed
+                } else {
+                    debug_assert!(!*validity.borrow(), "API generation validity is monotonic");
+                    ApiReadError::GenerationLost
+                }),
                 result = &mut backend_pid_query => BackendPidCompletion::Finished(result),
             }
         };
         let backend_pid = match backend_pid_completion {
-            BackendPidCompletion::Cancelled => {
+            BackendPidCompletion::Interrupted(result) => {
                 session.cancel(None).await;
-                return Err(ApiReadError::Cancelled);
+                return self.finish_read_error(result).await;
             }
             BackendPidCompletion::Finished(Ok(backend_pid)) => backend_pid,
             BackendPidCompletion::Finished(Err(error)) => {
@@ -635,12 +653,45 @@ impl ValidatedApiDbClient {
             .replace(ApiReadResourceHandoff { reached, release });
         assert!(previous.is_none(), "only one API read resource handoff may be installed");
     }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_backend_pid_completion(&self, reached: oneshot::Sender<i32>, release: oneshot::Receiver<()>) {
+        let previous = self
+            .backend_pid_handoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(BackendPidHandoff { reached, release });
+        assert!(previous.is_none(), "only one API read backend-PID completion may be held");
+    }
 }
 
 #[cfg(test)]
 struct ApiReadResourceHandoff {
     reached: oneshot::Sender<Option<i32>>,
     release: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+struct BackendPidHandoff {
+    reached: oneshot::Sender<i32>,
+    release: oneshot::Receiver<()>,
+}
+
+async fn query_backend_pid(connection: &mut PgConnection) -> Result<i32, sqlx::Error> {
+    sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(connection).await
+}
+
+#[cfg(test)]
+async fn query_backend_pid_with_handoff(
+    connection: &mut PgConnection,
+    handoff: Option<BackendPidHandoff>,
+) -> Result<i32, sqlx::Error> {
+    let backend_pid = query_backend_pid(connection).await?;
+    if let Some(BackendPidHandoff { reached, release }) = handoff {
+        let _ = reached.send(backend_pid);
+        let _ = release.await;
+    }
+    Ok(backend_pid)
 }
 
 /// Owns every database resource covered by one replacement lease.
@@ -668,10 +719,6 @@ impl ApiReadSession {
             #[cfg(test)]
             resource_handoff: None,
         }
-    }
-
-    fn connection(&mut self) -> &mut PgConnection {
-        self.connection.as_deref_mut().expect("API read session retains its connection")
     }
 
     fn parts(&mut self) -> (&mut PgConnection, &mut ApiDbReadLease) {
