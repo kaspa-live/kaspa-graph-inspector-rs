@@ -587,14 +587,14 @@ impl ApiService {
 
     /// Completes the idempotent terminal barrier for every ApiService-owned resource.
     pub async fn shutdown(&self) -> Result<(), ApiServiceError> {
-        self.request_admissions.close();
-        self.public_historical_reads.close();
-        self.historical_read_tasks.close();
         let mut runtime = self.runtime.lock().await;
         if matches!(*runtime, ApiRuntimeSlot::Stopped) {
             return Ok(());
         }
 
+        self.request_admissions.close();
+        self.public_historical_reads.close();
+        self.historical_read_tasks.close();
         if matches!(*runtime, ApiRuntimeSlot::AwaitReset | ApiRuntimeSlot::Running(_)) {
             let previous = std::mem::replace(&mut *runtime, ApiRuntimeSlot::Stopping(None));
             if let ApiRuntimeSlot::Running(installed) = previous {
@@ -3686,6 +3686,67 @@ mod tests {
 
         observer_release.add_permits(1);
         assert_eq!(shutdown.await.expect("terminal shutdown task completes"), Ok(()));
+        assert_eq!(successor_producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
+        assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopped));
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_waiting_for_reset_leaves_admission_open() {
+        let (service, mut events) = service();
+        let (predecessor_producer, predecessor_receiver) = graph_update_channel();
+        service.reset(predecessor_receiver, RecoveryMode::Resync).await.expect("predecessor starts");
+
+        let observer_release = Arc::new(Semaphore::new(0));
+        let gated_release = observer_release.clone();
+        let gated_observer = tokio::spawn(async move {
+            gated_release.acquire().await.expect("observer release signal remains open").forget();
+        });
+        let original_observer = {
+            let slot = service.runtime.lock().await;
+            let ApiRuntimeSlot::Running(predecessor) = &*slot else { panic!("predecessor remains current") };
+            predecessor.completion_observer.lock().await.replace(gated_observer)
+        };
+        let original_observer = original_observer.expect("predecessor owns its completion observer");
+        original_observer.abort();
+        assert!(original_observer.await.expect_err("original observer is replaced for the test").is_cancelled());
+
+        let (successor_producer, successor_receiver) = graph_update_channel();
+        let reset_service = service.clone();
+        let reset = tokio::spawn(async move { reset_service.reset(successor_receiver, RecoveryMode::Resync).await });
+        for _ in 0..100 {
+            if predecessor_producer.metrics().receiver_closure_count == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(predecessor_producer.metrics().receiver_closure_count, 1);
+
+        let shutdown_service = service.clone();
+        let shutdown = tokio::spawn(async move { shutdown_service.shutdown().await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!shutdown.is_finished(), "shutdown waits for reset lifecycle ownership");
+        shutdown.abort();
+        assert!(shutdown.await.expect_err("blocked shutdown waiter is cancelled").is_cancelled());
+
+        let head = service.admit_head_request().expect("Head admission remains open");
+        let status = service.admit_status_request().expect("status admission remains open");
+        let database =
+            service.public_historical_reads.clone().try_acquire_owned().expect("historical database admission remains open");
+        assert!(!service.historical_read_tasks.is_closed(), "historical task registration remains open");
+        assert!(!service.cancellation.http.is_cancelled());
+        assert!(!service.cancellation.sse.is_cancelled());
+        assert!(!service.cancellation.cache_jobs.is_cancelled());
+        drop((head, status, database));
+
+        observer_release.add_permits(1);
+        assert_eq!(reset.await.expect("reset task completes"), Ok(()));
+        assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Running(_)));
+        drop(service.admit_head_request().expect("successor remains fully admitting"));
+
+        service.shutdown().await.expect("terminal shutdown succeeds");
         assert_eq!(successor_producer.publish_catchup(), Err(GraphUpdateProducerError::ReceiverClosed));
         assert!(matches!(*service.runtime.lock().await, ApiRuntimeSlot::Stopped));
         assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
