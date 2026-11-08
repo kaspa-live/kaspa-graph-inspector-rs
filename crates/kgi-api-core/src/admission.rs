@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 /// Maximum concurrently admitted Head-lane HTTP requests.
@@ -11,8 +11,6 @@ pub(crate) const MAX_HEAD_HTTP_REQUESTS: usize = 64;
 pub(crate) const MAX_HISTORICAL_HTTP_REQUESTS: usize = 8;
 /// Maximum concurrently admitted memory-only status requests.
 pub(crate) const MAX_STATUS_HTTP_REQUESTS: usize = 16;
-
-const MAX_HTTP_REQUESTS: usize = MAX_HEAD_HTTP_REQUESTS + MAX_HISTORICAL_HTTP_REQUESTS + MAX_STATUS_HTTP_REQUESTS;
 
 /// Reason one nonblocking HTTP request admission failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -39,7 +37,47 @@ struct ApiRequestGuardInner {
     cancellation: CancellationToken,
     _cancellation_on_completion: DropGuard,
     lane: Mutex<Option<(ApiRequestLane, OwnedSemaphorePermit)>>,
-    _completion: OwnedSemaphorePermit,
+    _completion: ApiRequestCompletionGuard,
+}
+
+struct ApiRequestCompletion {
+    active: watch::Sender<usize>,
+}
+
+impl ApiRequestCompletion {
+    fn new() -> Self {
+        let (active, _) = watch::channel(0);
+        Self { active }
+    }
+
+    fn track(&self) -> ApiRequestCompletionGuard {
+        self.active.send_modify(|active| {
+            *active = active.checked_add(1).expect("active API request count fits usize");
+        });
+        ApiRequestCompletionGuard { active: self.active.clone() }
+    }
+
+    async fn wait(&self) {
+        let mut active = self.active.subscribe();
+        loop {
+            if *active.borrow_and_update() == 0 {
+                return;
+            }
+            active.changed().await.expect("request completion retains its watch sender");
+        }
+    }
+}
+
+struct ApiRequestCompletionGuard {
+    active: watch::Sender<usize>,
+}
+
+impl Drop for ApiRequestCompletionGuard {
+    fn drop(&mut self) {
+        self.active.send_modify(|active| {
+            *active = active.checked_sub(1).expect("a completed API request was tracked");
+        });
+    }
 }
 
 /// One admitted request's lane, cancellation, and shutdown-completion ownership.
@@ -82,7 +120,7 @@ pub(crate) struct ApiRequestAdmissions {
     head: Arc<Semaphore>,
     historical: Arc<Semaphore>,
     status: Arc<Semaphore>,
-    completion: Arc<Semaphore>,
+    completion: ApiRequestCompletion,
     http_cancellation: CancellationToken,
 }
 
@@ -93,7 +131,7 @@ impl ApiRequestAdmissions {
             head: Arc::new(Semaphore::new(MAX_HEAD_HTTP_REQUESTS)),
             historical: Arc::new(Semaphore::new(MAX_HISTORICAL_HTTP_REQUESTS)),
             status: Arc::new(Semaphore::new(MAX_STATUS_HTTP_REQUESTS)),
-            completion: Arc::new(Semaphore::new(MAX_HTTP_REQUESTS)),
+            completion: ApiRequestCompletion::new(),
             http_cancellation,
         }
     }
@@ -112,8 +150,7 @@ impl ApiRequestAdmissions {
             return Err(ApiRequestAdmissionError::Unavailable);
         }
         let permit = semaphore.clone().try_acquire_owned().map_err(admission_error)?;
-        let completion =
-            self.completion.clone().try_acquire_owned().expect("the completion bound equals the sum of independently admitted lanes");
+        let completion = self.completion.track();
         let cancellation = self.http_cancellation.child_token();
         let cancellation_on_completion = cancellation.clone().drop_guard();
         let request = ApiRequestGuard {
@@ -156,12 +193,7 @@ impl ApiRequestAdmissions {
     }
 
     pub(crate) async fn wait(&self) {
-        let _all_requests = self
-            .completion
-            .clone()
-            .acquire_many_owned(u32::try_from(MAX_HTTP_REQUESTS).expect("request bound fits u32"))
-            .await
-            .expect("the request-completion semaphore is never closed");
+        self.completion.wait().await;
     }
 }
 
@@ -220,5 +252,37 @@ mod tests {
         drop(cleanup);
         timeout(Duration::from_secs(1), admissions.wait()).await.expect("cleanup release completes the barrier");
         assert!(matches!(admissions.admit_status(), Err(ApiRequestAdmissionError::Unavailable)));
+    }
+
+    #[tokio::test]
+    async fn failed_handoffs_do_not_exhaust_completion_tracking() {
+        let admissions = ApiRequestAdmissions::new(CancellationToken::new());
+        let historical: Vec<_> = (0..MAX_HISTORICAL_HTTP_REQUESTS)
+            .map(|_| {
+                let request = admissions.admit_head().expect("Head admission");
+                admissions.handoff_to_historical(&request).expect("historical handoff");
+                request
+            })
+            .collect();
+
+        let rejected: Vec<_> = (0..(MAX_HEAD_HTTP_REQUESTS + MAX_STATUS_HTTP_REQUESTS + 1))
+            .map(|_| {
+                let request = admissions.admit_head().expect("a failed handoff releases its Head permit");
+                assert!(matches!(admissions.handoff_to_historical(&request), Err(ApiRequestAdmissionError::Saturated)));
+                assert_eq!(request.lane(), None);
+                request
+            })
+            .collect();
+
+        let heads: Vec<_> =
+            (0..MAX_HEAD_HTTP_REQUESTS).map(|_| admissions.admit_head().expect("Head admission remains usable")).collect();
+        assert!(matches!(admissions.admit_head(), Err(ApiRequestAdmissionError::Saturated)));
+
+        admissions.close();
+        assert!(timeout(Duration::from_millis(20), admissions.wait()).await.is_err());
+        drop(heads);
+        drop(rejected);
+        drop(historical);
+        timeout(Duration::from_secs(1), admissions.wait()).await.expect("every lane-less and lane-owning guard drains");
     }
 }

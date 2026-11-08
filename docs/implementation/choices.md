@@ -1245,18 +1245,22 @@ domain and leaves lane handoff and database execution to ApiService.
 ### Lane guards and terminal accounting
 
 Implement the independent Head, historical, and status request limits with
-three Tokio semaphores. Pair them with one completion semaphore whose capacity
-is their sum. Each admitted `ApiRequestGuard` owns one lane permit, one child
-HTTP cancellation token, and one completion permit through shared inner state.
-An independently owned cleanup clone retains that state without cancelling a
-still-running handler when the clone is dropped.
+three Tokio semaphores. Track terminal request completion separately with a
+reference-counted latch backed by a Tokio watch value. Each admitted
+`ApiRequestGuard` owns one lane permit, one child HTTP cancellation token, and
+one completion registration through shared inner state. An independently owned
+cleanup clone retains that state without adding another registration or
+cancelling a still-running handler when the clone is dropped. Completion
+tracking therefore remains valid while a failed Head-to-historical handoff
+retains its request guard without a lane permit.
 
 Serialize the short admission-versus-terminal-close boundary with one standard
 mutex protecting an `accepting` flag. Closing admission changes that flag and
 closes all three lane semaphores while holding the same guard used by initial
-admission. Terminal waiting acquires the complete completion-semaphore
-capacity, so it observes both request handlers and any independently retained
-cleanup ownership without tracking one task per memory-only request.
+admission. Terminal waiting observes the completion count reach zero, so it
+includes both request handlers and any independently retained cleanup ownership
+without deriving request lifetime from lane occupancy or tracking one task per
+memory-only request.
 
 For the anchored-window lane change, keep the current lane and its permit in a
 small mutex inside the shared request state. Remove and drop the Head permit,
