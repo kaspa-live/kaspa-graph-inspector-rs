@@ -488,3 +488,26 @@ public admission, HTTP/SSE transport, and the adaptive controller remain in
 later increments. Completion validation passed workspace formatting, Cargo
 check, 608/608 Nextest tests including Docker PostgreSQL integration, Cargo
 doctests, Clippy with warnings denied, and `git diff --check`.
+
+Implementation increment 19 is implemented: `GraphPublication` now resolves
+level, block-hash, and nominal VSPC DAA-floor window anchors from one immutable
+Head capture, applies the shared capped-extent calculation, and either returns
+one complete detached Head window or requires database fallback. `ApiService`
+now owns independent bounded Head, historical, and status request lanes with
+continuous cancellation and terminal-completion accounting. Anchored windows
+begin in the Head lane, hand off without overlapping permits, reserve bounded
+historical encoding, select one exact public API database generation, and run
+their complete cancellable database phase in an independently tracked cleanup
+task under the public-read allowance and query deadline. Successful historical
+seeds become request-local revision-zero fixed views only after every database
+resource has been released. Typed anchor misses remain all-or-nothing, and the
+memory-only status operation remains independent of graph and database
+availability. Focused tests cover every anchor and boundary condition, source
+coherence, lane saturation and independence, request handoff, exact generation
+selection, PostgreSQL replacement and cancellation races, handler abandonment,
+query timeout, detached cleanup ownership, terminal draining, status capture,
+and no partial result. HTTP parsing, response headers and delivery, and SSE
+transport remain in increment 20; adaptive interval control remains deferred.
+Completion validation passed workspace formatting, Cargo check, 626/626
+Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
+with warnings denied, and `git diff --check`.
