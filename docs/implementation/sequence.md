@@ -87,8 +87,8 @@ do not enlarge the PR silently. Any future regrouping requires updating this
 sequence first.
 
 The former broad Step 6 is now increments 6–20, former Step 7 is increments
-21–25, and former Step 8 is increments 26–30. Increments 6–18 are complete;
-the active production work is increment 19, without an additional nesting
+21–25, and former Step 8 is increments 26–30. Increments 6–19 are complete;
+the active production work is increment 20, without an additional nesting
 level.
 
 | Increment / PR | Isolated production scope | Completion evidence |
@@ -119,57 +119,59 @@ level.
 | 29. Deployment and release artifacts | Complete the conventional and Docker layouts, runtime log directories, systemd and Compose examples, static-asset cache behavior, and atomic `xtask` bundle/container construction against the composed binary and Web build. | Reproducible bundle and image checks, matching binary/assets and provenance, missing-root failure, unprivileged/read-only deployment, writable logs, direct signal delivery, and atomic failure cleanup. |
 | 30. Full-stack acceptance | Add only the remaining cross-component fixtures and acceptance coverage needed to prove the focused verification contract across node RPC, PostgreSQL, recovery, API/Web, packaging, logging, and resource isolation; update implementation status with the final evidence. | Full Rust, PostgreSQL, Vitest, deterministic and complete-stack Playwright, parity, packaging, shutdown, and load/isolation suites pass from a clean checkout. |
 
-### Active increment 19: anchored windows, status, and API admission
+### Active increment 20: HTTP and SSE transport
 
-Increment 19 is exactly one reviewable PR. It completes the remaining logical
-ApiService operations and their resource boundaries over the existing graph,
-publication, Storage API-read, encoding, and status foundations. HTTP parsing,
-response-header mapping, body delivery, and SSE transport remain in increment
-20. The focused [protocol](../architecture/api-protocol.md),
+Increment 20 is exactly one reviewable PR. It adds the `kgi-api-core` Axum
+transport over the completed logical ApiService operations and publication-
+local SSE registry. Process-level listener ownership, router nesting, tracing,
+static assets, runtime Web configuration, and global shutdown composition
+remain in increment 25. The focused
+[protocol](../architecture/api-protocol.md),
 [ApiService](../architecture/api-service.md),
 [publication](../architecture/api-publication.md),
-[storage](../architecture/storage.md), and
+[overview](../architecture/overview.md), and
 [verification](../architecture/verification.md) documents remain the sole
 owners of those contracts; this plan records only their implementation order.
 
-Use a small number of cohesive production commits. Tests belong with the
-behavior they verify; do not split types, implementation, and tests into
+Use two cohesive production commits. Tests belong with the behavior they
+verify; do not split transport types, implementation, and tests into
 artificially atomic commits or add temporary abstractions solely to preserve
 such a split.
 
-1. Implement the graph-side anchored-window operation as one coherent unit:
-   resolve level, block-hash, and nominal VSPC DAA-floor anchors from one
-   immutable Head capture; derive the effective capped extent; and either
-   return one complete frozen Head-backed window or identify that the complete
-   operation requires database fallback. Cover source coherence, boundary
-   shifting, tie behavior, external endpoint exclusion from DAA resolution,
-   and all fallback conditions.
-2. Implement the ApiService request boundary and the complete service-side
-   operations together: independent bounded request lanes, request-owned
-   cancellation and completion accounting, memory-only status capture,
-   Head-first anchored selection, exact-generation database fallback, bounded
-   public historical-read admission, complete database-phase timeout and
-   detachment, historical encoding reservation and execution, and typed
-   no-partial-result outcomes. Integrate terminal admission closure and request
-   draining into the existing shutdown barrier. Cover lane independence and
-   saturation, database/replacement races, timeout and cancellation cleanup,
-   detached-projection lifetime, status independence, and exact anchor misses.
-3. Reconcile the non-normative implementation records with the completed
-   operation and run the full Rust validation suite. Review corrections remain
-   ordinary incremental commits rather than a reason to pre-split the initial
-   implementation.
+1. Implement the complete ordinary HTTP transport as one vertical slice. Add
+   and record the transport-specific dependency, module, and response-body
+   choices. Add the state-awaiting public API router, strict route-specific
+   query and header parsing, API-owned fallback and `GET`-only method handling,
+   graph gzip negotiation, common error conversion, and exact
+   success/header/cache-policy mapping for status, Head snapshots, canonical
+   deltas, retained levels, and anchored windows. Add response-body ownership
+   that retains the admitted request guard through successful delivery,
+   disconnect, committed-response failure, cancellation, and the graph-
+   delivery deadline. Cover every route, malformed-input and compression
+   precedence, conditional Head request, logical outcome, saturation class,
+   exact headers and bodies, method, API fallback, delivery completion, and
+   timeout in router-level tests.
+2. Implement the complete SSE transport as one vertical slice. Add strict
+   wakeup-query parsing, connection admission, initial registration, ordered
+   mailbox-to-SSE framing, current-publication observation and atomic
+   registration replacement on the same transport, slow-client and stale-
+   registration cleanup, disconnect removal, and shutdown cancellation while
+   retaining the connection guard for the stream lifetime. Cover exact event
+   names and JSON frames, initial and replacement message order, identifier
+   turnover, concurrent publication replacement, mailbox saturation, slow and
+   disconnected clients, absence of the ordinary graph-delivery timeout, final
+   Stale delivery, and router shutdown.
+3. Reconcile the non-normative completion status, run the combined router
+   isolation and middleware-absence matrix, and execute the full Rust
+   validation suite. This is a completion record, not a third production
+   slice. Review corrections remain ordinary incremental commits rather than
+   a reason to pre-split the initial implementation.
 
-Point 2 follows the settled
-[ApiService anchored-window lane handoff](../architecture/api-service.md#resource-isolation-and-saturation--settled).
-Its database phase also follows the Storage-owned
-[cancellation-complete projection boundary](../architecture/storage.md#api-graph-projection-reads--settled)
-and the
-[ApiService-owned tracked cleanup-waiter contract](../architecture/api-service.md#resource-isolation-and-saturation--settled).
-
-This increment adds no Axum router, request parsing, HTTP header or error
-mapping, response-body delivery timeout, SSE connection task, or adaptive
-delta controller. Increment 20 owns transport. Controller design and
-implementation remain outside this PR under the
+The router remains state-awaiting and owns only `/api/v1`-relative API paths;
+the top composition crate supplies `Arc<ApiService>` and nesting later. This
+increment adds no listener, global middleware, static-file fallback, Web
+runtime configuration, process composition, or adaptive delta controller.
+Controller design and implementation remain outside this PR under the
 [open decision](../decisions/open.md#adaptive-delta-load-controller).
 
 ## Cross-increment ordering
