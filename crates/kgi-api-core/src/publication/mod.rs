@@ -591,6 +591,11 @@ impl GraphPublication {
         self.publication_id
     }
 
+    /// Samples this publication's latest externally meaningful lifecycle state.
+    pub(crate) async fn state(&self) -> GraphPublicationState {
+        self.core.read().await.state
+    }
+
     /// Returns this publication's response cache.
     pub(crate) fn cache(&self) -> Arc<GraphCache> {
         self.cache.clone()

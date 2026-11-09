@@ -1288,3 +1288,39 @@ After a successful detached seed, release the database client and permit before
 submitting the already reserved encoding work. These mechanisms implement the
 focused owners' existing cleanup and resource-lifetime contracts without
 introducing another public error or retry loop.
+
+## 8 November 2026: ordinary API HTTP transport
+
+### Router and parsing boundary
+
+Use Axum 0.8 for the state-awaiting `kgi-api-core` router and Tower's service
+utilities only in router-level tests. Keep transport implementation in the
+private `kgi_api_core::transport` module and expose only the architecture-owned
+crate-root `router()` function. The router contains route-local `GET` method
+fallbacks plus one API fallback; the later composition layer therefore cannot
+redirect an API miss into the browser application.
+
+Parse each route's raw query into decoded name/value pairs before ApiService
+admission. Route-specific code then enforces scalar uniqueness, repeated-level
+collection semantics, allowed names, and semantic bounds. Parse
+`Accept-Encoding` and `If-None-Match` directly at the same boundary instead of
+installing generic compression or conditional middleware. This preserves the
+protocol's route, method, syntax, and gzip precedence and prevents rejected
+requests from entering graph, database, cache, or encoding work.
+
+### Response delivery ownership
+
+Wrap every admitted ordinary response body in a private `http_body::Body`
+implementation that owns the existing `ApiRequestGuard`, request-cancellation
+future, and graph-delivery timer. It releases admission and completion only
+when the body reaches terminal polling, is cancelled, times out, or is dropped.
+Bodyless admitted responses use the same wrapper so header-only delivery does
+not bypass request accounting. Cached and request-local graph bytes enter this
+wrapper in their existing final gzip representation; errors and status remain
+ordinary uncompressed JSON. No router-wide timeout, compression, concurrency,
+or catch-panic layer is added.
+
+For oversized non-delta encoding, keep serializing into a counting sink after
+the retained JSON buffer reaches its hard bound. This records the complete
+observed uncompressed byte count required by the public typed error without
+allocating bytes beyond the bound.

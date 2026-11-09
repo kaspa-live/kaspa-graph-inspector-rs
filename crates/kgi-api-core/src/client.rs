@@ -40,6 +40,19 @@ impl ClientIdentifier {
         URL_SAFE_NO_PAD.encode(self.0.to_be_bytes())
     }
 
+    /// Parses the canonical unpadded base64url representation of one client identifier.
+    pub(crate) fn parse(encoded: &str) -> Option<Self> {
+        if encoded.len() != 11 || encoded.contains('=') {
+            return None;
+        }
+        let mut bytes = [0_u8; 8];
+        let written = URL_SAFE_NO_PAD.decode_slice(encoded, &mut bytes).ok()?;
+        if written != bytes.len() || URL_SAFE_NO_PAD.encode(bytes) != encoded {
+            return None;
+        }
+        Some(Self(u64::from_be_bytes(bytes)))
+    }
+
     /// Constructs the protocol payload assigning this identifier.
     pub(crate) fn registration(self) -> ClientRegistrationDto {
         ClientRegistrationDto::new(self.encode())
@@ -670,6 +683,17 @@ mod tests {
         ClientIdentifier, DeltaCompletionResult, DeltaScheduleAction, MAX_SSE_CLIENTS, SSE_CLIENT_BUFFER_CAPACITY,
         SseClientRegistrationError, SseClientRegistry, SseClientReplacementError, SseMailbox, SseMailboxAdmissionError, SseMessage,
     };
+
+    #[test]
+    fn client_identifier_parser_accepts_only_canonical_wire_values() {
+        let identifier = ClientIdentifier(0x0123_4567_89ab_cdef);
+        let encoded = identifier.encode();
+
+        assert_eq!(ClientIdentifier::parse(&encoded), Some(identifier));
+        assert_eq!(ClientIdentifier::parse(&format!("{encoded}=")), None);
+        assert_eq!(ClientIdentifier::parse("not+base64!!"), None);
+        assert_eq!(ClientIdentifier::parse("short"), None);
+    }
 
     fn required_registration(value: usize) -> SseMessage {
         SseMessage::ClientRegistration(ClientRegistrationDto::new(format!("client-{value}")))

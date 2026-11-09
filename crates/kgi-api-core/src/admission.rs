@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "request guards become transport-owned in increment 20")]
-
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, watch};
@@ -93,10 +91,6 @@ impl ApiRequestGuard {
 
     pub(crate) fn lane(&self) -> Option<ApiRequestLane> {
         self.inner.lane.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().map(|(lane, _)| *lane)
-    }
-
-    pub(crate) fn cancel(&self) {
-        self.inner.cancellation.cancel();
     }
 
     /// Retains all request resources for independently owned cleanup without

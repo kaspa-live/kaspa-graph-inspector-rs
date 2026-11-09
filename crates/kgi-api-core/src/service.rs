@@ -43,14 +43,11 @@ use crate::{
 };
 
 /// Maximum public historical database phases active at once.
-#[allow(dead_code, reason = "the logical operation is consumed by the transport increment")]
 pub(crate) const MAX_PUBLIC_HISTORICAL_DB_READS: usize = 6;
 /// Complete deadline for one public database projection phase.
-#[allow(dead_code, reason = "the logical operation is consumed by the transport increment")]
 pub(crate) const API_DB_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Logical result of one complete anchored-window operation.
-#[allow(dead_code, reason = "HTTP response mapping is introduced by the transport increment")]
 pub(crate) enum AnchoredWindowResponse {
     /// No coherent current publication or public database generation was available.
     Unavailable,
@@ -79,7 +76,6 @@ pub(crate) enum AnchoredWindowResponse {
 
 /// Failure of one admitted anchored-window operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[allow(dead_code, reason = "HTTP response mapping is introduced by the transport increment")]
 pub(crate) enum AnchoredWindowError {
     /// The Head-to-historical lane handoff could not be admitted.
     #[error(transparent)]
@@ -133,7 +129,6 @@ impl HeadRequestContext for CancellationToken {
 
 /// Parsed conditional state for one logical Head snapshot operation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-#[allow(dead_code, reason = "HTTP conditional parsing is introduced by the transport increment")]
 pub(crate) enum HeadSnapshotCondition {
     /// The caller supplied no current validator.
     #[default]
@@ -155,7 +150,6 @@ impl HeadSnapshotCondition {
 }
 
 /// Logical result of one in-memory Head snapshot operation.
-#[allow(dead_code, reason = "HTTP response delivery is introduced by the transport increment")]
 pub(crate) enum HeadSnapshotOutcome {
     /// No coherent publication is currently addressable.
     Unavailable,
@@ -176,7 +170,6 @@ pub(crate) enum HeadSnapshotOutcome {
 }
 
 /// Logical result of one retained Head-level lookup operation.
-#[allow(dead_code, reason = "HTTP response delivery is introduced by the transport increment")]
 pub(crate) enum HeadLevelLookupResponse {
     /// Every requested level was captured and encoded for delivery.
     Complete {
@@ -202,7 +195,6 @@ pub(crate) enum HeadLevelLookupResponse {
 }
 
 /// Body selection for one successful logical canonical-delta operation.
-#[allow(dead_code, reason = "HTTP response mapping is introduced by the transport increment")]
 pub(crate) enum CanonicalDeltaSuccess {
     /// The request cursor already equals the captured Head.
     UpToDate,
@@ -215,7 +207,6 @@ pub(crate) enum CanonicalDeltaSuccess {
 }
 
 /// Logical result of one canonical-delta operation before HTTP mapping.
-#[allow(dead_code, reason = "HTTP response mapping is introduced by the transport increment")]
 pub(crate) enum CanonicalDeltaResponse {
     /// The supplied publication does not address the retained current lineage.
     FreshViewRequired {
@@ -458,7 +449,6 @@ struct ApiStatusInputs {
 }
 
 impl ApiStatusInputs {
-    #[allow(dead_code, reason = "the logical status operation is consumed by the transport increment")]
     fn current(&self) -> SystemStatus {
         SystemStatus {
             kgi_version: self.kgi_version.to_owned(),
@@ -632,26 +622,22 @@ impl ApiService {
     }
 
     /// Captures the latest independent component observations without waiting for a common revision.
-    #[allow(dead_code, reason = "the logical status operation is consumed by the transport increment")]
     pub(crate) fn system_status(&self, request: &ApiRequestGuard) -> SystemStatus {
         assert_eq!(request.lane(), Some(ApiRequestLane::Status), "status capture requires status-lane admission");
         self.status.current()
     }
 
     /// Attempts nonblocking admission to the shared Head-operation lane.
-    #[allow(dead_code, reason = "HTTP handlers are introduced by the transport increment")]
     pub(crate) fn admit_head_request(&self) -> Result<ApiRequestGuard, ApiRequestAdmissionError> {
         self.request_admissions.admit_head()
     }
 
     /// Attempts nonblocking admission to the independent memory-only status lane.
-    #[allow(dead_code, reason = "HTTP handlers are introduced by the transport increment")]
     pub(crate) fn admit_status_request(&self) -> Result<ApiRequestGuard, ApiRequestAdmissionError> {
         self.request_admissions.admit_status()
     }
 
     /// Resolves and encodes one anchored graph window without combining sources.
-    #[allow(dead_code, reason = "the logical operation is consumed by the transport increment")]
     pub(crate) async fn anchored_window(
         &self,
         request: &ApiRequestGuard,
@@ -679,7 +665,6 @@ impl ApiService {
         }
     }
 
-    #[allow(dead_code, reason = "the logical operation is consumed by the transport increment")]
     async fn database_anchored_window(
         &self,
         request: &ApiRequestGuard,
@@ -726,7 +711,6 @@ impl ApiService {
     }
 
     /// Selects, constructs, and completes one logical canonical-delta request.
-    #[allow(dead_code, reason = "the logical operation is consumed by the later HTTP transport increment")]
     pub(crate) async fn canonical_delta<R: HeadRequestContext>(
         &self,
         requested_publication_id: u64,
@@ -914,7 +898,6 @@ impl ApiService {
     }
 
     /// Selects one coherent in-memory Head snapshot or its conditional result.
-    #[allow(dead_code, reason = "the logical operation is consumed by the later HTTP transport increment")]
     pub(crate) async fn head_snapshot<R: HeadRequestContext>(
         &self,
         target_depth: u32,
@@ -956,7 +939,6 @@ impl ApiService {
     }
 
     /// Captures and encodes complete retained levels from one exact publication.
-    #[allow(dead_code, reason = "the logical operation is consumed by the later HTTP transport increment")]
     pub(crate) async fn head_levels<R: HeadRequestContext>(
         &self,
         requested_publication_id: u64,
@@ -997,9 +979,13 @@ impl ApiService {
     pub(crate) fn current_publication(&self) -> Option<Arc<GraphPublication>> {
         self.current_publication.borrow().clone()
     }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_publication(&self, publication: Arc<GraphPublication>) {
+        self.current_publication.send_replace(Some(publication));
+    }
 }
 
-#[allow(dead_code, reason = "the logical operation is consumed by the transport increment")]
 async fn run_historical_projection(
     cleanup_owner: ApiRequestGuard,
     client: Arc<ValidatedApiDbClient>,
