@@ -1774,7 +1774,9 @@ without opening a stream when no coherent publication exists. A successful
 stream has the settled event-stream content type, `Cache-Control: no-store`,
 and no ETag, graph body, hash dictionary, database access, graph-cache work, or
 delta construction. A stale but well-formed request cursor must still receive
-the current publication.
+the current publication. Use request publication and revision values distinct
+from the current publication and Head, and verify that neither value enters the
+installed registration schedule.
 
 On initial connection and reconnection, require an ID-only
 `ClientRegistrationDto`, then `PublicationStateDto`, then
