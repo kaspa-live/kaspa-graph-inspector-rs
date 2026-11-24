@@ -561,10 +561,16 @@ mod tests {
         let status = application.clone().oneshot(request("/status")).await.expect("status routed");
         assert_eq!(status.status(), StatusCode::OK);
         assert_eq!(status.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(!status.headers().contains_key(header::VARY));
+        assert!(!status.headers().contains_key(header::CONTENT_ENCODING));
+        assert!(!status.headers().contains_key(header::ETAG));
         assert_eq!(json_body(status).await["supervisor"]["lifecycle"], "running");
 
         let unknown = application.clone().oneshot(request("/unknown")).await.expect("fallback routed");
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(unknown.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(!unknown.headers().contains_key(header::VARY));
+        assert!(!unknown.headers().contains_key(header::CONTENT_ENCODING));
         assert_eq!(json_body(unknown).await["code"], "route-not-found");
 
         let method = application
@@ -573,6 +579,8 @@ mod tests {
             .expect("method fallback routed");
         assert_eq!(method.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(method.headers()[header::ALLOW], "GET");
+        assert!(!method.headers().contains_key(header::VARY));
+        assert!(!method.headers().contains_key(header::CONTENT_ENCODING));
 
         let head_method = router()
             .with_state(service())
@@ -581,6 +589,8 @@ mod tests {
             .expect("HEAD method fallback routed");
         assert_eq!(head_method.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(head_method.headers()[header::ALLOW], "GET");
+        assert!(!head_method.headers().contains_key(header::VARY));
+        assert!(!head_method.headers().contains_key(header::CONTENT_ENCODING));
     }
 
     #[tokio::test]
@@ -594,6 +604,7 @@ mod tests {
             .expect("request routed");
         assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
         assert_eq!(malformed.headers()[header::VARY], "Accept-Encoding");
+        assert!(!malformed.headers().contains_key(header::CONTENT_ENCODING));
 
         let missing_gzip = application
             .clone()
@@ -601,6 +612,8 @@ mod tests {
             .await
             .expect("request routed");
         assert_eq!(missing_gzip.status(), StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(missing_gzip.headers()[header::VARY], "Accept-Encoding");
+        assert!(!missing_gzip.headers().contains_key(header::CONTENT_ENCODING));
         assert_eq!(json_body(missing_gzip).await["code"], "gzip-required");
 
         let method = application
@@ -609,6 +622,8 @@ mod tests {
             .expect("method routed");
         assert_eq!(method.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(method.headers()[header::ALLOW], "GET");
+        assert_eq!(method.headers()[header::VARY], "Accept-Encoding");
+        assert!(!method.headers().contains_key(header::CONTENT_ENCODING));
     }
 
     #[tokio::test]
@@ -622,6 +637,7 @@ mod tests {
         let head = application.clone().oneshot(request("/graph/head?target_depth=20")).await.expect("Head routed");
         assert_eq!(head.status(), StatusCode::OK);
         assert_eq!(head.headers()[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(head.headers()[header::VARY], "Accept-Encoding");
         assert_eq!(head.headers()[KGI_PUBLICATION_ID], publication_id.to_string());
         assert_eq!(head.headers()[KGI_PUBLICATION_STATE], "synchronizing");
         let etag = head.headers()[header::ETAG].clone();
@@ -652,6 +668,7 @@ mod tests {
         assert_eq!(delta.status(), StatusCode::OK);
         assert_eq!(delta.headers()[KGI_DELTA_OUTCOME], "up-to-date");
         assert_eq!(delta.headers()[KGI_DELTA_CONTINUATION], "head");
+        assert_eq!(delta.headers()[header::VARY], "Accept-Encoding");
         assert!(!delta.headers().contains_key(header::CONTENT_ENCODING));
         assert!(to_bytes(delta.into_body(), usize::MAX).await.expect("empty delta completes").is_empty());
 
@@ -661,10 +678,14 @@ mod tests {
             .await
             .expect("levels routed");
         assert_eq!(levels.status(), StatusCode::OK);
+        assert_eq!(levels.headers()[header::VARY], "Accept-Encoding");
+        assert_eq!(levels.headers()[header::CONTENT_ENCODING], "gzip");
         assert_eq!(gzip_json_body(levels).await["levels"].as_array().expect("levels array").len(), 2);
 
         let window = application.oneshot(request("/graph/window?max_depth=2&level=1")).await.expect("window routed");
         assert_eq!(window.status(), StatusCode::OK);
+        assert_eq!(window.headers()[header::VARY], "Accept-Encoding");
+        assert_eq!(window.headers()[header::CONTENT_ENCODING], "gzip");
         assert_eq!(gzip_json_body(window).await["resolution"]["resolved_level"], 1);
     }
 

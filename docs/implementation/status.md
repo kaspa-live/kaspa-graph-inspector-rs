@@ -511,3 +511,25 @@ transport remain in increment 20; adaptive interval control remains deferred.
 Completion validation passed workspace formatting, Cargo check, 626/626
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.
+
+Implementation increment 20 is implemented: `kgi-api-core` now exposes the
+state-awaiting `/api/v1`-relative Axum router over the completed `ApiService`
+operations. The ordinary transport supplies strict route-specific parsing,
+GET-only method handling, typed API fallbacks, graph gzip negotiation, exact
+success and error headers, and a guarded response body that retains request
+admission through delivery, cancellation, failure, or the graph-delivery
+deadline. The SSE transport supplies strict validation-only wakeup cursors,
+bounded connection admission, ordered mailbox framing, current-publication
+replacement on the same transport with a fresh client identifier, and cleanup
+for slow clients, disconnect, replacement, and shutdown without applying the
+ordinary graph-delivery deadline. Status, graph, and SSE lanes remain locally
+isolated without router-wide middleware or backpressure. Router-level tests
+cover routes and methods, validation precedence, logical outcomes, exact
+headers and cache policy, body-delivery ownership, SSE ordering and
+replacement, saturation, final Stale delivery, shutdown, and the combined
+middleware-absence matrix. Listener ownership, top-level router composition,
+tracing, static assets, Web runtime configuration, and global shutdown remain
+in increment 25; adaptive delta control remains deferred. Completion
+validation passed workspace formatting, Cargo check, 649/649 Nextest tests
+including Docker PostgreSQL integration, Cargo doctests, Clippy with warnings
+denied, and `git diff --check`.
