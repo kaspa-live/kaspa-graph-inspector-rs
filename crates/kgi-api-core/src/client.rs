@@ -1,5 +1,3 @@
-#![allow(dead_code, reason = "the client scheduling foundation is completed by later increment points")]
-
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, Weak},
@@ -169,6 +167,7 @@ impl SseMailbox {
     }
 
     /// Atomically appends one complete ordered batch of required messages.
+    #[cfg(test)]
     pub(crate) fn admit_required<const N: usize>(&self, messages: [SseMessage; N]) -> Result<(), SseMailboxAdmissionError> {
         let mut state = self.lock_state();
         state.admit_required(messages)?;
@@ -180,6 +179,7 @@ impl SseMailbox {
     }
 
     /// Inserts or coalesces the ordinary wakeup for one publication.
+    #[cfg(test)]
     pub(crate) fn admit_graph_wakeup(&self, wakeup: PublicationWakeupDto) -> Result<(), SseMailboxAdmissionError> {
         let mut state = self.lock_state();
         state.admit_graph_wakeup(wakeup)?;
@@ -188,18 +188,8 @@ impl SseMailbox {
         Ok(())
     }
 
-    /// Updates an ordinary wakeup only while it remains queued.
-    pub(crate) fn coalesce_graph_wakeup(&self, wakeup: PublicationWakeupDto) -> Result<bool, SseMailboxAdmissionError> {
-        let mut state = self.lock_state();
-        let coalesced = state.coalesce_graph_wakeup(wakeup)?;
-        drop(state);
-        if coalesced {
-            self.ready.notify_one();
-        }
-        Ok(coalesced)
-    }
-
     /// Removes a still-queued ordinary wakeup for one publication.
+    #[cfg(test)]
     pub(crate) fn remove_graph_wakeup(&self, publication_id: u64) -> bool {
         self.lock_state().remove_graph_wakeup(publication_id)
     }
@@ -371,14 +361,13 @@ impl SseClientRegistry {
         }
     }
 
-    /// Registers one connection and atomically admits its initial message batch.
+    /// Registers one connection at the current Head and atomically admits its initial message batch.
     pub(crate) fn register(
         &self,
-        client_revision_id: u64,
         mailbox: &Arc<SseMailbox>,
         disconnect: CancellationToken,
     ) -> Result<ClientIdentifier, SseClientRegistrationError> {
-        self.register_with(client_revision_id, mailbox, disconnect, &mut OsRng)
+        self.register_with(mailbox, disconnect, &mut OsRng)
     }
 
     /// Removes one connection's exact registration.
@@ -537,7 +526,6 @@ impl SseClientRegistry {
 
     fn register_with(
         &self,
-        client_revision_id: u64,
         mailbox: &Arc<SseMailbox>,
         disconnect: CancellationToken,
         random: &mut impl RngCore,
@@ -571,10 +559,11 @@ impl SseClientRegistry {
                 let mut mailbox_state = mailbox.lock_state();
                 match mailbox_state.admit_required(batch) {
                     Ok(()) => {
+                        let head_revision_id = state.head_revision_id;
                         state.clients.insert(
                             identifier.key(),
                             SseClientRegistration {
-                                schedule: DeltaWakeSchedule { wake_at_revision_id: client_revision_id, wake_sent: true },
+                                schedule: DeltaWakeSchedule { wake_at_revision_id: head_revision_id, wake_sent: true },
                                 mailbox: Arc::downgrade(mailbox),
                                 disconnect,
                             },
@@ -849,7 +838,7 @@ mod tests {
         let disconnect = tokio_util::sync::CancellationToken::new();
         let mut random = StepRng::new(41, 1);
 
-        let identifier = registry.register_with(3, &mailbox, disconnect.clone(), &mut random).expect("registration succeeds");
+        let identifier = registry.register_with(&mailbox, disconnect.clone(), &mut random).expect("registration succeeds");
 
         assert_eq!(identifier.key(), 41);
         assert_eq!(mailbox.recv().await, Some(SseMessage::ClientRegistration(identifier.registration())));
@@ -860,7 +849,7 @@ mod tests {
         assert_eq!(mailbox.recv().await, Some(SseMessage::PublicationWakeup(wakeup(7, 9))));
         let state = registry.lock_state();
         let registration = state.clients.get(&identifier.key()).expect("registration was installed");
-        assert_eq!(registration.schedule.wake_at_revision_id, 3);
+        assert_eq!(registration.schedule.wake_at_revision_id, 9);
         assert!(registration.schedule.wake_sent);
         assert!(registration.mailbox.upgrade().is_some());
         assert!(!disconnect.is_cancelled());
@@ -871,7 +860,7 @@ mod tests {
         let registry = SseClientRegistry::new(7, GraphPublicationState::Synchronizing, 9);
         let mailbox = Arc::new(SseMailbox::new());
         let identifier = registry
-            .register_with(3, &mailbox, tokio_util::sync::CancellationToken::new(), &mut StepRng::new(41, 1))
+            .register_with(&mailbox, tokio_util::sync::CancellationToken::new(), &mut StepRng::new(41, 1))
             .expect("registration succeeds");
 
         registry.publish_state(GraphPublicationState::Live, 9);
@@ -892,7 +881,7 @@ mod tests {
         registry.publish_state(GraphPublicationState::Live, 9);
         let mailbox = Arc::new(SseMailbox::new());
         let identifier = registry
-            .register_with(3, &mailbox, tokio_util::sync::CancellationToken::new(), &mut StepRng::new(41, 1))
+            .register_with(&mailbox, tokio_util::sync::CancellationToken::new(), &mut StepRng::new(41, 1))
             .expect("registration succeeds");
 
         for expected in [
@@ -914,10 +903,10 @@ mod tests {
         let mut colliding_random = StepRng::new(41, 1);
 
         let first = registry
-            .register_with(3, &first_mailbox, tokio_util::sync::CancellationToken::new(), &mut first_random)
+            .register_with(&first_mailbox, tokio_util::sync::CancellationToken::new(), &mut first_random)
             .expect("first registration succeeds");
         let second = registry
-            .register_with(3, &second_mailbox, tokio_util::sync::CancellationToken::new(), &mut colliding_random)
+            .register_with(&second_mailbox, tokio_util::sync::CancellationToken::new(), &mut colliding_random)
             .expect("collision is regenerated");
 
         assert_eq!(first.key(), 41);
@@ -933,14 +922,14 @@ mod tests {
         for _ in 0..MAX_SSE_CLIENTS {
             let mailbox = Arc::new(SseMailbox::new());
             registry
-                .register_with(3, &mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
+                .register_with(&mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
                 .expect("client within the bound is admitted");
             mailboxes.push(mailbox);
         }
 
         let saturated = Arc::new(SseMailbox::new());
         assert_eq!(
-            registry.register_with(3, &saturated, tokio_util::sync::CancellationToken::new(), &mut random),
+            registry.register_with(&saturated, tokio_util::sync::CancellationToken::new(), &mut random),
             Err(SseClientRegistrationError::Capacity)
         );
         assert_eq!(registry.lock_state().clients.len(), MAX_SSE_CLIENTS);
@@ -957,7 +946,7 @@ mod tests {
         let disconnect = tokio_util::sync::CancellationToken::new();
 
         assert_eq!(
-            registry.register_with(3, &mailbox, disconnect.clone(), &mut random),
+            registry.register_with(&mailbox, disconnect.clone(), &mut random),
             Err(SseClientRegistrationError::Mailbox(SseMailboxAdmissionError::Full))
         );
         assert!(registry.lock_state().clients.is_empty());
@@ -971,7 +960,7 @@ mod tests {
         let mailbox = Arc::new(SseMailbox::new());
         let disconnect = tokio_util::sync::CancellationToken::new();
         let mut random = StepRng::new(41, 1);
-        registry.register_with(3, &mailbox, disconnect.clone(), &mut random).expect("registration succeeds");
+        registry.register_with(&mailbox, disconnect.clone(), &mut random).expect("registration succeeds");
         drop(mailbox);
 
         registry.publish_state(GraphPublicationState::Live, 9);
@@ -986,7 +975,7 @@ mod tests {
         let mailbox = Arc::new(SseMailbox::new());
         let disconnect = tokio_util::sync::CancellationToken::new();
         let mut random = StepRng::new(41, 1);
-        registry.register_with(3, &mailbox, disconnect.clone(), &mut random).expect("registration succeeds");
+        registry.register_with(&mailbox, disconnect.clone(), &mut random).expect("registration succeeds");
         for value in 0..5 {
             mailbox.admit_required([required_registration(value)]).expect("fixture item fits");
         }
@@ -1013,9 +1002,8 @@ mod tests {
         let registry = SseClientRegistry::new(7, GraphPublicationState::Live, 9);
         let mailbox = Arc::new(SseMailbox::new());
         let mut random = StepRng::new(41, 1);
-        let identifier = registry
-            .register_with(3, &mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
-            .expect("registration succeeds");
+        let identifier =
+            registry.register_with(&mailbox, tokio_util::sync::CancellationToken::new(), &mut random).expect("registration succeeds");
         for _ in 0..3 {
             mailbox.recv().await.expect("initial batch item");
         }
@@ -1046,7 +1034,7 @@ mod tests {
         let mailbox = Arc::new(SseMailbox::new());
         let disconnect = tokio_util::sync::CancellationToken::new();
         let mut random = StepRng::new(41, 1);
-        let identifier = registry.register_with(3, &mailbox, disconnect.clone(), &mut random).expect("registration succeeds");
+        let identifier = registry.register_with(&mailbox, disconnect.clone(), &mut random).expect("registration succeeds");
         {
             let mut mailbox_state = mailbox.lock_state();
             mailbox_state.queue.clear();
@@ -1074,10 +1062,10 @@ mod tests {
         let second_mailbox = Arc::new(SseMailbox::new());
         let mut random = StepRng::new(41, 1);
         let first = registry
-            .register_with(3, &first_mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
+            .register_with(&first_mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
             .expect("first registration succeeds");
         let second = registry
-            .register_with(3, &second_mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
+            .register_with(&second_mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
             .expect("second registration succeeds");
 
         assert!(registry.remove(first));
@@ -1092,9 +1080,8 @@ mod tests {
         let registry = SseClientRegistry::new(7, GraphPublicationState::Live, 9);
         let mailbox = Arc::new(SseMailbox::new());
         let mut random = StepRng::new(41, 1);
-        let identifier = registry
-            .register_with(3, &mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
-            .expect("registration succeeds");
+        let identifier =
+            registry.register_with(&mailbox, tokio_util::sync::CancellationToken::new(), &mut random).expect("registration succeeds");
         mailbox.lock_state().queue.clear();
         mailbox.admit_graph_wakeup(wakeup(7, 9)).expect("previous wakeup fits");
 
@@ -1120,9 +1107,8 @@ mod tests {
         let registry = SseClientRegistry::new(7, GraphPublicationState::Live, 12);
         let mailbox = Arc::new(SseMailbox::new());
         let mut random = StepRng::new(41, 1);
-        let identifier = registry
-            .register_with(3, &mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
-            .expect("registration succeeds");
+        let identifier =
+            registry.register_with(&mailbox, tokio_util::sync::CancellationToken::new(), &mut random).expect("registration succeeds");
         mailbox.lock_state().queue.clear();
         mailbox.admit_graph_wakeup(wakeup(7, 10)).expect("previous wakeup fits");
 
@@ -1143,9 +1129,8 @@ mod tests {
         let registry = SseClientRegistry::new(7, GraphPublicationState::Live, 12);
         let mailbox = Arc::new(SseMailbox::new());
         let mut random = StepRng::new(41, 1);
-        let identifier = registry
-            .register_with(3, &mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
-            .expect("registration succeeds");
+        let identifier =
+            registry.register_with(&mailbox, tokio_util::sync::CancellationToken::new(), &mut random).expect("registration succeeds");
         mailbox.lock_state().queue.clear();
         mailbox.admit_graph_wakeup(wakeup(7, 10)).expect("previous wakeup fits");
 
@@ -1166,9 +1151,8 @@ mod tests {
         let registry = SseClientRegistry::new(7, GraphPublicationState::Stale, 12);
         let mailbox = Arc::new(SseMailbox::new());
         let mut random = StepRng::new(41, 1);
-        let identifier = registry
-            .register_with(3, &mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
-            .expect("registration succeeds");
+        let identifier =
+            registry.register_with(&mailbox, tokio_util::sync::CancellationToken::new(), &mut random).expect("registration succeeds");
         mailbox.lock_state().queue.clear();
         mailbox.admit_graph_wakeup(wakeup(7, 12)).expect("existing wakeup fits");
         let schedule = registry.lock_state().clients[&identifier.key()].schedule;
@@ -1189,7 +1173,7 @@ mod tests {
         let mailbox = Arc::new(SseMailbox::new());
         let disconnect = tokio_util::sync::CancellationToken::new();
         let mut random = StepRng::new(41, 1);
-        let identifier = registry.register_with(3, &mailbox, disconnect.clone(), &mut random).expect("registration succeeds");
+        let identifier = registry.register_with(&mailbox, disconnect.clone(), &mut random).expect("registration succeeds");
         mailbox.close();
 
         assert_eq!(
@@ -1205,9 +1189,8 @@ mod tests {
         let registry = SseClientRegistry::new(7, GraphPublicationState::Live, u64::MAX - 1);
         let mailbox = Arc::new(SseMailbox::new());
         let mut random = StepRng::new(41, 1);
-        let identifier = registry
-            .register_with(3, &mailbox, tokio_util::sync::CancellationToken::new(), &mut random)
-            .expect("registration succeeds");
+        let identifier =
+            registry.register_with(&mailbox, tokio_util::sync::CancellationToken::new(), &mut random).expect("registration succeeds");
         mailbox.lock_state().queue.clear();
 
         assert_eq!(
@@ -1227,7 +1210,7 @@ mod tests {
         let disconnect = tokio_util::sync::CancellationToken::new();
         let mut old_random = StepRng::new(41, 1);
         let old_identifier =
-            old_registry.register_with(3, &mailbox, disconnect.clone(), &mut old_random).expect("old registration succeeds");
+            old_registry.register_with(&mailbox, disconnect.clone(), &mut old_random).expect("old registration succeeds");
         mailbox.admit_required([required_state(9)]).expect("required old message fits");
         mailbox.admit_graph_wakeup(wakeup(7, 10)).expect("ordinary old wakeup fits");
         let mut replacement_random = StepRng::new(51, 1);
@@ -1269,10 +1252,10 @@ mod tests {
         let disconnect = tokio_util::sync::CancellationToken::new();
         let mut old_random = StepRng::new(1, 1);
         let old_identifier =
-            old_registry.register_with(3, &mailbox, disconnect.clone(), &mut old_random).expect("old registration succeeds");
+            old_registry.register_with(&mailbox, disconnect.clone(), &mut old_random).expect("old registration succeeds");
         let mut occupied_random = StepRng::new(41, 1);
         replacement_registry
-            .register_with(20, &occupied_mailbox, tokio_util::sync::CancellationToken::new(), &mut occupied_random)
+            .register_with(&occupied_mailbox, tokio_util::sync::CancellationToken::new(), &mut occupied_random)
             .expect("collision fixture succeeds");
         let mut replacement_random = StepRng::new(41, 1);
 
@@ -1291,7 +1274,7 @@ mod tests {
         let disconnect = tokio_util::sync::CancellationToken::new();
         let mut old_random = StepRng::new(41, 1);
         let old_identifier =
-            old_registry.register_with(3, &mailbox, disconnect.clone(), &mut old_random).expect("old registration succeeds");
+            old_registry.register_with(&mailbox, disconnect.clone(), &mut old_random).expect("old registration succeeds");
         mailbox.lock_state().queue.clear();
         for value in 0..6 {
             mailbox.admit_required([required_registration(value)]).expect("fixture required message fits");
@@ -1317,7 +1300,7 @@ mod tests {
         let mailbox = Arc::new(SseMailbox::new());
         let disconnect = tokio_util::sync::CancellationToken::new();
         let old_identifier =
-            old_registry.register_with(3, &mailbox, disconnect.clone(), &mut StepRng::new(41, 1)).expect("old registration succeeds");
+            old_registry.register_with(&mailbox, disconnect.clone(), &mut StepRng::new(41, 1)).expect("old registration succeeds");
         assert!(old_registry.remove(old_identifier));
 
         assert_eq!(
@@ -1335,7 +1318,7 @@ mod tests {
         let mailbox = Arc::new(SseMailbox::new());
         let disconnect = tokio_util::sync::CancellationToken::new();
         let old_identifier =
-            old_registry.register_with(3, &mailbox, disconnect.clone(), &mut StepRng::new(41, 1)).expect("old registration succeeds");
+            old_registry.register_with(&mailbox, disconnect.clone(), &mut StepRng::new(41, 1)).expect("old registration succeeds");
         drop(mailbox);
 
         assert_eq!(
@@ -1356,10 +1339,10 @@ mod tests {
         let first_disconnect = tokio_util::sync::CancellationToken::new();
         let second_disconnect = tokio_util::sync::CancellationToken::new();
         let first_identifier = first_registry
-            .register_with(3, &first_mailbox, first_disconnect.clone(), &mut StepRng::new(1, 1))
+            .register_with(&first_mailbox, first_disconnect.clone(), &mut StepRng::new(1, 1))
             .expect("first registration succeeds");
         let second_identifier = second_registry
-            .register_with(4, &second_mailbox, second_disconnect.clone(), &mut StepRng::new(2, 1))
+            .register_with(&second_mailbox, second_disconnect.clone(), &mut StepRng::new(2, 1))
             .expect("second registration succeeds");
         let start = Arc::new(Barrier::new(3));
 

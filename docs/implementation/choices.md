@@ -1301,8 +1301,9 @@ fallbacks plus one API fallback; the later composition layer therefore cannot
 redirect an API miss into the browser application.
 
 Parse each route's raw query into decoded name/value pairs before ApiService
-admission. Route-specific code then enforces scalar uniqueness, repeated-level
-collection semantics, allowed names, and semantic bounds. Parse
+admission, then construct an explicit validated query value for that endpoint.
+Those constructors enforce scalar uniqueness, repeated-level collection
+semantics, allowed names, and semantic bounds. Parse
 `Accept-Encoding` and `If-None-Match` directly at the same boundary instead of
 installing generic compression or conditional middleware. This preserves the
 protocol's route, method, syntax, and gzip precedence and prevents rejected
@@ -1324,3 +1325,22 @@ For oversized non-delta encoding, keep serializing into a counting sink after
 the retained JSON buffer reaches its hard bound. This records the complete
 observed uncompressed byte count required by the public typed error without
 allocating bytes beyond the bound.
+
+### SSE connection ownership and framing
+
+Implement the independent SSE connection bound with one Tokio semaphore and
+reuse the watch-backed admission-completion latch used by ordinary requests.
+Each admitted `SseConnection` owns that guard, its bounded `SseMailbox`, the
+current publication and identifier, and a receiver for the ApiService current-
+publication watch. The connection observes cancellation first, publication
+replacement second, and mailbox delivery third. This lets replacement remove
+a still-queued ordinary old-publication wakeup before the stream can dequeue
+it, while the publication registries retain ownership of the atomic removal,
+replacement batch, and lock ordering.
+
+Use Axum's `Sse` response encoder over a private `async-stream` producer that
+pulls the existing semantic `SseMessage` values from the connection. Stream
+drop closes the mailbox, removes the exact current registration, and releases
+the admission guard. The stream has no graph-response delivery timer; slow-
+client termination comes from bounded mailbox admission and the connection's
+private cancellation token.

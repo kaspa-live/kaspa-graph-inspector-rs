@@ -2929,6 +2929,7 @@ dependencies = [
 name = "kgi-api-core"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "axum",
  "base64 0.22.1",

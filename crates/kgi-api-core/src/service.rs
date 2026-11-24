@@ -21,10 +21,10 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
-    admission::{ApiRequestAdmissionError, ApiRequestAdmissions, ApiRequestGuard, ApiRequestLane},
+    admission::{ApiRequestAdmissionError, ApiRequestAdmissions, ApiRequestGuard, ApiRequestLane, SseAdmissions, SseConnectionGuard},
     api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
     cache::{CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot},
-    client::{ClientIdentifier, DeltaCompletionResult, DeltaScheduleAction},
+    client::{ClientIdentifier, DeltaCompletionResult, DeltaScheduleAction, SseClientRegistrationError, SseMailbox, SseMessage},
     codec::{
         HeadEtag,
         graph::{GraphWindowResponseDto, HeadLevelLookupResponseDto},
@@ -98,6 +98,68 @@ pub(crate) enum AnchoredWindowError {
     /// The independently owned database cleanup waiter could not be joined.
     #[error("public historical database waiter failed")]
     DatabaseWaiterFailed,
+}
+
+/// Failure to establish an SSE connection before response commitment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum SseConnectionOpenError {
+    /// The independent SSE admission lane rejected this connection.
+    #[error(transparent)]
+    Admission(#[from] ApiRequestAdmissionError),
+    /// No coherent current publication is available.
+    #[error("graph publication is unavailable")]
+    Unavailable,
+    /// Initial registration failed for a reason other than bounded capacity.
+    #[error("initial SSE registration failed")]
+    RegistrationFailed,
+}
+
+/// One admitted SSE transport and its current publication-local registration.
+pub(crate) struct SseConnection {
+    _admission: SseConnectionGuard,
+    cancellation: CancellationToken,
+    publications: watch::Receiver<Option<Arc<GraphPublication>>>,
+    publication: Arc<GraphPublication>,
+    identifier: ClientIdentifier,
+    mailbox: Arc<SseMailbox>,
+}
+
+impl SseConnection {
+    /// Receives the next ordered semantic message, following publication replacement.
+    pub(crate) async fn next_message(&mut self) -> Option<SseMessage> {
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => return None,
+                changed = self.publications.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    let replacement = self.publications.borrow_and_update().clone()?;
+                    if Arc::ptr_eq(&self.publication, &replacement) {
+                        continue;
+                    }
+                    let Ok(identifier) = self
+                        .publication
+                        .client_registry()
+                        .replace_registration_into(self.identifier, replacement.client_registry())
+                    else {
+                        return None;
+                    };
+                    self.publication = replacement;
+                    self.identifier = identifier;
+                }
+                message = self.mailbox.recv() => return message,
+            }
+        }
+    }
+}
+
+impl Drop for SseConnection {
+    fn drop(&mut self) {
+        self.publication.client_registry().remove(self.identifier);
+        self.mailbox.close();
+    }
 }
 
 /// Admitted cancellation context accepted by logical Head operations.
@@ -371,7 +433,6 @@ impl OwnedEncodingScheduler {
         Self { scheduler, completion_observer: AsyncMutex::new(Some(completion_observer)), events }
     }
 
-    #[allow(dead_code, reason = "terminal shutdown consumes this barrier in increment-14 point 6")]
     async fn shutdown(&self) -> Result<(), ApiServiceError> {
         let result = self.scheduler.shutdown().await.map_err(Self::failure);
         let observer_result = {
@@ -432,14 +493,12 @@ impl<G: ApiDbGeneration> PublicationInstaller for RuntimePublicationInstaller<G>
     }
 }
 
-#[allow(dead_code, reason = "the cancellation roots are consumed by later increment-14 lifecycle points")]
 struct ApiCancellation {
     http: CancellationToken,
     sse: CancellationToken,
     cache_jobs: CancellationToken,
 }
 
-#[allow(dead_code, reason = "status aggregation is implemented in increment-14 point 3")]
 struct ApiStatusInputs {
     kgi_version: &'static str,
     supervisor: watch::Receiver<SupervisorStatus>,
@@ -461,7 +520,6 @@ impl ApiStatusInputs {
 }
 
 /// Permanent owner of API publication, cache, encoding, and transport lifecycles.
-#[allow(dead_code, reason = "the initialized resources are consumed by later increment-14 control points")]
 pub struct ApiService {
     events: mpsc::UnboundedSender<ApiServiceEvent>,
     runtime: AsyncMutex<ApiRuntimeSlot>,
@@ -470,6 +528,7 @@ pub struct ApiService {
     current_publication: watch::Sender<Option<Arc<GraphPublication>>>,
     cancellation: ApiCancellation,
     request_admissions: ApiRequestAdmissions,
+    sse_admissions: SseAdmissions,
     public_historical_reads: Arc<Semaphore>,
     historical_read_tasks: TaskTracker,
     database_query_timeout: Duration,
@@ -495,6 +554,7 @@ impl ApiService {
         let (events, event_rx) = mpsc::unbounded_channel();
         let cache_jobs_cancellation = CancellationToken::new();
         let http_cancellation = CancellationToken::new();
+        let sse_cancellation = CancellationToken::new();
         let api_db = Arc::new(ApiDbState::new());
         let publication_install = Arc::new(Mutex::new(PublicationInstallState { runtime_generation: 0 }));
         let (current_publication, _) = watch::channel(None);
@@ -507,10 +567,11 @@ impl ApiService {
             current_publication,
             cancellation: ApiCancellation {
                 http: http_cancellation.clone(),
-                sse: CancellationToken::new(),
+                sse: sse_cancellation.clone(),
                 cache_jobs: cache_jobs_cancellation.clone(),
             },
             request_admissions: ApiRequestAdmissions::new(http_cancellation),
+            sse_admissions: SseAdmissions::new(sse_cancellation),
             public_historical_reads: Arc::new(Semaphore::new(MAX_PUBLIC_HISTORICAL_DB_READS)),
             historical_read_tasks: TaskTracker::new(),
             database_query_timeout: API_DB_QUERY_TIMEOUT,
@@ -583,6 +644,7 @@ impl ApiService {
         }
 
         self.request_admissions.close();
+        self.sse_admissions.close();
         self.public_historical_reads.close();
         self.historical_read_tasks.close();
         if matches!(*runtime, ApiRuntimeSlot::AwaitReset | ApiRuntimeSlot::Running(_)) {
@@ -607,8 +669,9 @@ impl ApiService {
 
         self.cancellation.sse.cancel();
         self.cancellation.http.cancel();
-        tokio::join!(self.request_admissions.wait(), self.historical_read_tasks.wait());
+        tokio::join!(self.sse_admissions.wait(), self.request_admissions.wait(), self.historical_read_tasks.wait());
 
+        self.cancellation.cache_jobs.cancel();
         let ((), encoding_result) = tokio::join!(biased; self.cache_jobs.shutdown(), self.encoding.shutdown());
         if result.is_ok()
             && let Err(error) = encoding_result
@@ -635,6 +698,23 @@ impl ApiService {
     /// Attempts nonblocking admission to the independent memory-only status lane.
     pub(crate) fn admit_status_request(&self) -> Result<ApiRequestGuard, ApiRequestAdmissionError> {
         self.request_admissions.admit_status()
+    }
+
+    /// Establishes one admitted SSE connection against the current publication.
+    pub(crate) fn open_sse_connection(&self) -> Result<SseConnection, SseConnectionOpenError> {
+        let admission = self.sse_admissions.admit()?;
+        let cancellation = admission.cancellation();
+        let mut publications = self.current_publication.subscribe();
+        let publication = publications.borrow_and_update().clone().ok_or(SseConnectionOpenError::Unavailable)?;
+        let mailbox = Arc::new(SseMailbox::new());
+        let identifier = match publication.client_registry().register(&mailbox, cancellation.clone()) {
+            Ok(identifier) => identifier,
+            Err(SseClientRegistrationError::Capacity) => {
+                return Err(SseConnectionOpenError::Admission(ApiRequestAdmissionError::Saturated));
+            }
+            Err(SseClientRegistrationError::Mailbox(_)) => return Err(SseConnectionOpenError::RegistrationFailed),
+        };
+        Ok(SseConnection { _admission: admission, cancellation, publications, publication, identifier, mailbox })
     }
 
     /// Resolves and encodes one anchored graph window without combining sources.
@@ -975,7 +1055,6 @@ impl ApiService {
     }
 
     /// Returns the complete publication current at this instant, when present.
-    #[allow(dead_code, reason = "public graph operations are implemented in later API increments")]
     pub(crate) fn current_publication(&self) -> Option<Arc<GraphPublication>> {
         self.current_publication.borrow().clone()
     }
@@ -1040,7 +1119,6 @@ fn delta_history_error_reason(error: GraphHistoryRangeError) -> FreshViewReason 
     }
 }
 
-#[allow(dead_code, reason = "called by the logical Head operation before its HTTP consumer exists")]
 fn selected_head_depth(target_depth: u32) -> u32 {
     assert!((1..=MAX_WINDOW_DEPTH).contains(&target_depth), "Head target depth is validated before logical selection");
     CACHED_HEAD_WINDOW_DEPTHS
@@ -1335,16 +1413,10 @@ mod tests {
         Arc::new(GraphPublication::new(state, origin, view, history).expect("coherent synthetic publication"))
     }
 
-    async fn register_delta_client(
-        publication: &Arc<GraphPublication>,
-        client_revision_id: u64,
-    ) -> (ClientIdentifier, Arc<SseMailbox>, CancellationToken) {
+    async fn register_delta_client(publication: &Arc<GraphPublication>) -> (ClientIdentifier, Arc<SseMailbox>, CancellationToken) {
         let mailbox = Arc::new(SseMailbox::new());
         let disconnect = CancellationToken::new();
-        let identifier = publication
-            .client_registry()
-            .register(client_revision_id, &mailbox, disconnect.clone())
-            .expect("fixture registration succeeds");
+        let identifier = publication.client_registry().register(&mailbox, disconnect.clone()).expect("fixture registration succeeds");
         for _ in 0..3 {
             mailbox.recv().await.expect("initial registration message");
         }
@@ -2550,7 +2622,7 @@ mod tests {
             CanonicalDeltaResponse::InvalidFutureCursor { publication: current } if Arc::ptr_eq(&current, &publication)
         ));
 
-        let (identifier, _mailbox, _disconnect) = register_delta_client(&publication, 0).await;
+        let (identifier, _mailbox, _disconnect) = register_delta_client(&publication).await;
         assert!(publication.client_registry().remove(identifier));
         assert!(matches!(
             service
@@ -2684,7 +2756,7 @@ mod tests {
             let entries = (1..=39).map(|revision| (revision, 1)).collect::<Vec<_>>();
             let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
             service.current_publication.send_replace(Some(publication.clone()));
-            let (identifier, mailbox, _disconnect) = register_delta_client(&publication, 32).await;
+            let (identifier, mailbox, _disconnect) = register_delta_client(&publication).await;
 
             let first = service
                 .canonical_delta(publication.publication_id(), 32, Some(identifier), CancellationToken::new())
@@ -2738,7 +2810,7 @@ mod tests {
         let entries = (1..=40).map(|revision| (revision, 1)).collect::<Vec<_>>();
         let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
         service.current_publication.send_replace(Some(publication.clone()));
-        let (identifier, mailbox, _disconnect) = register_delta_client(&publication, 32).await;
+        let (identifier, mailbox, _disconnect) = register_delta_client(&publication).await;
         assert!(matches!(
             service
                 .canonical_delta(publication.publication_id(), 32, Some(identifier), CancellationToken::new())
@@ -2781,7 +2853,7 @@ mod tests {
         let entries = (1..=4).map(|revision| (revision, 1)).collect::<Vec<_>>();
         let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
         service.current_publication.send_replace(Some(publication.clone()));
-        let (identifier, _mailbox, _disconnect) = register_delta_client(&publication, 0).await;
+        let (identifier, _mailbox, _disconnect) = register_delta_client(&publication).await;
 
         let started = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
@@ -2965,7 +3037,7 @@ mod tests {
         let reentry_hook =
             Arc::get_mut(&mut publication).expect("the fixture publication is not yet shared").pause_before_delta_reentry();
         service.current_publication.send_replace(Some(publication.clone()));
-        let (identifier, mailbox, _disconnect) = register_delta_client(&publication, 32).await;
+        let (identifier, mailbox, _disconnect) = register_delta_client(&publication).await;
 
         let started = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
@@ -3087,7 +3159,7 @@ mod tests {
         let entries = (1..=4).map(|revision| (revision, 1)).collect::<Vec<_>>();
         let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
         service.current_publication.send_replace(Some(publication.clone()));
-        let (identifier, mailbox, _disconnect) = register_delta_client(&publication, 0).await;
+        let (identifier, mailbox, _disconnect) = register_delta_client(&publication).await;
 
         let started = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
@@ -3446,7 +3518,7 @@ mod tests {
         let mailbox = Arc::new(SseMailbox::new());
         let identifier = publication
             .client_registry()
-            .register(target.revision(), &mailbox, CancellationToken::new())
+            .register(&mailbox, CancellationToken::new())
             .expect("active publication accepts an SSE registration");
         for expected in [
             SseMessage::ClientRegistration(identifier.registration()),

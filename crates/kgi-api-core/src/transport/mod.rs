@@ -1,5 +1,6 @@
 mod body;
 mod query;
+mod sse;
 
 use std::sync::Arc;
 
@@ -21,13 +22,15 @@ use crate::{
     publication::{GraphPublication, GraphPublicationState},
     service::{
         AnchoredWindowError, AnchoredWindowResponse, ApiService, CanonicalDeltaResponse, CanonicalDeltaSuccess,
-        HeadLevelLookupResponse, HeadSnapshotCondition, HeadSnapshotOutcome,
+        HeadLevelLookupResponse, HeadSnapshotCondition, HeadSnapshotOutcome, SseConnectionOpenError,
     },
 };
 
 use self::{
     body::GuardedBody,
-    query::{AnchoredWindowQuery, CanonicalDeltaQuery, EmptyQuery, HeadLevelsQuery, HeadSnapshotQuery, accepts_gzip},
+    query::{
+        AnchoredWindowQuery, CanonicalDeltaQuery, EmptyQuery, HeadLevelsQuery, HeadSnapshotQuery, PublicationWakeupQuery, accepts_gzip,
+    },
 };
 
 const KGI_PUBLICATION_ID: HeaderName = HeaderName::from_static("kgi-publication-id");
@@ -72,6 +75,10 @@ pub(super) fn router() -> Router<Arc<ApiService>> {
         .route(
             "/graph/window",
             on(MethodFilter::GET, anchored_window).on(MethodFilter::HEAD, graph_method_not_allowed).fallback(graph_method_not_allowed),
+        )
+        .route(
+            "/graph/wakeups",
+            on(MethodFilter::GET, publication_wakeups).on(MethodFilter::HEAD, method_not_allowed).fallback(method_not_allowed),
         )
         .route("/status", on(MethodFilter::GET, status).on(MethodFilter::HEAD, method_not_allowed).fallback(method_not_allowed))
         .fallback(route_not_found)
@@ -266,6 +273,21 @@ async fn anchored_window(State(service): State<Arc<ApiService>>, request: Reques
     }
 }
 
+async fn publication_wakeups(State(service): State<Arc<ApiService>>, request: Request<Body>) -> Response<Body> {
+    let Some(_query) = PublicationWakeupQuery::parse(request.uri().query()) else { return invalid_request(false) };
+    if request_has_body(&request) {
+        return invalid_request(false);
+    }
+    match service.open_sse_connection() {
+        Ok(connection) => sse::response(connection),
+        Err(SseConnectionOpenError::Admission(error)) => admission_error(error, false),
+        Err(SseConnectionOpenError::Unavailable) => unavailable(false, None),
+        Err(SseConnectionOpenError::RegistrationFailed) => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, ApiErrorDto::internal_error(), false, None)
+        }
+    }
+}
+
 async fn add_publication_headers(response: &mut Response<Body>, publication: &GraphPublication) {
     insert_header(response.headers_mut(), KGI_PUBLICATION_ID, &publication.publication_id().to_string());
     insert_header(
@@ -443,7 +465,9 @@ fn insert_header(headers: &mut HeaderMap, name: HeaderName, value: &str) {
 mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
+        future::poll_fn,
         io::Read,
+        pin::Pin,
         sync::Arc,
         time::Instant,
     };
@@ -453,6 +477,7 @@ mod tests {
         http::{Request, StatusCode, header},
     };
     use flate2::read::GzDecoder;
+    use http_body::Body as _;
     use kgi_api_model::{
         graph::{GraphView, Level, LevelExtent, TrackingPolicy},
         history::GraphHistory,
@@ -467,7 +492,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::{
-        client::ClientIdentifier,
+        client::{ClientIdentifier, DeltaCompletionResult, DeltaScheduleAction},
         publication::{GraphPublication, GraphPublicationState},
         service::ApiService,
     };
@@ -515,6 +540,18 @@ mod tests {
         let mut json = Vec::new();
         GzDecoder::new(body.as_ref()).read_to_end(&mut json).expect("gzip body decodes");
         serde_json::from_slice(&json).expect("response is JSON")
+    }
+
+    async fn next_sse_frame(body: &mut Body) -> Option<String> {
+        let frame = poll_fn(|context| Pin::new(&mut *body).poll_frame(context)).await?;
+        let data = frame.expect("SSE body frame succeeds").into_data().expect("SSE emits data frames");
+        Some(String::from_utf8(data.to_vec()).expect("SSE frames are UTF-8"))
+    }
+
+    fn sse_payload(frame: &str, event: &str) -> Value {
+        let prefix = format!("event: {event}\ndata: ");
+        let data = frame.strip_prefix(&prefix).and_then(|frame| frame.strip_suffix("\n\n")).expect("exact SSE frame shape");
+        serde_json::from_str(data).expect("SSE data is compact JSON")
     }
 
     #[tokio::test]
@@ -692,5 +729,214 @@ mod tests {
             .expect("missing level routed");
         assert_eq!(missing_level.status(), StatusCode::NOT_FOUND);
         assert_eq!(json_body(missing_level).await["details"]["requested_level"], 3);
+    }
+
+    #[tokio::test]
+    async fn sse_stream_reports_initial_and_replacement_publications_in_order() {
+        let service = service();
+        let initial = publication();
+        let initial_id = initial.publication_id();
+        service.install_test_publication(initial.clone());
+        let application = router().with_state(service.clone());
+
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .uri("/graph/wakeups?publication_id=999&from_revision_id=123")
+                    .header("last-event-id", "not-a-graph-cursor")
+                    .body(Body::empty())
+                    .expect("valid SSE request"),
+            )
+            .await
+            .expect("SSE request routed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/event-stream");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
+        assert!(!response.headers().contains_key(header::ETAG));
+        assert!(!response.headers().contains_key(header::VARY));
+
+        let mut body = response.into_body();
+        let registration_frame = next_sse_frame(&mut body).await.expect("initial registration frame");
+        let initial_registration = sse_payload(&registration_frame, "client-registration");
+        let initial_client = initial_registration["client_id"].as_str().expect("client identifier string");
+        assert_eq!(initial_client.len(), 11);
+        let initial_identifier = ClientIdentifier::parse(initial_client).expect("canonical client identifier");
+
+        let state = sse_payload(&next_sse_frame(&mut body).await.expect("initial state frame"), "publication-state");
+        assert_eq!(
+            state,
+            serde_json::json!({
+                "publication_id": initial_id.to_string(),
+                "revision": "0",
+                "state": "synchronizing",
+            })
+        );
+        let wakeup = sse_payload(&next_sse_frame(&mut body).await.expect("initial wakeup frame"), "publication-wakeup");
+        assert_eq!(wakeup, serde_json::json!({ "publication_id": initial_id.to_string(), "revision": "0" }));
+
+        assert_eq!(
+            initial
+                .client_registry()
+                .complete_delta(initial_identifier, DeltaScheduleAction::Replace { wake_at_revision_id: 1, wake_sent: false },),
+            DeltaCompletionResult::Accepted
+        );
+        initial.client_registry().advance_head(1);
+
+        let replacement = publication();
+        let replacement_id = replacement.publication_id();
+        assert_ne!(replacement_id, initial_id);
+        service.install_test_publication(replacement.clone());
+
+        let registration_frame = next_sse_frame(&mut body).await.expect("replacement registration frame");
+        let replacement_registration = sse_payload(&registration_frame, "client-registration");
+        let replacement_client = replacement_registration["client_id"].as_str().expect("replacement identifier string");
+        assert_ne!(replacement_client, initial_client);
+        let replacement_identifier = ClientIdentifier::parse(replacement_client).expect("canonical replacement identifier");
+        let state = sse_payload(&next_sse_frame(&mut body).await.expect("replacement state frame"), "publication-state");
+        assert_eq!(state["publication_id"], replacement_id.to_string());
+        let wakeup = sse_payload(&next_sse_frame(&mut body).await.expect("replacement wakeup frame"), "publication-wakeup");
+        assert_eq!(wakeup["publication_id"], replacement_id.to_string());
+        assert!(!initial.client_registry().validate(initial_identifier));
+        assert!(replacement.client_registry().validate(replacement_identifier));
+
+        drop(body);
+        assert!(!replacement.client_registry().validate(replacement_identifier));
+    }
+
+    #[tokio::test]
+    async fn sse_state_delivery_slow_client_disconnect_and_shutdown_are_bounded() {
+        let active_service = service();
+        let active_publication = publication();
+        active_service.install_test_publication(active_publication.clone());
+        let application = router().with_state(active_service.clone());
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .uri("/graph/wakeups?publication_id=1&from_revision_id=0")
+                    .body(Body::empty())
+                    .expect("valid SSE request"),
+            )
+            .await
+            .expect("SSE request routed");
+        let mut body = response.into_body();
+        for _ in 0..3 {
+            next_sse_frame(&mut body).await.expect("initial sequence frame");
+        }
+
+        active_publication.transition_live().await;
+        let live = sse_payload(&next_sse_frame(&mut body).await.expect("Live state frame"), "publication-state");
+        assert_eq!(live["state"], "live");
+        assert!(active_publication.transition_stale().await);
+        let stale = sse_payload(&next_sse_frame(&mut body).await.expect("Stale state frame"), "publication-state");
+        assert_eq!(stale["state"], "stale");
+
+        let shutdown_service = active_service.clone();
+        let shutdown = tokio::spawn(async move { shutdown_service.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished(), "shutdown retains the live SSE completion guard");
+        assert!(next_sse_frame(&mut body).await.is_none());
+        assert_eq!(shutdown.await.expect("shutdown task completes"), Ok(()));
+
+        let slow_service = service();
+        let slow_publication = publication();
+        slow_service.install_test_publication(slow_publication.clone());
+        let slow_response = router()
+            .with_state(slow_service)
+            .oneshot(
+                Request::builder()
+                    .uri("/graph/wakeups?publication_id=1&from_revision_id=0")
+                    .body(Body::empty())
+                    .expect("valid slow-client request"),
+            )
+            .await
+            .expect("slow SSE request routed");
+        let mut slow_body = slow_response.into_body();
+        for _ in 0..=crate::client::SSE_CLIENT_BUFFER_CAPACITY {
+            slow_publication.client_registry().publish_state(GraphPublicationState::Synchronizing, 0);
+        }
+        assert!(next_sse_frame(&mut slow_body).await.is_none(), "a saturated required-message mailbox disconnects the client");
+    }
+
+    #[tokio::test]
+    async fn sse_request_validation_precedes_connection_work() {
+        let application = router().with_state(service());
+        for request in [
+            Request::builder().uri("/graph/wakeups?publication_id=1").body(Body::empty()).expect("missing cursor request"),
+            Request::builder()
+                .uri("/graph/wakeups?publication_id=1&from_revision_id=0&client_id=bad")
+                .body(Body::empty())
+                .expect("extra parameter request"),
+            Request::builder()
+                .uri("/graph/wakeups?publication_id=1&from_revision_id=0")
+                .body(Body::from("unexpected"))
+                .expect("body-bearing request"),
+        ] {
+            let response = application.clone().oneshot(request).await.expect("invalid SSE request routed");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(!response.headers().contains_key(header::VARY));
+        }
+
+        let unavailable = application
+            .oneshot(
+                Request::builder()
+                    .uri("/graph/wakeups?publication_id=1&from_revision_id=0")
+                    .body(Body::empty())
+                    .expect("well-formed unavailable request"),
+            )
+            .await
+            .expect("unavailable SSE request routed");
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.headers()[header::RETRY_AFTER], "1");
+
+        let method = router()
+            .with_state(service())
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/graph/wakeups?publication_id=1&from_revision_id=0")
+                    .body(Body::empty())
+                    .expect("valid method request"),
+            )
+            .await
+            .expect("SSE method fallback routed");
+        assert_eq!(method.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(method.headers()[header::ALLOW], "GET");
+        assert!(!method.headers().contains_key(header::VARY));
+    }
+
+    #[tokio::test]
+    async fn sse_connection_lane_rejects_only_after_its_exact_bound() {
+        let service = service();
+        service.install_test_publication(publication());
+        let application = router().with_state(service);
+        let mut bodies = Vec::with_capacity(crate::client::MAX_SSE_CLIENTS);
+        for cursor in 0..crate::client::MAX_SSE_CLIENTS {
+            let response = application
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/graph/wakeups?publication_id=1&from_revision_id={cursor}"))
+                        .body(Body::empty())
+                        .expect("valid bounded SSE request"),
+                )
+                .await
+                .expect("bounded SSE request routed");
+            assert_eq!(response.status(), StatusCode::OK);
+            bodies.push(response.into_body());
+        }
+
+        let saturated = application
+            .oneshot(
+                Request::builder()
+                    .uri("/graph/wakeups?publication_id=1&from_revision_id=0")
+                    .body(Body::empty())
+                    .expect("valid saturated SSE request"),
+            )
+            .await
+            .expect("saturated SSE request routed");
+        assert_eq!(saturated.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(saturated.headers()[header::RETRY_AFTER], "1");
+        drop(bodies);
     }
 }

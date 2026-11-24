@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
+use crate::client::MAX_SSE_CLIENTS;
+
 /// Maximum concurrently admitted Head-lane HTTP requests.
 pub(crate) const MAX_HEAD_HTTP_REQUESTS: usize = 64;
 /// Maximum concurrently admitted historical HTTP requests.
@@ -35,24 +37,24 @@ struct ApiRequestGuardInner {
     cancellation: CancellationToken,
     _cancellation_on_completion: DropGuard,
     lane: Mutex<Option<(ApiRequestLane, OwnedSemaphorePermit)>>,
-    _completion: ApiRequestCompletionGuard,
+    _completion: ApiAdmissionCompletionGuard,
 }
 
-struct ApiRequestCompletion {
+struct ApiAdmissionCompletion {
     active: watch::Sender<usize>,
 }
 
-impl ApiRequestCompletion {
+impl ApiAdmissionCompletion {
     fn new() -> Self {
         let (active, _) = watch::channel(0);
         Self { active }
     }
 
-    fn track(&self) -> ApiRequestCompletionGuard {
+    fn track(&self) -> ApiAdmissionCompletionGuard {
         self.active.send_modify(|active| {
-            *active = active.checked_add(1).expect("active API request count fits usize");
+            *active = active.checked_add(1).expect("active API admission count fits usize");
         });
-        ApiRequestCompletionGuard { active: self.active.clone() }
+        ApiAdmissionCompletionGuard { active: self.active.clone() }
     }
 
     async fn wait(&self) {
@@ -61,19 +63,19 @@ impl ApiRequestCompletion {
             if *active.borrow_and_update() == 0 {
                 return;
             }
-            active.changed().await.expect("request completion retains its watch sender");
+            active.changed().await.expect("API admission completion retains its watch sender");
         }
     }
 }
 
-struct ApiRequestCompletionGuard {
+struct ApiAdmissionCompletionGuard {
     active: watch::Sender<usize>,
 }
 
-impl Drop for ApiRequestCompletionGuard {
+impl Drop for ApiAdmissionCompletionGuard {
     fn drop(&mut self) {
         self.active.send_modify(|active| {
-            *active = active.checked_sub(1).expect("a completed API request was tracked");
+            *active = active.checked_sub(1).expect("a completed API admission was tracked");
         });
     }
 }
@@ -114,7 +116,7 @@ pub(crate) struct ApiRequestAdmissions {
     head: Arc<Semaphore>,
     historical: Arc<Semaphore>,
     status: Arc<Semaphore>,
-    completion: ApiRequestCompletion,
+    completion: ApiAdmissionCompletion,
     http_cancellation: CancellationToken,
 }
 
@@ -125,7 +127,7 @@ impl ApiRequestAdmissions {
             head: Arc::new(Semaphore::new(MAX_HEAD_HTTP_REQUESTS)),
             historical: Arc::new(Semaphore::new(MAX_HISTORICAL_HTTP_REQUESTS)),
             status: Arc::new(Semaphore::new(MAX_STATUS_HTTP_REQUESTS)),
-            completion: ApiRequestCompletion::new(),
+            completion: ApiAdmissionCompletion::new(),
             http_cancellation,
         }
     }
@@ -191,6 +193,71 @@ impl ApiRequestAdmissions {
     }
 }
 
+/// One admitted SSE connection's cancellation and completion ownership.
+pub(crate) struct SseConnectionGuard {
+    cancellation: CancellationToken,
+    _cancellation_on_completion: DropGuard,
+    _permit: OwnedSemaphorePermit,
+    _completion: ApiAdmissionCompletionGuard,
+}
+
+impl SseConnectionGuard {
+    /// Returns this connection's private cancellation token.
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+}
+
+/// Bounded SSE connection admission plus its terminal completion barrier.
+pub(crate) struct SseAdmissions {
+    accepting: Mutex<bool>,
+    clients: Arc<Semaphore>,
+    completion: ApiAdmissionCompletion,
+    cancellation: CancellationToken,
+}
+
+impl SseAdmissions {
+    pub(crate) fn new(cancellation: CancellationToken) -> Self {
+        Self {
+            accepting: Mutex::new(true),
+            clients: Arc::new(Semaphore::new(MAX_SSE_CLIENTS)),
+            completion: ApiAdmissionCompletion::new(),
+            cancellation,
+        }
+    }
+
+    pub(crate) fn admit(&self) -> Result<SseConnectionGuard, ApiRequestAdmissionError> {
+        let accepting = self.accepting.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !*accepting {
+            return Err(ApiRequestAdmissionError::Unavailable);
+        }
+        let permit = self.clients.clone().try_acquire_owned().map_err(admission_error)?;
+        let completion = self.completion.track();
+        let cancellation = self.cancellation.child_token();
+        let cancellation_on_completion = cancellation.clone().drop_guard();
+        drop(accepting);
+        Ok(SseConnectionGuard {
+            cancellation,
+            _cancellation_on_completion: cancellation_on_completion,
+            _permit: permit,
+            _completion: completion,
+        })
+    }
+
+    pub(crate) fn close(&self) {
+        let mut accepting = self.accepting.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !*accepting {
+            return;
+        }
+        *accepting = false;
+        self.clients.close();
+    }
+
+    pub(crate) async fn wait(&self) {
+        self.completion.wait().await;
+    }
+}
+
 fn admission_error(error: TryAcquireError) -> ApiRequestAdmissionError {
     match error {
         TryAcquireError::NoPermits => ApiRequestAdmissionError::Saturated,
@@ -205,7 +272,7 @@ mod tests {
 
     use super::{
         ApiRequestAdmissionError, ApiRequestAdmissions, ApiRequestLane, MAX_HEAD_HTTP_REQUESTS, MAX_HISTORICAL_HTTP_REQUESTS,
-        MAX_STATUS_HTTP_REQUESTS,
+        MAX_STATUS_HTTP_REQUESTS, SseAdmissions,
     };
 
     #[test]
@@ -278,5 +345,22 @@ mod tests {
         drop(rejected);
         drop(historical);
         timeout(Duration::from_secs(1), admissions.wait()).await.expect("every lane-less and lane-owning guard drains");
+    }
+
+    #[tokio::test]
+    async fn sse_admission_saturates_and_waits_for_every_connection_guard() {
+        let cancellation = CancellationToken::new();
+        let admissions = SseAdmissions::new(cancellation.clone());
+        let connections: Vec<_> = (0..crate::client::MAX_SSE_CLIENTS)
+            .map(|_| admissions.admit().expect("SSE connection within the bound is admitted"))
+            .collect();
+        assert!(matches!(admissions.admit(), Err(ApiRequestAdmissionError::Saturated)));
+
+        admissions.close();
+        cancellation.cancel();
+        assert!(timeout(Duration::from_millis(20), admissions.wait()).await.is_err());
+        drop(connections);
+        timeout(Duration::from_secs(1), admissions.wait()).await.expect("connection release completes the SSE barrier");
+        assert!(matches!(admissions.admit(), Err(ApiRequestAdmissionError::Unavailable)));
     }
 }

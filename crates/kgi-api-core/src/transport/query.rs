@@ -46,6 +46,29 @@ pub(super) struct CanonicalDeltaQuery {
     pub(super) client: Option<ClientIdentifier>,
 }
 
+/// Proof that `/graph/wakeups` supplied one complete, valid cursor.
+///
+/// The cursor values are validation-only because registration always binds to
+/// the coherent current publication and its current Head.
+pub(super) struct PublicationWakeupQuery;
+
+impl PublicationWakeupQuery {
+    pub(super) fn parse(query: Option<&str>) -> Option<Self> {
+        let mut publication_id = None;
+        let mut from_revision_id = None;
+        for (name, value) in decode_query(query)? {
+            match name.as_str() {
+                "publication_id" => set_once(&mut publication_id, parse_u64(&value)?)?,
+                "from_revision_id" => set_once(&mut from_revision_id, parse_u64(&value)?)?,
+                _ => return None,
+            }
+        }
+        publication_id?;
+        from_revision_id?;
+        Some(Self)
+    }
+}
+
 impl CanonicalDeltaQuery {
     pub(super) fn parse(query: Option<&str>) -> Option<Self> {
         let mut publication_id = None;
@@ -311,7 +334,9 @@ fn parse_entity_tag_list(value: &str, tags: &mut Vec<HeadEtag>) -> Option<()> {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
-    use super::{CanonicalDeltaQuery, EmptyQuery, HeadLevelsQuery, HeadSnapshotQuery, accepts_gzip, decode_query};
+    use super::{
+        CanonicalDeltaQuery, EmptyQuery, HeadLevelsQuery, HeadSnapshotQuery, PublicationWakeupQuery, accepts_gzip, decode_query,
+    };
     use crate::transport::ParsedHeadCondition;
 
     #[test]
@@ -330,6 +355,8 @@ mod tests {
         assert!(HeadSnapshotQuery::parse(Some("target_depth=20")).is_some());
         assert!(HeadSnapshotQuery::parse(Some("target_depth=20&target_depth=30")).is_none());
         assert!(CanonicalDeltaQuery::parse(Some("publication_id=1&from_revision_id=2&unknown=3")).is_none());
+        assert!(PublicationWakeupQuery::parse(Some("publication_id=1&from_revision_id=2")).is_some());
+        assert!(PublicationWakeupQuery::parse(Some("publication_id=1&from_revision_id=2&client_id=3")).is_none());
     }
 
     #[test]
