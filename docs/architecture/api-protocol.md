@@ -912,13 +912,15 @@ client's actual graph cursor when it opens the stream. The endpoint accepts no
 Malformed, duplicate, missing, or additional parameters follow the
 [common request rules](#common-http-conventions--settled).
 
-The supplied cursor initializes transport scheduling only. It does not
-constrain the initial messages to that publication or revision. If a coherent
+The supplied cursor declares the client's actual graph position but does not
+constrain registration or initialize transport scheduling. If a coherent
 current publication exists, ApiService accepts a well-formed stale cursor,
 registers the connection in the current publication, and reports that
 publication below. Without a coherent graph publication, return the ordinary
 graph-unavailable `503 Service Unavailable` outcome instead of opening an
-empty stream.
+empty stream. Requiring the complete cursor keeps reconnection input explicit,
+while registration against the current publication makes both supplied values
+validation-only at this endpoint.
 
 A successful operation returns `200 OK` with `Content-Type:
 text/event-stream` and `Cache-Control: no-store`. It has no ETag, graph body,
@@ -1028,15 +1030,16 @@ owns the concrete `SseClientRegistry`, its collection and synchronization,
 and the mailbox synchronization and readiness requirements.
 
 No current or highest graph revision is stored in this value. Registration
-initializes the boundary from the client-supplied cursor and marks the
-connection's mandatory initial graph wakeup sent. Disconnect removes the
-registration. Reconnection and publication replacement each create a new
-opaque identifier. Replacement initializes its otherwise inert sent boundary
-from the replacement Head because it has no new client-supplied cursor; the
-first delta response establishes the useful schedule. A supplied expired or
-wrong-publication identifier returns `ClientRegistrationRequired`; the client
-first establishes a current SSE registration. An omitted identifier creates
-no registry entry and never returns that outcome.
+and publication replacement initialize the boundary from their publication's
+current Head and mark the mandatory graph wakeup sent. That boundary is inert:
+the first delta response replaces it with the useful schedule. Using the
+current Head avoids retaining validation-only request cursor values while
+giving both registration paths the same complete internal state. Disconnect
+removes the registration. Reconnection and publication replacement each
+create a new opaque identifier. A supplied expired or wrong-publication
+identifier returns `ClientRegistrationRequired`; the client first establishes
+a current SSE registration. An omitted identifier creates no registry entry
+and never returns that outcome.
 
 SSE delivery is not exactly once and provides no event replay. KGI does not
 use SSE `Last-Event-ID` as a graph revision, publication ID, or `client_id`.

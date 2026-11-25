@@ -1288,3 +1288,82 @@ After a successful detached seed, release the database client and permit before
 submitting the already reserved encoding work. These mechanisms implement the
 focused owners' existing cleanup and resource-lifetime contracts without
 introducing another public error or retry loop.
+
+## 8 November 2026: ordinary API HTTP transport
+
+### Router and parsing boundary
+
+Use Axum 0.8 for the state-awaiting `kgi-api-core` router and Tower's service
+utilities only in router-level tests. Keep transport implementation in the
+private `kgi_api_core::transport` module and expose only the architecture-owned
+crate-root `router()` function. The router contains route-local `GET` method
+fallbacks plus one API fallback; the later composition layer therefore cannot
+redirect an API miss into the browser application.
+
+Parse each route's raw query into decoded name/value pairs before ApiService
+admission, then construct an explicit validated query value for that endpoint.
+Those constructors enforce scalar uniqueness, repeated-level collection
+semantics, allowed names, and semantic bounds. Parse
+`Accept-Encoding` and `If-None-Match` directly at the same boundary instead of
+installing generic compression or conditional middleware. This preserves the
+protocol's route, method, syntax, and gzip precedence and prevents rejected
+requests from entering graph, database, cache, or encoding work.
+
+### Response delivery ownership
+
+Use a reusable `kgi-api-core` HTTP/1.1 connection adapter for the settled
+socket-boundary delivery contract. The router places each admitted request
+guard, its cancellation observation, and its optional graph-delivery deadline
+in a private response extension. The adapter removes that extension before
+giving the response to Hyper and transfers it into a connection-local tracked
+delivery task. SSE responses carry their connection cancellation token through
+the same extension boundary but no graph-delivery deadline.
+
+Serialize response production per HTTP/1.1 connection. This gives the adapter
+one unambiguous active response while retaining ordinary cross-connection
+concurrency. The body wrapper reports exact-size completion but never releases
+admission. The socket wrapper locates the encoded header boundary, counts body
+bytes actually accepted by the socket across scalar and vectored writes, and
+requires a later successful flush before resolving delivery. Header-only and
+`HEAD` responses use an expected body length of zero. Unknown-length stream
+termination closes the connection rather than manufacturing a successful
+flush boundary.
+
+Cancellation, delivery expiry, body failure, peer disconnect, and socket write
+or flush failure signal the connection driver. It drops the Hyper connection
+before resolving every affected registration as failed. The adapter owns and
+joins its delivery tasks on ordinary completion; an RAII connection lifetime
+also resolves them if its serving future is abandoned. Cached and request-
+local graph bytes retain their existing final gzip representation, while
+errors and status remain ordinary uncompressed JSON. No router-wide timeout,
+compression, concurrency, or catch-panic layer is added.
+
+The former body-local `GuardedBody` timer was insufficient because Hyper could
+buffer its single frame and stop polling the body while socket flush was
+blocked. Increment 20 replaces it and verifies the adapter over test-only
+loopback sockets. Increment 25 binds the production listener and installs this
+same adapter around the composed application.
+
+For oversized non-delta encoding, keep serializing into a counting sink after
+the retained JSON buffer reaches its hard bound. This records the complete
+observed uncompressed byte count required by the public typed error without
+allocating bytes beyond the bound.
+
+### SSE connection ownership and framing
+
+Implement the independent SSE connection bound with one Tokio semaphore and
+reuse the watch-backed admission-completion latch used by ordinary requests.
+Each admitted `SseConnection` owns that guard, its bounded `SseMailbox`, the
+current publication and identifier, and a receiver for the ApiService current-
+publication watch. The connection observes cancellation first, publication
+replacement second, and mailbox delivery third. This lets replacement remove
+a still-queued ordinary old-publication wakeup before the stream can dequeue
+it, while the publication registries retain ownership of the atomic removal,
+replacement batch, and lock ordering.
+
+Use Axum's `Sse` response encoder over a private `async-stream` producer that
+pulls the existing semantic `SseMessage` values from the connection. Stream
+drop closes the mailbox, removes the exact current registration, and releases
+the admission guard. The stream has no graph-response delivery timer; slow-
+client termination comes from bounded mailbox admission and the connection's
+private cancellation token.

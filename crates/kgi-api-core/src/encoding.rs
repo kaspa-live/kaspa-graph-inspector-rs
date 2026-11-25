@@ -64,8 +64,11 @@ pub(crate) enum GraphEncodingError {
     #[error("graph JSON serialization failed")]
     Serialization,
     /// The complete uncompressed JSON representation exceeds its hard limit.
-    #[error("uncompressed graph JSON exceeds its hard response limit")]
-    UncompressedResponseTooLarge,
+    #[error("uncompressed graph JSON exceeds its hard response limit ({actual_uncompressed_bytes} bytes)")]
+    UncompressedResponseTooLarge {
+        /// Complete observed uncompressed JSON byte count.
+        actual_uncompressed_bytes: u64,
+    },
     /// The size-checked JSON representation could not be compressed.
     #[error("graph gzip compression failed")]
     Compression,
@@ -86,11 +89,10 @@ where
 {
     let mut json = LimitedJsonBuffer::new(MAX_UNCOMPRESSED_NON_DELTA_GRAPH_RESPONSE_BYTES);
     if serde_json::to_writer(&mut json, value).is_err() {
-        return Err(if json.limit_exceeded {
-            GraphEncodingError::UncompressedResponseTooLarge
-        } else {
-            GraphEncodingError::Serialization
-        });
+        return Err(GraphEncodingError::Serialization);
+    }
+    if json.limit_exceeded {
+        return Err(GraphEncodingError::UncompressedResponseTooLarge { actual_uncompressed_bytes: json.observed_bytes });
     }
 
     let json = json.into_inner();
@@ -146,11 +148,12 @@ struct LimitedJsonBuffer {
     bytes: Vec<u8>,
     limit: usize,
     limit_exceeded: bool,
+    observed_bytes: u64,
 }
 
 impl LimitedJsonBuffer {
     fn new(limit: usize) -> Self {
-        Self { bytes: Vec::new(), limit, limit_exceeded: false }
+        Self { bytes: Vec::new(), limit, limit_exceeded: false, observed_bytes: 0 }
     }
 
     fn into_inner(self) -> Vec<u8> {
@@ -160,15 +163,16 @@ impl LimitedJsonBuffer {
 
 impl Write for LimitedJsonBuffer {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
-        let Some(new_len) = self.bytes.len().checked_add(input.len()) else {
-            self.limit_exceeded = true;
-            return Err(io::Error::other("graph JSON size overflow"));
-        };
-        if new_len > self.limit {
-            self.limit_exceeded = true;
-            return Err(io::Error::other("graph JSON response limit exceeded"));
+        let input_len = u64::try_from(input.len()).expect("one serializer write length fits u64");
+        self.observed_bytes = self.observed_bytes.checked_add(input_len).expect("one graph JSON body length fits u64");
+        if !self.limit_exceeded {
+            let new_len = self.bytes.len().saturating_add(input.len());
+            if new_len > self.limit {
+                self.limit_exceeded = true;
+            } else {
+                self.bytes.extend_from_slice(input);
+            }
         }
-        self.bytes.extend_from_slice(input);
         Ok(input.len())
     }
 
@@ -221,7 +225,12 @@ mod tests {
         })
         .expect_err("the first oversized byte is rejected");
 
-        assert_eq!(error, GraphEncodingError::UncompressedResponseTooLarge);
+        assert_eq!(
+            error,
+            GraphEncodingError::UncompressedResponseTooLarge {
+                actual_uncompressed_bytes: (MAX_UNCOMPRESSED_NON_DELTA_GRAPH_RESPONSE_BYTES + 1) as u64,
+            }
+        );
         assert!(!compression_called);
     }
 

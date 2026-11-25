@@ -1,5 +1,5 @@
 use std::{
-    fmt::Display,
+    fmt::{Debug, Display, Formatter},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -21,10 +21,10 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
-    admission::{ApiRequestAdmissionError, ApiRequestAdmissions, ApiRequestGuard, ApiRequestLane},
+    admission::{ApiRequestAdmissionError, ApiRequestAdmissions, ApiRequestGuard, ApiRequestLane, SseAdmissions, SseConnectionGuard},
     api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
     cache::{CacheJobTracker, CacheWaitError, CachedDelta, CachedHeadSnapshot},
-    client::{ClientIdentifier, DeltaCompletionResult, DeltaScheduleAction},
+    client::{ClientIdentifier, DeltaCompletionResult, DeltaScheduleAction, SseClientRegistrationError, SseMailbox, SseMessage},
     codec::{
         HeadEtag,
         graph::{GraphWindowResponseDto, HeadLevelLookupResponseDto},
@@ -43,17 +43,17 @@ use crate::{
 };
 
 /// Maximum public historical database phases active at once.
-#[allow(dead_code, reason = "the logical operation is consumed by the transport increment")]
 pub(crate) const MAX_PUBLIC_HISTORICAL_DB_READS: usize = 6;
 /// Complete deadline for one public database projection phase.
-#[allow(dead_code, reason = "the logical operation is consumed by the transport increment")]
 pub(crate) const API_DB_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Logical result of one complete anchored-window operation.
-#[allow(dead_code, reason = "HTTP response mapping is introduced by the transport increment")]
 pub(crate) enum AnchoredWindowResponse {
     /// No coherent current publication or public database generation was available.
-    Unavailable,
+    Unavailable {
+        /// Exact publication retained when database availability failed after selection.
+        publication: Option<Arc<GraphPublication>>,
+    },
     /// One immutable Head supplied the complete encoded window.
     Head {
         /// Exact publication retained through response delivery.
@@ -79,7 +79,6 @@ pub(crate) enum AnchoredWindowResponse {
 
 /// Failure of one admitted anchored-window operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[allow(dead_code, reason = "HTTP response mapping is introduced by the transport increment")]
 pub(crate) enum AnchoredWindowError {
     /// The Head-to-historical lane handoff could not be admitted.
     #[error(transparent)]
@@ -102,6 +101,73 @@ pub(crate) enum AnchoredWindowError {
     /// The independently owned database cleanup waiter could not be joined.
     #[error("public historical database waiter failed")]
     DatabaseWaiterFailed,
+}
+
+/// Failure to establish an SSE connection before response commitment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum SseConnectionOpenError {
+    /// The independent SSE admission lane rejected this connection.
+    #[error(transparent)]
+    Admission(#[from] ApiRequestAdmissionError),
+    /// No coherent current publication is available.
+    #[error("graph publication is unavailable")]
+    Unavailable,
+    /// Initial registration failed for a reason other than bounded capacity.
+    #[error("initial SSE registration failed")]
+    RegistrationFailed,
+}
+
+/// One admitted SSE transport and its current publication-local registration.
+pub(crate) struct SseConnection {
+    _admission: SseConnectionGuard,
+    cancellation: CancellationToken,
+    publications: watch::Receiver<Option<Arc<GraphPublication>>>,
+    publication: Arc<GraphPublication>,
+    identifier: ClientIdentifier,
+    mailbox: Arc<SseMailbox>,
+}
+
+impl SseConnection {
+    /// Returns this connection's private transport-cancellation token.
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    /// Receives the next ordered semantic message, following publication replacement.
+    pub(crate) async fn next_message(&mut self) -> Option<SseMessage> {
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => return None,
+                changed = self.publications.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    let replacement = self.publications.borrow_and_update().clone()?;
+                    if Arc::ptr_eq(&self.publication, &replacement) {
+                        continue;
+                    }
+                    let Ok(identifier) = self
+                        .publication
+                        .client_registry()
+                        .replace_registration_into(self.identifier, replacement.client_registry())
+                    else {
+                        return None;
+                    };
+                    self.publication = replacement;
+                    self.identifier = identifier;
+                }
+                message = self.mailbox.recv() => return message,
+            }
+        }
+    }
+}
+
+impl Drop for SseConnection {
+    fn drop(&mut self) {
+        self.publication.client_registry().remove(self.identifier);
+        self.mailbox.close();
+    }
 }
 
 /// Admitted cancellation context accepted by logical Head operations.
@@ -131,9 +197,40 @@ impl HeadRequestContext for CancellationToken {
     fn assert_head_lane(&self) {}
 }
 
+/// Failure of one DAG operation with its exact publication context, when selection completed.
+pub(crate) struct GraphOperationError<E> {
+    publication: Option<Arc<GraphPublication>>,
+    error: E,
+}
+
+impl<E> GraphOperationError<E> {
+    fn before_selection(error: E) -> Self {
+        Self { publication: None, error }
+    }
+
+    /// Retains the exact publication selected before this failure occurred.
+    pub(crate) fn after_selection(publication: Arc<GraphPublication>, error: E) -> Self {
+        Self { publication: Some(publication), error }
+    }
+
+    /// Separates the retained publication context from the operation failure.
+    pub(crate) fn into_parts(self) -> (Option<Arc<GraphPublication>>, E) {
+        (self.publication, self.error)
+    }
+}
+
+impl<E: Debug> Debug for GraphOperationError<E> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GraphOperationError")
+            .field("publication_id", &self.publication.as_ref().map(|publication| publication.publication_id()))
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
 /// Parsed conditional state for one logical Head snapshot operation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-#[allow(dead_code, reason = "HTTP conditional parsing is introduced by the transport increment")]
 pub(crate) enum HeadSnapshotCondition {
     /// The caller supplied no current validator.
     #[default]
@@ -155,7 +252,6 @@ impl HeadSnapshotCondition {
 }
 
 /// Logical result of one in-memory Head snapshot operation.
-#[allow(dead_code, reason = "HTTP response delivery is introduced by the transport increment")]
 pub(crate) enum HeadSnapshotOutcome {
     /// No coherent publication is currently addressable.
     Unavailable,
@@ -176,7 +272,6 @@ pub(crate) enum HeadSnapshotOutcome {
 }
 
 /// Logical result of one retained Head-level lookup operation.
-#[allow(dead_code, reason = "HTTP response delivery is introduced by the transport increment")]
 pub(crate) enum HeadLevelLookupResponse {
     /// Every requested level was captured and encoded for delivery.
     Complete {
@@ -202,7 +297,6 @@ pub(crate) enum HeadLevelLookupResponse {
 }
 
 /// Body selection for one successful logical canonical-delta operation.
-#[allow(dead_code, reason = "HTTP response mapping is introduced by the transport increment")]
 pub(crate) enum CanonicalDeltaSuccess {
     /// The request cursor already equals the captured Head.
     UpToDate,
@@ -215,7 +309,6 @@ pub(crate) enum CanonicalDeltaSuccess {
 }
 
 /// Logical result of one canonical-delta operation before HTTP mapping.
-#[allow(dead_code, reason = "HTTP response mapping is introduced by the transport increment")]
 pub(crate) enum CanonicalDeltaResponse {
     /// The supplied publication does not address the retained current lineage.
     FreshViewRequired {
@@ -380,7 +473,6 @@ impl OwnedEncodingScheduler {
         Self { scheduler, completion_observer: AsyncMutex::new(Some(completion_observer)), events }
     }
 
-    #[allow(dead_code, reason = "terminal shutdown consumes this barrier in increment-14 point 6")]
     async fn shutdown(&self) -> Result<(), ApiServiceError> {
         let result = self.scheduler.shutdown().await.map_err(Self::failure);
         let observer_result = {
@@ -441,14 +533,12 @@ impl<G: ApiDbGeneration> PublicationInstaller for RuntimePublicationInstaller<G>
     }
 }
 
-#[allow(dead_code, reason = "the cancellation roots are consumed by later increment-14 lifecycle points")]
 struct ApiCancellation {
     http: CancellationToken,
     sse: CancellationToken,
     cache_jobs: CancellationToken,
 }
 
-#[allow(dead_code, reason = "status aggregation is implemented in increment-14 point 3")]
 struct ApiStatusInputs {
     kgi_version: &'static str,
     supervisor: watch::Receiver<SupervisorStatus>,
@@ -458,7 +548,6 @@ struct ApiStatusInputs {
 }
 
 impl ApiStatusInputs {
-    #[allow(dead_code, reason = "the logical status operation is consumed by the transport increment")]
     fn current(&self) -> SystemStatus {
         SystemStatus {
             kgi_version: self.kgi_version.to_owned(),
@@ -471,7 +560,6 @@ impl ApiStatusInputs {
 }
 
 /// Permanent owner of API publication, cache, encoding, and transport lifecycles.
-#[allow(dead_code, reason = "the initialized resources are consumed by later increment-14 control points")]
 pub struct ApiService {
     events: mpsc::UnboundedSender<ApiServiceEvent>,
     runtime: AsyncMutex<ApiRuntimeSlot>,
@@ -480,6 +568,7 @@ pub struct ApiService {
     current_publication: watch::Sender<Option<Arc<GraphPublication>>>,
     cancellation: ApiCancellation,
     request_admissions: ApiRequestAdmissions,
+    sse_admissions: SseAdmissions,
     public_historical_reads: Arc<Semaphore>,
     historical_read_tasks: TaskTracker,
     database_query_timeout: Duration,
@@ -505,6 +594,7 @@ impl ApiService {
         let (events, event_rx) = mpsc::unbounded_channel();
         let cache_jobs_cancellation = CancellationToken::new();
         let http_cancellation = CancellationToken::new();
+        let sse_cancellation = CancellationToken::new();
         let api_db = Arc::new(ApiDbState::new());
         let publication_install = Arc::new(Mutex::new(PublicationInstallState { runtime_generation: 0 }));
         let (current_publication, _) = watch::channel(None);
@@ -517,10 +607,11 @@ impl ApiService {
             current_publication,
             cancellation: ApiCancellation {
                 http: http_cancellation.clone(),
-                sse: CancellationToken::new(),
+                sse: sse_cancellation.clone(),
                 cache_jobs: cache_jobs_cancellation.clone(),
             },
             request_admissions: ApiRequestAdmissions::new(http_cancellation),
+            sse_admissions: SseAdmissions::new(sse_cancellation),
             public_historical_reads: Arc::new(Semaphore::new(MAX_PUBLIC_HISTORICAL_DB_READS)),
             historical_read_tasks: TaskTracker::new(),
             database_query_timeout: API_DB_QUERY_TIMEOUT,
@@ -593,6 +684,7 @@ impl ApiService {
         }
 
         self.request_admissions.close();
+        self.sse_admissions.close();
         self.public_historical_reads.close();
         self.historical_read_tasks.close();
         if matches!(*runtime, ApiRuntimeSlot::AwaitReset | ApiRuntimeSlot::Running(_)) {
@@ -617,8 +709,9 @@ impl ApiService {
 
         self.cancellation.sse.cancel();
         self.cancellation.http.cancel();
-        tokio::join!(self.request_admissions.wait(), self.historical_read_tasks.wait());
+        tokio::join!(self.sse_admissions.wait(), self.request_admissions.wait(), self.historical_read_tasks.wait());
 
+        self.cancellation.cache_jobs.cancel();
         let ((), encoding_result) = tokio::join!(biased; self.cache_jobs.shutdown(), self.encoding.shutdown());
         if result.is_ok()
             && let Err(error) = encoding_result
@@ -632,54 +725,75 @@ impl ApiService {
     }
 
     /// Captures the latest independent component observations without waiting for a common revision.
-    #[allow(dead_code, reason = "the logical status operation is consumed by the transport increment")]
     pub(crate) fn system_status(&self, request: &ApiRequestGuard) -> SystemStatus {
         assert_eq!(request.lane(), Some(ApiRequestLane::Status), "status capture requires status-lane admission");
         self.status.current()
     }
 
     /// Attempts nonblocking admission to the shared Head-operation lane.
-    #[allow(dead_code, reason = "HTTP handlers are introduced by the transport increment")]
     pub(crate) fn admit_head_request(&self) -> Result<ApiRequestGuard, ApiRequestAdmissionError> {
         self.request_admissions.admit_head()
     }
 
     /// Attempts nonblocking admission to the independent memory-only status lane.
-    #[allow(dead_code, reason = "HTTP handlers are introduced by the transport increment")]
     pub(crate) fn admit_status_request(&self) -> Result<ApiRequestGuard, ApiRequestAdmissionError> {
         self.request_admissions.admit_status()
     }
 
+    /// Establishes one admitted SSE connection against the current publication.
+    pub(crate) fn open_sse_connection(&self) -> Result<SseConnection, SseConnectionOpenError> {
+        let admission = self.sse_admissions.admit()?;
+        let cancellation = admission.cancellation();
+        let mut publications = self.current_publication.subscribe();
+        let publication = publications.borrow_and_update().clone().ok_or(SseConnectionOpenError::Unavailable)?;
+        let mailbox = Arc::new(SseMailbox::new());
+        let identifier = match publication.client_registry().register(&mailbox, cancellation.clone()) {
+            Ok(identifier) => identifier,
+            Err(SseClientRegistrationError::Capacity) => {
+                return Err(SseConnectionOpenError::Admission(ApiRequestAdmissionError::Saturated));
+            }
+            Err(SseClientRegistrationError::Mailbox(_)) => return Err(SseConnectionOpenError::RegistrationFailed),
+        };
+        Ok(SseConnection { _admission: admission, cancellation, publications, publication, identifier, mailbox })
+    }
+
     /// Resolves and encodes one anchored graph window without combining sources.
-    #[allow(dead_code, reason = "the logical operation is consumed by the transport increment")]
     pub(crate) async fn anchored_window(
         &self,
         request: &ApiRequestGuard,
         anchor: GraphWindowAnchor,
         max_depth: u32,
-    ) -> Result<AnchoredWindowResponse, AnchoredWindowError> {
+    ) -> Result<AnchoredWindowResponse, GraphOperationError<AnchoredWindowError>> {
         assert_eq!(request.lane(), Some(ApiRequestLane::Head), "anchored-window selection begins in the Head lane");
         if request.cancellation().is_cancelled() {
-            return Err(AnchoredWindowError::Cancelled);
+            return Err(GraphOperationError::before_selection(AnchoredWindowError::Cancelled));
         }
         let Some(publication) = self.current_publication() else {
-            return Ok(AnchoredWindowResponse::Unavailable);
+            return Ok(AnchoredWindowResponse::Unavailable { publication: None });
         };
 
         match publication.select_anchored_window(anchor, max_depth).await {
             HeadWindowSelection::Complete { capture, resolution, head_high_level } => {
                 let response = GraphWindowResponseDto::from_head(&capture, head_high_level, resolution);
-                let body = self.encoding.scheduler.encode_priority(response, request.cancellation()).await?;
+                let body = self
+                    .encoding
+                    .scheduler
+                    .encode_priority(response, request.cancellation())
+                    .await
+                    .map_err(|error| GraphOperationError::after_selection(publication.clone(), error.into()))?;
                 Ok(AnchoredWindowResponse::Head { publication, body })
             }
             HeadWindowSelection::RequiresDatabase => {
-                self.request_admissions.handoff_to_historical(request)?;
-                self.database_anchored_window(request, publication, anchor, max_depth).await
+                self.request_admissions
+                    .handoff_to_historical(request)
+                    .map_err(|error| GraphOperationError::after_selection(publication.clone(), error.into()))?;
+                self.database_anchored_window(request, publication.clone(), anchor, max_depth)
+                    .await
+                    .map_err(|error| GraphOperationError::after_selection(publication, error))
             }
         }
     }
 
-    #[allow(dead_code, reason = "the logical operation is consumed by the transport increment")]
     async fn database_anchored_window(
         &self,
         request: &ApiRequestGuard,
@@ -692,10 +806,12 @@ impl ApiService {
         let database_permit = match self.public_historical_reads.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(tokio::sync::TryAcquireError::NoPermits) => return Err(AnchoredWindowError::DatabaseAdmissionSaturated),
-            Err(tokio::sync::TryAcquireError::Closed) => return Ok(AnchoredWindowResponse::Unavailable),
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Ok(AnchoredWindowResponse::Unavailable { publication: Some(publication) });
+            }
         };
         let Some(client) = self.api_db.public_read_client() else {
-            return Ok(AnchoredWindowResponse::Unavailable);
+            return Ok(AnchoredWindowResponse::Unavailable { publication: Some(publication) });
         };
 
         let cleanup_owner = request.cleanup_owner();
@@ -726,18 +842,17 @@ impl ApiService {
     }
 
     /// Selects, constructs, and completes one logical canonical-delta request.
-    #[allow(dead_code, reason = "the logical operation is consumed by the later HTTP transport increment")]
     pub(crate) async fn canonical_delta<R: HeadRequestContext>(
         &self,
         requested_publication_id: u64,
         from_revision_id: u64,
         client: Option<ClientIdentifier>,
         request: R,
-    ) -> Result<CanonicalDeltaResponse, CacheWaitError> {
+    ) -> Result<CanonicalDeltaResponse, GraphOperationError<CacheWaitError>> {
         request.assert_head_lane();
         let cancellation = request.head_cancellation();
         if cancellation.is_cancelled() {
-            return Err(CacheWaitError::Cancelled);
+            return Err(GraphOperationError::before_selection(CacheWaitError::Cancelled));
         }
         let Some(publication) = self.current_publication() else {
             return Ok(CanonicalDeltaResponse::FreshViewRequired { publication: None, reason: FreshViewReason::PublicationMismatch });
@@ -811,7 +926,7 @@ impl ApiService {
                         reason: FreshViewReason::DeltaReplayBarrier,
                     });
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(GraphOperationError::after_selection(publication, error)),
             };
             if candidate.is_adequate_for(requested_target) {
                 return Ok(self.complete_cached_delta(publication, requested_target, candidate, client, active_interval).await);
@@ -914,13 +1029,12 @@ impl ApiService {
     }
 
     /// Selects one coherent in-memory Head snapshot or its conditional result.
-    #[allow(dead_code, reason = "the logical operation is consumed by the later HTTP transport increment")]
     pub(crate) async fn head_snapshot<R: HeadRequestContext>(
         &self,
         target_depth: u32,
         condition: &HeadSnapshotCondition,
         request: R,
-    ) -> Result<HeadSnapshotOutcome, CacheWaitError> {
+    ) -> Result<HeadSnapshotOutcome, GraphOperationError<CacheWaitError>> {
         request.assert_head_lane();
         let cancellation = request.head_cancellation();
         let depth = selected_head_depth(target_depth);
@@ -930,7 +1044,7 @@ impl ApiService {
 
         loop {
             if cancellation.is_cancelled() {
-                return Err(CacheWaitError::Cancelled);
+                return Err(GraphOperationError::after_selection(publication, CacheWaitError::Cancelled));
             }
             let access =
                 match publication.head_tier(&self.cache_jobs, &self.encoding.scheduler, depth, |etag| condition.matches(etag)).await {
@@ -942,7 +1056,7 @@ impl ApiService {
             let candidate = match access.resolve(cancellation.clone()).await {
                 Ok(candidate) => candidate,
                 Err(CacheWaitError::InvalidatedByReplayFloor { .. }) => continue,
-                Err(error) => return Err(error),
+                Err(error) => return Err(GraphOperationError::after_selection(publication, error)),
             };
             let candidate = match publication.admit_cached_head_replay_floor(candidate).await {
                 ReplayFloorAdmission::Admitted(candidate) => candidate,
@@ -956,17 +1070,16 @@ impl ApiService {
     }
 
     /// Captures and encodes complete retained levels from one exact publication.
-    #[allow(dead_code, reason = "the logical operation is consumed by the later HTTP transport increment")]
     pub(crate) async fn head_levels<R: HeadRequestContext>(
         &self,
         requested_publication_id: u64,
         requested_levels: &[u32],
         request: R,
-    ) -> Result<HeadLevelLookupResponse, EncodingSchedulerError> {
+    ) -> Result<HeadLevelLookupResponse, GraphOperationError<EncodingSchedulerError>> {
         request.assert_head_lane();
         let cancellation = request.head_cancellation();
         if cancellation.is_cancelled() {
-            return Err(EncodingSchedulerError::Cancelled);
+            return Err(GraphOperationError::before_selection(EncodingSchedulerError::Cancelled));
         }
         let Some(publication) = self.current_publication() else {
             return Ok(HeadLevelLookupResponse::FreshViewRequired { publication: None, reason: FreshViewReason::PublicationMismatch });
@@ -988,18 +1101,31 @@ impl ApiService {
             }
         };
         let response = HeadLevelLookupResponseDto::from_complete(publication_id, revision, &levels);
-        let body = self.encoding.scheduler.encode_priority(response, cancellation).await?;
+        let body = self
+            .encoding
+            .scheduler
+            .encode_priority(response, cancellation)
+            .await
+            .map_err(|error| GraphOperationError::after_selection(publication.clone(), error))?;
         Ok(HeadLevelLookupResponse::Complete { publication, body })
     }
 
     /// Returns the complete publication current at this instant, when present.
-    #[allow(dead_code, reason = "public graph operations are implemented in later API increments")]
     pub(crate) fn current_publication(&self) -> Option<Arc<GraphPublication>> {
         self.current_publication.borrow().clone()
     }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_publication(&self, publication: Arc<GraphPublication>) {
+        self.current_publication.send_replace(Some(publication));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_encoding_for_test(&self) {
+        self.encoding.scheduler.fail_worker();
+    }
 }
 
-#[allow(dead_code, reason = "the logical operation is consumed by the transport increment")]
 async fn run_historical_projection(
     cleanup_owner: ApiRequestGuard,
     client: Arc<ValidatedApiDbClient>,
@@ -1054,7 +1180,6 @@ fn delta_history_error_reason(error: GraphHistoryRangeError) -> FreshViewReason 
     }
 }
 
-#[allow(dead_code, reason = "called by the logical Head operation before its HTTP consumer exists")]
 fn selected_head_depth(target_depth: u32) -> u32 {
     assert!((1..=MAX_WINDOW_DEPTH).contains(&target_depth), "Head target depth is validated before logical selection");
     CACHED_HEAD_WINDOW_DEPTHS
@@ -1110,8 +1235,9 @@ mod tests {
 
     use super::{
         AnchoredWindowResponse, ApiDbGenerationMessage, ApiRuntimeSlot, ApiService, ApiServiceEvent, ApiStatusInputs,
-        CanonicalDeltaResponse, CanonicalDeltaSuccess, FreshViewReason, HeadLevelLookupResponse, HeadSnapshotCondition,
-        HeadSnapshotOutcome, OwnedPublicationRuntime, PublicationInstallState, RuntimePublicationInstaller, selected_head_depth,
+        CanonicalDeltaResponse, CanonicalDeltaSuccess, FreshViewReason, GraphOperationError, HeadLevelLookupResponse,
+        HeadSnapshotCondition, HeadSnapshotOutcome, OwnedPublicationRuntime, PublicationInstallState, RuntimePublicationInstaller,
+        selected_head_depth,
     };
     use crate::{
         api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
@@ -1349,16 +1475,10 @@ mod tests {
         Arc::new(GraphPublication::new(state, origin, view, history).expect("coherent synthetic publication"))
     }
 
-    async fn register_delta_client(
-        publication: &Arc<GraphPublication>,
-        client_revision_id: u64,
-    ) -> (ClientIdentifier, Arc<SseMailbox>, CancellationToken) {
+    async fn register_delta_client(publication: &Arc<GraphPublication>) -> (ClientIdentifier, Arc<SseMailbox>, CancellationToken) {
         let mailbox = Arc::new(SseMailbox::new());
         let disconnect = CancellationToken::new();
-        let identifier = publication
-            .client_registry()
-            .register(client_revision_id, &mailbox, disconnect.clone())
-            .expect("fixture registration succeeds");
+        let identifier = publication.client_registry().register(&mailbox, disconnect.clone()).expect("fixture registration succeeds");
         for _ in 0..3 {
             mailbox.recv().await.expect("initial registration message");
         }
@@ -1689,7 +1809,7 @@ mod tests {
             GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head, GraphHistory::new())
                 .expect("coherent publication"),
         );
-        service.current_publication.send_replace(Some(publication));
+        service.current_publication.send_replace(Some(publication.clone()));
         let database_permits: Vec<_> = (0..super::MAX_PUBLIC_HISTORICAL_DB_READS)
             .map(|_| service.public_historical_reads.clone().try_acquire_owned().expect("database-read permit"))
             .collect();
@@ -1697,7 +1817,10 @@ mod tests {
         let fallback = service.admit_head_request().expect("fallback Head admission");
         assert!(matches!(
             service.anchored_window(&fallback, GraphWindowAnchor::Level(1), 1).await,
-            Err(super::AnchoredWindowError::DatabaseAdmissionSaturated)
+            Err(GraphOperationError {
+                publication: Some(retained),
+                error: super::AnchoredWindowError::DatabaseAdmissionSaturated,
+            }) if Arc::ptr_eq(&retained, &publication)
         ));
         let head_request = service.admit_head_request().expect("unrelated Head request remains admissible");
         assert!(matches!(
@@ -1831,14 +1954,18 @@ mod tests {
         let (mut service, _events) = service();
         Arc::get_mut(&mut service).expect("the fixture owns the only service Arc").database_query_timeout = Duration::from_secs(2);
         service.update_api_db_generation(ApiDbGenerationMessage::Published(api)).await.expect("API generation is bound");
-        service.current_publication.send_replace(Some(database_fallback_publication()));
+        let publication = database_fallback_publication();
+        service.current_publication.send_replace(Some(publication.clone()));
         let request = service.admit_head_request().expect("Head admission");
         let request_service = service.clone();
         let operation = tokio::spawn(async move { request_service.anchored_window(&request, GraphWindowAnchor::Level(1), 1).await });
         wait_for_blocked_database_lock(&lock_pool).await;
         assert!(matches!(
             timeout(TEST_TIMEOUT, operation).await.expect("request reaches its database deadline").expect("request task joins"),
-            Err(super::AnchoredWindowError::DatabaseTimeout)
+            Err(GraphOperationError {
+                publication: Some(retained),
+                error: super::AnchoredWindowError::DatabaseTimeout,
+            }) if Arc::ptr_eq(&retained, &publication)
         ));
         assert_eq!(service.public_historical_reads.available_permits(), super::MAX_PUBLIC_HISTORICAL_DB_READS);
         assert!(!has_blocked_database_lock(&lock_pool).await);
@@ -2412,11 +2539,14 @@ mod tests {
 
         assert!(matches!(
             service.head_snapshot(1, &HeadSnapshotCondition::Unconditional, cancelled.clone()).await,
-            Err(CacheWaitError::Cancelled)
+            Err(GraphOperationError {
+                publication: Some(retained),
+                error: CacheWaitError::Cancelled,
+            }) if Arc::ptr_eq(&retained, &publication)
         ));
         assert!(matches!(
             service.head_levels(publication.publication_id(), &[1], cancelled).await,
-            Err(EncodingSchedulerError::Cancelled)
+            Err(GraphOperationError { publication: None, error: EncodingSchedulerError::Cancelled })
         ));
         assert!(matches!(
             publication.cache().lookup_head(20, HeadEligibilityBoundary::new(0, 0, 0)),
@@ -2426,11 +2556,17 @@ mod tests {
         service.encoding.scheduler.fail_worker();
         assert!(matches!(
             service.head_levels(publication.publication_id(), &[1], CancellationToken::new()).await,
-            Err(EncodingSchedulerError::ShuttingDown)
+            Err(GraphOperationError {
+                publication: Some(retained),
+                error: EncodingSchedulerError::ShuttingDown,
+            }) if Arc::ptr_eq(&retained, &publication)
         ));
         assert!(matches!(
             service.head_snapshot(1, &HeadSnapshotCondition::Unconditional, CancellationToken::new()).await,
-            Err(CacheWaitError::Build(CacheBuildError::Encoding(EncodingSchedulerError::ShuttingDown)))
+            Err(GraphOperationError {
+                publication: Some(retained),
+                error: CacheWaitError::Build(CacheBuildError::Encoding(EncodingSchedulerError::ShuttingDown)),
+            }) if Arc::ptr_eq(&retained, &publication)
         ));
         assert!(service.shutdown().await.is_err());
     }
@@ -2564,7 +2700,7 @@ mod tests {
             CanonicalDeltaResponse::InvalidFutureCursor { publication: current } if Arc::ptr_eq(&current, &publication)
         ));
 
-        let (identifier, _mailbox, _disconnect) = register_delta_client(&publication, 0).await;
+        let (identifier, _mailbox, _disconnect) = register_delta_client(&publication).await;
         assert!(publication.client_registry().remove(identifier));
         assert!(matches!(
             service
@@ -2698,7 +2834,7 @@ mod tests {
             let entries = (1..=39).map(|revision| (revision, 1)).collect::<Vec<_>>();
             let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
             service.current_publication.send_replace(Some(publication.clone()));
-            let (identifier, mailbox, _disconnect) = register_delta_client(&publication, 32).await;
+            let (identifier, mailbox, _disconnect) = register_delta_client(&publication).await;
 
             let first = service
                 .canonical_delta(publication.publication_id(), 32, Some(identifier), CancellationToken::new())
@@ -2752,7 +2888,7 @@ mod tests {
         let entries = (1..=40).map(|revision| (revision, 1)).collect::<Vec<_>>();
         let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
         service.current_publication.send_replace(Some(publication.clone()));
-        let (identifier, mailbox, _disconnect) = register_delta_client(&publication, 32).await;
+        let (identifier, mailbox, _disconnect) = register_delta_client(&publication).await;
         assert!(matches!(
             service
                 .canonical_delta(publication.publication_id(), 32, Some(identifier), CancellationToken::new())
@@ -2795,7 +2931,7 @@ mod tests {
         let entries = (1..=4).map(|revision| (revision, 1)).collect::<Vec<_>>();
         let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
         service.current_publication.send_replace(Some(publication.clone()));
-        let (identifier, _mailbox, _disconnect) = register_delta_client(&publication, 0).await;
+        let (identifier, _mailbox, _disconnect) = register_delta_client(&publication).await;
 
         let started = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
@@ -2979,7 +3115,7 @@ mod tests {
         let reentry_hook =
             Arc::get_mut(&mut publication).expect("the fixture publication is not yet shared").pause_before_delta_reentry();
         service.current_publication.send_replace(Some(publication.clone()));
-        let (identifier, mailbox, _disconnect) = register_delta_client(&publication, 32).await;
+        let (identifier, mailbox, _disconnect) = register_delta_client(&publication).await;
 
         let started = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
@@ -3101,7 +3237,7 @@ mod tests {
         let entries = (1..=4).map(|revision| (revision, 1)).collect::<Vec<_>>();
         let publication = synthetic_delta_publication(GraphPublicationState::Synchronizing, &entries);
         service.current_publication.send_replace(Some(publication.clone()));
-        let (identifier, mailbox, _disconnect) = register_delta_client(&publication, 0).await;
+        let (identifier, mailbox, _disconnect) = register_delta_client(&publication).await;
 
         let started = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
@@ -3460,7 +3596,7 @@ mod tests {
         let mailbox = Arc::new(SseMailbox::new());
         let identifier = publication
             .client_registry()
-            .register(target.revision(), &mailbox, CancellationToken::new())
+            .register(&mailbox, CancellationToken::new())
             .expect("active publication accepts an SSE registration");
         for expected in [
             SseMessage::ClientRegistration(identifier.registration()),

@@ -42,6 +42,11 @@ pub(crate) struct HeadEtag {
 }
 
 impl HeadEtag {
+    /// Constructs a semantic validator from one parsed HTTP opaque tag.
+    pub(crate) fn from_opaque(opaque: impl Into<Arc<str>>) -> Self {
+        Self { opaque: opaque.into() }
+    }
+
     /// Returns the opaque validator text without HTTP quotes or the weak prefix.
     pub(crate) fn opaque(&self) -> &str {
         &self.opaque

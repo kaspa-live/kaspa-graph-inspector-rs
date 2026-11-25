@@ -660,17 +660,31 @@ router-wide default. SSE therefore inherits tracing but no ordinary HTTP
 timeout, concurrency, or compression policy. Production uses one origin and
 needs no CORS policy.
 
+The production KGI listener serves HTTP/1.1 only. It does not negotiate
+HTTP/2 and does not accept prior-knowledge `h2c`. This keeps one observable
+connection write-and-flush boundary for the ApiService-owned response-delivery
+deadline and permits a timed-out or cancelled response to terminate the
+socket that is applying its backpressure. An operator may terminate HTTP/2 at
+a reverse proxy and use HTTP/1.1 from that proxy to KGI; the external proxy
+transport is outside the KGI process contract.
+
 Axum, Tower, and tower-http crate versions are implementation dependency
 choices. A version change is architectural only when it changes one of the
 settled behaviors above.
 
 The top `kgi` crate's Supervisor owns the bound listener and Axum server task.
-ApiService owns `/api/v1` admission, request work, response delivery tracking,
-and SSE connection state after routing; it does not own the listener or static
-Web requests. An ordinary ApiService reset changes publication registrations
-without restarting the router, listener, HTTP request infrastructure, or SSE
-connections. Terminal server failure and graceful-shutdown ordering belong to
-the [Supervisor lifecycle](processing-lifecycle.md#teardown-and-delivery-semantics--settled).
+For every accepted socket it invokes the reusable HTTP/1.1 connection adapter
+supplied by `kgi-api-core` around the completed application service. ApiService
+owns `/api/v1` admission, request work, the connection adapter's API response
+delivery registrations, and SSE connection state after routing; it does not
+own listener admission or static Web requests. The
+[ApiService owner](api-service.md#http-requests-and-sse-connections) defines
+the delivery-completion and connection-abort contract; this composition owner
+only installs that adapter at the socket boundary. An ordinary ApiService
+reset changes publication registrations without restarting the router,
+listener, HTTP request infrastructure, or SSE connections. Terminal server
+failure and graceful-shutdown ordering belong to the
+[Supervisor lifecycle](processing-lifecycle.md#teardown-and-delivery-semantics--settled).
 
 The production browser and API share one origin. Browser code uses the fixed
 relative `/api/v1` contract and obtains its own site identity from

@@ -769,12 +769,27 @@ An anchored-window request retains this same cancellation and completion
 registration while changing its applicable lane permit only through the
 [source-dependent lane handoff](#resource-isolation-and-saturation--settled).
 
-Axum executes the handler future. For a graph response, the response body
-retains the guard through complete delivery, delivery failure, client
-disconnect, delivery timeout, or shutdown cancellation. A request cancelled
-before response commitment returns the applicable unavailable result when
-possible; cancellation after commitment terminates the body or stream and
-never attempts a second response.
+Axum executes the handler future. Every admitted ordinary response remains
+owned by API delivery tracking through terminal transport completion.
+Reaching end-of-body, dropping the response body, or handing the final frame
+to Hyper does not itself establish completion or release admission.
+
+Successful complete delivery means that Hyper has consumed the complete
+response and the HTTP/1.1 connection driver has subsequently completed the
+socket write-and-flush boundary containing the response's final headers or
+body bytes. This is a server resource-completion boundary: KGI neither knows
+nor waits for the remote application to consume bytes already accepted by the
+socket. Header-only admitted responses use the same rule.
+
+The connection driver observes response cancellation and the graph-delivery
+deadline independently of body polling. If either becomes terminal before
+the successful final flush, or if socket write or flush fails, it closes that
+HTTP/1.1 connection and resolves every affected response registration as
+failed. This may terminate another pipelined response on the same connection;
+each affected request releases its own guard through the same connection-
+failure path. A request cancelled before response commitment returns the
+applicable unavailable result when possible. Cancellation after commitment
+aborts the connection and never attempts a second response.
 
 Each accepted SSE connection owns an SSE admission guard, one bounded
 `SseMailbox`, its current publication-local identifier and registration, and a
@@ -786,6 +801,13 @@ disconnection, or cancellation affects only that child and removes the current
 registration before releasing the guard. Mandatory-mailbox admission follows
 the protocol-owned slow-client rule and never blocks publication mutation or
 shutdown.
+
+The SSE stream has no graph-delivery deadline, but its cancellation and
+slow-client termination signals are also observed by the HTTP/1.1 connection
+driver. If socket backpressure prevents Hyper from polling the SSE body, those
+signals still close the connection, terminate transport delivery, remove the
+current registration, and release the SSE guard. Normal SSE termination and
+peer disconnect use the same connection-observed terminal boundary.
 
 Cancellation requests termination but does not prove cleanup. HTTP and SSE
 completion remains established by their guards, cache completion by
@@ -1025,8 +1047,11 @@ unavailability under the API protocol. Cancellation removes a queued job and
 releases its reservation.
 
 The delivery timeout begins only when a complete gzip graph response is ready.
-A client that cannot receive it within the limit loses that response and its
-HTTP admission and any request-owned body are released. A cached body remains
+Its connection-level observer remains live while Hyper is flushing buffered
+bytes and therefore does not depend on another response-body poll. If the
+final response flush has not completed within the limit, the connection driver
+aborts the socket; the request then releases its HTTP admission and any
+request-owned body through the failed-delivery path. A cached body remains
 owned by `GraphCache` independently of that waiter. SSE streams are exempt from
 this duration and use their bounded delivery behavior instead.
 

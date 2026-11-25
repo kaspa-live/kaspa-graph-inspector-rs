@@ -591,6 +591,11 @@ impl GraphPublication {
         self.publication_id
     }
 
+    /// Samples this publication's latest externally meaningful lifecycle state.
+    pub(crate) async fn state(&self) -> GraphPublicationState {
+        self.core.read().await.state
+    }
+
     /// Returns this publication's response cache.
     pub(crate) fn cache(&self) -> Arc<GraphCache> {
         self.cache.clone()
@@ -1372,7 +1377,7 @@ mod tests {
             let mailbox = Arc::new(SseMailbox::new());
             let identifier = publication
                 .client_registry()
-                .register(0, &mailbox, tokio_util::sync::CancellationToken::new())
+                .register(&mailbox, tokio_util::sync::CancellationToken::new())
                 .expect("initial registration succeeds");
             assert_eq!(mailbox.recv().await, Some(SseMessage::ClientRegistration(identifier.registration())));
             assert_eq!(
@@ -1522,10 +1527,7 @@ mod tests {
         drop(core);
 
         let mailbox = Arc::new(SseMailbox::new());
-        publication
-            .client_registry()
-            .register(0, &mailbox, tokio_util::sync::CancellationToken::new())
-            .expect("registration succeeds");
+        publication.client_registry().register(&mailbox, tokio_util::sync::CancellationToken::new()).expect("registration succeeds");
         mailbox.recv().await.expect("client-registration message");
         assert_eq!(
             mailbox.recv().await,
@@ -1550,7 +1552,7 @@ mod tests {
         let mailbox = Arc::new(SseMailbox::new());
         let identifier = publication
             .client_registry()
-            .register(0, &mailbox, tokio_util::sync::CancellationToken::new())
+            .register(&mailbox, tokio_util::sync::CancellationToken::new())
             .expect("registration succeeds");
         for _ in 0..3 {
             mailbox.recv().await.expect("initial registration message");
@@ -1711,7 +1713,7 @@ mod tests {
         let mailbox = Arc::new(SseMailbox::new());
         let identifier = publication
             .client_registry()
-            .register(0, &mailbox, tokio_util::sync::CancellationToken::new())
+            .register(&mailbox, tokio_util::sync::CancellationToken::new())
             .expect("registration succeeds");
         for _ in 0..3 {
             mailbox.recv().await.expect("initial registration message");
@@ -1979,10 +1981,7 @@ mod tests {
                 .expect("matching candidate");
         let initial = publication.capture_delta_target().await;
         let mailbox = Arc::new(SseMailbox::new());
-        publication
-            .client_registry()
-            .register(initial.revision(), &mailbox, tokio_util::sync::CancellationToken::new())
-            .expect("registration succeeds");
+        publication.client_registry().register(&mailbox, tokio_util::sync::CancellationToken::new()).expect("registration succeeds");
         for _ in 0..3 {
             mailbox.recv().await.expect("initial registration message");
         }

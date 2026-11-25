@@ -511,3 +511,36 @@ transport remain in increment 20; adaptive interval control remains deferred.
 Completion validation passed workspace formatting, Cargo check, 626/626
 Nextest tests including Docker PostgreSQL integration, Cargo doctests, Clippy
 with warnings denied, and `git diff --check`.
+
+Implementation increment 20 is implemented: `kgi-api-core` now exposes the
+state-awaiting `/api/v1`-relative Axum router over the completed `ApiService`
+operations. The ordinary transport supplies strict route-specific parsing,
+GET-only method handling, typed API fallbacks, graph gzip negotiation, and
+exact success and error headers. Its reusable HTTP/1.1 connection adapter
+transfers admitted request guards, cancellation, and graph-delivery deadlines
+from response extensions into connection-owned registrations. The adapter
+retains each guard until the complete response body has been accepted by the
+socket and a subsequent socket flush succeeds; timeout, cancellation, write or
+flush failure, peer disconnect, and adapter abandonment instead terminate the
+connection before releasing the applicable ownership. Header-only responses
+use the same socket boundary. SSE cancellation is observed by the connection
+driver even while body polling is blocked by socket backpressure and remains
+independent of the ordinary graph-delivery deadline. The SSE transport supplies
+strict validation-only wakeup cursors, bounded connection admission, ordered
+mailbox framing, current-publication replacement on the same transport with a
+fresh client identifier, and cleanup for slow clients, disconnect,
+replacement, and shutdown. Status, graph, and SSE lanes remain locally isolated
+without router-wide middleware or backpressure. Router-level tests cover routes
+and methods, validation precedence, logical outcomes, exact headers and cache
+policy, SSE ordering and replacement, saturation, final Stale delivery,
+shutdown, and the combined middleware-absence matrix. Real loopback HTTP/1.1
+tests cover successful socket flush, a stopped reader reaching the delivery
+deadline and aborting a truncated send, exact guard release, `ApiService`
+shutdown, peer disconnect, adapter abandonment, SSE backpressure cancellation,
+and rejection of an HTTP/2 prior-knowledge preface. Production listener
+ownership, top-level router composition, tracing, static assets, Web runtime
+configuration, and global shutdown remain in increment 25; adaptive delta
+control remains deferred. Completion validation passed workspace formatting,
+Cargo check, 656/656 Nextest tests including Docker PostgreSQL integration and
+real loopback transport coverage, Cargo doctests, Clippy with warnings denied,
+and `git diff --check`.
