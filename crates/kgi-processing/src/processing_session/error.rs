@@ -39,6 +39,10 @@ pub(super) fn managed_component_unavailable(component: Component) -> ComponentFa
     }
 }
 
+pub(super) fn unexpected_worker_termination(diagnostic: impl Into<Arc<str>>) -> ComponentFault {
+    ownership_fault(OwnershipFault::UnexpectedWorkerTermination, diagnostic)
+}
+
 fn ownership_fault(kind: OwnershipFault, diagnostic: impl Into<Arc<str>>) -> ComponentFault {
     ComponentFault {
         source: Component::ProcessingSession,

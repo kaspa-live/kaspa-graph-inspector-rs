@@ -562,9 +562,10 @@ session's exact generation clones and event receivers. Focused tests cover
 both preparation modes, threshold boundaries, every Rebuild setup-cancellation
 stage, both sides of the transaction-start race, post-start success and
 failure, startup conclusions, inert and partial-launch cleanup, marker ordering
-and backpressure, exact generation release, and Genesis milestone forwarding.
+and backpressure, unexpected marker termination, fault-free graph-receiver
+closure, exact generation release, and Genesis milestone forwarding.
 The synchronization pump, notification activation, Catchup/Live coordination,
 and Supervisor remain in increments 22 and 23. Completion validation passed
-workspace formatting, Cargo check, 682/682 Nextest tests including Docker
+workspace formatting, Cargo check, 684/684 Nextest tests including Docker
 PostgreSQL integration, Cargo doctests, Clippy with warnings denied, and
 `git diff --check`.

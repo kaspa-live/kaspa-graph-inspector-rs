@@ -5,7 +5,10 @@ use std::sync::{
 
 use kgi_api_ingress::channel::GraphUpdateProducer;
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 
 /// Failure to hand one lifecycle marker to the session-owned worker.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -35,6 +38,8 @@ pub(super) enum MarkerShutdownError {
 enum MarkerCommand {
     Catchup,
     Live,
+    #[cfg(test)]
+    Panic,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +50,21 @@ enum MarkerState {
     Complete,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MarkerTaskExit {
+    ReceiverClosed,
+    CommandInputClosed,
+}
+
+/// Terminal observation produced by the session-owned marker task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MarkerCompletion {
+    /// ApiService dropped this session's graph-update receiver.
+    ReceiverClosed,
+    /// The worker stopped while its session was still active.
+    UnexpectedTermination,
+}
+
 /// Owns serialized Catchup and Live delivery for one processing session.
 pub(super) struct LifecycleMarker {
     commands: mpsc::UnboundedSender<MarkerCommand>,
@@ -52,6 +72,7 @@ pub(super) struct LifecycleMarker {
     state: MarkerState,
     task: Option<MarkerTask>,
     join: Option<JoinHandle<()>>,
+    completion: Option<oneshot::Receiver<MarkerTaskExit>>,
 }
 
 impl LifecycleMarker {
@@ -60,7 +81,7 @@ impl LifecycleMarker {
         let (commands, receiver) = mpsc::unbounded_channel();
         let receiver_closed = Arc::new(AtomicBool::new(false));
         let task = MarkerTask::new(producer, receiver, receiver_closed.clone());
-        Self { commands, receiver_closed, state: MarkerState::Inert, task: Some(task), join: None }
+        Self { commands, receiver_closed, state: MarkerState::Inert, task: Some(task), join: None, completion: None }
     }
 
     /// Launches the worker exactly once with the initialized session tree.
@@ -68,7 +89,27 @@ impl LifecycleMarker {
         let task = self.task.take().expect("lifecycle-marker worker starts exactly once");
         assert_eq!(self.state, MarkerState::Inert, "lifecycle-marker worker starts only from inert state");
         self.state = MarkerState::AwaitingCatchup;
-        self.join = Some(tokio::spawn(task.run()));
+        let (completion_tx, completion) = oneshot::channel();
+        self.completion = Some(completion);
+        self.join = Some(tokio::spawn(async move {
+            let exit = task.run().await;
+            let _ = completion_tx.send(exit);
+        }));
+    }
+
+    /// Returns whether the launched worker still has an unobserved terminal outcome.
+    pub(super) fn completion_pending(&self) -> bool {
+        self.completion.is_some()
+    }
+
+    /// Observes the launched worker once without consuming its shutdown join handle.
+    pub(super) async fn completion(&mut self) -> MarkerCompletion {
+        let result = self.completion.as_mut().expect("only a pending marker completion is observed").await;
+        self.completion = None;
+        match result {
+            Ok(MarkerTaskExit::ReceiverClosed) => MarkerCompletion::ReceiverClosed,
+            Ok(MarkerTaskExit::CommandInputClosed) | Err(_) => MarkerCompletion::UnexpectedTermination,
+        }
     }
 
     /// Reliably accepts the session's exact-once Catchup command.
@@ -112,6 +153,11 @@ impl LifecycleMarker {
             }
         })
     }
+
+    #[cfg(test)]
+    pub(super) fn panic_worker(&self) {
+        self.commands.send(MarkerCommand::Panic).expect("test marker worker accepts panic command");
+    }
 }
 
 struct MarkerTask {
@@ -125,17 +171,20 @@ impl MarkerTask {
         Self { producer, commands, receiver_closed }
     }
 
-    async fn run(mut self) {
+    async fn run(mut self) -> MarkerTaskExit {
         while let Some(command) = self.commands.recv().await {
             let result = match command {
                 MarkerCommand::Catchup => self.producer.publish_catchup(),
                 MarkerCommand::Live => self.producer.publish_live().await,
+                #[cfg(test)]
+                MarkerCommand::Panic => panic!("injected lifecycle-marker worker panic"),
             };
             if result.is_err() {
                 self.receiver_closed.store(true, Ordering::Release);
-                return;
+                return MarkerTaskExit::ReceiverClosed;
             }
         }
+        MarkerTaskExit::CommandInputClosed
     }
 }
 

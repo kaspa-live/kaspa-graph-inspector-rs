@@ -15,8 +15,8 @@ use kgi_storage::generation::ValidatedDbClient;
 use tokio::sync::mpsc;
 
 use self::{
-    error::{block_control, invalid_lifecycle, managed_component_unavailable, vspc_control},
-    marker::LifecycleMarker,
+    error::{block_control, invalid_lifecycle, managed_component_unavailable, unexpected_worker_termination, vspc_control},
+    marker::{LifecycleMarker, MarkerCompletion},
     preparation::{PreparationDb, PreparationOutcome, PreparationRpc, StartupCancellation, prepare},
 };
 use crate::{
@@ -182,9 +182,22 @@ impl<R: SessionRpc, D: SessionDb> ProcessingSession<R, D> {
         if self.state != ProcessingSessionState::Started {
             return None;
         }
-        tokio::select! {
-            event = self.block_events.recv() => self.handle_block_event(event),
-            event = self.vspc_events.recv() => self.handle_vspc_event(event),
+        loop {
+            let marker_completion_pending = self.marker.completion_pending();
+            tokio::select! {
+                completion = self.marker.completion(), if marker_completion_pending => {
+                    match completion {
+                        MarkerCompletion::ReceiverClosed => continue,
+                        MarkerCompletion::UnexpectedTermination => {
+                            return Some(ProcessingSessionEvent::Fault(unexpected_worker_termination(
+                                "lifecycle-marker worker terminated unexpectedly",
+                            )));
+                        }
+                    }
+                }
+                event = self.block_events.recv() => return self.handle_block_event(event),
+                event = self.vspc_events.recv() => return self.handle_vspc_event(event),
+            }
         }
     }
 
@@ -239,6 +252,7 @@ mod tests {
         Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+    use std::time::Duration;
 
     use kaspa_consensus_core::network::{NetworkId, NetworkType};
     use kgi_api_ingress::channel::graph_update_channel;
@@ -491,6 +505,48 @@ mod tests {
 
         session.shutdown().await;
         assert_eq!(graph_updates.recv_update().await, None);
+    }
+
+    #[tokio::test]
+    async fn unexpected_marker_termination_reports_one_reliable_fault() {
+        let (rpc, db) = non_genesis_fixture();
+        let (producer, _graph_updates) = graph_update_channel();
+        let mut session = ProcessingSession::new(RecoveryMode::Resync, rpc, db, producer);
+
+        assert_eq!(session.start().await, ProcessingSessionStartOutcome::Started);
+        session.marker.panic_worker();
+
+        let Some(ProcessingSessionEvent::Fault(fault)) = session.next_event().await else {
+            panic!("marker termination must reach the session fault path");
+        };
+        assert_eq!(fault.source, Component::ProcessingSession);
+        assert_eq!(fault.disposition, FaultDisposition::Fatal);
+        assert_eq!(fault.kind, FaultKind::Ownership(OwnershipFault::UnexpectedWorkerTermination));
+        assert!(!session.marker.completion_pending(), "marker completion is observed exactly once");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), session.next_event()).await.is_err(),
+            "the observed marker termination must not be reported twice"
+        );
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn graph_receiver_closure_is_not_a_processing_fault() {
+        let (rpc, db) = non_genesis_fixture();
+        let (producer, graph_updates) = graph_update_channel();
+        let mut session = ProcessingSession::new(RecoveryMode::Resync, rpc, db, producer);
+
+        assert_eq!(session.start().await, ProcessingSessionStartOutcome::Started);
+        drop(graph_updates);
+        session.marker.publish_catchup().expect("marker handoff precedes receiver-closure observation");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), session.next_event()).await.is_err(),
+            "receiver closure is consumed without producing a session event"
+        );
+        assert!(!session.marker.completion_pending(), "receiver closure is observed exactly once");
+        session.shutdown().await;
     }
 
     #[tokio::test]
