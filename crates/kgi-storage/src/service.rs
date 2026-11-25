@@ -8,7 +8,7 @@ use kaspa_consensus_core::network::NetworkId;
 use kgi_core::timing::Timing;
 use kgi_model::{
     block::{BlockHash, MaterializedSyncAnchor},
-    lifecycle::{PersistenceFault, StorageServiceStatus, StorageServiceStatusState},
+    lifecycle::{PersistenceFault, RebuildSetupFault, StorageServiceStatus, StorageServiceStatusState},
 };
 use tokio::{
     sync::{Mutex, mpsc, oneshot, watch},
@@ -674,7 +674,7 @@ impl StorageServiceWorker {
                     Ok(client) => break client,
                     Err(_) => {
                         let _ = completion.send(Err(StorageError::RebuildSetupFailed(
-                            crate::error::RebuildSetupFault::ApiGenerationPreparation,
+                            RebuildSetupFault::ApiGenerationPreparation,
                         )));
                         return Ok(None);
                     }
@@ -1331,7 +1331,7 @@ mod tests {
     use kgi_core::timing::{Clock, Jitter, Timing};
     use kgi_model::{
         block::{BlockColor, BlockHash, BlockPresence, MAX_DAA_SCORE, ValidatedNodeBlock},
-        lifecycle::{PersistenceFault, StorageServiceStatusState},
+        lifecycle::{PersistenceFault, RebuildSetupFault, StorageServiceStatusState},
     };
     use sqlx::{Connection, PgConnection};
     use testcontainers_modules::{
@@ -1352,7 +1352,7 @@ mod tests {
             DatabaseConnector, LockedDatabase, SqlxDatabaseConnector, ValidatedGenerations, open_api_generation,
             open_validated_generations_managed,
         },
-        error::{ProcessingDbError, RebuildSetupFault, StorageError, StorageRejection},
+        error::{ProcessingDbError, StorageError, StorageRejection},
         generation::{DatabaseBinding, ValidatedApiDbClient, ValidatedDbClient},
         operation::RebuildFromPruningPointError,
         replacement::ApiReplacementGate,

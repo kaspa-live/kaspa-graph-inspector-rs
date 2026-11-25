@@ -3,10 +3,11 @@ use std::sync::Arc;
 use kgi_model::{
     block::{BlockCoordinate, BlockHash, CompactId, VspcPoint},
     graph_update::{BlockCommitted, LevelCommitted},
+    lifecycle::RebuildSetupFault,
 };
 use thiserror::Error;
 
-use crate::error::{ProcessingDbError, RebuildSetupFault};
+use crate::error::ProcessingDbError;
 
 /// Failure to resolve an ordered batch exclusively to materialized block IDs.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]

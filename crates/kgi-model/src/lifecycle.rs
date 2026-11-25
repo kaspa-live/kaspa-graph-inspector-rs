@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use kaspa_consensus_core::network::NetworkId;
+use thiserror::Error;
 
 /// Recovery strength. Ordering is not lifecycle or execution order.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -22,7 +23,7 @@ pub enum Component {
     Supervisor,
     NodeService,
     StorageService,
-    ResyncEngine,
+    ProcessingSession,
     BlockProcessor,
     OrphanManager,
     DependencyResolver,
@@ -84,6 +85,18 @@ pub enum ScoreRangeFault {
     BoundarySealThreshold,
 }
 
+/// Failure while establishing database-replacement preconditions.
+#[derive(Clone, Copy, Debug, Eq, Error, Hash, PartialEq)]
+pub enum RebuildSetupFault {
+    /// The fresh read-only API generation could not be prepared.
+    #[error("fresh API database generation preparation failed")]
+    ApiGenerationPreparation,
+
+    /// Existing API database phases could not be cancelled and drained.
+    #[error("API database phases could not be excluded")]
+    ApiReadExclusion,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum BoundedProcessingState {
     Orphans,
@@ -106,6 +119,7 @@ pub enum FaultKind {
     StorageQueryFailed,
     StorageInvariantViolation,
     SubscriptionControlFailed,
+    RebuildSetupFailed(RebuildSetupFault),
     SessionContinuityLost,
     NotificationInputInvalid(NotificationInputKind),
     RecoveryInputInvalid(RecoveryInputKind),
