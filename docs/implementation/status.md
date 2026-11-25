@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 27 October 2026.
+Updated 25 November 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -545,12 +545,22 @@ Cargo check, 656/656 Nextest tests including Docker PostgreSQL integration and
 real loopback transport coverage, Cargo doctests, Clippy with warnings denied,
 and `git diff --check`.
 
-Implementation increment 21 is active on its dedicated main-based branch. Its
-review unit is the non-reusable ProcessingSession construction and preparation
-boundary: session-owned lifecycle-marker worker, Resync and Rebuild
-preparation, checked seal-threshold construction, common processor
-initialization and launch, the four typed startup outcomes, startup
-cancellation, and consuming actor-tree shutdown. The synchronization pump,
+Implementation increment 21 is implemented on its dedicated main-based branch.
+The private non-reusable `ProcessingSession` now constructs its complete inert
+processor tree and session-owned lifecycle-marker child from exact RPC,
+processing-database, and graph-update capabilities. Its Resync and Rebuild
+preparation paths produce one common checked initialization value, preserve
+typed node and storage conclusions, and retain an already-started database
+replacement through cancellation. Exact-once startup initializes and launches
+both processors and the marker child only after preparation, exposes the four
+typed startup outcomes, and forwards the Rebuild pruning-point boundary
+milestone. Consuming shutdown disables notifications, joins both processor
+trees and the marker child, and then releases the session's exact generation
+clones and event receivers. Focused tests cover both preparation modes,
+threshold boundaries, cancellation races, startup conclusions, inert and
+partial-launch cleanup, marker ordering and backpressure, exact generation
+release, and Genesis milestone forwarding. The synchronization pump,
 notification activation, Catchup/Live coordination, and Supervisor remain in
-increments 22 and 23. No increment 21 production behavior has been completed
-or validated yet.
+increments 22 and 23. Completion validation passed workspace formatting,
+Cargo check, 677/677 Nextest tests including Docker PostgreSQL integration,
+Cargo doctests, Clippy with warnings denied, and `git diff --check`.
