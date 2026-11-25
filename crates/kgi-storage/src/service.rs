@@ -7,13 +7,16 @@ use async_trait::async_trait;
 use kaspa_consensus_core::network::NetworkId;
 use kgi_core::timing::Timing;
 use kgi_model::{
-    block::{BlockHash, MaterializedSyncAnchor},
+    block::{BlockHash, MaterializedSyncAnchor, ValidatedNodeBlock},
     lifecycle::{PersistenceFault, RebuildSetupFault, StorageServiceStatus, StorageServiceStatusState},
 };
+#[cfg(test)]
+use tokio::sync::Semaphore;
 use tokio::{
     sync::{Mutex, mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
 };
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
@@ -23,7 +26,8 @@ use crate::{
     },
     error::{StorageError, StorageRejection},
     generation::{DatabaseBinding, ValidatedApiDbClient, ValidatedDbClient},
-    replacement::ApiReplacementGate,
+    operation::RebuildFromPruningPointOutcome,
+    replacement::{ApiReplacementExclusive, ApiReplacementGate},
     runtime::{
         RebuildReceiver, RebuildRequest, RebuildSender, RetirementReceiver, RetirementRequest, RetirementSender, RetirementTarget,
         rebuild_channel, retirement_channel,
@@ -41,6 +45,8 @@ const RETRY_DELAYS: [Duration; 6] = [
     Duration::from_secs(16),
     Duration::from_secs(30),
 ];
+
+type RebuildCompletion = oneshot::Sender<Result<RebuildFromPruningPointOutcome, StorageError>>;
 
 /// Reliable ordered lifecycle event produced by StorageService.
 #[derive(Clone, Debug)]
@@ -72,6 +78,8 @@ pub struct StorageService {
     panic_next_cleanup: Arc<AtomicBool>,
     #[cfg(test)]
     replacement_gate: Arc<ApiReplacementGate>,
+    #[cfg(test)]
+    rebuild_boundary_hook: Arc<std::sync::Mutex<Option<Arc<RebuildBoundaryHook>>>>,
 }
 
 impl StorageService {
@@ -106,6 +114,8 @@ impl StorageService {
         let retained_cleanup_tasks = Arc::new(AtomicUsize::new(0));
         #[cfg(test)]
         let panic_next_cleanup = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let rebuild_boundary_hook = Arc::new(std::sync::Mutex::new(None));
         let worker = StorageServiceWorker {
             database_url,
             connector,
@@ -124,6 +134,8 @@ impl StorageService {
             retained_cleanup_tasks: retained_cleanup_tasks.clone(),
             #[cfg(test)]
             panic_next_cleanup: panic_next_cleanup.clone(),
+            #[cfg(test)]
+            rebuild_boundary_hook: rebuild_boundary_hook.clone(),
         };
         let join = tokio::spawn(async move {
             let result = worker.run().await;
@@ -140,6 +152,8 @@ impl StorageService {
             panic_next_cleanup,
             #[cfg(test)]
             replacement_gate,
+            #[cfg(test)]
+            rebuild_boundary_hook,
         });
         (service, event_rx)
     }
@@ -208,6 +222,11 @@ impl StorageService {
     #[cfg(test)]
     fn break_replacement_control(&self) {
         self.replacement_gate.break_control();
+    }
+
+    #[cfg(test)]
+    fn install_rebuild_boundary_hook(&self, hook: Arc<RebuildBoundaryHook>) {
+        *self.rebuild_boundary_hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
     }
 }
 
@@ -286,6 +305,38 @@ struct StorageServiceWorker {
     retained_cleanup_tasks: Arc<AtomicUsize>,
     #[cfg(test)]
     panic_next_cleanup: Arc<AtomicBool>,
+    #[cfg(test)]
+    rebuild_boundary_hook: Arc<std::sync::Mutex<Option<Arc<RebuildBoundaryHook>>>>,
+}
+
+struct PreparedRebuild {
+    fresh: Arc<ValidatedApiDbClient>,
+    exclusive: ApiReplacementExclusive,
+}
+
+enum RebuildSetupOutcome {
+    Ready(PreparedRebuild),
+    Cancelled,
+    Failed { error: StorageError, exit: Option<ActiveExit> },
+}
+
+#[cfg(test)]
+struct RebuildBoundaryHook {
+    before_transition: mpsc::UnboundedSender<()>,
+    transition_permit: Semaphore,
+    transaction_started: mpsc::UnboundedSender<()>,
+}
+
+#[cfg(test)]
+impl RebuildBoundaryHook {
+    async fn wait_before_transition(&self) {
+        self.before_transition.send(()).expect("Rebuild-boundary observer");
+        self.transition_permit.acquire().await.expect("Rebuild-boundary gate").forget();
+    }
+
+    fn announce_transaction_started(&self) {
+        self.transaction_started.send(()).expect("transaction-start observer");
+    }
 }
 
 impl StorageServiceWorker {
@@ -637,17 +688,53 @@ impl StorageServiceWorker {
             request.complete(Err(StorageError::GenerationLost));
             return Ok(None);
         };
-        let (pruning_point, mut completion) = request.into_parts();
+        let (pruning_point, cancellation, mut completion) = request.into_parts();
         if completion.is_closed() {
             return Ok(None);
         }
+        if cancellation.is_cancelled() {
+            let _ = completion.send(Ok(RebuildFromPruningPointOutcome::Cancelled));
+            return Ok(None);
+        }
 
+        let prepared = match self.prepare_rebuild(database, active, &processing, &cancellation, &mut completion).await {
+            Ok(RebuildSetupOutcome::Ready(prepared)) => prepared,
+            Ok(RebuildSetupOutcome::Cancelled) => {
+                if !completion.is_closed() {
+                    let _ = completion.send(Ok(RebuildFromPruningPointOutcome::Cancelled));
+                }
+                return Ok(None);
+            }
+            Ok(RebuildSetupOutcome::Failed { error, exit }) => {
+                let _ = completion.send(Err(error));
+                return Ok(exit);
+            }
+            Err(error) => {
+                let _ = completion.send(Err(error.clone()));
+                return Err(error);
+            }
+        };
+
+        self.execute_rebuild(pruning_point, processing, prepared, database, active, completion).await
+    }
+
+    async fn prepare_rebuild(
+        &mut self,
+        database: &mut PreparedDatabase,
+        active: &mut ActiveGenerations,
+        processing: &Arc<ValidatedDbClient>,
+        cancellation: &CancellationToken,
+        completion: &mut RebuildCompletion,
+    ) -> Result<RebuildSetupOutcome, StorageError> {
         let replacement = match self.replacement_gate.begin_replacement() {
             Ok(replacement) => replacement,
             Err(error) => {
                 self.retire_api(active).await?;
-                let _ = completion.send(Err(error));
-                return Ok(None);
+                return Ok(if cancellation.is_cancelled() {
+                    RebuildSetupOutcome::Cancelled
+                } else {
+                    RebuildSetupOutcome::Failed { error, exit: None }
+                });
             }
         };
         active.api_required = false;
@@ -665,155 +752,150 @@ impl StorageServiceWorker {
         let replacement_gate = self.replacement_gate.clone();
         let opening = async move { generation_opener.open_api(database_url, binding, retirement_tx, replacement_gate).await };
         tokio::pin!(opening);
+        let mut fresh = None;
         let health = wait_for_lock_health(self.timing.clone());
         tokio::pin!(health);
-        let fresh = loop {
+
+        let outcome = loop {
+            if cancellation.is_cancelled() || completion.is_closed() {
+                break RebuildSetupOutcome::Cancelled;
+            }
+            if fresh.is_some() && exclusive_result.is_some() {
+                let client = fresh.take().expect("published Rebuild API generation exists");
+                let result = exclusive_result.take().expect("completed exclusive-access result exists");
+                match result {
+                    Ok(exclusive) => break RebuildSetupOutcome::Ready(PreparedRebuild { fresh: client, exclusive }),
+                    Err(error) => break RebuildSetupOutcome::Failed { error, exit: None },
+                }
+            }
+
             tokio::select! {
+                biased;
+                () = cancellation.cancelled() => break RebuildSetupOutcome::Cancelled,
+                () = completion.closed() => break RebuildSetupOutcome::Cancelled,
                 cleanup = self.cleanup.join_next(), if !self.cleanup.is_empty() => self.complete_cleanup(cleanup)?,
-                result = &mut opening => match result {
-                    Ok(client) => break client,
-                    Err(_) => {
-                        let _ = completion.send(Err(StorageError::RebuildSetupFailed(
-                            RebuildSetupFault::ApiGenerationPreparation,
-                        )));
-                        return Ok(None);
+                result = &mut opening, if fresh.is_none() => match result {
+                    Ok(client) => {
+                        let ping = database.ping();
+                        match wait_for_rebuild_setup(cancellation, completion, ping).await {
+                            None => {
+                                self.retire_unpublished_api(client);
+                                break RebuildSetupOutcome::Cancelled;
+                            }
+                            Some(Err(_)) => {
+                                self.retire_unpublished_api(client);
+                                self.handle_lock_loss(active).await?;
+                                break RebuildSetupOutcome::Failed {
+                                    error: StorageError::GenerationLost,
+                                    exit: Some(ActiveExit::Reconnect),
+                                };
+                            }
+                            Some(Ok(())) => {}
+                        }
+                        if let Err(error) = replacement.ensure_current() {
+                            self.retire_unpublished_api(client);
+                            break RebuildSetupOutcome::Failed { error, exit: None };
+                        }
+                        if let Err(error) = self.send_event(StorageServiceEvent::ApiDbPublished(client.clone())) {
+                            self.retire_unpublished_api(client);
+                            return Err(error);
+                        }
+                        active.api = Some(client.clone());
+                        fresh = Some(client);
                     }
+                    Err(_) => break RebuildSetupOutcome::Failed {
+                        error: StorageError::RebuildSetupFailed(RebuildSetupFault::ApiGenerationPreparation),
+                        exit: None,
+                    },
                 },
                 result = &mut exclusive_wait, if exclusive_result.is_none() => match result {
                     Err(error @ StorageError::ReplacementControlUnavailable { .. }) => {
-                        let _ = completion.send(Err(error));
-                        return Ok(None);
+                        break RebuildSetupOutcome::Failed { error, exit: None };
                     }
                     result => exclusive_result = Some(result),
                 },
                 () = &mut health => {
-                    if database.ping().await.is_err() {
-                        self.handle_lock_loss(active).await?;
-                        let _ = completion.send(Err(StorageError::GenerationLost));
-                        return Ok(Some(ActiveExit::Reconnect));
+                    match wait_for_rebuild_setup(cancellation, completion, database.ping()).await {
+                        None => break RebuildSetupOutcome::Cancelled,
+                        Some(Err(_)) => {
+                            self.handle_lock_loss(active).await?;
+                            break RebuildSetupOutcome::Failed {
+                                error: StorageError::GenerationLost,
+                                exit: Some(ActiveExit::Reconnect),
+                            };
+                        }
+                        Some(Ok(())) => health.set(wait_for_lock_health(self.timing.clone())),
                     }
-                    health.set(wait_for_lock_health(self.timing.clone()));
                 },
                 command = self.commands.recv() => {
                     if let Some(exit) = self.handle_active_command(command, database, active).await? {
-                        let _ = completion.send(Err(StorageError::GenerationLost));
-                        return Ok(Some(exit));
+                        break RebuildSetupOutcome::Failed { error: StorageError::GenerationLost, exit: Some(exit) };
                     }
                     health.set(wait_for_lock_health(self.timing.clone()));
                 },
                 retirement = self.retirements.recv() => {
                     self.handle_retirement(retirement, active).await?;
-                    if !active.processing.as_ref().is_some_and(|current| Arc::ptr_eq(current, &processing)) {
-                        let _ = completion.send(Err(StorageError::GenerationLost));
-                        return Ok(None);
+                    let processing_current = active.processing.as_ref().is_some_and(|current| Arc::ptr_eq(current, processing));
+                    let api_current = fresh.as_ref().is_none_or(|client| {
+                        active.api.as_ref().is_some_and(|current| Arc::ptr_eq(current, client))
+                    });
+                    if !processing_current || !api_current {
+                        break RebuildSetupOutcome::Failed { error: StorageError::GenerationLost, exit: None };
                     }
                     health.set(wait_for_lock_health(self.timing.clone()));
                 },
-                () = completion.closed() => return Ok(None),
-            }
-        };
-        if database.ping().await.is_err() {
-            fresh.retire();
-            self.track_api_cleanup(fresh);
-            self.handle_lock_loss(active).await?;
-            let _ = completion.send(Err(StorageError::GenerationLost));
-            return Ok(Some(ActiveExit::Reconnect));
-        }
-        if let Err(error) = replacement.ensure_current() {
-            fresh.retire();
-            self.track_api_cleanup(fresh);
-            let _ = completion.send(Err(error));
-            return Ok(None);
-        }
-        if let Err(error) = self.send_event(StorageServiceEvent::ApiDbPublished(fresh.clone())) {
-            fresh.retire();
-            self.track_api_cleanup(fresh);
-            let _ = completion.send(Err(error.clone()));
-            return Err(error);
-        }
-        active.api = Some(fresh.clone());
-
-        let exclusive = match exclusive_result {
-            Some(Ok(exclusive)) => exclusive,
-            Some(Err(error @ StorageError::RebuildSetupFailed(_))) => {
-                self.retire_api(active).await?;
-                let _ = completion.send(Err(error));
-                return Ok(None);
-            }
-            Some(Err(error)) => {
-                self.retire_api(active).await?;
-                let _ = completion.send(Err(error));
-                return Ok(None);
-            }
-            None => {
-                let health = wait_for_lock_health(self.timing.clone());
-                tokio::pin!(health);
-                loop {
-                    tokio::select! {
-                        cleanup = self.cleanup.join_next(), if !self.cleanup.is_empty() => self.complete_cleanup(cleanup)?,
-                        result = &mut exclusive_wait => match result {
-                            Ok(exclusive) => break exclusive,
-                            Err(error @ StorageError::RebuildSetupFailed(_)) => {
-                                self.retire_api(active).await?;
-                                let _ = completion.send(Err(error));
-                                return Ok(None);
-                            }
-                            Err(error) => {
-                                self.retire_api(active).await?;
-                                let _ = completion.send(Err(error));
-                                return Ok(None);
-                            }
-                        },
-                        () = &mut health => {
-                            if database.ping().await.is_err() {
-                                self.handle_lock_loss(active).await?;
-                                let _ = completion.send(Err(StorageError::GenerationLost));
-                                return Ok(Some(ActiveExit::Reconnect));
-                            }
-                            health.set(wait_for_lock_health(self.timing.clone()));
-                        },
-                        command = self.commands.recv() => {
-                            if let Some(exit) = self.handle_active_command(command, database, active).await? {
-                                let _ = completion.send(Err(StorageError::GenerationLost));
-                                return Ok(Some(exit));
-                            }
-                            health.set(wait_for_lock_health(self.timing.clone()));
-                        },
-                        retirement = self.retirements.recv() => {
-                            self.handle_retirement(retirement, active).await?;
-                            let processing_current = active.processing.as_ref().is_some_and(|current| Arc::ptr_eq(current, &processing));
-                            let api_current = active.api.as_ref().is_some_and(|current| Arc::ptr_eq(current, &fresh));
-                            if !processing_current || !api_current {
-                                self.retire_api(active).await?;
-                                let _ = completion.send(Err(StorageError::GenerationLost));
-                                return Ok(None);
-                            }
-                            health.set(wait_for_lock_health(self.timing.clone()));
-                        },
-                        () = completion.closed() => {
-                            self.retire_api(active).await?;
-                            return Ok(None);
-                        },
-                    }
-                }
             }
         };
 
-        if completion.is_closed() {
+        let RebuildSetupOutcome::Ready(prepared) = outcome else {
             self.retire_api(active).await?;
-            return Ok(None);
-        }
-        if database.ping().await.is_err() {
+            return Ok(outcome);
+        };
+
+        let ping = database.ping();
+        let Some(ping_result) = wait_for_rebuild_setup(cancellation, completion, ping).await else {
+            self.retire_api(active).await?;
+            return Ok(RebuildSetupOutcome::Cancelled);
+        };
+        if ping_result.is_err() {
             self.handle_lock_loss(active).await?;
-            let _ = completion.send(Err(StorageError::GenerationLost));
-            return Ok(Some(ActiveExit::Reconnect));
+            return Ok(RebuildSetupOutcome::Failed { error: StorageError::GenerationLost, exit: Some(ActiveExit::Reconnect) });
         }
-        if let Err(error) = exclusive.ensure_current() {
+        if let Err(error) = prepared.exclusive.ensure_current() {
             self.retire_api(active).await?;
-            let _ = completion.send(Err(error));
-            return Ok(None);
+            return Ok(RebuildSetupOutcome::Failed { error, exit: None });
         }
 
+        #[cfg(test)]
+        let boundary_hook = self.rebuild_boundary_hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        #[cfg(test)]
+        if let Some(hook) = &boundary_hook {
+            hook.wait_before_transition().await;
+        }
+
+        // This sample is the serialized transition to TransactionStarted.
+        if cancellation.is_cancelled() || completion.is_closed() {
+            self.retire_api(active).await?;
+            return Ok(RebuildSetupOutcome::Cancelled);
+        }
+        #[cfg(test)]
+        if let Some(hook) = &boundary_hook {
+            hook.announce_transaction_started();
+        }
+
+        Ok(RebuildSetupOutcome::Ready(prepared))
+    }
+
+    async fn execute_rebuild(
+        &mut self,
+        pruning_point: ValidatedNodeBlock,
+        processing: Arc<ValidatedDbClient>,
+        prepared: PreparedRebuild,
+        database: &mut PreparedDatabase,
+        active: &mut ActiveGenerations,
+        completion: RebuildCompletion,
+    ) -> Result<Option<ActiveExit>, StorageError> {
+        let PreparedRebuild { fresh, exclusive } = prepared;
         let rebuild_client = processing.clone();
         let rebuild = async move { rebuild_client.perform_rebuild(pruning_point).await };
         tokio::pin!(rebuild);
@@ -859,20 +941,11 @@ impl StorageServiceWorker {
             self.handle_lock_loss(active).await?;
         }
 
-        if let Some(exit) = forced_exit {
-            let reported = rebuild_result_after_retirement(result);
+        let exit = forced_exit.or_else(|| ownership_lost.then_some(ActiveExit::Reconnect));
+        if exit.is_some() || generation_changed {
+            let reported = rebuild_result_after_retirement(result).map(RebuildFromPruningPointOutcome::Rebuilt);
             let _ = completion.send(reported);
-            return Ok(Some(exit));
-        }
-        if ownership_lost {
-            let reported = rebuild_result_after_retirement(result);
-            let _ = completion.send(reported);
-            return Ok(Some(ActiveExit::Reconnect));
-        }
-        if generation_changed {
-            let reported = rebuild_result_after_retirement(result);
-            let _ = completion.send(reported);
-            return Ok(None);
+            return Ok(exit);
         }
 
         match result {
@@ -883,7 +956,7 @@ impl StorageServiceWorker {
                     return Ok(None);
                 }
                 active.api_required = true;
-                let _ = completion.send(Ok(anchor));
+                let _ = completion.send(Ok(RebuildFromPruningPointOutcome::Rebuilt(anchor)));
                 Ok(None)
             }
             Err(error @ StorageError::Persistence(PersistenceFault::AmbiguousCommit)) => {
@@ -904,6 +977,11 @@ impl StorageServiceWorker {
                 Ok(None)
             }
         }
+    }
+
+    fn retire_unpublished_api(&mut self, client: Arc<ValidatedApiDbClient>) {
+        client.retire();
+        self.track_api_cleanup(client);
     }
 
     async fn handle_active_command(
@@ -1309,6 +1387,23 @@ fn rebuild_result_after_retirement(
     }
 }
 
+async fn wait_for_rebuild_setup<F>(
+    cancellation: &CancellationToken,
+    completion: &mut RebuildCompletion,
+    future: F,
+) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => None,
+        () = completion.closed() => None,
+        result = &mut future => Some(result),
+    }
+}
+
 async fn wait_for_lock_health(timing: Timing) {
     timing.sleep(LOCK_HEALTH_INTERVAL).await;
 }
@@ -1342,10 +1437,12 @@ mod tests {
         sync::{Semaphore, mpsc},
         time::timeout,
     };
+    use tokio_util::sync::CancellationToken;
     use url::Url;
 
     use super::{
-        GenerationOpener, LOCK_HEALTH_INTERVAL, READY_BACKOFF_RESET, StorageService, StorageServiceEvent, StorageServiceEventReceiver,
+        GenerationOpener, LOCK_HEALTH_INTERVAL, READY_BACKOFF_RESET, RebuildBoundaryHook, StorageService, StorageServiceEvent,
+        StorageServiceEventReceiver,
     };
     use crate::{
         database::{
@@ -1354,7 +1451,7 @@ mod tests {
         },
         error::{ProcessingDbError, StorageError, StorageRejection},
         generation::{DatabaseBinding, ValidatedApiDbClient, ValidatedDbClient},
-        operation::RebuildFromPruningPointError,
+        operation::{RebuildFromPruningPointError, RebuildFromPruningPointOutcome},
         replacement::ApiReplacementGate,
         runtime::{RebuildSender, RetirementSender},
         state::DatabaseState,
@@ -1441,6 +1538,16 @@ mod tests {
         (service, events, processing, api)
     }
 
+    fn install_rebuild_boundary_hook(
+        service: &StorageService,
+    ) -> (Arc<RebuildBoundaryHook>, mpsc::UnboundedReceiver<()>, mpsc::UnboundedReceiver<()>) {
+        let (before_transition, before_transition_rx) = mpsc::unbounded_channel();
+        let (transaction_started, transaction_started_rx) = mpsc::unbounded_channel();
+        let hook = Arc::new(RebuildBoundaryHook { before_transition, transition_permit: Semaphore::new(0), transaction_started });
+        service.install_rebuild_boundary_hook(hook.clone());
+        (hook, before_transition_rx, transaction_started_rx)
+    }
+
     #[tokio::test]
     async fn initialization_publishes_ordered_generations_and_shutdown_retires_exact_arcs() {
         let (_container, database_url) = fixture().await;
@@ -1484,7 +1591,8 @@ mod tests {
 
         let rebuild_client = processing.clone();
         let rebuild_block = pruning_point.clone();
-        let rebuild = tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(rebuild_block).await });
+        let rebuild =
+            tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(rebuild_block, CancellationToken::new()).await });
 
         match next_event(&mut events).await {
             StorageServiceEvent::ApiDbRetired(retired) => assert!(Arc::ptr_eq(&retired, &api)),
@@ -1494,8 +1602,11 @@ mod tests {
             StorageServiceEvent::ApiDbPublished(client) => client,
             event => panic!("expected gated API publication, got {event:?}"),
         };
-        let anchor =
-            timeout(TEST_TIMEOUT, rebuild).await.expect("Rebuild must complete").expect("Rebuild task").expect("Rebuild transaction");
+        let RebuildFromPruningPointOutcome::Rebuilt(anchor) =
+            timeout(TEST_TIMEOUT, rebuild).await.expect("Rebuild must complete").expect("Rebuild task").expect("Rebuild transaction")
+        else {
+            panic!("uncancelled Rebuild must commit");
+        };
 
         assert!(processing.is_valid(), "successful Rebuild keeps its processing generation");
         assert_eq!(anchor.point.hash(), pruning_point.hash);
@@ -1591,7 +1702,8 @@ mod tests {
         assert!(timeout(Duration::from_millis(100), events.recv()).await.is_err());
         let pruning_point = genesis_pruning_point();
         let rebuild_client = processing.clone();
-        let rebuild = tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point).await });
+        let rebuild =
+            tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point, CancellationToken::new()).await });
 
         let api = match next_event(&mut events).await {
             StorageServiceEvent::ApiDbPublished(client) => client,
@@ -1612,7 +1724,7 @@ mod tests {
         let invalid = ValidatedNodeBlock { daa_score: MAX_DAA_SCORE + 1, ..genesis_pruning_point() };
 
         assert!(matches!(
-            processing.rebuild_from_pruning_point(invalid).await,
+            processing.rebuild_from_pruning_point(invalid, CancellationToken::new()).await,
             Err(RebuildFromPruningPointError::Database(ProcessingDbError::ScoreOutOfRange(
                 kgi_model::lifecycle::ScoreRangeFault::DaaScore
             )))
@@ -1632,7 +1744,8 @@ mod tests {
         let lease = api.acquire_read_lease().await.expect("old API lease");
         let pruning_point = genesis_pruning_point();
         let rebuild_client = processing.clone();
-        let mut rebuild = tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point).await });
+        let mut rebuild =
+            tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point, CancellationToken::new()).await });
 
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
         let fresh = match next_event(&mut events).await {
@@ -1711,7 +1824,8 @@ mod tests {
 
         let pruning_point = genesis_pruning_point();
         let rebuild_client = processing.clone();
-        let mut rebuild = tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point).await });
+        let mut rebuild =
+            tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point, CancellationToken::new()).await });
         timeout(TEST_TIMEOUT, api_open_rx.recv()).await.expect("Rebuild API preparation starts").expect("API-open observer");
         // The superseded autonomous opener remains suspended on this stack while
         // the worker handles Rebuild, so release both registered waiters.
@@ -1736,17 +1850,31 @@ mod tests {
     async fn definite_rebuild_failure_rolls_back_and_retires_the_gated_api_only() {
         let (_container, database_url) = fixture().await;
         let (service, mut events, processing, api) = initialize_service(database_url).await;
+        let (boundary, mut before_transition, mut transaction_started) = install_rebuild_boundary_hook(&service);
         processing.inject_rebuild_commit_behavior(crate::generation::rebuild::CommitBehavior::RollbackThenFail);
         let pruning_point = genesis_pruning_point();
         let rebuild_client = processing.clone();
         let rebuild_block = pruning_point.clone();
-        let rebuild = tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(rebuild_block).await });
+        let cancellation = CancellationToken::new();
+        let operation_cancellation = cancellation.clone();
+        let rebuild =
+            tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(rebuild_block, operation_cancellation).await });
 
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
         let fresh = match next_event(&mut events).await {
             StorageServiceEvent::ApiDbPublished(client) => client,
             event => panic!("expected gated API publication, got {event:?}"),
         };
+        timeout(TEST_TIMEOUT, before_transition.recv())
+            .await
+            .expect("Rebuild must reach its transaction boundary")
+            .expect("boundary observer");
+        boundary.transition_permit.add_permits(1);
+        timeout(TEST_TIMEOUT, transaction_started.recv())
+            .await
+            .expect("Rebuild transaction must start")
+            .expect("transaction-start observer");
+        cancellation.cancel();
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &fresh)));
         assert_eq!(
             rebuild.await.expect("Rebuild task"),
@@ -1774,7 +1902,8 @@ mod tests {
         processing.inject_rebuild_commit_behavior(crate::generation::rebuild::CommitBehavior::RollbackThenLoseConnection);
         let pruning_point = genesis_pruning_point();
         let rebuild_client = processing.clone();
-        let rebuild = tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point).await });
+        let rebuild =
+            tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point, CancellationToken::new()).await });
 
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
         let fresh = match next_event(&mut events).await {
@@ -1827,7 +1956,8 @@ mod tests {
         let pruning_point = genesis_pruning_point();
 
         let rebuild_client = processing.clone();
-        let rebuild = tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point).await });
+        let rebuild =
+            tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point, CancellationToken::new()).await });
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
         assert_eq!(
             rebuild.await.expect("Rebuild task"),
@@ -1875,7 +2005,8 @@ mod tests {
         let lease = api.acquire_read_lease().await.expect("old API lease");
         let pruning_point = genesis_pruning_point();
         let rebuild_client = processing.clone();
-        let mut rebuild = tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point).await });
+        let mut rebuild =
+            tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point, CancellationToken::new()).await });
 
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
         timeout(TEST_TIMEOUT, api_open_rx.recv()).await.expect("fresh API preparation starts").expect("API-open observer");
@@ -1923,7 +2054,90 @@ mod tests {
         let lease = api.acquire_read_lease().await.expect("old API lease");
         let pruning_point = genesis_pruning_point();
         let rebuild_client = processing.clone();
-        let rebuild = tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point).await });
+        let cancellation = CancellationToken::new();
+        let operation_cancellation = cancellation.clone();
+        let rebuild =
+            tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point, operation_cancellation).await });
+
+        assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
+        let fresh = match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbPublished(client) => client,
+            event => panic!("expected gated API publication, got {event:?}"),
+        };
+        cancellation.cancel();
+        assert_eq!(rebuild.await.expect("Rebuild task"), Ok(RebuildFromPruningPointOutcome::Cancelled));
+        assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &fresh)));
+        assert!(processing.is_valid());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM block_identifiers")
+                .fetch_one(processing.pool())
+                .await
+                .expect("identity count"),
+            0
+        );
+        drop(lease);
+
+        service.shutdown().await.expect("service shutdown");
+    }
+
+    #[tokio::test]
+    async fn rebuild_cancellation_during_fresh_api_preparation_starts_no_transaction() {
+        let (_container, database_url) = fixture().await;
+        let (api_open_tx, mut api_open_rx) = mpsc::unbounded_channel();
+        let generation_opener =
+            Arc::new(GatedApiGenerationOpener { api_open_started: api_open_tx, api_open_permit: Semaphore::new(0) });
+        let (service, mut events) = StorageService::start_with_generation_opener(
+            database_url,
+            Arc::new(SqlxDatabaseConnector),
+            Timing::production(),
+            generation_opener,
+        );
+        wait_for_status(&service, StorageServiceStatusState::AwaitingInitialization).await;
+        service.initialize_if_uninitialized(mainnet(), hash(1)).await.expect("database initialization");
+        let processing = match next_event(&mut events).await {
+            StorageServiceEvent::ProcessingDbPublished(client) => client,
+            event => panic!("expected processing publication, got {event:?}"),
+        };
+        let api = match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbPublished(client) => client,
+            event => panic!("expected API publication, got {event:?}"),
+        };
+
+        let cancellation = CancellationToken::new();
+        let operation_cancellation = cancellation.clone();
+        let rebuild_client = processing.clone();
+        let rebuild =
+            tokio::spawn(
+                async move { rebuild_client.rebuild_from_pruning_point(genesis_pruning_point(), operation_cancellation).await },
+            );
+
+        assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
+        timeout(TEST_TIMEOUT, api_open_rx.recv()).await.expect("fresh API preparation starts").expect("API-open observer");
+        cancellation.cancel();
+        assert_eq!(rebuild.await.expect("Rebuild task"), Ok(RebuildFromPruningPointOutcome::Cancelled));
+        assert!(events.try_recv().is_err(), "cancelled API preparation must not publish a generation");
+        assert!(processing.is_valid());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM block_identifiers")
+                .fetch_one(processing.pool())
+                .await
+                .expect("identity count"),
+            0
+        );
+
+        service.shutdown().await.expect("service shutdown");
+    }
+
+    #[tokio::test]
+    async fn dropped_rebuild_caller_during_setup_starts_no_transaction() {
+        let (_container, database_url) = fixture().await;
+        let (service, mut events, processing, api) = initialize_service(database_url).await;
+        let lease = api.acquire_read_lease().await.expect("old API lease");
+        let rebuild_client = processing.clone();
+        let rebuild =
+            tokio::spawn(
+                async move { rebuild_client.rebuild_from_pruning_point(genesis_pruning_point(), CancellationToken::new()).await },
+            );
 
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
         let fresh = match next_event(&mut events).await {
@@ -1947,13 +2161,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_winning_rebuild_transaction_boundary_starts_no_transaction() {
+        let (_container, database_url) = fixture().await;
+        let (service, mut events, processing, api) = initialize_service(database_url).await;
+        let (boundary, mut before_transition, mut transaction_started) = install_rebuild_boundary_hook(&service);
+        let cancellation = CancellationToken::new();
+        let operation_cancellation = cancellation.clone();
+        let rebuild_client = processing.clone();
+        let rebuild =
+            tokio::spawn(
+                async move { rebuild_client.rebuild_from_pruning_point(genesis_pruning_point(), operation_cancellation).await },
+            );
+
+        assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
+        let fresh = match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbPublished(client) => client,
+            event => panic!("expected gated API publication, got {event:?}"),
+        };
+        timeout(TEST_TIMEOUT, before_transition.recv())
+            .await
+            .expect("Rebuild must reach its transaction boundary")
+            .expect("boundary observer");
+        cancellation.cancel();
+        boundary.transition_permit.add_permits(1);
+
+        assert_eq!(rebuild.await.expect("Rebuild task"), Ok(RebuildFromPruningPointOutcome::Cancelled));
+        assert!(transaction_started.try_recv().is_err(), "cancellation must win before TransactionStarted");
+        assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &fresh)));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM block_identifiers")
+                .fetch_one(processing.pool())
+                .await
+                .expect("identity count"),
+            0
+        );
+
+        service.shutdown().await.expect("service shutdown");
+    }
+
+    #[tokio::test]
+    async fn transaction_start_winning_rebuild_boundary_retains_success() {
+        let (_container, database_url) = fixture().await;
+        let (service, mut events, processing, api) = initialize_service(database_url).await;
+        let (boundary, mut before_transition, mut transaction_started) = install_rebuild_boundary_hook(&service);
+        let cancellation = CancellationToken::new();
+        let operation_cancellation = cancellation.clone();
+        let rebuild_client = processing.clone();
+        let rebuild =
+            tokio::spawn(
+                async move { rebuild_client.rebuild_from_pruning_point(genesis_pruning_point(), operation_cancellation).await },
+            );
+
+        assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
+        let fresh = match next_event(&mut events).await {
+            StorageServiceEvent::ApiDbPublished(client) => client,
+            event => panic!("expected gated API publication, got {event:?}"),
+        };
+        timeout(TEST_TIMEOUT, before_transition.recv())
+            .await
+            .expect("Rebuild must reach its transaction boundary")
+            .expect("boundary observer");
+        boundary.transition_permit.add_permits(1);
+        timeout(TEST_TIMEOUT, transaction_started.recv())
+            .await
+            .expect("Rebuild transaction must start")
+            .expect("transaction-start observer");
+        cancellation.cancel();
+
+        assert!(matches!(rebuild.await.expect("Rebuild task"), Ok(RebuildFromPruningPointOutcome::Rebuilt(_))));
+        assert!(fresh.acquire_read_lease().await.is_ok());
+        assert!(processing.has_cached_identity(hash(1)));
+
+        service.shutdown().await.expect("service shutdown");
+    }
+
+    #[tokio::test]
     async fn replacement_control_failure_before_fresh_publication_is_fatal_without_mutation() {
         let (_container, database_url) = fixture().await;
         let (service, mut events, processing, api) = initialize_service(database_url).await;
         service.break_replacement_control();
         let pruning_point = genesis_pruning_point();
         let rebuild_client = processing.clone();
-        let rebuild = tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point).await });
+        let rebuild =
+            tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point, CancellationToken::new()).await });
 
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
         assert!(matches!(
@@ -1979,7 +2269,8 @@ mod tests {
         let lease = api.acquire_read_lease().await.expect("old API lease");
         let pruning_point = genesis_pruning_point();
         let rebuild_client = processing.clone();
-        let rebuild = tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point).await });
+        let rebuild =
+            tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(pruning_point, CancellationToken::new()).await });
 
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
         let fresh = match next_event(&mut events).await {
@@ -2010,17 +2301,31 @@ mod tests {
     async fn ambiguous_rebuild_commit_retires_both_generations_without_cache_publication() {
         let (_container, database_url) = fixture().await;
         let (service, mut events, processing, api) = initialize_service(database_url.clone()).await;
+        let (boundary, mut before_transition, mut transaction_started) = install_rebuild_boundary_hook(&service);
         processing.inject_rebuild_commit_behavior(crate::generation::rebuild::CommitBehavior::CommitThenLoseAcknowledgement);
         let pruning_point = genesis_pruning_point();
         let rebuild_client = processing.clone();
         let rebuild_block = pruning_point.clone();
-        let rebuild = tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(rebuild_block).await });
+        let cancellation = CancellationToken::new();
+        let operation_cancellation = cancellation.clone();
+        let rebuild =
+            tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(rebuild_block, operation_cancellation).await });
 
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
         let fresh = match next_event(&mut events).await {
             StorageServiceEvent::ApiDbPublished(client) => client,
             event => panic!("expected gated API publication, got {event:?}"),
         };
+        timeout(TEST_TIMEOUT, before_transition.recv())
+            .await
+            .expect("Rebuild must reach its transaction boundary")
+            .expect("boundary observer");
+        boundary.transition_permit.add_permits(1);
+        timeout(TEST_TIMEOUT, transaction_started.recv())
+            .await
+            .expect("Rebuild transaction must start")
+            .expect("transaction-start observer");
+        cancellation.cancel();
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &fresh)));
         assert!(
             matches!(next_event(&mut events).await, StorageServiceEvent::ProcessingDbRetired(retired) if Arc::ptr_eq(&retired, &processing))
@@ -3150,7 +3455,10 @@ mod tests {
             processing.inject_rebuild_commit_behavior(crate::generation::rebuild::CommitBehavior::RollbackThenFail);
         }
         let rebuild_client = processing.clone();
-        let rebuild = tokio::spawn(async move { rebuild_client.rebuild_from_pruning_point(genesis_pruning_point()).await });
+        let rebuild =
+            tokio::spawn(
+                async move { rebuild_client.rebuild_from_pruning_point(genesis_pruning_point(), CancellationToken::new()).await },
+            );
         assert!(matches!(next_event(&mut events).await, StorageServiceEvent::ApiDbRetired(retired) if Arc::ptr_eq(&retired, &api)));
         let fresh = match next_event(&mut events).await {
             StorageServiceEvent::ApiDbPublished(client) => client,

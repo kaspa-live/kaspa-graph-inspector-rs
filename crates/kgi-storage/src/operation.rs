@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use kgi_model::{
-    block::{BlockCoordinate, BlockHash, CompactId, VspcPoint},
+    block::{BlockCoordinate, BlockHash, CompactId, MaterializedSyncAnchor, VspcPoint},
     graph_update::{BlockCommitted, LevelCommitted},
     lifecycle::RebuildSetupFault,
 };
@@ -99,6 +99,15 @@ pub enum RebuildFromPruningPointError {
     /// Storage's replacement-control primitive became unusable.
     #[error("database replacement control is unavailable: {diagnostic}")]
     ReplacementControlUnavailable { diagnostic: Arc<str> },
+}
+
+/// Authoritative conclusion of one cancellation-aware processing-data replacement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RebuildFromPruningPointOutcome {
+    /// Replacement committed definitely and produced this synchronization anchor.
+    Rebuilt(MaterializedSyncAnchor),
+    /// Cancellation won before the replacement transaction started.
+    Cancelled,
 }
 
 /// Persisted evidence for the first selected-parent discontinuity in a VSPC path.

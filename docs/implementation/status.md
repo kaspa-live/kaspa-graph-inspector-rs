@@ -545,27 +545,26 @@ Cargo check, 656/656 Nextest tests including Docker PostgreSQL integration and
 real loopback transport coverage, Cargo doctests, Clippy with warnings denied,
 and `git diff --check`.
 
-Implementation increment 21 has its original feature surface implemented on
-its dedicated main-based branch, but is not complete against the corrected
-Rebuild cancellation contract. The current preparation path treats first poll
-of the Storage future as transaction start; it must instead pass cancellation
-into the Storage operation and consume Storage's typed setup-cancellation or
-authoritative post-start result. No production correction has yet been made.
-The private non-reusable `ProcessingSession` otherwise constructs its complete
-inert processor tree and session-owned lifecycle-marker child from exact RPC,
-processing-database, and graph-update capabilities. Its Resync and Rebuild
-preparation paths produce one common checked initialization value, preserve
-typed node and storage conclusions, and retain an already-started database
-replacement through cancellation. Exact-once startup initializes and launches
-both processors and the marker child only after preparation, exposes the four
-typed startup outcomes, and forwards the Rebuild pruning-point boundary
-milestone. Consuming shutdown disables notifications, joins both processor
-trees and the marker child, and then releases the session's exact generation
-clones and event receivers. Focused tests cover both preparation modes,
-threshold boundaries, cancellation races, startup conclusions, inert and
-partial-launch cleanup, marker ordering and backpressure, exact generation
-release, and Genesis milestone forwarding. The synchronization pump,
-notification activation, Catchup/Live coordination, and Supervisor remain in
-increments 22 and 23. Completion validation passed workspace formatting,
-Cargo check, 677/677 Nextest tests including Docker PostgreSQL integration,
-Cargo doctests, Clippy with warnings denied, and `git diff --check`.
+Implementation increment 21 is implemented on its dedicated main-based branch.
+Rebuild preparation passes its startup cancellation capability into one
+cancellation-aware Storage operation and consumes Storage's typed setup
+cancellation or authoritative replacement result without a caller-owned
+transaction-start proxy. The private non-reusable `ProcessingSession`
+constructs its complete inert processor tree and session-owned lifecycle-marker
+child from exact RPC, processing-database, and graph-update capabilities. Its
+Resync and Rebuild preparation paths produce one common checked initialization
+value and preserve typed node and storage conclusions. Exact-once startup
+initializes and launches both processors and the marker child only after
+preparation, exposes the four typed startup outcomes, and forwards the Rebuild
+pruning-point boundary milestone. Consuming shutdown disables notifications,
+joins both processor trees and the marker child, and then releases the
+session's exact generation clones and event receivers. Focused tests cover
+both preparation modes, threshold boundaries, every Rebuild setup-cancellation
+stage, both sides of the transaction-start race, post-start success and
+failure, startup conclusions, inert and partial-launch cleanup, marker ordering
+and backpressure, exact generation release, and Genesis milestone forwarding.
+The synchronization pump, notification activation, Catchup/Live coordination,
+and Supervisor remain in increments 22 and 23. Completion validation passed
+workspace formatting, Cargo check, 682/682 Nextest tests including Docker
+PostgreSQL integration, Cargo doctests, Clippy with warnings denied, and
+`git diff --check`.

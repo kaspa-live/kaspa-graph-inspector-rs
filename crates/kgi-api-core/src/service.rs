@@ -1656,17 +1656,20 @@ mod tests {
         api: &Arc<kgi_storage::generation::ValidatedApiDbClient>,
     ) -> Arc<kgi_storage::generation::ValidatedApiDbClient> {
         processing
-            .rebuild_from_pruning_point(ValidatedNodeBlock {
-                hash: hash(9),
-                selected_parent: hash(5),
-                direct_parents: vec![hash(4), hash(5)],
-                blue_merge_set: vec![hash(3), hash(5)],
-                red_merge_set: vec![hash(2), hash(3)],
-                timestamp: 9,
-                daa_score: 42,
-                blue_score: 43,
-                blue_work: Default::default(),
-            })
+            .rebuild_from_pruning_point(
+                ValidatedNodeBlock {
+                    hash: hash(9),
+                    selected_parent: hash(5),
+                    direct_parents: vec![hash(4), hash(5)],
+                    blue_merge_set: vec![hash(3), hash(5)],
+                    red_merge_set: vec![hash(2), hash(3)],
+                    timestamp: 9,
+                    daa_score: 42,
+                    blue_score: 43,
+                    blue_work: Default::default(),
+                },
+                CancellationToken::new(),
+            )
             .await
             .expect("pruning-point rebuild succeeds");
         assert!(matches!(

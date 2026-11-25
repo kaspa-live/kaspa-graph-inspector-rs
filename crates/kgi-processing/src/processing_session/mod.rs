@@ -254,10 +254,11 @@ mod tests {
         error::ProcessingDbError,
         generation::{StoredSessionSnapshot, StoredSessionState, StoredVspcSink},
         operation::{
-            ApplyVspcChangeError, MaterializeBlockError, MaterializeBlockOutcome, RebuildFromPruningPointError, ReferencePolicy,
-            ResolveMaterializedIdsError, VspcCommitOutcome,
+            ApplyVspcChangeError, MaterializeBlockError, MaterializeBlockOutcome, RebuildFromPruningPointError,
+            RebuildFromPruningPointOutcome, ReferencePolicy, ResolveMaterializedIdsError, VspcCommitOutcome,
         },
     };
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::block_processor::DependencyRpc;
@@ -333,7 +334,7 @@ mod tests {
         network_id: NetworkId,
         genesis_hash: BlockHash,
         state: Mutex<Option<Result<StoredSessionState, ProcessingDbError>>>,
-        rebuild: Mutex<Option<Result<MaterializedSyncAnchor, RebuildFromPruningPointError>>>,
+        rebuild: Mutex<Option<Result<RebuildFromPruningPointOutcome, RebuildFromPruningPointError>>>,
     }
 
     impl MockDb {
@@ -346,7 +347,7 @@ mod tests {
                 network_id: NetworkId::new(NetworkType::Mainnet),
                 genesis_hash,
                 state: Mutex::new(Some(state)),
-                rebuild: Mutex::new(Some(rebuild)),
+                rebuild: Mutex::new(Some(rebuild.map(RebuildFromPruningPointOutcome::Rebuilt))),
             })
         }
     }
@@ -359,7 +360,8 @@ mod tests {
         async fn rebuild_from_pruning_point(
             &self,
             _pruning_point: ValidatedNodeBlock,
-        ) -> Result<MaterializedSyncAnchor, RebuildFromPruningPointError> {
+            _cancellation: CancellationToken,
+        ) -> Result<RebuildFromPruningPointOutcome, RebuildFromPruningPointError> {
             self.rebuild.lock().expect("rebuild mutex").take().expect("one rebuild result")
         }
     }

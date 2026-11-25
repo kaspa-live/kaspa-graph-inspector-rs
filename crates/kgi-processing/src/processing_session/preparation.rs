@@ -1,10 +1,4 @@
-use std::{
-    future::Future,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::{future::Future, sync::Arc};
 
 use kgi_model::{
     block::{
@@ -16,9 +10,9 @@ use kgi_node::{error::NodeError, rpc::ValidatedRpcClient};
 use kgi_storage::{
     error::ProcessingDbError,
     generation::{StoredSessionState, ValidatedDbClient},
-    operation::RebuildFromPruningPointError,
+    operation::{RebuildFromPruningPointError, RebuildFromPruningPointOutcome},
 };
-use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::fault::storage_fault;
 
@@ -41,28 +35,28 @@ pub(super) enum PreparationOutcome<R: PreparationRpc, D: PreparationDb> {
 /// Cloneable request to stop one in-progress session startup.
 #[derive(Clone)]
 pub(crate) struct StartupCancellation {
-    sender: watch::Sender<bool>,
+    token: CancellationToken,
 }
 
 impl StartupCancellation {
     pub(crate) fn new() -> Self {
-        let (sender, _) = watch::channel(false);
-        Self { sender }
+        Self { token: CancellationToken::new() }
     }
 
     pub(crate) fn cancel(&self) {
-        self.sender.send_replace(true);
+        self.token.cancel();
     }
 
     fn is_cancelled(&self) -> bool {
-        *self.sender.borrow()
+        self.token.is_cancelled()
     }
 
     async fn cancelled(&self) {
-        let mut receiver = self.sender.subscribe();
-        while !*receiver.borrow_and_update() {
-            receiver.changed().await.expect("startup-cancellation sender remains owned by the session");
-        }
+        self.token.cancelled().await;
+    }
+
+    fn token(&self) -> CancellationToken {
+        self.token.clone()
     }
 }
 
@@ -123,11 +117,12 @@ pub(crate) trait PreparationDb: Send + Sync + 'static {
     /// Loads fresh local processing state for one recovery-session attempt.
     fn load_session_state(&self) -> impl Future<Output = Result<StoredSessionState, ProcessingDbError>> + Send;
 
-    /// Atomically replaces all processing data with one validated pruning-point anchor.
+    /// Replaces processing data while forwarding startup cancellation to the database generation.
     fn rebuild_from_pruning_point(
         &self,
         pruning_point: ValidatedNodeBlock,
-    ) -> impl Future<Output = Result<MaterializedSyncAnchor, RebuildFromPruningPointError>> + Send;
+        cancellation: CancellationToken,
+    ) -> impl Future<Output = Result<RebuildFromPruningPointOutcome, RebuildFromPruningPointError>> + Send;
 }
 
 impl PreparationDb for ValidatedDbClient {
@@ -138,8 +133,9 @@ impl PreparationDb for ValidatedDbClient {
     async fn rebuild_from_pruning_point(
         &self,
         pruning_point: ValidatedNodeBlock,
-    ) -> Result<MaterializedSyncAnchor, RebuildFromPruningPointError> {
-        self.rebuild_from_pruning_point(pruning_point).await
+        cancellation: CancellationToken,
+    ) -> Result<RebuildFromPruningPointOutcome, RebuildFromPruningPointError> {
+        self.rebuild_from_pruning_point(pruning_point, cancellation).await
     }
 }
 
@@ -228,28 +224,13 @@ async fn prepare_rebuild<R: PreparationRpc, D: PreparationDb>(
         Err(error) => return PreparationOutcome::Failed(threshold_fault(error)),
     };
 
-    let (result, cancelled) = {
-        let started = AtomicBool::new(false);
-        let rebuild = async {
-            started.store(true, Ordering::Release);
-            db.rebuild_from_pruning_point(pruning_point).await
-        };
-        tokio::pin!(rebuild);
-        tokio::select! {
-            biased;
-            () = cancellation.cancelled() => {
-                if !started.load(Ordering::Acquire) {
-                    return PreparationOutcome::Cancelled;
-                }
-                (rebuild.await, true)
-            },
-            result = &mut rebuild => (result, cancellation.is_cancelled()),
-        }
-    };
-    match result {
+    match db.rebuild_from_pruning_point(pruning_point, cancellation.token()).await {
         Err(error) => PreparationOutcome::Failed(rebuild_fault(error)),
-        Ok(_) if cancelled => PreparationOutcome::Cancelled,
-        Ok(anchor) => PreparationOutcome::Prepared(PreparedSync { rpc, db, anchor, boundary_seal_blue_score: threshold }),
+        Ok(RebuildFromPruningPointOutcome::Cancelled) => PreparationOutcome::Cancelled,
+        Ok(RebuildFromPruningPointOutcome::Rebuilt(_)) if cancellation.is_cancelled() => PreparationOutcome::Cancelled,
+        Ok(RebuildFromPruningPointOutcome::Rebuilt(anchor)) => {
+            PreparationOutcome::Prepared(PreparedSync { rpc, db, anchor, boundary_seal_blue_score: threshold })
+        }
     }
 }
 
@@ -384,7 +365,7 @@ mod tests {
 
     struct MockDb {
         state_result: Mutex<Option<Result<StoredSessionState, ProcessingDbError>>>,
-        rebuild_result: Mutex<Option<Result<MaterializedSyncAnchor, RebuildFromPruningPointError>>>,
+        rebuild_result: Mutex<Option<Result<RebuildFromPruningPointOutcome, RebuildFromPruningPointError>>>,
         rebuild_gate: Option<Gate>,
         load_calls: AtomicUsize,
         rebuild_inputs: Mutex<Vec<ValidatedNodeBlock>>,
@@ -397,7 +378,7 @@ mod tests {
         ) -> Self {
             Self {
                 state_result: Mutex::new(Some(state_result)),
-                rebuild_result: Mutex::new(Some(rebuild_result)),
+                rebuild_result: Mutex::new(Some(rebuild_result.map(RebuildFromPruningPointOutcome::Rebuilt))),
                 rebuild_gate: None,
                 load_calls: AtomicUsize::new(0),
                 rebuild_inputs: Mutex::new(Vec::new()),
@@ -419,7 +400,8 @@ mod tests {
         async fn rebuild_from_pruning_point(
             &self,
             pruning_point: ValidatedNodeBlock,
-        ) -> Result<MaterializedSyncAnchor, RebuildFromPruningPointError> {
+            _cancellation: CancellationToken,
+        ) -> Result<RebuildFromPruningPointOutcome, RebuildFromPruningPointError> {
             self.rebuild_inputs.lock().expect("rebuild-input mutex").push(pruning_point);
             if let Some(gate) = &self.rebuild_gate {
                 gate.wait().await;
@@ -732,5 +714,17 @@ mod tests {
             panic!("typed rebuild failure must survive cancellation");
         };
         assert_eq!(fault.kind, FaultKind::Persistence(PersistenceFault::AmbiguousCommit));
+    }
+
+    #[tokio::test]
+    async fn storage_setup_cancellation_is_the_session_cancelled_outcome() {
+        let rpc = Arc::new(MockRpc::new(Ok(header()), Ok(pruning_point())));
+        let db = Arc::new(MockDb::new(Ok(session_state()), Ok(anchor())));
+        *db.rebuild_result.lock().expect("rebuild-result mutex") = Some(Ok(RebuildFromPruningPointOutcome::Cancelled));
+
+        let outcome = prepare(RecoveryMode::Rebuild, rpc, db.clone(), &StartupCancellation::new()).await;
+
+        assert!(matches!(outcome, PreparationOutcome::Cancelled));
+        assert_eq!(&*db.rebuild_inputs.lock().expect("rebuild-input mutex"), &[pruning_point()]);
     }
 }
