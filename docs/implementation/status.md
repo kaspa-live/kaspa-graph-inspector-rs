@@ -544,3 +544,13 @@ control remains deferred. Completion validation passed workspace formatting,
 Cargo check, 656/656 Nextest tests including Docker PostgreSQL integration and
 real loopback transport coverage, Cargo doctests, Clippy with warnings denied,
 and `git diff --check`.
+
+Implementation increment 21 is active on its dedicated main-based branch. Its
+review unit is the non-reusable ProcessingSession construction and preparation
+boundary: session-owned lifecycle-marker worker, Resync and Rebuild
+preparation, checked seal-threshold construction, common processor
+initialization and launch, the four typed startup outcomes, startup
+cancellation, and consuming actor-tree shutdown. The synchronization pump,
+notification activation, Catchup/Live coordination, and Supervisor remain in
+increments 22 and 23. No increment 21 production behavior has been completed
+or validated yet.
