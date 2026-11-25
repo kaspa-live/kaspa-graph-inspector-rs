@@ -21,7 +21,7 @@ use crate::{
     encoding::{GraphEncodingError, MAX_UNCOMPRESSED_NON_DELTA_GRAPH_RESPONSE_BYTES, scheduler::EncodingSchedulerError},
     publication::{GraphPublication, GraphPublicationState},
     service::{
-        AnchoredWindowError, AnchoredWindowResponse, ApiService, CanonicalDeltaResponse, CanonicalDeltaSuccess,
+        AnchoredWindowError, AnchoredWindowResponse, ApiService, CanonicalDeltaResponse, CanonicalDeltaSuccess, GraphOperationError,
         HeadLevelLookupResponse, HeadSnapshotCondition, HeadSnapshotOutcome, SseConnectionOpenError,
     },
 };
@@ -130,7 +130,7 @@ async fn head_snapshot(State(service): State<Arc<ApiService>>, request: Request<
             add_publication_headers(&mut response, &publication).await;
             response
         }
-        Err(error) => cache_wait_error(error, admitted),
+        Err(error) => graph_operation_error(error, admitted, cache_wait_error).await,
     }
 }
 
@@ -202,7 +202,7 @@ async fn canonical_delta(State(service): State<Arc<ApiService>>, request: Reques
             add_publication_headers(&mut response, &publication).await;
             response
         }
-        Err(error) => cache_wait_error(error, admitted),
+        Err(error) => graph_operation_error(error, admitted, cache_wait_error).await,
     }
 }
 
@@ -237,7 +237,7 @@ async fn head_levels(State(service): State<Arc<ApiService>>, request: Request<Bo
             }
             response
         }
-        Err(error) => encoding_error(error, admitted),
+        Err(error) => graph_operation_error(error, admitted, encoding_error).await,
     }
 }
 
@@ -254,7 +254,9 @@ async fn anchored_window(State(service): State<Arc<ApiService>>, request: Reques
         Err(error) => return admission_error(error, true),
     };
     match service.anchored_window(&admitted, query.anchor, query.max_depth).await {
-        Ok(AnchoredWindowResponse::Unavailable) => unavailable(true, Some(admitted)),
+        Ok(AnchoredWindowResponse::Unavailable { publication }) => {
+            add_optional_publication_headers(unavailable(true, Some(admitted)), publication).await
+        }
         Ok(AnchoredWindowResponse::Head { publication, body }) | Ok(AnchoredWindowResponse::Database { publication, body }) => {
             let mut response = gzip_graph_response(body.into_gzip_body(), "no-store", admitted);
             add_publication_headers(&mut response, &publication).await;
@@ -266,7 +268,7 @@ async fn anchored_window(State(service): State<Arc<ApiService>>, request: Reques
             add_publication_headers(&mut response, &publication).await;
             response
         }
-        Err(error) => anchored_window_error(error, admitted),
+        Err(error) => graph_operation_error(error, admitted, anchored_window_error).await,
     }
 }
 
@@ -296,6 +298,13 @@ async fn add_publication_headers(response: &mut Response<Body>, publication: &Gr
             GraphPublicationState::Stale => "stale",
         },
     );
+}
+
+async fn add_optional_publication_headers(mut response: Response<Body>, publication: Option<Arc<GraphPublication>>) -> Response<Body> {
+    if let Some(publication) = publication {
+        add_publication_headers(&mut response, &publication).await;
+    }
+    response
 }
 
 fn request_has_body(request: &Request<Body>) -> bool {
@@ -333,6 +342,15 @@ fn admission_error(error: ApiRequestAdmissionError, graph: bool) -> Response<Bod
         }
         ApiRequestAdmissionError::Unavailable | ApiRequestAdmissionError::Cancelled => unavailable(graph, None),
     }
+}
+
+async fn graph_operation_error<E>(
+    failure: GraphOperationError<E>,
+    request: ApiRequestGuard,
+    map: impl FnOnce(E, ApiRequestGuard) -> Response<Body>,
+) -> Response<Body> {
+    let (publication, error) = failure.into_parts();
+    add_optional_publication_headers(map(error, request), publication).await
 }
 
 fn cache_wait_error(error: CacheWaitError, request: ApiRequestGuard) -> Response<Body> {
@@ -482,6 +500,7 @@ mod tests {
         NodeServiceStatus, NodeServiceStatusState, ProcessingState, ProcessingStatus, StorageServiceStatus, StorageServiceStatusState,
         SupervisorLifecycle, SupervisorStatus,
     };
+    use kgi_storage::error::ApiReadError;
     use rand::rngs::mock::StepRng;
     use serde_json::Value;
     use tokio::sync::watch;
@@ -490,10 +509,13 @@ mod tests {
     use crate::{
         client::{ClientIdentifier, DeltaCompletionResult, DeltaScheduleAction},
         publication::{GraphPublication, GraphPublicationState},
-        service::ApiService,
+        service::{AnchoredWindowError, ApiService, GraphOperationError},
     };
 
-    use super::{KGI_DELTA_CONTINUATION, KGI_DELTA_OUTCOME, KGI_PUBLICATION_ID, KGI_PUBLICATION_STATE, router};
+    use super::{
+        KGI_DELTA_CONTINUATION, KGI_DELTA_OUTCOME, KGI_PUBLICATION_ID, KGI_PUBLICATION_STATE, anchored_window_error,
+        graph_operation_error, router,
+    };
 
     fn service() -> Arc<ApiService> {
         let (_, supervisor) = watch::channel(SupervisorStatus {
@@ -746,6 +768,39 @@ mod tests {
             .expect("missing level routed");
         assert_eq!(missing_level.status(), StatusCode::NOT_FOUND);
         assert_eq!(json_body(missing_level).await["details"]["requested_level"], 3);
+    }
+
+    #[tokio::test]
+    async fn post_selection_failures_retain_the_exact_publication_headers() {
+        let service = service();
+        let selected = publication();
+        let selected_id = selected.publication_id();
+        service.install_test_publication(selected.clone());
+        service.fail_encoding_for_test();
+        let application = router().with_state(service.clone());
+
+        for uri in [
+            "/graph/head?target_depth=20".to_owned(),
+            format!("/graph/levels?publication_id={selected_id}&level=1"),
+            "/graph/window?max_depth=1&level=1".to_owned(),
+        ] {
+            let response = application.clone().oneshot(request(&uri)).await.expect("post-selection failure is mapped");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[KGI_PUBLICATION_ID], selected_id.to_string());
+            assert_eq!(response.headers()[KGI_PUBLICATION_STATE], "synchronizing");
+        }
+
+        let replacement = publication();
+        assert_ne!(replacement.publication_id(), selected_id);
+        service.install_test_publication(replacement);
+        for error in [AnchoredWindowError::Database(ApiReadError::QueryFailed), AnchoredWindowError::DatabaseTimeout] {
+            let admitted = service.admit_head_request().expect("Head request admission remains available");
+            let failure = GraphOperationError::after_selection(selected.clone(), error);
+            let response = graph_operation_error(failure, admitted, anchored_window_error).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(response.headers()[KGI_PUBLICATION_ID], selected_id.to_string());
+            assert_eq!(response.headers()[KGI_PUBLICATION_STATE], "synchronizing");
+        }
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 use std::{
-    fmt::Display,
+    fmt::{Debug, Display, Formatter},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -50,7 +50,10 @@ pub(crate) const API_DB_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Logical result of one complete anchored-window operation.
 pub(crate) enum AnchoredWindowResponse {
     /// No coherent current publication or public database generation was available.
-    Unavailable,
+    Unavailable {
+        /// Exact publication retained when database availability failed after selection.
+        publication: Option<Arc<GraphPublication>>,
+    },
     /// One immutable Head supplied the complete encoded window.
     Head {
         /// Exact publication retained through response delivery.
@@ -192,6 +195,38 @@ impl HeadRequestContext for CancellationToken {
     }
 
     fn assert_head_lane(&self) {}
+}
+
+/// Failure of one DAG operation with its exact publication context, when selection completed.
+pub(crate) struct GraphOperationError<E> {
+    publication: Option<Arc<GraphPublication>>,
+    error: E,
+}
+
+impl<E> GraphOperationError<E> {
+    fn before_selection(error: E) -> Self {
+        Self { publication: None, error }
+    }
+
+    /// Retains the exact publication selected before this failure occurred.
+    pub(crate) fn after_selection(publication: Arc<GraphPublication>, error: E) -> Self {
+        Self { publication: Some(publication), error }
+    }
+
+    /// Separates the retained publication context from the operation failure.
+    pub(crate) fn into_parts(self) -> (Option<Arc<GraphPublication>>, E) {
+        (self.publication, self.error)
+    }
+}
+
+impl<E: Debug> Debug for GraphOperationError<E> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GraphOperationError")
+            .field("publication_id", &self.publication.as_ref().map(|publication| publication.publication_id()))
+            .field("error", &self.error)
+            .finish()
+    }
 }
 
 /// Parsed conditional state for one logical Head snapshot operation.
@@ -728,24 +763,33 @@ impl ApiService {
         request: &ApiRequestGuard,
         anchor: GraphWindowAnchor,
         max_depth: u32,
-    ) -> Result<AnchoredWindowResponse, AnchoredWindowError> {
+    ) -> Result<AnchoredWindowResponse, GraphOperationError<AnchoredWindowError>> {
         assert_eq!(request.lane(), Some(ApiRequestLane::Head), "anchored-window selection begins in the Head lane");
         if request.cancellation().is_cancelled() {
-            return Err(AnchoredWindowError::Cancelled);
+            return Err(GraphOperationError::before_selection(AnchoredWindowError::Cancelled));
         }
         let Some(publication) = self.current_publication() else {
-            return Ok(AnchoredWindowResponse::Unavailable);
+            return Ok(AnchoredWindowResponse::Unavailable { publication: None });
         };
 
         match publication.select_anchored_window(anchor, max_depth).await {
             HeadWindowSelection::Complete { capture, resolution, head_high_level } => {
                 let response = GraphWindowResponseDto::from_head(&capture, head_high_level, resolution);
-                let body = self.encoding.scheduler.encode_priority(response, request.cancellation()).await?;
+                let body = self
+                    .encoding
+                    .scheduler
+                    .encode_priority(response, request.cancellation())
+                    .await
+                    .map_err(|error| GraphOperationError::after_selection(publication.clone(), error.into()))?;
                 Ok(AnchoredWindowResponse::Head { publication, body })
             }
             HeadWindowSelection::RequiresDatabase => {
-                self.request_admissions.handoff_to_historical(request)?;
-                self.database_anchored_window(request, publication, anchor, max_depth).await
+                self.request_admissions
+                    .handoff_to_historical(request)
+                    .map_err(|error| GraphOperationError::after_selection(publication.clone(), error.into()))?;
+                self.database_anchored_window(request, publication.clone(), anchor, max_depth)
+                    .await
+                    .map_err(|error| GraphOperationError::after_selection(publication, error))
             }
         }
     }
@@ -762,10 +806,12 @@ impl ApiService {
         let database_permit = match self.public_historical_reads.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(tokio::sync::TryAcquireError::NoPermits) => return Err(AnchoredWindowError::DatabaseAdmissionSaturated),
-            Err(tokio::sync::TryAcquireError::Closed) => return Ok(AnchoredWindowResponse::Unavailable),
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Ok(AnchoredWindowResponse::Unavailable { publication: Some(publication) });
+            }
         };
         let Some(client) = self.api_db.public_read_client() else {
-            return Ok(AnchoredWindowResponse::Unavailable);
+            return Ok(AnchoredWindowResponse::Unavailable { publication: Some(publication) });
         };
 
         let cleanup_owner = request.cleanup_owner();
@@ -802,11 +848,11 @@ impl ApiService {
         from_revision_id: u64,
         client: Option<ClientIdentifier>,
         request: R,
-    ) -> Result<CanonicalDeltaResponse, CacheWaitError> {
+    ) -> Result<CanonicalDeltaResponse, GraphOperationError<CacheWaitError>> {
         request.assert_head_lane();
         let cancellation = request.head_cancellation();
         if cancellation.is_cancelled() {
-            return Err(CacheWaitError::Cancelled);
+            return Err(GraphOperationError::before_selection(CacheWaitError::Cancelled));
         }
         let Some(publication) = self.current_publication() else {
             return Ok(CanonicalDeltaResponse::FreshViewRequired { publication: None, reason: FreshViewReason::PublicationMismatch });
@@ -880,7 +926,7 @@ impl ApiService {
                         reason: FreshViewReason::DeltaReplayBarrier,
                     });
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(GraphOperationError::after_selection(publication, error)),
             };
             if candidate.is_adequate_for(requested_target) {
                 return Ok(self.complete_cached_delta(publication, requested_target, candidate, client, active_interval).await);
@@ -988,7 +1034,7 @@ impl ApiService {
         target_depth: u32,
         condition: &HeadSnapshotCondition,
         request: R,
-    ) -> Result<HeadSnapshotOutcome, CacheWaitError> {
+    ) -> Result<HeadSnapshotOutcome, GraphOperationError<CacheWaitError>> {
         request.assert_head_lane();
         let cancellation = request.head_cancellation();
         let depth = selected_head_depth(target_depth);
@@ -998,7 +1044,7 @@ impl ApiService {
 
         loop {
             if cancellation.is_cancelled() {
-                return Err(CacheWaitError::Cancelled);
+                return Err(GraphOperationError::after_selection(publication, CacheWaitError::Cancelled));
             }
             let access =
                 match publication.head_tier(&self.cache_jobs, &self.encoding.scheduler, depth, |etag| condition.matches(etag)).await {
@@ -1010,7 +1056,7 @@ impl ApiService {
             let candidate = match access.resolve(cancellation.clone()).await {
                 Ok(candidate) => candidate,
                 Err(CacheWaitError::InvalidatedByReplayFloor { .. }) => continue,
-                Err(error) => return Err(error),
+                Err(error) => return Err(GraphOperationError::after_selection(publication, error)),
             };
             let candidate = match publication.admit_cached_head_replay_floor(candidate).await {
                 ReplayFloorAdmission::Admitted(candidate) => candidate,
@@ -1029,11 +1075,11 @@ impl ApiService {
         requested_publication_id: u64,
         requested_levels: &[u32],
         request: R,
-    ) -> Result<HeadLevelLookupResponse, EncodingSchedulerError> {
+    ) -> Result<HeadLevelLookupResponse, GraphOperationError<EncodingSchedulerError>> {
         request.assert_head_lane();
         let cancellation = request.head_cancellation();
         if cancellation.is_cancelled() {
-            return Err(EncodingSchedulerError::Cancelled);
+            return Err(GraphOperationError::before_selection(EncodingSchedulerError::Cancelled));
         }
         let Some(publication) = self.current_publication() else {
             return Ok(HeadLevelLookupResponse::FreshViewRequired { publication: None, reason: FreshViewReason::PublicationMismatch });
@@ -1055,7 +1101,12 @@ impl ApiService {
             }
         };
         let response = HeadLevelLookupResponseDto::from_complete(publication_id, revision, &levels);
-        let body = self.encoding.scheduler.encode_priority(response, cancellation).await?;
+        let body = self
+            .encoding
+            .scheduler
+            .encode_priority(response, cancellation)
+            .await
+            .map_err(|error| GraphOperationError::after_selection(publication.clone(), error))?;
         Ok(HeadLevelLookupResponse::Complete { publication, body })
     }
 
@@ -1067,6 +1118,11 @@ impl ApiService {
     #[cfg(test)]
     pub(crate) fn install_test_publication(&self, publication: Arc<GraphPublication>) {
         self.current_publication.send_replace(Some(publication));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_encoding_for_test(&self) {
+        self.encoding.scheduler.fail_worker();
     }
 }
 
@@ -1179,8 +1235,9 @@ mod tests {
 
     use super::{
         AnchoredWindowResponse, ApiDbGenerationMessage, ApiRuntimeSlot, ApiService, ApiServiceEvent, ApiStatusInputs,
-        CanonicalDeltaResponse, CanonicalDeltaSuccess, FreshViewReason, HeadLevelLookupResponse, HeadSnapshotCondition,
-        HeadSnapshotOutcome, OwnedPublicationRuntime, PublicationInstallState, RuntimePublicationInstaller, selected_head_depth,
+        CanonicalDeltaResponse, CanonicalDeltaSuccess, FreshViewReason, GraphOperationError, HeadLevelLookupResponse,
+        HeadSnapshotCondition, HeadSnapshotOutcome, OwnedPublicationRuntime, PublicationInstallState, RuntimePublicationInstaller,
+        selected_head_depth,
     };
     use crate::{
         api_db::{ApiDbGeneration, ApiDbGenerationUpdate, ApiDbState},
@@ -1752,7 +1809,7 @@ mod tests {
             GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), head, GraphHistory::new())
                 .expect("coherent publication"),
         );
-        service.current_publication.send_replace(Some(publication));
+        service.current_publication.send_replace(Some(publication.clone()));
         let database_permits: Vec<_> = (0..super::MAX_PUBLIC_HISTORICAL_DB_READS)
             .map(|_| service.public_historical_reads.clone().try_acquire_owned().expect("database-read permit"))
             .collect();
@@ -1760,7 +1817,10 @@ mod tests {
         let fallback = service.admit_head_request().expect("fallback Head admission");
         assert!(matches!(
             service.anchored_window(&fallback, GraphWindowAnchor::Level(1), 1).await,
-            Err(super::AnchoredWindowError::DatabaseAdmissionSaturated)
+            Err(GraphOperationError {
+                publication: Some(retained),
+                error: super::AnchoredWindowError::DatabaseAdmissionSaturated,
+            }) if Arc::ptr_eq(&retained, &publication)
         ));
         let head_request = service.admit_head_request().expect("unrelated Head request remains admissible");
         assert!(matches!(
@@ -1894,14 +1954,18 @@ mod tests {
         let (mut service, _events) = service();
         Arc::get_mut(&mut service).expect("the fixture owns the only service Arc").database_query_timeout = Duration::from_secs(2);
         service.update_api_db_generation(ApiDbGenerationMessage::Published(api)).await.expect("API generation is bound");
-        service.current_publication.send_replace(Some(database_fallback_publication()));
+        let publication = database_fallback_publication();
+        service.current_publication.send_replace(Some(publication.clone()));
         let request = service.admit_head_request().expect("Head admission");
         let request_service = service.clone();
         let operation = tokio::spawn(async move { request_service.anchored_window(&request, GraphWindowAnchor::Level(1), 1).await });
         wait_for_blocked_database_lock(&lock_pool).await;
         assert!(matches!(
             timeout(TEST_TIMEOUT, operation).await.expect("request reaches its database deadline").expect("request task joins"),
-            Err(super::AnchoredWindowError::DatabaseTimeout)
+            Err(GraphOperationError {
+                publication: Some(retained),
+                error: super::AnchoredWindowError::DatabaseTimeout,
+            }) if Arc::ptr_eq(&retained, &publication)
         ));
         assert_eq!(service.public_historical_reads.available_permits(), super::MAX_PUBLIC_HISTORICAL_DB_READS);
         assert!(!has_blocked_database_lock(&lock_pool).await);
@@ -2475,11 +2539,14 @@ mod tests {
 
         assert!(matches!(
             service.head_snapshot(1, &HeadSnapshotCondition::Unconditional, cancelled.clone()).await,
-            Err(CacheWaitError::Cancelled)
+            Err(GraphOperationError {
+                publication: Some(retained),
+                error: CacheWaitError::Cancelled,
+            }) if Arc::ptr_eq(&retained, &publication)
         ));
         assert!(matches!(
             service.head_levels(publication.publication_id(), &[1], cancelled).await,
-            Err(EncodingSchedulerError::Cancelled)
+            Err(GraphOperationError { publication: None, error: EncodingSchedulerError::Cancelled })
         ));
         assert!(matches!(
             publication.cache().lookup_head(20, HeadEligibilityBoundary::new(0, 0, 0)),
@@ -2489,11 +2556,17 @@ mod tests {
         service.encoding.scheduler.fail_worker();
         assert!(matches!(
             service.head_levels(publication.publication_id(), &[1], CancellationToken::new()).await,
-            Err(EncodingSchedulerError::ShuttingDown)
+            Err(GraphOperationError {
+                publication: Some(retained),
+                error: EncodingSchedulerError::ShuttingDown,
+            }) if Arc::ptr_eq(&retained, &publication)
         ));
         assert!(matches!(
             service.head_snapshot(1, &HeadSnapshotCondition::Unconditional, CancellationToken::new()).await,
-            Err(CacheWaitError::Build(CacheBuildError::Encoding(EncodingSchedulerError::ShuttingDown)))
+            Err(GraphOperationError {
+                publication: Some(retained),
+                error: CacheWaitError::Build(CacheBuildError::Encoding(EncodingSchedulerError::ShuttingDown)),
+            }) if Arc::ptr_eq(&retained, &publication)
         ));
         assert!(service.shutdown().await.is_err());
     }
