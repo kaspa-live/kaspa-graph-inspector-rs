@@ -1401,6 +1401,10 @@ delivery. The outer trace layer must preserve every response and streaming
 behavior. Verify graph bodies are compressed exactly once, SSE remains open
 beyond the ordinary graph-delivery timeout, and API lane saturation remains
 ApiService-owned rather than becoming router-wide backpressure.
+Assert that the production server enables HTTP/1.1 only, rejects HTTP/2 and
+prior-knowledge `h2c`, and installs the `kgi-api-core` connection adapter around
+every accepted socket before serving the completed application. A test-only
+listener may exercise this adapter before production listener composition.
 
 Verify graph-value serialization uses zero-based response-local `u32` hash
 references and a first-encounter dictionary built from the serializer's actual
@@ -2214,10 +2218,11 @@ direct update call after ApiDbState becomes `Stopped` is rejected. Admission
 closes first. Runtime shutdown performs its ordinary terminal `Stale`
 transition and allows that mandatory state message to enter every currently
 registered client's normal ordered bounded SSE path before connections are
-cancelled. Shutdown does not await network delivery; a full client buffer
-invokes the ordinary slow-client disconnection rule. Verify API request guards
-remain held through complete body delivery, failure, disconnect, timeout, or
-cancellation; cancellation before response commitment returns the applicable
+cancelled. Shutdown does not await successful network delivery; a full client
+buffer invokes the ordinary slow-client disconnection rule. Verify API request
+guards remain held through connection-observed successful delivery, failure,
+disconnect, timeout, or cancellation; end-of-body alone releases none of
+them. Cancellation before response commitment returns the applicable
 unavailable outcome when possible, while cancellation after commitment
 terminates delivery without a second response. The graph receiver drop
 unblocks a waiting marker worker. Closing and cancelling the cache task tracker
@@ -2383,11 +2388,24 @@ At every focused-owner admission boundary, exercise the final accepted request
 and the next rejected request independently for Head, historical, status, and
 SSE work. Fill an SSE delivery buffer with coalescible graph wakeups, then with
 required ordered messages, and verify coalescing or disconnect respectively.
-An HTTP graph delivery exceeding its owner-defined duration closes after
-commitment and releases admission and any request-owned body. A delivery from
-`GraphCache` must share the cached immutable `Bytes` allocation rather than
-copying the body per waiter; cancelling or timing out one waiter does not
-release the cache-owned allocation.
+Use a real loopback HTTP/1.1 connection and a near-limit graph body whose peer
+stops reading after response commitment. Prove that handing the final body
+frame to Hyper does not release the request guard, the connection-level
+deadline remains observable while socket flush is backpressured, expiry aborts
+the actual connection, and the exact lane permit and request-owned body are
+released. Hold that delivery across terminal shutdown and prove the abort
+unblocks `ApiService::shutdown()`. Also cover successful final flush, peer
+disconnect, write failure, cancellation, and a header-only admitted response;
+each registration completes exactly once and no post-commit path attempts a
+second response. A delivery from `GraphCache` must share the cached immutable
+`Bytes` allocation rather than copying the body per waiter; cancelling or
+timing out one waiter does not release the cache-owned allocation.
+
+On a real backpressured SSE connection, fill the bounded mailbox until the
+ordinary slow-client rule or terminal cancellation fires while Hyper is not
+polling the body. Prove that the connection observer closes the socket,
+removes the exact current registration, releases the SSE guard, and permits
+shutdown to complete without applying the graph-response delivery deadline.
 
 Exercise the
 [anchored-window lane handoff](api-service.md#resource-isolation-and-saturation--settled)

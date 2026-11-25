@@ -1311,15 +1311,24 @@ requests from entering graph, database, cache, or encoding work.
 
 ### Response delivery ownership
 
-Wrap every admitted ordinary response body in a private `http_body::Body`
-implementation that owns the existing `ApiRequestGuard`, request-cancellation
-future, and graph-delivery timer. It releases admission and completion only
-when the body reaches terminal polling, is cancelled, times out, or is dropped.
-Bodyless admitted responses use the same wrapper so header-only delivery does
-not bypass request accounting. Cached and request-local graph bytes enter this
-wrapper in their existing final gzip representation; errors and status remain
+Use a reusable `kgi-api-core` HTTP/1.1 connection adapter for the settled
+socket-boundary delivery contract. A private response body reports body
+completion or failure to a connection-local delivery registration; it does
+not own or release `ApiRequestGuard` at end-of-body. The registration owns the
+guard, request-cancellation observation, and optional graph-delivery deadline
+until the connection driver observes the final flush or terminates the socket.
+Bodyless admitted responses use the same registration so header-only delivery
+does not bypass request accounting. Cached and request-local graph bytes enter
+the body in their existing final gzip representation; errors and status remain
 ordinary uncompressed JSON. No router-wide timeout, compression, concurrency,
 or catch-panic layer is added.
+
+The initial body-local `GuardedBody` timer is insufficient because Hyper may
+buffer its single frame and stop polling the body while the connection is
+blocked in socket flush. Replace that implementation rather than treating
+terminal body polling as delivery completion. Increment 20 supplies and tests
+the adapter over test-only loopback sockets; increment 25 binds the production
+listener and installs the same adapter around the composed application.
 
 For oversized non-delta encoding, keep serializing into a counting sink after
 the retained JSON buffer reaches its hard bound. This records the complete
