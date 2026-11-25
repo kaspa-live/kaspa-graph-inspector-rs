@@ -1312,23 +1312,37 @@ requests from entering graph, database, cache, or encoding work.
 ### Response delivery ownership
 
 Use a reusable `kgi-api-core` HTTP/1.1 connection adapter for the settled
-socket-boundary delivery contract. A private response body reports body
-completion or failure to a connection-local delivery registration; it does
-not own or release `ApiRequestGuard` at end-of-body. The registration owns the
-guard, request-cancellation observation, and optional graph-delivery deadline
-until the connection driver observes the final flush or terminates the socket.
-Bodyless admitted responses use the same registration so header-only delivery
-does not bypass request accounting. Cached and request-local graph bytes enter
-the body in their existing final gzip representation; errors and status remain
-ordinary uncompressed JSON. No router-wide timeout, compression, concurrency,
-or catch-panic layer is added.
+socket-boundary delivery contract. The router places each admitted request
+guard, its cancellation observation, and its optional graph-delivery deadline
+in a private response extension. The adapter removes that extension before
+giving the response to Hyper and transfers it into a connection-local tracked
+delivery task. SSE responses carry their connection cancellation token through
+the same extension boundary but no graph-delivery deadline.
 
-The initial body-local `GuardedBody` timer is insufficient because Hyper may
-buffer its single frame and stop polling the body while the connection is
-blocked in socket flush. Replace that implementation rather than treating
-terminal body polling as delivery completion. Increment 20 supplies and tests
-the adapter over test-only loopback sockets; increment 25 binds the production
-listener and installs the same adapter around the composed application.
+Serialize response production per HTTP/1.1 connection. This gives the adapter
+one unambiguous active response while retaining ordinary cross-connection
+concurrency. The body wrapper reports exact-size completion but never releases
+admission. The socket wrapper locates the encoded header boundary, counts body
+bytes actually accepted by the socket across scalar and vectored writes, and
+requires a later successful flush before resolving delivery. Header-only and
+`HEAD` responses use an expected body length of zero. Unknown-length stream
+termination closes the connection rather than manufacturing a successful
+flush boundary.
+
+Cancellation, delivery expiry, body failure, peer disconnect, and socket write
+or flush failure signal the connection driver. It drops the Hyper connection
+before resolving every affected registration as failed. The adapter owns and
+joins its delivery tasks on ordinary completion; an RAII connection lifetime
+also resolves them if its serving future is abandoned. Cached and request-
+local graph bytes retain their existing final gzip representation, while
+errors and status remain ordinary uncompressed JSON. No router-wide timeout,
+compression, concurrency, or catch-panic layer is added.
+
+The former body-local `GuardedBody` timer was insufficient because Hyper could
+buffer its single frame and stop polling the body while socket flush was
+blocked. Increment 20 replaces it and verifies the adapter over test-only
+loopback sockets. Increment 25 binds the production listener and installs this
+same adapter around the composed application.
 
 For oversized non-delta encoding, keep serializing into a counting sink after
 the retained JSON buffer reaches its hard bound. This records the complete

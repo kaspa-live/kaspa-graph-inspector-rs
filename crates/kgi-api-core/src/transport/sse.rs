@@ -16,6 +16,7 @@ use crate::{
 
 /// Frames one admitted connection's semantic messages as an SSE response.
 pub(super) fn response(mut connection: SseConnection) -> Response<Body> {
+    let cancellation = connection.cancellation();
     let messages = stream! {
         while let Some(message) = connection.next_message().await {
             match frame(message) {
@@ -29,6 +30,7 @@ pub(super) fn response(mut connection: SseConnection) -> Response<Body> {
     };
     let mut response = Sse::new(messages).into_response();
     response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().expect("static cache policy is valid"));
+    super::connection::track_sse(&mut response, cancellation);
     response
 }
 

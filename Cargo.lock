@@ -2936,6 +2936,8 @@ dependencies = [
  "bytes",
  "flate2",
  "http-body",
+ "hyper",
+ "hyper-util",
  "kaspa-consensus-core",
  "kgi-api-ingress",
  "kgi-api-model",

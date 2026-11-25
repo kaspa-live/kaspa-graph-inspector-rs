@@ -19,6 +19,8 @@ kgi-model = { path = "../kgi-model" }
 kgi-storage = { path = "../kgi-storage" }
 log.workspace = true
 http-body.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 percent-encoding.workspace = true
 pin-project-lite.workspace = true
 rand.workspace = true
@@ -26,8 +28,9 @@ serde.workspace = true
 serde_json.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util", "net"] }
 tokio-util.workspace = true
+tower.workspace = true
 
 [lints]
 workspace = true
@@ -36,5 +39,4 @@ workspace = true
 async-trait.workspace = true
 sqlx.workspace = true
 testcontainers-modules.workspace = true
-tower.workspace = true
 url.workspace = true

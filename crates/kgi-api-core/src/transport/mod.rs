@@ -1,4 +1,4 @@
-mod body;
+pub(super) mod connection;
 mod query;
 mod sse;
 
@@ -26,11 +26,8 @@ use crate::{
     },
 };
 
-use self::{
-    body::GuardedBody,
-    query::{
-        AnchoredWindowQuery, CanonicalDeltaQuery, EmptyQuery, HeadLevelsQuery, HeadSnapshotQuery, PublicationWakeupQuery, accepts_gzip,
-    },
+use self::query::{
+    AnchoredWindowQuery, CanonicalDeltaQuery, EmptyQuery, HeadLevelsQuery, HeadSnapshotQuery, PublicationWakeupQuery, accepts_gzip,
 };
 
 const KGI_PUBLICATION_ID: HeaderName = HeaderName::from_static("kgi-publication-id");
@@ -421,11 +418,10 @@ fn response(
     gzip: bool,
     request: Option<ApiRequestGuard>,
 ) -> Response<Body> {
-    let body = match request {
-        Some(request) => Body::new(GuardedBody::new(bytes, request, gzip)),
-        None => Body::from(bytes),
-    };
-    let mut response = Response::new(body);
+    let mut response = Response::new(Body::from(bytes));
+    if let Some(request) = request {
+        connection::track_request(&mut response, request, gzip);
+    }
     *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache_control));

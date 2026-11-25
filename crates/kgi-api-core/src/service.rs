@@ -125,6 +125,11 @@ pub(crate) struct SseConnection {
 }
 
 impl SseConnection {
+    /// Returns this connection's private transport-cancellation token.
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
     /// Receives the next ordered semantic message, following publication replacement.
     pub(crate) async fn next_message(&mut self) -> Option<SseMessage> {
         loop {

@@ -41,6 +41,8 @@ kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v
 log = "0.4.20"
 moka = { version = "0.12.16", default-features = false, features = ["sync"] }
 http-body = "1.1.0"
+hyper = { version = "1.11.1", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["service", "tokio"] }
 percent-encoding = "2.3.2"
 pin-project-lite = "0.2.17"
 rand = { version = "0.8.5", features = ["small_rng"] }

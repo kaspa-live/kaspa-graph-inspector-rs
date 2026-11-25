@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use service::ApiService;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Builds the public API router awaiting its application state.
 ///
@@ -26,4 +27,15 @@ use service::ApiService;
 /// shared [`ApiService`] exactly once after composing the complete HTTP tree.
 pub fn router() -> Router<Arc<ApiService>> {
     transport::router()
+}
+
+/// Serves one accepted socket through KGI's HTTP/1.1 delivery boundary.
+///
+/// The supplied application must be the completed router, including the API
+/// router state and any outer static-file and tracing composition.
+pub async fn serve_http1_connection<I>(io: I, application: Router) -> Result<(), hyper::Error>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    transport::connection::serve(io, application).await
 }
