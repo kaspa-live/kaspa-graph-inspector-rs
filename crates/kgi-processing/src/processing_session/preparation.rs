@@ -40,17 +40,17 @@ pub(super) enum PreparationOutcome<R: PreparationRpc, D: PreparationDb> {
 
 /// Cloneable request to stop one in-progress session startup.
 #[derive(Clone)]
-pub(super) struct StartupCancellation {
+pub(crate) struct StartupCancellation {
     sender: watch::Sender<bool>,
 }
 
 impl StartupCancellation {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (sender, _) = watch::channel(false);
         Self { sender }
     }
 
-    pub(super) fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.sender.send_replace(true);
     }
 
@@ -86,7 +86,7 @@ fn construct_boundary_seal_blue_score(
 }
 
 /// Node-generation capabilities consumed by session preparation.
-pub(super) trait PreparationRpc: Send + Sync + 'static {
+pub(crate) trait PreparationRpc: Send + Sync + 'static {
     /// Returns the immutable validation result for this generation.
     fn genesis_hash(&self) -> BlockHash;
 
@@ -119,7 +119,7 @@ impl PreparationRpc for ValidatedRpcClient {
 }
 
 /// Database-generation capabilities consumed by session preparation.
-pub(super) trait PreparationDb: Send + Sync + 'static {
+pub(crate) trait PreparationDb: Send + Sync + 'static {
     /// Loads fresh local processing state for one recovery-session attempt.
     fn load_session_state(&self) -> impl Future<Output = Result<StoredSessionState, ProcessingDbError>> + Send;
 

@@ -8,7 +8,7 @@ pub(crate) const PROCESSING_DATA_CHANNEL_CAPACITY: usize = 1024;
 mod block_processor;
 mod fault;
 
-#[allow(dead_code, reason = "implemented incrementally with ProcessingSession")]
+#[allow(dead_code, reason = "consumed by the upcoming Supervisor integration point")]
 mod processing_session;
 
 #[allow(dead_code, reason = "integrated by the upcoming ProcessingSession point")]

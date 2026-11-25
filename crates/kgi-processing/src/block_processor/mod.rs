@@ -1,7 +1,7 @@
 use std::future::Future;
 
 use kaspa_consensus_core::network::NetworkId;
-use kgi_model::block::{BlockHash, BlockPresence, MaterializedSyncAnchor, ValidatedNodeBlock};
+use kgi_model::block::{BlockHash, BlockPresence, ValidatedNodeBlock};
 use kgi_node::error::NodeError;
 use kgi_node::rpc::ValidatedRpcClient;
 use kgi_storage::{
@@ -15,6 +15,7 @@ mod error;
 mod orphan;
 mod processor;
 
+pub(crate) use dependency::DependencyRpc;
 #[allow(unused_imports, reason = "consumed by the upcoming ProcessingSession integration point")]
 pub(crate) use processor::{
     BlockOverlap, BlockProcessor, BlockProcessorControlError, BlockProcessorEvent, BlockProcessorMetricsSnapshot, BlockSubmissionError,
@@ -24,11 +25,6 @@ pub(crate) use processor::{
 pub(crate) enum BlockResolutionEvent {
     OrphanReady(ValidatedNodeBlock),
     DependencyResolved { requested_hash: BlockHash, result: Result<ValidatedNodeBlock, NodeError> },
-}
-
-pub(crate) struct BlockProcessorInitialization {
-    pub anchor: MaterializedSyncAnchor,
-    pub boundary_seal_blue_score: u64,
 }
 
 pub(crate) trait BlockDatabase: Send + Sync + 'static {
@@ -67,7 +63,7 @@ impl BlockDatabase for ValidatedDbClient {
     }
 }
 
-pub(crate) trait BlockRpc: dependency::DependencyRpc {
+pub(crate) trait BlockRpc: DependencyRpc {
     fn network_id(&self) -> NetworkId;
 
     fn genesis_hash(&self) -> BlockHash;
