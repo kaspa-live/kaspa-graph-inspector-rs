@@ -1367,3 +1367,52 @@ drop closes the mailbox, removes the exact current registration, and releases
 the admission guard. The stream has no graph-response delivery timer; slow-
 client termination comes from bounded mailbox admission and the connection's
 private cancellation token.
+
+## 25 November 2026: ProcessingSession construction and preparation
+
+### Module and deterministic-operation boundaries
+
+Keep the session owner and its preparation logic in a private
+`processing_session` module. Keep the recovered lifecycle-marker worker as a
+private child of that module rather than restoring its superseded
+BlockProcessor ownership. The crate root exposes only the session-facing types
+needed by the later composition crate.
+
+Use private statically dispatched RPC and database operation adapters for
+deterministic preparation tests. Their production implementations delegate to
+the exact `ValidatedRpcClient` and `ValidatedDbClient`; they add no boxed
+future, public mock surface, alternate retry path, or passive resource
+container. Reuse the processor adapters already established for their focused
+tests instead of adding a repository-wide mocking framework.
+
+### Startup cancellation and actor-tree ownership
+
+Represent startup cancellation with one cloneable, session-local signal that
+Supervisor can capture before polling the borrowing startup future. Signalling
+it is idempotent and carries no recovery semantics. ProcessingSession retains
+the receiving side and passes a cancellation capability into Storage's Rebuild
+operation. It continuously awaits that one typed operation: Storage owns setup
+cancellation and the transition to non-droppable transaction completion.
+ProcessingSession uses no first-poll flag or local transaction-start proxy.
+The signal is an implementation capability, not another session lifecycle
+operation.
+
+Store inert processor values, child event receivers, marker state, and later
+launched join ownership inside one non-reusable session value. Do not create a
+separate `ProcessingResources` aggregate. Preparation-only tests instantiate
+the same owner with static test adapters; production keeps the concrete
+validated generation types and direct `Arc` retention required by the focused
+owner.
+
+### Preparation and launch organization
+
+Keep checked threshold construction and the two mode-specific preparation
+paths as small session-owned operations returning one common prepared value.
+Centralize translation from existing typed node, storage, processor-control,
+and marker-control results into startup outcomes at the session boundary; do
+not inspect diagnostic strings or duplicate the component fault-policy table.
+
+Launch uses the already implemented processor `initialize`, `start`, and
+consuming `shutdown` surfaces. Retain final-launch progress in the session so
+an interrupted or failed startup can consume whichever children actually
+started without inventing a rollback command or reusable actor phase.

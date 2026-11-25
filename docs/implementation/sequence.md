@@ -87,8 +87,8 @@ do not enlarge the PR silently. Any future regrouping requires updating this
 sequence first.
 
 The former broad Step 6 is now increments 6–20, former Step 7 is increments
-21–25, and former Step 8 is increments 26–30. Increments 6–19 are complete;
-the active production work is increment 20, without an additional nesting
+21–25, and former Step 8 is increments 26–30. Increments 6–20 are complete;
+the active production work is increment 21, without an additional nesting
 level.
 
 | Increment / PR | Isolated production scope | Completion evidence |
@@ -108,7 +108,7 @@ level.
 | 18. Canonical delta operation | Implement the complete logical canonical-delta operation: dyadic target selection, atomic-history budgeting, five-minute source-age policy, source-job joining and enlargement, soft-estimate descent, cached batch construction, typed outcomes, continuation, and SSE registration completion and rearming. Store one mutable ApiService-wide active interval initialized from `INITIAL_ADAPTIVE_DELTA_INTERVAL = 4`; every decision reads its current value, while production performs no later update until the adaptive controller is settled. Keep transport parsing and Axum response delivery out of this PR. | Operation tests for every dyadic boundary and active interval, cache hits and age pruning, serialized enlargement, size-limited reuse, Complete/Prefix/UpToDate/fresh-view outcomes, Stale catch-up, HTTP-only continuation, registration disappearance, rearming races, and upward/downward interval changes without rescheduling existing registrations. |
 | 19. Anchored windows, status, and API admission | Implement Head-first anchored-window resolution with database fallback, detached historical projections, status composition, the independent Head/historical/status admission lanes, database-read permits and timeouts, and request-owned resource accounting. | Tests for all anchors and misses, immutable-source selection, DB/gate races, detached-resource lifetime, status independence, lane saturation, query timeout, and no partial graph. |
 | 20. HTTP and SSE transport | Implement the `kgi-api-core` Axum router, strict request parsing, HTTP outcome/header mapping, gzip requirements, the reusable HTTP/1.1 connection-delivery adapter, SSE connection tasks, API fallback, and method handling over the completed logical operations. | Router-level tests for every route and method plus real loopback HTTP/1.1 tests for socket-flush completion, stopped-reader timeout, connection abort, SSE backpressure, exact guard release, malformed input precedence, headers/errors/cache policy, conditional requests, SSE framing/replacement/slow clients, committed-response failure, middleware isolation, and router shutdown. |
-| 21. ProcessingSession construction and preparation | Implement the non-reusable session owner, inert actor-tree and lifecycle-marker-worker construction, Resync and Rebuild preparation, processor initialization/launch, startup outcomes and cancellation, and consuming actor-tree shutdown. Recover the removed marker-worker primitive from pre-refactor commit `1a7fd26`, then adapt its ownership and first marker to the settled ProcessingSession contract. Do not yet add the synchronization pump or Supervisor. | Session tests for both preparation modes and all typed outcomes, threshold construction, exact generation retention/release, startup cancellation races, partial-launch cleanup, no marker before Catchup, and complete descendant joining. |
+| 21. ProcessingSession construction and preparation | Implement the non-reusable session owner, inert actor-tree and lifecycle-marker-worker construction, Resync and cancellation-aware Rebuild preparation, processor initialization/launch, startup outcomes and cancellation, and consuming actor-tree shutdown. Recover the removed marker-worker primitive from pre-refactor commit `1a7fd26`, then adapt its ownership and first marker to the settled ProcessingSession contract. Do not yet add the synchronization pump or Supervisor. | Session and Storage-operation tests for both preparation modes and all typed outcomes, threshold construction, exact generation retention/release, cancellation throughout Rebuild setup and across the transaction boundary, post-start authoritative completion, partial-launch cleanup, no marker before Catchup, and complete descendant joining. |
 | 22. ProcessingSession synchronization and Live transition | Add the common GetBlocks/VSPC pump, rolling Catchup trigger and fallbacks, Catchup marker handoff, notification activation, synthetic dispatch, Catchup accounting, overlap admission, producer shutdown, ordered processor and marker-worker Live commands, and `EnteredLive`. | Deterministic pump tests for page/cursor order, held-page behavior, marker refresh, all fallbacks, Catchup marker/open ordering without delivery acknowledgement, malformed and cancelled RPC outcomes, cross-page deduplication, overlap at complete page boundaries, asynchronous Live delivery, and abandonment of synthetic work at Live. |
 | 23. Supervisor recovery orchestration | Implement service-event resource binding, exact-generation retirement coalescence, fault/recovery policy and backoff, session slot transitions, API DB event forwarding, per-attempt ingress/reset, milestone handling, retry/Fatal behavior, and status publication. | End-to-end orchestration tests for startup, Resync-to-Rebuild replacement, stronger intent, malformed-input budget, persistence and ownership faults, stale service events, API forwarding, same-generation reuse, and no cross-session state. |
 | 24. Logging and administrative command | Initialize the retained rusty-kaspa-derived console/file logging after validated configuration and implement the complete one-shot database reinitialization dispatch and exit behavior. Preserve secret redaction and validation-before-effects; leave ordinary service dispatch to increment 25 rather than adding a placeholder composition path. | Command-level tests for help/version, logging modes and failure, administrative success and failure exits, redaction, startup ordering, and absence of every long-lived component in the one-shot command. |
@@ -119,67 +119,69 @@ level.
 | 29. Deployment and release artifacts | Complete the conventional and Docker layouts, runtime log directories, systemd and Compose examples, static-asset cache behavior, and atomic `xtask` bundle/container construction against the composed binary and Web build. | Reproducible bundle and image checks, matching binary/assets and provenance, missing-root failure, unprivileged/read-only deployment, writable logs, direct signal delivery, and atomic failure cleanup. |
 | 30. Full-stack acceptance | Add only the remaining cross-component fixtures and acceptance coverage needed to prove the focused verification contract across node RPC, PostgreSQL, recovery, API/Web, packaging, logging, and resource isolation; update implementation status with the final evidence. | Full Rust, PostgreSQL, Vitest, deterministic and complete-stack Playwright, parity, packaging, shutdown, and load/isolation suites pass from a clean checkout. |
 
-### Active increment 20: HTTP and SSE transport
+### Active increment 21: ProcessingSession construction and preparation
 
-Increment 20 is exactly one reviewable PR. It adds the `kgi-api-core` Axum
-transport over the completed logical ApiService operations and publication-
-local SSE registry, including the reusable HTTP/1.1 connection adapter that
-observes socket delivery for API responses and streams. Production listener
-binding, router nesting, tracing, static assets, runtime Web configuration,
-and global shutdown composition remain in increment 25. Test-only loopback
-listeners exercise the adapter in this increment. The focused
-[protocol](../architecture/api-protocol.md),
-[ApiService](../architecture/api-service.md),
-[publication](../architecture/api-publication.md),
-[overview](../architecture/overview.md), and
+Increment 21 is exactly one reviewable PR. It adds the non-reusable
+`ProcessingSession` owner around the already implemented inert processor tree
+and the existing validated RPC, processing-database, and graph-update
+capabilities. The focused
+[processing lifecycle](../architecture/processing-lifecycle.md),
+[block processor](../architecture/block-processing.md),
+[VSPC processor](../architecture/vspc-processing.md),
+[graph ingress](../architecture/api-ingress.md),
+[NodeService](../architecture/node-service.md),
+[Storage](../architecture/storage.md), and
 [verification](../architecture/verification.md) documents remain the sole
 owners of those contracts; this plan records only their implementation order.
 
-Use two cohesive production commits. Tests belong with the behavior they
-verify; do not split transport types, implementation, and tests into
-artificially atomic commits or add temporary abstractions solely to preserve
-such a split.
+Use three cohesive production commits. Keep each behavior with its focused
+tests, and do not add temporary lifecycle abstractions merely to split the
+implementation into smaller commits.
 
-1. Implement the complete ordinary HTTP transport as one vertical slice. Add
-   and record the transport-specific dependency, module, and response-body
-   choices. Add the state-awaiting public API router, strict route-specific
-   query and header parsing, API-owned fallback and `GET`-only method handling,
-   graph gzip negotiation, common error conversion, and exact
-   success/header/cache-policy mapping for status, Head snapshots, canonical
-   deltas, retained levels, and anchored windows. Add the reusable HTTP/1.1
-   connection adapter and response-delivery registration that retain admitted
-   request guards through the final socket flush, disconnect, committed-
-   response failure, cancellation, and the graph-delivery deadline. Cover
-   every route, malformed-input and compression precedence, conditional Head
-   request, logical outcome, saturation class, exact headers and bodies,
-   method, API fallback, and body production in router-level tests. Use a real
-   test-only loopback connection for successful flush, stopped-reader timeout,
-   socket abort, disconnect, and shutdown completion.
-2. Implement the complete SSE transport as one vertical slice. Add strict
-   wakeup-query parsing, connection admission, initial registration, ordered
-   mailbox-to-SSE framing, current-publication observation and atomic
-   registration replacement on the same transport, slow-client and stale-
-   registration cleanup, disconnect removal, and shutdown cancellation while
-   retaining the connection guard for the stream lifetime. Cover exact event
-   names and JSON frames, initial and replacement message order, identifier
-   turnover, concurrent publication replacement, mailbox saturation, slow and
-   disconnected clients, absence of the ordinary graph-delivery timeout, final
-   Stale delivery, and router shutdown. Exercise slow-client and shutdown
-   cancellation through a backpressured loopback socket so termination does
-   not depend on another SSE body poll.
-3. Reconcile the non-normative completion status, run the combined router
-   isolation and middleware-absence matrix, and execute the full Rust
-   validation suite. This is a completion record, not a third production
-   slice. Review corrections remain ordinary incremental commits rather than
-   a reason to pre-split the initial implementation.
+1. Recover the lifecycle-marker primitive from the tree at `1a7fd26`, move it
+   under ProcessingSession ownership, and adapt its local FIFO to the current
+   `Catchup` then `Live` marker protocol. Construct it inertly, start it only
+   with the initialized actor tree, retain receiver closure as the graph-feed
+   exception, distinguish internal command-path and join failure, and drain
+   already accepted work during consuming shutdown. Verify inert construction,
+   exact command order and cardinality, nonblocking local handoff, lossless
+   Live delivery under graph-channel backpressure, receiver closure, and join.
+2. Implement the preparation kernel and its complete typed outcome mapping.
+   Add the common prepared value and checked boundary-seal threshold helper.
+   Resync loads one stored-session snapshot and enriches its committed sink
+   through the exact RPC generation. Rebuild obtains one normalized current
+   pruning-point block, validates its threshold before replacement, and gives
+   that exact block to the storage replacement operation. Verify successful
+   Genesis and non-Genesis preparation, Empty and Inconsistent state, all
+   Rebuild conclusions, DAA and threshold mismatches, maximum and overflow
+   boundaries, malformed and opaque node results, every processing-database
+   error class, replacement setup/control failures, exact operation ordering,
+   and cancellation throughout Storage setup and in both linearizations of its
+   replacement-transaction boundary. Pass the session cancellation capability
+   into Storage, remove any caller-owned first-poll proxy, and continuously
+   await the same typed Storage operation through `Cancelled`, post-start
+   `Rebuilt`, or error completion.
+3. Implement the complete session owner and startup/shutdown barriers. Its
+   synchronous constructor builds the entire private inert graph from the
+   exact generations and producer. Its exact-once startup initializes both
+   processors from one prepared value, launches processors, descendants, and
+   marker worker only after successful preparation, and completes the
+   mode-specific initial handoff before returning its typed outcome. Its
+   consuming shutdown drops an inert graph or joins every launched descendant,
+   marker worker, channel, and exact-generation clone. Verify all four startup
+   outcomes, cancellation at every await boundary, generation retirement
+   races, initial milestone and partial-launch failures, absence of every
+   producer and marker before launch or Catchup, exact generation retention and
+   release, and complete predecessor joining before a fresh session can reuse
+   still-valid service generations.
+4. Reconcile the non-normative completion status and run the full Rust
+   validation suite. This is a completion record, not a fourth production
+   slice. Review corrections remain incremental commits on this PR.
 
-The router remains state-awaiting and owns only `/api/v1`-relative API paths;
-the top composition crate supplies `Arc<ApiService>` and nesting later. This
-increment adds no production listener, global middleware, static-file
-fallback, Web runtime configuration, process composition, or adaptive delta
-controller. Its test listener is verification infrastructure only.
-Controller design and implementation remain outside this PR under the
-[open decision](../decisions/open.md#adaptive-delta-load-controller).
+Increment 21 adds no GetBlocks/VSPC synchronization pump, notification
+activation, Catchup handoff, Live transition, or Supervisor. Those remain in
+increments 22 and 23. It also adds no general service-generation container,
+session restart, in-place recovery-mode change, or reusable actor state.
 
 ## Cross-increment ordering
 

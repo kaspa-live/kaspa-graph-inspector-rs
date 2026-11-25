@@ -9,7 +9,9 @@ use std::{
 use kgi_api_ingress::channel::{GraphUpdateOfferOutcome, GraphUpdateProducer, GraphUpdateProducerError};
 use kgi_core::channel::{BoundedChannelMetrics, BoundedChannelMetricsSnapshot, BoundedReceiver, BoundedSender, bounded_channel};
 use kgi_model::{
-    block::{BlockHash, BlockPresence, CompactId, ConsensusOrder, PersistedBlock, ValidatedNodeBlock, VspcPoint},
+    block::{
+        BlockHash, BlockPresence, CompactId, ConsensusOrder, MaterializedSyncAnchor, PersistedBlock, ValidatedNodeBlock, VspcPoint,
+    },
     lifecycle::{
         BoundedProcessingState, Component, ComponentFault, FaultDisposition, FaultKind, OwnershipFault, RecoveryMode, ServiceKind,
     },
@@ -23,7 +25,7 @@ use tokio::{
 };
 
 use super::{
-    BlockDatabase, BlockProcessorInitialization, BlockResolutionEvent, BlockRpc,
+    BlockDatabase, BlockResolutionEvent, BlockRpc,
     dependency::{DependencyResolverMetrics, DependencyResolverMetricsSnapshot},
     error::{ChildControlError, ChildFault, ChildFaultKind},
     orphan::OrphanManager,
@@ -180,11 +182,15 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessor<D, R> {
         (processor, event_rx)
     }
 
-    pub(crate) fn initialize(&mut self, initialization: BlockProcessorInitialization) -> Result<(), BlockProcessorControlError> {
+    pub(crate) fn initialize(
+        &mut self,
+        anchor: MaterializedSyncAnchor,
+        boundary_seal_blue_score: u64,
+    ) -> Result<(), BlockProcessorControlError> {
         self.worker
             .as_mut()
             .expect("BlockProcessor initialization precedes its single start")
-            .initialize(initialization)
+            .initialize(anchor, boundary_seal_blue_score)
             .map_err(BlockProcessorControlError::Rejected)
     }
 
@@ -337,7 +343,7 @@ struct BlockProcessorWorker<D: BlockDatabase, R: BlockRpc> {
 }
 
 impl<D: BlockDatabase, R: BlockRpc> BlockProcessorWorker<D, R> {
-    fn initialize(&mut self, initialization: BlockProcessorInitialization) -> Result<(), ComponentFault> {
+    fn initialize(&mut self, anchor: MaterializedSyncAnchor, boundary_seal_blue_score: u64) -> Result<(), ComponentFault> {
         let BlockProcessorRun::Inert { mode } = self.run else {
             return Err(invalid_lifecycle("BlockProcessor initialization requires an inert worker"));
         };
@@ -346,23 +352,20 @@ impl<D: BlockDatabase, R: BlockRpc> BlockProcessorWorker<D, R> {
         }
         if self.rpc.network_id() != self.db.network_id()
             || self.rpc.genesis_hash() != self.db.genesis_hash()
-            || initialization.anchor.blue_score > kgi_model::block::MAX_BLUE_SCORE
+            || anchor.blue_score > kgi_model::block::MAX_BLUE_SCORE
         {
             return Err(invalid_lifecycle("BlockProcessor generations or anchor are inconsistent"));
         }
-        if mode == RecoveryMode::Resync && initialization.anchor.blue_score < initialization.boundary_seal_blue_score {
+        if mode == RecoveryMode::Resync && anchor.blue_score < boundary_seal_blue_score {
             return Err(invalid_lifecycle("Resync anchor is below the sealed boundary"));
         }
-        let genesis = initialization.anchor.point.hash() == self.db.genesis_hash();
-        if mode == RecoveryMode::Rebuild
-            && genesis
-            && (initialization.anchor.blue_score != 0 || initialization.boundary_seal_blue_score != 0)
-        {
+        let genesis = anchor.point.hash() == self.db.genesis_hash();
+        if mode == RecoveryMode::Rebuild && genesis && (anchor.blue_score != 0 || boundary_seal_blue_score != 0) {
             return Err(invalid_lifecycle("Genesis Rebuild requires zero blue scores"));
         }
 
         let stage = if mode == RecoveryMode::Rebuild && !genesis {
-            RunStage::Synchronizing(SealPhase::PreSeal { seal_blue_score: initialization.boundary_seal_blue_score })
+            RunStage::Synchronizing(SealPhase::PreSeal { seal_blue_score: boundary_seal_blue_score })
         } else {
             RunStage::Synchronizing(SealPhase::PostSeal)
         };
@@ -895,9 +898,7 @@ mod tests {
     use tokio::sync::{Semaphore, mpsc};
 
     use super::*;
-    use crate::block_processor::{
-        BlockDatabase, BlockProcessorInitialization, BlockRpc, dependency::DependencyRpc, orphan::ORPHAN_RESOLUTION_THRESHOLD,
-    };
+    use crate::block_processor::{BlockDatabase, BlockRpc, dependency::DependencyRpc, orphan::ORPHAN_RESOLUTION_THRESHOLD};
 
     #[derive(Default)]
     struct MockDbState {
@@ -1079,9 +1080,7 @@ mod tests {
         let rpc = MockRpc::new(db.network_id, db.genesis_hash);
         let (persisted_tx, persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (mut processor, events) = BlockProcessor::new(mode, rpc.clone(), db.clone(), graph_updates, persisted_tx);
-        processor
-            .initialize(BlockProcessorInitialization { anchor: sync_anchor, boundary_seal_blue_score })
-            .expect("BlockProcessor initialization");
+        processor.initialize(sync_anchor, boundary_seal_blue_score).expect("BlockProcessor initialization");
         processor.start().expect("BlockProcessor start");
         ProcessorFixture { processor, events, persisted: persisted_rx, db, rpc }
     }
@@ -1097,9 +1096,7 @@ mod tests {
 
         assert!(graph_rx.try_recv_update().is_err());
         assert!(events.try_recv().is_err());
-        processor
-            .initialize(BlockProcessorInitialization { anchor: anchor(genesis, 20), boundary_seal_blue_score: 10 })
-            .expect("BlockProcessor initialization");
+        processor.initialize(anchor(genesis, 20), 10).expect("BlockProcessor initialization");
         assert!(graph_rx.try_recv_update().is_err());
         assert!(events.try_recv().is_err());
 
@@ -1147,9 +1144,7 @@ mod tests {
         let (graph, _graph_rx) = graph_update_channel();
         let (persisted, _persisted_rx) = bounded_channel(PROCESSING_DATA_CHANNEL_CAPACITY);
         let (mut processor, events) = BlockProcessor::new(RecoveryMode::Rebuild, rpc, db, graph, persisted);
-        processor
-            .initialize(BlockProcessorInitialization { anchor: anchor(genesis, 0), boundary_seal_blue_score: 0 })
-            .expect("BlockProcessor initialization");
+        processor.initialize(anchor(genesis, 0), 0).expect("BlockProcessor initialization");
         drop(events);
 
         assert!(matches!(
@@ -1457,7 +1452,7 @@ mod tests {
         let (mut processor, _events) = BlockProcessor::new(RecoveryMode::Resync, wrong_rpc, db, graph, persisted);
 
         assert!(matches!(
-            processor.initialize(BlockProcessorInitialization { anchor: anchor(genesis, 20), boundary_seal_blue_score: 10 }),
+            processor.initialize(anchor(genesis, 20), 10),
             Err(BlockProcessorControlError::Rejected(ComponentFault {
                 kind: FaultKind::Ownership(OwnershipFault::InvalidLifecycleControl),
                 ..
@@ -1522,9 +1517,7 @@ mod tests {
         graph.publish_catchup().expect("open API graph-update gate");
         assert_eq!(graph_rx.try_recv_update(), Ok(GraphUpdate::Catchup));
         let (mut processor, mut events) = BlockProcessor::new(RecoveryMode::Resync, rpc, db, graph, persisted_tx);
-        processor
-            .initialize(BlockProcessorInitialization { anchor: anchor(genesis, 4), boundary_seal_blue_score: 0 })
-            .expect("BlockProcessor initialization");
+        processor.initialize(anchor(genesis, 4), 0).expect("BlockProcessor initialization");
         processor.start().expect("BlockProcessor start");
 
         processor.submit_synthetic(inserted.clone()).await.expect("inserted block");

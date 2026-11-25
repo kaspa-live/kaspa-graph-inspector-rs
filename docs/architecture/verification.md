@@ -633,16 +633,27 @@ populate the same `PreparedSync` used to initialize BlockProcessor. Malformed pr
 responses use the shared malformed-input budget; `RpcRequestFailed` and
 generation loss retain their session-fault disposition.
 Under the
-[storage-owned post-start cancellation contract](storage.md#api-read-exclusion-during-database-replacement--settled),
-request session and service cancellation immediately before and at every
-observable replacement-transaction boundary. Before transaction start,
-ordinary cancellation may complete without running replacement. After start,
-verify the storage future is never dropped: definite success publishes caches,
-opens the gate, returns the anchor, and causes the session startup barrier to
-return `Cancelled` without processor initialization; definite failure and
-ambiguous outcome complete their owner-defined cleanup and retain their typed
-`Failed` disposition. Supervisor must remain responsive while awaiting each
-outcome and invoke consuming session shutdown only afterward.
+[storage-owned Rebuild cancellation contract](storage.md#api-read-exclusion-during-database-replacement--settled),
+request session and service cancellation after Storage accepts the request at
+each setup boundary: fresh API generation preparation, active API-read lease
+drain, exclusive replacement-permit acquisition, and the interval after
+exclusive acquisition but before transaction start. Each case must perform
+its applicable API generation and gate cleanup, return Storage `Cancelled`,
+and prove that no replacement transaction or processing-data mutation begins.
+Dropping a caller during setup has the same no-transaction guarantee through
+completion-receiver closure.
+
+Race cancellation against Storage's final serialized transition to
+`TransactionStarted` in both linearizations. Cancellation winning returns
+`Cancelled` and starts no transaction. Transaction start winning makes the
+future non-droppable: definite success publishes caches, opens the gate,
+returns `Rebuilt(anchor)`, and causes the session startup barrier to return
+`Cancelled` without processor initialization; definite failure and ambiguous
+outcome complete their owner-defined cleanup and retain their typed `Failed`
+disposition. ProcessingSession must pass the cancellation capability, poll one
+Storage future continuously, and use no first-poll or caller-owned transaction-
+start proxy. Supervisor must remain responsive while awaiting each outcome and
+invoke consuming session shutdown only afterward.
 
 Also cover a coherent Genesis-anchored database below anticone finalization
 depth, Empty-versus-Genesis discrimination, exact node/database

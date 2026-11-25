@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 27 October 2026.
+Updated 25 November 2026.
 
 The architecture bootstrap, post-handoff reconciliation, focused-document
 extraction, and two independent losslessness reviews are complete. The focused
@@ -544,3 +544,28 @@ control remains deferred. Completion validation passed workspace formatting,
 Cargo check, 656/656 Nextest tests including Docker PostgreSQL integration and
 real loopback transport coverage, Cargo doctests, Clippy with warnings denied,
 and `git diff --check`.
+
+Implementation increment 21 is implemented on its dedicated main-based branch.
+Rebuild preparation passes its startup cancellation capability into one
+cancellation-aware Storage operation and consumes Storage's typed setup
+cancellation or authoritative replacement result without a caller-owned
+transaction-start proxy. The private non-reusable `ProcessingSession`
+constructs its complete inert processor tree and session-owned lifecycle-marker
+child from exact RPC, processing-database, and graph-update capabilities. Its
+Resync and Rebuild preparation paths produce one common checked initialization
+value and preserve typed node and storage conclusions. Exact-once startup
+initializes and launches both processors and the marker child only after
+preparation, exposes the four typed startup outcomes, and forwards the Rebuild
+pruning-point boundary milestone. Consuming shutdown disables notifications,
+joins both processor trees and the marker child, and then releases the
+session's exact generation clones and event receivers. Focused tests cover
+both preparation modes, threshold boundaries, every Rebuild setup-cancellation
+stage, both sides of the transaction-start race, post-start success and
+failure, startup conclusions, inert and partial-launch cleanup, marker ordering
+and backpressure, unexpected marker termination, fault-free graph-receiver
+closure, exact generation release, and Genesis milestone forwarding.
+The synchronization pump, notification activation, Catchup/Live coordination,
+and Supervisor remain in increments 22 and 23. Completion validation passed
+workspace formatting, Cargo check, 684/684 Nextest tests including Docker
+PostgreSQL integration, Cargo doctests, Clippy with warnings denied, and
+`git diff --check`.

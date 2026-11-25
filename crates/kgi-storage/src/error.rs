@@ -3,7 +3,7 @@ use std::sync::Arc;
 use kaspa_consensus_core::network::NetworkId;
 use kgi_model::{
     block::{BlockHash, CompactId},
-    lifecycle::{PersistenceFault, ScoreRangeFault},
+    lifecycle::{PersistenceFault, RebuildSetupFault, ScoreRangeFault},
 };
 use thiserror::Error;
 
@@ -27,18 +27,6 @@ pub enum ApiReadError {
     /// The initiating caller cancelled the database read.
     #[error("API database read was cancelled")]
     Cancelled,
-}
-
-/// Failure while establishing the database-replacement preconditions.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum RebuildSetupFault {
-    /// The fresh read-only API generation could not be prepared.
-    #[error("fresh API database generation preparation failed")]
-    ApiGenerationPreparation,
-
-    /// Existing API database phases could not be cancelled and drained.
-    #[error("API database phases could not be excluded")]
-    ApiReadExclusion,
 }
 
 /// Permanent reason a PostgreSQL database cannot be used by KGI.

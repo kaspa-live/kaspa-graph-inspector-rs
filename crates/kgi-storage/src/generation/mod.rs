@@ -10,7 +10,7 @@ use kaspa_consensus_core::network::NetworkId;
 use kgi_api_model::projection::{GraphViewSeedOutcome, GraphViewSeedRequest};
 use kgi_core::timing::Timing;
 use kgi_model::{
-    block::{BlockHash, BlockPresence, CompactId, MaterializedSyncAnchor, ValidatedNodeBlock},
+    block::{BlockHash, BlockPresence, CompactId, ValidatedNodeBlock},
     lifecycle::PersistenceFault,
 };
 use sqlx::{Connection, PgConnection, PgPool, Postgres, pool::PoolConnection};
@@ -22,7 +22,7 @@ use crate::{
     cache::{CachedVspcSink, ProcessingCaches},
     error::{ApiReadError, ProcessingDbError, StorageError},
     identity,
-    operation::{RebuildFromPruningPointError, ResolveMaterializedIdsError},
+    operation::{RebuildFromPruningPointError, RebuildFromPruningPointOutcome, ResolveMaterializedIdsError},
     replacement::{ApiDbReadLease, ApiReplacementGate},
     runtime::{RebuildRequest, RebuildSender, RetirementRequest, RetirementSender, RetirementTarget},
     state::ProcessingStateInspection,
@@ -248,11 +248,12 @@ impl ValidatedDbClient {
         }
     }
 
-    /// Atomically replaces all processing data with one validated pruning-point anchor.
+    /// Atomically replaces all processing data, returning cancellation only before the transaction starts.
     pub async fn rebuild_from_pruning_point(
         &self,
         pruning_point: ValidatedNodeBlock,
-    ) -> Result<MaterializedSyncAnchor, RebuildFromPruningPointError> {
+        cancellation: CancellationToken,
+    ) -> Result<RebuildFromPruningPointOutcome, RebuildFromPruningPointError> {
         rebuild::validate_input(&pruning_point)
             .map_err(ProcessingDbError::mutation)
             .map_err(RebuildFromPruningPointError::Database)?;
@@ -261,7 +262,7 @@ impl ValidatedDbClient {
         }
         let (completion, acknowledgement) = oneshot::channel();
         self.rebuild_tx
-            .send(RebuildRequest::new(self.runtime.self_weak.clone(), pruning_point, completion))
+            .send(RebuildRequest::new(self.runtime.self_weak.clone(), pruning_point, cancellation, completion))
             .map_err(|_| rebuild_error(StorageError::ControlUnavailable))?;
         acknowledgement.await.map_err(|_| rebuild_error(StorageError::ControlUnavailable))?.map_err(rebuild_error)
     }

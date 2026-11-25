@@ -5,9 +5,10 @@ use std::{
 };
 
 use kgi_core::timing::Timing;
+use kgi_model::lifecycle::RebuildSetupFault;
 use tokio::sync::watch;
 
-use crate::error::{RebuildSetupFault, StorageError};
+use crate::error::StorageError;
 
 pub(crate) const API_REPLACEMENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -224,10 +225,11 @@ mod tests {
 
     use async_trait::async_trait;
     use kgi_core::timing::{Clock, Jitter, Timing};
+    use kgi_model::lifecycle::RebuildSetupFault;
     use tokio::sync::{mpsc, oneshot};
 
     use super::{API_REPLACEMENT_DRAIN_TIMEOUT, ApiReplacementGate};
-    use crate::error::{RebuildSetupFault, StorageError};
+    use crate::error::StorageError;
 
     struct IdentityJitter;
 

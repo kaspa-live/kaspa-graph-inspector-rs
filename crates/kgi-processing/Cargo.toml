@@ -14,6 +14,7 @@ kgi-node = { path = "../kgi-node" }
 kgi-storage = { path = "../kgi-storage" }
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 
 [lints]
 workspace = true
