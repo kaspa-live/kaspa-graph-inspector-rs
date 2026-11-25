@@ -919,16 +919,28 @@ clears processing data; StorageService establishes the API-read replacement
 gate owned by the storage contract:
 
 ```rust
-let anchor = db.rebuild_from_pruning_point(pp).await?;
+let outcome = db.rebuild_from_pruning_point(pp, startup_cancellation.clone()).await;
 ```
 
 The pruning point is mandatory. Storage owns the transaction, retained network
 binding, PP-boundary representation, metadata replacement, cache publication,
-and returned anchor, including the pruning point's selected-parent hash; see
+typed setup-cancellation outcome, and returned anchor, including the pruning
+point's selected-parent hash; see
 [storage.md](storage.md#rebuild-transaction--settled). ProcessingSession must not
 expose or use a general clear-without-PP primitive. It combines the returned
 anchor with the already constructed threshold and exact clients to publish
 `PreparedSync`; it does not derive the threshold from the returned sink.
+
+ProcessingSession passes its startup-cancellation capability into the Storage
+operation and continuously polls that one future; it neither drops the future
+nor infers transaction start from first poll or any local flag. Storage
+`Cancelled` produces the session's `Cancelled` startup outcome. Storage
+`Rebuilt(anchor)` produces `PreparedSync` only while startup cancellation is
+still absent; if cancellation was requested after Storage's transaction
+boundary, ProcessingSession discards the returned anchor and reports
+`Cancelled` without initializing or launching a processor. Every Storage error
+retains its existing typed `Failed` disposition even when cancellation was
+requested after transaction start.
 
 ### API session replacement and publication
 
@@ -1346,16 +1358,16 @@ ProcessingSession's consuming `shutdown` performs this barrier in order:
 If `start` is pending when replacement or terminal shutdown is requested,
 Supervisor keeps the session in `Active`, signals startup cancellation, and
 continues polling `start` to an outcome before invoking `shutdown(self)`.
-Preparation that has not begun a storage replacement may return `Cancelled`
-promptly. If `start` is awaiting `rebuild_from_pruning_point` after the
-storage-owned cancellation boundary, it remains pending until that operation
-completes under the
+Preparation awaiting Rebuild setup passes that signal to Storage and may
+return `Cancelled` promptly when Storage proves that no replacement
+transaction began. If the storage-owned transaction boundary has already been
+crossed, `start` remains pending until that operation completes under the
 [replacement contract](storage.md#api-read-exclusion-during-database-replacement--settled).
-A successful anchor returned after cancellation activates no processor and
-produces `Cancelled`; an operation error retains its typed `Failed`
-disposition. Supervisor remains responsive while polling this completion. Only
-then does it atomically move the session to `Stopping` and invoke the consuming
-`shutdown` barrier.
+A successful `Rebuilt(anchor)` returned after cancellation activates no
+processor and produces `Cancelled`; an operation error retains its typed
+`Failed` disposition. Supervisor remains responsive while polling this
+completion. Only then does it atomically move the session to `Stopping` and
+invoke the consuming `shutdown` barrier.
 
 Supervisor atomically replaces `Active(session)` with
 `Stopping(session.shutdown())`; the slot then prevents another control path

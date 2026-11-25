@@ -545,9 +545,14 @@ Cargo check, 656/656 Nextest tests including Docker PostgreSQL integration and
 real loopback transport coverage, Cargo doctests, Clippy with warnings denied,
 and `git diff --check`.
 
-Implementation increment 21 is implemented on its dedicated main-based branch.
-The private non-reusable `ProcessingSession` now constructs its complete inert
-processor tree and session-owned lifecycle-marker child from exact RPC,
+Implementation increment 21 has its original feature surface implemented on
+its dedicated main-based branch, but is not complete against the corrected
+Rebuild cancellation contract. The current preparation path treats first poll
+of the Storage future as transaction start; it must instead pass cancellation
+into the Storage operation and consume Storage's typed setup-cancellation or
+authoritative post-start result. No production correction has yet been made.
+The private non-reusable `ProcessingSession` otherwise constructs its complete
+inert processor tree and session-owned lifecycle-marker child from exact RPC,
 processing-database, and graph-update capabilities. Its Resync and Rebuild
 preparation paths produce one common checked initialization value, preserve
 typed node and storage conclusions, and retain an already-started database

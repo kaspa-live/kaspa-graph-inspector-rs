@@ -1390,9 +1390,11 @@ tests instead of adding a repository-wide mocking framework.
 Represent startup cancellation with one cloneable, session-local signal that
 Supervisor can capture before polling the borrowing startup future. Signalling
 it is idempotent and carries no recovery semantics. ProcessingSession retains
-the receiving side and applies it around each preparation await while keeping
-Storage's already-started replacement future owned through completion. The
-signal is an implementation capability, not another session lifecycle
+the receiving side and passes a cancellation capability into Storage's Rebuild
+operation. It continuously awaits that one typed operation: Storage owns setup
+cancellation and the transition to non-droppable transaction completion.
+ProcessingSession uses no first-poll flag or local transaction-start proxy.
+The signal is an implementation capability, not another session lifecycle
 operation.
 
 Store inert processor values, child event receivers, marker state, and later

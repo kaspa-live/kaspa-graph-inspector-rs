@@ -285,9 +285,12 @@ do not start an independent storage retry loop; the processing lifecycle owns
 the complete-attempt retry.
 
 Session or service cancellation during setup performs the same applicable API
-generation cleanup and follows the ordinary cancellation path rather than
-returning `RebuildFromPruningPointError::Setup`. If connection loss proves the
-processing generation unusable, StorageService instead retires it and returns
+generation cleanup and returns
+`RebuildFromPruningPointOutcome::Cancelled` rather than
+`RebuildFromPruningPointError::Setup`. That outcome proves that no replacement
+transaction started. If connection loss proves the processing generation
+unusable before cancellation is selected, StorageService instead retires it
+and returns
 `RebuildFromPruningPointError::Database(ProcessingDbError::GenerationLost)`;
 the processing lifecycle maps that result to
 `ServiceGenerationLost(Storage)`.
@@ -305,7 +308,8 @@ loss of API replacement control does not prove processing-generation loss.
 The [processing lifecycle](processing-lifecycle.md#supervisor-and-recovery-intent--settled)
 owns the resulting terminal component disposition.
 If session or service cancellation has already been selected, the ordinary
-cancellation path takes precedence over this fault.
+`RebuildFromPruningPointOutcome::Cancelled` path takes precedence over this
+fault.
 
 The exclusive permit remains held through the atomic replacement outcome and
 cache publication or generation retirement. A database phase started through
@@ -317,16 +321,24 @@ replacement contents. Publishing the generation does not open public
 historical-request admission; that remains owned by the linked ApiService
 lifecycle.
 
-Session or service cancellation observed after the replacement transaction
-has started must not drop or abort the replacement future. StorageService
-continues to a definite success, definite failure, or ambiguous outcome and
-performs the cache, generation, and replacement-gate publication or cleanup
-owned by that outcome before the method completes. A definite success still
-returns its coherent anchor even when the caller has requested cancellation;
-the processing lifecycle decides whether to initialize processors or discard
-that anchor. Definite and ambiguous failures retain their typed result rather
-than becoming ordinary cancellation. This rule does not weaken the ordinary
-cancellation behavior during setup before the transaction begins.
+StorageService owns the one cancellation boundary between setup and the
+replacement transaction. After establishing exclusive replacement access and
+validating that access is still current, it serializes one final cancellation
+observation with the operation-state transition to `TransactionStarted`. If
+cancellation wins, StorageService starts no transaction, performs the setup
+cleanup above, and returns `RebuildFromPruningPointOutcome::Cancelled`. If the
+transition wins, later cancellation cannot change the Storage result or abort
+the operation.
+
+Session or service cancellation observed after `TransactionStarted` must not
+drop or abort the replacement future. StorageService continues to a definite
+success, definite failure, or ambiguous outcome and performs the cache,
+generation, and replacement-gate publication or cleanup owned by that outcome
+before the method completes. A definite success returns
+`RebuildFromPruningPointOutcome::Rebuilt(anchor)` even when the caller has
+subsequently requested cancellation; the processing lifecycle decides whether
+to initialize processors or discard that anchor. Definite and ambiguous
+failures retain their typed result rather than becoming ordinary cancellation.
 
 A final definite replacement failure rolls back the transaction and retires
 the gated API generation before it can become readable. No replacement API
@@ -1080,11 +1092,17 @@ enum RebuildFromPruningPointError {
     },
 }
 
+enum RebuildFromPruningPointOutcome {
+    Rebuilt(MaterializedSyncAnchor),
+    Cancelled,
+}
+
 impl ValidatedDbClient {
     async fn rebuild_from_pruning_point(
         &self,
         pruning_point: ValidatedNodeBlock,
-    ) -> Result<MaterializedSyncAnchor, RebuildFromPruningPointError>;
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<RebuildFromPruningPointOutcome, RebuildFromPruningPointError>;
 }
 ```
 
@@ -1092,6 +1110,16 @@ The pruning point is mandatory. Administrative schema reinitialization is a
 separate [schema-lifecycle operation](#administrative-reinitialization--settled)
 and is never implemented through this method. There is no processing-data
 clear primitive without a pruning point.
+
+The cancellation capability belongs to this one call and is observed
+throughout API generation preparation, API-read cancellation and drain, and
+exclusive replacement-permit acquisition. Cancellation does not require the
+caller to drop the method future. The caller continues polling the same future
+until Storage returns its typed outcome and has completed the cleanup owned by
+that outcome. Dropping the caller future or closing its completion receiver
+remains an additional setup-cancellation source before `TransactionStarted`;
+after that boundary Storage completes the authoritative transaction outcome
+even when no receiver remains.
 
 ### Preconditions and exclusive access
 
