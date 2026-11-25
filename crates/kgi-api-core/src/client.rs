@@ -382,6 +382,13 @@ impl SseClientRegistry {
         self.complete_delta(identifier, DeltaScheduleAction::ValidateOnly) == DeltaCompletionResult::Accepted
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_messages_for_test(&self, identifier: ClientIdentifier) -> Option<usize> {
+        let state = self.lock_state();
+        let mailbox = state.clients.get(&identifier.key())?.mailbox.upgrade()?;
+        Some(mailbox.lock_state().queue.len())
+    }
+
     /// Publishes one required lifecycle observation to every live registration.
     pub(crate) fn publish_state(&self, publication_state: GraphPublicationState, revision: u64) {
         let mut cancellations = Vec::new();

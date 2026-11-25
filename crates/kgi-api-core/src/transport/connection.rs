@@ -590,14 +590,11 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
-        convert::Infallible,
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
+        collections::{BTreeMap, HashMap},
+        sync::Arc,
+        time::Instant,
     };
 
-    use async_stream::stream;
     use axum::{
         Router,
         body::{Body, Bytes},
@@ -613,14 +610,23 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
+    use kgi_api_model::{
+        graph::{GraphView, Level, LevelExtent, TrackingPolicy},
+        history::GraphHistory,
+    };
     use kgi_model::lifecycle::{
         NodeServiceStatus, NodeServiceStatusState, ProcessingState, ProcessingStatus, StorageServiceStatus, StorageServiceStatusState,
         SupervisorLifecycle, SupervisorStatus,
     };
 
-    use crate::{admission::ApiRequestAdmissions, service::ApiService};
+    use crate::{
+        admission::{ApiRequestAdmissionError, ApiRequestAdmissions},
+        client::{ClientIdentifier, MAX_SSE_CLIENTS},
+        publication::{GraphPublication, GraphPublicationState},
+        service::{ApiService, SseConnectionOpenError},
+    };
 
-    use super::{serve, track_request_with_timeout, track_sse};
+    use super::{serve, track_request_with_timeout};
 
     fn api_service() -> (Arc<ApiService>, crate::service::ApiServiceEventReceiver) {
         let (_, supervisor) = tokio::sync::watch::channel(SupervisorStatus {
@@ -633,6 +639,21 @@ mod tests {
         let (_, storage) = tokio::sync::watch::channel(StorageServiceStatus { state: StorageServiceStatusState::Connecting });
         let (_, processing) = tokio::sync::watch::channel(ProcessingStatus { state: ProcessingState::Idle });
         ApiService::new(supervisor, node, storage, processing)
+    }
+
+    fn publication() -> Arc<GraphPublication> {
+        let view = GraphView::from_database_projection(
+            250,
+            LevelExtent::new(1, 2).expect("valid extent"),
+            TrackingPolicy::Head,
+            BTreeMap::from([(1, Level { size: 1, daa_score: Some(10) }), (2, Level { size: 2, daa_score: Some(20) })]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        Arc::new(
+            GraphPublication::new(GraphPublicationState::Synchronizing, Instant::now(), view, GraphHistory::new())
+                .expect("coherent publication"),
+        )
     }
 
     async fn spawn_server(application: Router) -> (std::net::SocketAddr, JoinHandle<Result<(), hyper::Error>>) {
@@ -651,6 +672,40 @@ mod tests {
 
     async fn request(stream: &mut TcpStream) {
         stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.expect("test request written");
+    }
+
+    async fn request_sse(stream: &mut TcpStream) {
+        stream
+            .write_all(
+                b"GET /graph/wakeups?publication_id=1&from_revision_id=0 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("SSE request written");
+    }
+
+    async fn read_client_registration(stream: &mut TcpStream) -> ClientIdentifier {
+        const PREFIX: &[u8] = b"\"client_id\":\"";
+
+        timeout(Duration::from_secs(2), async {
+            let mut response = Vec::new();
+            let mut buffer = [0_u8; 1_024];
+            loop {
+                let read = stream.read(&mut buffer).await.expect("SSE response remains readable");
+                assert_ne!(read, 0, "SSE response includes its initial registration before EOF");
+                response.extend_from_slice(&buffer[..read]);
+                let Some(start) = response.windows(PREFIX.len()).position(|window| window == PREFIX) else {
+                    continue;
+                };
+                let value_start = start + PREFIX.len();
+                let Some(value) = response.get(value_start..value_start + 11) else {
+                    continue;
+                };
+                let value = std::str::from_utf8(value).expect("client identifier is UTF-8");
+                return ClientIdentifier::parse(value).expect("client identifier is canonical");
+            }
+        })
+        .await
+        .expect("initial SSE registration arrives")
     }
 
     #[tokio::test]
@@ -893,68 +948,69 @@ mod tests {
             .expect("buffered response bytes remain readable");
     }
 
-    struct StreamDropProbe(Arc<AtomicBool>);
-
-    impl Drop for StreamDropProbe {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
     #[tokio::test]
-    async fn sse_cancellation_aborts_a_backpressured_connection() {
-        let cancellation = CancellationToken::new();
-        let response_started = Arc::new(Notify::new());
-        let stream_started = Arc::new(Notify::new());
-        let stream_dropped = Arc::new(AtomicBool::new(false));
-        let application = Router::new().route(
-            "/",
-            get({
-                let cancellation = cancellation.clone();
-                let response_started = response_started.clone();
-                let stream_started = stream_started.clone();
-                let stream_dropped = stream_dropped.clone();
-                move || {
-                    let cancellation = cancellation.clone();
-                    let response_started = response_started.clone();
-                    let stream_started = stream_started.clone();
-                    let stream_dropped = stream_dropped.clone();
-                    async move {
-                        let chunks = stream! {
-                            let _probe = StreamDropProbe(stream_dropped);
-                            stream_started.notify_one();
-                            loop {
-                                yield Ok::<Bytes, Infallible>(Bytes::from(vec![b's'; 64 * 1024]));
-                            }
-                        };
-                        let mut response = Response::new(Body::from_stream(chunks));
-                        track_sse(&mut response, cancellation);
-                        response_started.notify_one();
-                        response
-                    }
-                }
-            }),
-        );
+    async fn real_sse_backpressure_disconnects_registration_releases_admission_and_allows_shutdown() {
+        let (service, _events) = api_service();
+        let publication = publication();
+        service.install_test_publication(publication.clone());
+        let application = crate::router().with_state(service.clone());
         let (address, server) = spawn_server(application).await;
         let socket = TcpSocket::new_v4().expect("test socket created");
         socket.set_recv_buffer_size(1024).expect("small receive buffer configured");
         let mut client = socket.connect(address).await.expect("test client connects");
-        request(&mut client).await;
-        response_started.notified().await;
-        stream_started.notified().await;
-        cancellation.cancel();
+        request_sse(&mut client).await;
+        let identifier = read_client_registration(&mut client).await;
+        assert!(publication.client_registry().validate(identifier));
+
+        let mut backpressured = false;
+        for _ in 0..10_000 {
+            publication.client_registry().publish_state(GraphPublicationState::Synchronizing, 0);
+            let drained = timeout(Duration::from_millis(20), async {
+                loop {
+                    if publication.client_registry().pending_messages_for_test(identifier) != Some(0) {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    break;
+                }
+            })
+            .await;
+            if drained.is_err() {
+                backpressured = true;
+                break;
+            }
+        }
+        assert!(backpressured, "stopped peer reading eventually prevents Hyper from polling the real SSE mailbox");
+
+        for _ in 0..10_000 {
+            if !publication.client_registry().validate(identifier) {
+                break;
+            }
+            publication.client_registry().publish_state(GraphPublicationState::Synchronizing, 0);
+        }
+        assert!(!publication.client_registry().validate(identifier), "mailbox saturation removes the exact registration");
 
         timeout(Duration::from_secs(2), server)
             .await
-            .expect("SSE cancellation closes the connection")
+            .expect("slow-client cancellation closes the connection")
             .expect("server task joins")
-            .expect("SSE cancellation is an expected connection outcome");
-        assert!(stream_dropped.load(Ordering::SeqCst), "connection abort drops the SSE stream");
+            .expect("slow-client cancellation is an expected connection outcome");
         let mut response = Vec::new();
         timeout(Duration::from_secs(2), client.read_to_end(&mut response))
             .await
-            .expect("cancelled SSE socket reaches EOF")
+            .expect("slow-client SSE socket reaches EOF")
             .expect("buffered SSE bytes remain readable");
+
+        let mut admitted = Vec::with_capacity(MAX_SSE_CLIENTS);
+        for _ in 0..MAX_SSE_CLIENTS {
+            admitted.push(service.open_sse_connection().expect("the released SSE permit restores the exact full capacity"));
+        }
+        assert!(matches!(service.open_sse_connection(), Err(SseConnectionOpenError::Admission(ApiRequestAdmissionError::Saturated))));
+        drop(admitted);
+        timeout(Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("released SSE delivery permits shutdown to complete")
+            .expect("service shuts down cleanly");
     }
 
     #[tokio::test]
